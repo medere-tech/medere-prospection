@@ -1,0 +1,17 @@
+node_modules
+.next
+out
+build
+coverage
+playwright-report
+test-results
+next-env.d.ts
+package-lock.json
+
+# Docs human-curated : contenu exact, NE PAS auto-formater (protection explicite).
+AGENTS.md
+CLAUDE.md
+README.md
+SYNTHESE.md
+SECURITY-NOTES.md
+.claude/
