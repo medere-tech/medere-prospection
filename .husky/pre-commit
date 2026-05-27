@@ -1,16 +1,18 @@
 # Pre-commit léger : format + lint des fichiers stagés uniquement (rapide).
+#
+# Windows / GitHub Desktop : le git embarqué de GHD (MinGit) fournit sh/dash
+# mais PAS bash. Les wrappers POSIX npm/npx (#!/usr/bin/env bash) y échouent.
+# On contourne en appelant le binaire local (node_modules/.bin, shebang #!/bin/sh)
+# et en garantissant que node.exe est sur le PATH.
 
-# Fix Windows : GitHub Desktop bash ne trouve pas Node sans cet ajout au PATH.
-if [ -d "/c/Program Files/nodejs" ]; then
+if ! command -v node >/dev/null 2>&1 && [ -d "/c/Program Files/nodejs" ]; then
   export PATH="/c/Program Files/nodejs:$PATH"
 fi
 
-# Sur Windows, utilise npx.cmd si le bash-npx est absent
-if command -v npx >/dev/null 2>&1; then
-  npx lint-staged
-elif [ -f "/c/Program Files/nodejs/npx.cmd" ]; then
-  "/c/Program Files/nodejs/npx.cmd" lint-staged
-else
-  echo "ERROR: npx not found. Install Node.js or fix PATH."
+if ! command -v node >/dev/null 2>&1; then
+  echo "ERROR: node introuvable. Installe Node.js ou corrige le PATH." >&2
   exit 1
 fi
+
+# node_modules/.bin est déjà préfixé au PATH par le wrapper Husky (.husky/_/h).
+lint-staged
