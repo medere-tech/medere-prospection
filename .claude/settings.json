@@ -29,8 +29,6 @@
     ],
     "deny": [
       "Bash(rm -rf /)",
-      "Bash(curl:* | sh)",
-      "Bash(wget:* | sh)",
       "Bash(eval:*)",
       "Read(./.env)",
       "Read(./.env.local)",
@@ -38,6 +36,8 @@
       "Read(./.env.*.local)"
     ],
     "ask": [
+      "Bash(curl:*)",
+      "Bash(wget:*)",
       "Bash(git push:*)",
       "Bash(git rebase:*)",
       "Bash(git reset:*)",

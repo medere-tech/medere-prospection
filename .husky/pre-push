@@ -1,0 +1,16 @@
+# Pre-push : garde-fou complet avant d'envoyer du code (typecheck + tests).
+
+# Fix Windows : GitHub Desktop bash ne trouve pas Node sans cet ajout au PATH.
+if [ -d "/c/Program Files/nodejs" ]; then
+  export PATH="/c/Program Files/nodejs:$PATH"
+fi
+
+# Sur Windows, utilise npm.cmd si le bash-npm est absent
+if command -v npm >/dev/null 2>&1; then
+  npm run typecheck && npm test
+elif [ -f "/c/Program Files/nodejs/npm.cmd" ]; then
+  "/c/Program Files/nodejs/npm.cmd" run typecheck && "/c/Program Files/nodejs/npm.cmd" test
+else
+  echo "ERROR: npm not found. Install Node.js or fix PATH."
+  exit 1
+fi

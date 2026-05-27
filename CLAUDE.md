@@ -222,6 +222,7 @@ Toutes définies dans `.env.example`. Au boot, validation stricte via `src/lib/s
 | 4ème SMS dans 30j | `compliance/rate-limits.ts` bloque, ne jamais bypass |
 | Pas d'annonce IA dans 1er SMS | Validation post-génération obligatoire |
 | Stocker données de santé | INTERDIT — uniquement coordonnées professionnelles |
+| Husky v9 : `core.hooksPath = .husky/_` | Normal (wrappers générés). Ne PAS forcer `.husky` |
 
 ---
 
