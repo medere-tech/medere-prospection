@@ -223,6 +223,47 @@ Toutes définies dans `.env.example`. Au boot, validation stricte via `src/lib/s
 | Pas d'annonce IA dans 1er SMS | Validation post-génération obligatoire |
 | Stocker données de santé | INTERDIT — uniquement coordonnées professionnelles |
 | Husky v9 : `core.hooksPath = .husky/_` | Normal (wrappers générés). Ne PAS forcer `.husky` |
+| Hooks Husky qui plantent via GitHub Desktop (Windows) | Voir BUG-001 ci-dessous. Jamais d'appel `npx`/`npm` dans un hook |
+
+### BUG-001 — Hooks Husky cassés via GitHub Desktop sur Windows
+
+> Réf. Notion : projet → **Backlog technique → BUG-001**. Résolu le 27 mai 2026.
+
+**Symptôme** : les hooks (`pre-commit`, `pre-push`) plantent au commit/push via GitHub
+Desktop sur Windows, alors qu'ils passent en PowerShell direct.
+
+**Cause racine** : GitHub Desktop embarque un **MinGit** (`.../GitHubDesktop/app-x.y.z/resources/app/git/usr/bin`)
+qui fournit `sh.exe` et `dash.exe` mais **PAS `bash.exe`**. Or les wrappers POSIX
+`npm` et `npx` installés par Node (`C:\Program Files\nodejs\npx`) ont le shebang
+`#!/usr/bin/env bash`. Sous GHD, `npx lint-staged` échoue donc avec
+`/usr/bin/env: 'bash': No such file or directory` (exit 127) — même quand le PATH
+contient bien Node. En PowerShell, `bash.exe` existe (Git for Windows complet), d'où
+l'asymétrie. (Bonus : GHD ne charge pas le PATH système complet, donc Node manque
+aussi au départ → double problème.)
+
+**Solution** (dans `.husky/pre-commit` et `.husky/pre-push`) : ne JAMAIS appeler
+`npm`/`npx` dans un hook. Appeler les binaires locaux directement depuis
+`node_modules/.bin` (`lint-staged`, `tsc`, `vitest`), dont le shebang est `#!/bin/sh`
+→ compatible avec le `sh`/`dash` de GHD. Le wrapper Husky `.husky/_/h` préfixe déjà
+`node_modules/.bin` au PATH. On ajoute en tête de hook un bloc qui garantit que
+`node.exe` est trouvable :
+
+```sh
+if ! command -v node >/dev/null 2>&1 && [ -d "/c/Program Files/nodejs" ]; then
+  export PATH="/c/Program Files/nodejs:$PATH"
+fi
+```
+
+**Pourquoi ça marche aussi sur Mac/Linux/CI** : le shebang `#!/bin/sh` est universel
+(tout Unix a `/bin/sh`), donc les binaires `node_modules/.bin` s'exécutent partout sans
+dépendre de bash. Le bloc PATH Windows est un **no-op sur Unix** : `command -v node`
+y réussit toujours (Node est sur le PATH) ET `/c/Program Files/nodejs` n'existe pas,
+donc la condition est doublement fausse → la ligne `export` n'est jamais atteinte.
+
+**À ne pas faire** : ne pas tenter de réparer en routant via `npx.cmd`/`npm.cmd`
+(`.cmd` non exécutable de façon fiable depuis `sh`), ni en modifiant `.husky/_/h`
+(régénéré par Husky). Pour un correctif par-machine non partagé, `~/.config/husky/init.sh`
+existe (sourcé par `h`) mais ne suffit pas seul : il règle le PATH, pas l'absence de bash.
 
 ---
 

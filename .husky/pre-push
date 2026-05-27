@@ -1,16 +1,14 @@
-# Pre-push : garde-fou complet avant d'envoyer du code (typecheck + tests).
+# Pre-push : garde-fou complet (typecheck + tests) avant d'envoyer du code.
+# Même contournement Windows/GHD que pre-commit : on évite npm/npx (bash absent),
+# on appelle tsc et vitest directement depuis node_modules/.bin.
 
-# Fix Windows : GitHub Desktop bash ne trouve pas Node sans cet ajout au PATH.
-if [ -d "/c/Program Files/nodejs" ]; then
+if ! command -v node >/dev/null 2>&1 && [ -d "/c/Program Files/nodejs" ]; then
   export PATH="/c/Program Files/nodejs:$PATH"
 fi
 
-# Sur Windows, utilise npm.cmd si le bash-npm est absent
-if command -v npm >/dev/null 2>&1; then
-  npm run typecheck && npm test
-elif [ -f "/c/Program Files/nodejs/npm.cmd" ]; then
-  "/c/Program Files/nodejs/npm.cmd" run typecheck && "/c/Program Files/nodejs/npm.cmd" test
-else
-  echo "ERROR: npm not found. Install Node.js or fix PATH."
+if ! command -v node >/dev/null 2>&1; then
+  echo "ERROR: node introuvable. Installe Node.js ou corrige le PATH." >&2
   exit 1
 fi
+
+tsc --noEmit && vitest run
