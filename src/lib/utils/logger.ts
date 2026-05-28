@@ -42,9 +42,10 @@
  * `LOG_LEVEL` et `NODE_ENV` sont lus directement via `process.env` (runtime
  * non secret, pas de couplage à `lib/security/env.ts`).
  *
- * TODO(post-S1, backlog Notion BUG-002) : ajouter à `redact.paths` les chemins
- * standards pour les secrets HTTP (authorization, cookie, signature,
- * `headers["x-ovh-signature"]`, `headers["x-slack-signature"]`, apiKey, token).
+ * Secrets HTTP couverts (BUG-002 résolu en pre-task S3) : authorization,
+ * cookie, signatures webhooks (`x-ovh-signature`, `x-slack-signature`,
+ * `x-inngest-signature`, `x-slack-request-timestamp`), apiKey/api_key/token/
+ * accessToken/refreshToken — cf. `PII_KEYS` et `HEADER_SIGNATURE_KEYS`.
  */
 import pino from "pino";
 
@@ -100,9 +101,47 @@ const PII_KEYS = [
   "civilite",
   // Contenu de message (potentiellement personnel)
   "body",
+  // Secrets HTTP (BUG-002 — backlog Notion résolu) : Authorization,
+  // Cookie, et signatures de webhooks. Headers Node sont en lowercase ;
+  // on couvre aussi les variantes capitalisées par sécurité.
+  "authorization",
+  "Authorization",
+  "cookie",
+  "Cookie",
+  // Tokens applicatifs (clé/api d'un wrapper, OAuth, Inngest, etc.)
+  "apiKey",
+  "api_key",
+  "apikey",
+  "token",
+  "accessToken",
+  "refreshToken",
+  "access_token",
+  "refresh_token",
+  // Signature générique (pour les payloads qui auraient `signature` au
+  // top-level plutôt que dans un header — ex. Inngest body verify)
+  "signature",
 ] as const;
 
-const REDACT_PATHS = PII_KEYS.flatMap((key) => [key, `*.${key}`, `*.*.${key}`]);
+/**
+ * Signatures de webhooks qui vivent dans `headers[...]` avec des tirets
+ * dans le nom de clé : non couvertes par les wildcards simples, on liste
+ * les paths explicitement avec la notation bracket (single quotes).
+ */
+const HEADER_SIGNATURE_KEYS = [
+  "x-ovh-signature",
+  "x-slack-signature",
+  "x-slack-request-timestamp",
+  "x-inngest-signature",
+] as const;
+
+const REDACT_PATHS = [
+  ...PII_KEYS.flatMap((key) => [key, `*.${key}`, `*.*.${key}`]),
+  ...HEADER_SIGNATURE_KEYS.flatMap((key) => [
+    `headers['${key}']`,
+    `*.headers['${key}']`,
+    `*.*.headers['${key}']`,
+  ]),
+];
 
 /**
  * Scrub par VALEUR sur une string. Email scruber appliqué en premier (un

@@ -127,6 +127,40 @@ describe("logger — scrub par VALEUR : profondeur arbitraire et tableaux", () =
   });
 });
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Secrets HTTP — BUG-002 résolu (pre-task S3)
+// ─────────────────────────────────────────────────────────────────────────────
+
+describe("logger — secrets HTTP (BUG-002)", () => {
+  it("redacte req.headers.authorization (Bearer …)", () => {
+    const cap = captureDestination();
+    const log = buildLogger({ level: "debug" }, cap.stream);
+    log.info({ req: { headers: { authorization: "Bearer sk-real-xyz" } } });
+    const out = cap.output();
+    expect(out).not.toContain("Bearer");
+    expect(out).not.toContain("sk-real-xyz");
+    expect(out).toContain("[REDACTED]");
+  });
+
+  it("redacte req.headers['x-ovh-signature']", () => {
+    const cap = captureDestination();
+    const log = buildLogger({ level: "debug" }, cap.stream);
+    log.info({ req: { headers: { "x-ovh-signature": "abc123" } } });
+    const out = cap.output();
+    expect(out).not.toContain("abc123");
+    expect(out).toContain("[REDACTED]");
+  });
+
+  it("redacte config.apiKey", () => {
+    const cap = captureDestination();
+    const log = buildLogger({ level: "debug" }, cap.stream);
+    log.info({ config: { apiKey: "real-secret" } });
+    const out = cap.output();
+    expect(out).not.toContain("real-secret");
+    expect(out).toContain("[REDACTED]");
+  });
+});
+
 describe("logger — clés tiers (variantes HubSpot/Lusha/FR)", () => {
   it("redacte les clés alternatives via redact.paths ET le scrub valeur", () => {
     const cap = captureDestination();
