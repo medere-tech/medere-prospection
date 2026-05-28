@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import { hasOptOut, isOptOut } from "./opt-out";
+import { hasOptOut, isOptOut, OPT_OUT_KEYWORDS, OPT_OUT_MAX_INCOMING_LENGTH } from "./opt-out";
 
 // ─────────────────────────────────────────────────────────────────────────────
 // hasOptOut — validation message SORTANT
@@ -171,6 +171,32 @@ describe("isOptOut — bord", () => {
 // échapper à `isOptOut` est techniquement possible. Le normalizer retire
 // désormais les `\p{Cf}` et `\p{Cc}` en plus des diacritiques.
 // ─────────────────────────────────────────────────────────────────────────────
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 🔒 SENTINELLES GUARD-001 — verrouillage des constantes
+//
+// ⚠️  TEST SENTINELLE. Si tu modifies ce test, c'est que tu as MODIFIÉ une
+//     constante critique de la règle compliance opt-out. STOP.
+//
+//     Lis la sous-page « Backlog technique » → GUARD-001 dans Notion AVANT
+//     de toucher à ces valeurs. Re-validation compliance-auditor obligatoire.
+//
+//     Justification : `isOptOut` ne détecte que les opt-out courts. Tant que
+//     S7 (classifier Claude d'intent) n'est pas livré, modifier le seuil 50
+//     ou la liste des mots-clés peut introduire un faux négatif et créer
+//     une violation L.34-5 CPCE caractérisée (sanction CNIL jusqu'à 20 M€).
+// ─────────────────────────────────────────────────────────────────────────────
+
+describe("opt-out — SENTINELLES GUARD-001 (NE PAS MODIFIER sans review)", () => {
+  it("SENTINEL: OPT_OUT_MAX_INCOMING_LENGTH === 50", () => {
+    expect(OPT_OUT_MAX_INCOMING_LENGTH).toBe(50);
+  });
+
+  it("SENTINEL: OPT_OUT_KEYWORDS === ['STOP', 'STOPP', 'ARRET', 'DESINSCRIPTION', 'UNSUB']", () => {
+    expect(OPT_OUT_KEYWORDS).toEqual(["STOP", "STOPP", "ARRET", "DESINSCRIPTION", "UNSUB"]);
+    expect(OPT_OUT_KEYWORDS).toHaveLength(5);
+  });
+});
 
 describe("isOptOut — anti-évasion Unicode invisible", () => {
   it("'S\\u200BTOP' (Zero-Width Space) → true (ZWSP retiré)", () => {

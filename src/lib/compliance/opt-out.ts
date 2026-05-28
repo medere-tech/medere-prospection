@@ -1,6 +1,30 @@
 /**
  * Règle 2 (skill `medere-sms-compliance`) — Opt-out STOP.
  *
+ * ⚠️ GARDE-FOU GUARD-001 (Notion → Backlog technique) — IMPORTANT ⚠️
+ * ─────────────────────────────────────────────────────────────────
+ * `isOptOut` ci-dessous ne détecte QUE les opt-out COURTS :
+ *   - mots-clés exacts (`OPT_OUT_KEYWORDS`)
+ *   - longueur ≤ `OPT_OUT_MAX_INCOMING_LENGTH` (50 chars)
+ *
+ * Un PS qui écrit « Arrêtez de me déranger merci je ne suis pas
+ * intéressé » (52 chars) → renvoie `false` → si on continue à envoyer,
+ * c'est un opt-out manifeste non équivoque côté CNIL → violation L.34-5
+ * CPCE caractérisée.
+ *
+ * Décision Déthié S4 (Option A) : tant que **S7 (classifier Claude
+ * d'intent sur messages entrants)** n'est PAS livré, NE PAS déployer en
+ * prod. Voir aussi la JSDoc de `pre-send-check.ts` (point 4) qui rappelle
+ * cette dépendance dure.
+ *
+ * **Modifier `OPT_OUT_MAX_INCOMING_LENGTH` ou `OPT_OUT_KEYWORDS`
+ * nécessite re-validation par compliance-auditor.** Ces constantes sont
+ * verrouillées par des tests SENTINELLES dans `opt-out.test.ts` —
+ * modifier l'une d'elles fera échouer le build, ce qui est volontaire.
+ * Si tu veux vraiment les modifier : (a) parle à Déthié, (b) re-passe
+ * par compliance-auditor, (c) mets à jour GUARD-001 dans Notion.
+ * ─────────────────────────────────────────────────────────────────
+ *
  * Deux fonctions distinctes pour deux contextes :
  *
  *   - `hasOptOut(outboundMessage)` : valide qu'un message SORTANT (généré
@@ -27,17 +51,34 @@
 /**
  * Mots-clés d'opt-out stockés SANS accent et en MAJUSCULES. On normalise
  * le message ENTRANT (NFD + strip diacritiques + uppercase) avant d'y
- * chercher ces mots-clés. NE PAS ajouter d'accents ici, NE PAS ajouter de
- * nouveaux mots sans repasser par `compliance-auditor`.
+ * chercher ces mots-clés.
+ *
+ * 🔒 **SENTINEL GUARD-001** — exporté pour permettre au test sentinelle
+ * de `opt-out.test.ts` de verrouiller cette liste. Toute modification
+ * (ajout/retrait d'un mot-clé) cassera le build, ce qui est volontaire.
+ * Si tu dois modifier : (a) parle à Déthié, (b) re-passe par
+ * compliance-auditor, (c) mets à jour GUARD-001 Notion.
  */
-const OPT_OUT_KEYWORDS: readonly string[] = ["STOP", "STOPP", "ARRET", "DESINSCRIPTION", "UNSUB"];
+export const OPT_OUT_KEYWORDS: readonly string[] = [
+  "STOP",
+  "STOPP",
+  "ARRET",
+  "DESINSCRIPTION",
+  "UNSUB",
+];
 
 /**
  * Seuil au-delà duquel un message entrant n'est PLUS interprété comme
  * opt-out mais comme conversation (skill = 50 caractères). Évite qu'une
  * phrase longue contenant "stop" par hasard ne déclenche un opt-out.
+ *
+ * 🔒 **SENTINEL GUARD-001** — exporté pour permettre au test sentinelle
+ * de `opt-out.test.ts` de verrouiller cette valeur. Cette borne est la
+ * source du trou GUARD-001 (long-form opt-out > 50 chars non détecté).
+ * Modifier sans validation compliance-auditor + mise à jour GUARD-001
+ * Notion est INTERDIT.
  */
-const OPT_OUT_MAX_INCOMING_LENGTH = 50;
+export const OPT_OUT_MAX_INCOMING_LENGTH = 50;
 
 /**
  * Vrai si le message SORTANT contient le mot "STOP" (insensible à la casse,
