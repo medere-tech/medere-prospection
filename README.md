@@ -522,6 +522,62 @@ Confirme que tu as compris le projet et propose la première étape concrète
 selon la roadmap d'implémentation. Ne code rien encore.
 ```
 
+### Firestore emulator local (Phase 1 — S6)
+
+Toute la suite `lib/firestore/` se teste contre l'**emulator Firestore réel** (port 8085), pas contre un mock. Cela couvre vraiment les Timestamps, transactions, FieldValue et règles de sécurité — un mock raterait ces invariants.
+
+**Prérequis** :
+
+- **Java 17+** sur le PATH (`java -version`). Firebase emulator est un JAR.
+- **`firebase-tools`** en devDependency (déjà dans `package.json`, installé via `npm install`). Pas d'install globale nécessaire.
+- **Port 8085 libre** (cf. check ci-dessous).
+
+**Vérifier que le port 8085 est libre** :
+
+```bash
+# Windows (PowerShell ou Git Bash)
+netstat -ano | findstr :8085
+
+# Mac/Linux
+lsof -i :8085
+```
+
+Si le port est occupé : modifier `firebase.json` (`emulators.firestore.port`) ET `FIRESTORE_EMULATOR_HOST` dans `.env.local` en cohérence.
+
+**Cache Firebase — IMPORTANT sur Windows avec home accentué** :
+
+Si ton home utilisateur contient un caractère non-ASCII (ex: `C:\Users\Déthié\`), Firebase casse le téléchargement du JAR emulator. Le script `scripts/setup-firebase-cache.mjs` (appelé automatiquement par `npm run test:firestore` et `npm run emulator:firestore`) détecte le cas et exige de définir `FIREBASE_CACHE_DIR` vers un path ASCII pur.
+
+```powershell
+# PowerShell — persistant pour l'utilisateur
+[Environment]::SetEnvironmentVariable("FIREBASE_CACHE_DIR","C:/firebase-cache","User")
+# Ouvrir un nouveau terminal pour que la variable soit prise en compte.
+```
+
+```bash
+# Git Bash / WSL — session courante
+export FIREBASE_CACHE_DIR=C:/firebase-cache
+```
+
+Le script crée le dossier automatiquement (mkdir recursive). Si tu n'as pas d'accent dans ton home (CI, Mac, Linux), tu peux ignorer cette variable.
+
+**Firewall Windows** :
+
+Au premier `npm run emulator:firestore`, Windows demande d'autoriser Java et Node sur le réseau privé. Accepter une fois. Pas applicable en CI.
+
+**Commandes utiles** :
+
+```bash
+# Vérification pré-flight du cache uniquement (rapide)
+npm run emulator:check
+
+# Démarrer l'emulator en interactif (Ctrl+C pour stop)
+npm run emulator:firestore
+
+# Lancer les tests Firestore (start emulator → run tests → stop)
+npm run test:firestore
+```
+
 ---
 
 ## 9. Schéma Firestore

@@ -42,3 +42,55 @@
     Cloud génère des UUID sans buffer de sortie attaquant-contrôlé.
 - **Condition de réévaluation** : dès que `firebase-admin` embarque
   `uuid >= 11.1.1`, relancer `npm audit` et retirer cette entrée.
+
+### tar < 7.5.1 — path traversal au moment de l'extraction (élevée)
+
+- **Avis** : famille `node-tar` — hardlink path traversal, symlink poisoning,
+  hardlink target escape via symlink chain, drive-relative linkpath
+  (Windows/macOS), race condition sur reservations Unicode (APFS).
+- **Sévérité** : élevée (`high`)
+- **Chemin** : transitif via `firebase-tools` (ajout S6.0) —
+  `firebase-tools → tar@6.2.1`. Confirmé par `npm audit --json` :
+  `isDirect=false`, dep parent direct = `firebase-tools`.
+- **Date** : 2026-05-29 (S6.0 Phase 1, ajout du toolchain emulator)
+- **Décision** : **acceptée, non corrigée**
+- **Justification** :
+  - `firebase-tools` est **strictement un outil dev/CI**, jamais embarqué
+    dans le bundle Next.js de production. Vérifications :
+    - Listé en `devDependencies` dans `package.json`, pas en `dependencies`.
+    - Aucun import depuis `src/` (audit : `firebase-tools` n'est pas
+      résolvable côté runtime).
+    - Le build `next build` ne le tree-shake même pas — il n'y entre jamais.
+  - Le vecteur d'attaque (extraction d'une archive `.tar` malveillante
+    fournie par un tiers) ne s'applique pas : `firebase-tools` extrait
+    uniquement le JAR de l'emulator Firestore depuis le serveur Google
+    officiel sur HTTPS pinné. Pas d'archive utilisateur en entrée.
+  - Le « fix » proposé par `npm audit fix --force` impose un upgrade
+    semver-majeur `firebase-tools v14 → v15`, à évaluer hors S6 sur sa
+    propre branche (pas dans le périmètre Phase 1).
+- **Condition de réévaluation** : (a) si on commence à passer une archive
+  utilisateur à `firebase-tools` (jamais prévu), réévaluer **immédiatement** ;
+  (b) si `firebase-tools` publie une `v14.x` qui bump `tar >= 7.5.1`, retirer
+  cette entrée sans attendre la v15 ; (c) sinon, dossier d'upgrade
+  `firebase-tools` à ouvrir lors du hardening Phase 2.
+
+### gaxios — uuid bounds check manquant (élevée, via firebase-tools)
+
+- **Avis** : GHSA-w5hq-g745-h8pq (même CVE que l'entrée `uuid` ci-dessus,
+  mais réinjectée via une autre chaîne)
+- **Sévérité** : élevée (`high`) dans cette chaîne (Google Cloud regroupé)
+- **Chemin** : transitif via `firebase-tools` →
+  `gaxios → uuid`. Confirmé par `npm audit --json` au moment de l'ajout
+  `firebase-tools` (S6.0).
+- **Date** : 2026-05-29 (S6.0 Phase 1)
+- **Décision** : **acceptée, non corrigée**
+- **Justification** :
+  - Même argument que `tar` ci-dessus : `firebase-tools` est dev/CI only,
+    jamais bundled prod. `gaxios` est utilisé par le CLI Firebase pour
+    parler aux APIs Google, pas par notre runtime applicatif.
+  - Le vecteur (absence de bounds check `uuid` quand buffer fourni) ne
+    s'applique pas : `firebase-tools` ne passe pas de buffer attaquant-
+    contrôlé à `uuid`.
+- **Condition de réévaluation** : alignée avec l'entrée `tar` ci-dessus —
+  un bump `firebase-tools` qui résout les deux chaînes en une fois est
+  préférable à deux upgrades séparés.

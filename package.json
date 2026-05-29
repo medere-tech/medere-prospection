@@ -14,7 +14,10 @@
     "test": "vitest run",
     "test:watch": "vitest",
     "test:coverage": "vitest run --coverage",
+    "test:firestore": "node scripts/setup-firebase-cache.mjs && firebase emulators:exec --only firestore --project medere-test \"vitest run --project firestore\"",
     "test:e2e": "playwright test",
+    "emulator:firestore": "node scripts/setup-firebase-cache.mjs && firebase emulators:start --only firestore --project medere-test",
+    "emulator:check": "node scripts/setup-firebase-cache.mjs",
     "prepare": "husky"
   },
   "dependencies": {
@@ -64,9 +67,11 @@
     "@types/node": "^20",
     "@types/react": "^19",
     "@types/react-dom": "^19",
+    "@firebase/rules-unit-testing": "^4.0.1",
     "@vitejs/plugin-react": "^6.0.2",
     "@vitest/coverage-v8": "^4.1.7",
     "@vitest/ui": "^4.1.7",
+    "firebase-tools": "^14.21.0",
     "eslint": "^9",
     "eslint-config-next": "16.2.6",
     "eslint-config-prettier": "^10.1.8",
