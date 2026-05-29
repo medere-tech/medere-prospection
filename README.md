@@ -576,7 +576,43 @@ npm run emulator:firestore
 
 # Lancer les tests Firestore (start emulator → run tests → stop)
 npm run test:firestore
+
+# Workaround BUG-004 : tuer un emulator zombie qui tient encore le port
+# 8085 après un run précédent (verbose, identifie le PID avant de killer).
+npm run emulator:kill
 ```
+
+#### Emulator zombie après crash (Windows uniquement) — BUG-004
+
+Sur Windows, après un `npm run test:firestore` (même réussi), le process
+`java.exe` du Firestore emulator peut rester en `LISTENING` sur le port 8085
+**plusieurs minutes** après le SIGINT envoyé par `firebase emulators:exec`.
+`firebase-tools` reporte « exited upon SIGINT » mais le JVM n'est pas tué
+dans le même groupe de processus que le parent (différence comportementale
+Windows vs Unix, où SIGINT propage au PGID complet).
+
+**Symptôme** : ton run suivant fail avec :
+
+```
+! firestore: Port 8085 is not open on 127.0.0.1, could not start Firestore Emulator.
+Error: Could not start Firestore Emulator, port taken.
+```
+
+**Workaround** :
+
+```bash
+npm run emulator:kill   # identifie le PID + taskkill /F (verbose)
+# puis relance ton test
+npm run test:firestore
+```
+
+Le script est verbeux par design : il affiche exactement quel PID est
+ciblé. Il NE tourne PAS en `pretest:firestore` automatiquement — un kill
+silent au démarrage de chaque run pourrait masquer des emulators
+légitimes (multi-projets, sessions de dev long-running).
+
+Sur Mac/Linux/CI : le script affiche un message « rien à faire » et exit 0,
+puisque le bug ne se reproduit pas (SIGINT propage correctement au PGID).
 
 ---
 

@@ -14,10 +14,13 @@
     "test": "vitest run",
     "test:watch": "vitest",
     "test:coverage": "vitest run --coverage",
-    "test:firestore": "node scripts/setup-firebase-cache.mjs && firebase emulators:exec --only firestore --project medere-test \"vitest run --project firestore\"",
+    "test:firestore": "node scripts/setup-firebase-cache.mjs && firebase emulators:exec --only firestore --project medere-test \"vitest run --config vitest.config.firestore.ts\"",
+    "test:firestore:coverage": "node scripts/setup-firebase-cache.mjs && firebase emulators:exec --only firestore --project medere-test \"vitest run --config vitest.config.firestore.ts --coverage\"",
+    "test:all": "npm test && npm run test:firestore",
     "test:e2e": "playwright test",
     "emulator:firestore": "node scripts/setup-firebase-cache.mjs && firebase emulators:start --only firestore --project medere-test",
     "emulator:check": "node scripts/setup-firebase-cache.mjs",
+    "emulator:kill": "node scripts/kill-emulator-port.mjs",
     "prepare": "husky"
   },
   "dependencies": {
