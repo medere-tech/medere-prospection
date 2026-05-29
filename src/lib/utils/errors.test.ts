@@ -5,6 +5,7 @@ import {
   AuditPiiError,
   ComplianceError,
   ConfigError,
+  ConflictError,
   ExternalServiceError,
   ForbiddenError,
   InternalError,
@@ -22,6 +23,7 @@ describe("AppError subclasses", () => {
     { Cls: UnauthorizedError, code: "UNAUTHORIZED", status: 401, operational: true },
     { Cls: ForbiddenError, code: "FORBIDDEN", status: 403, operational: true },
     { Cls: NotFoundError, code: "NOT_FOUND", status: 404, operational: true },
+    { Cls: ConflictError, code: "CONFLICT", status: 409, operational: true },
     { Cls: RateLimitError, code: "RATE_LIMITED", status: 429, operational: true },
     { Cls: ComplianceError, code: "COMPLIANCE_BLOCKED", status: 422, operational: true },
     { Cls: ExternalServiceError, code: "EXTERNAL_SERVICE", status: 502, operational: true },
@@ -121,6 +123,11 @@ describe("noRetry — marqueur orchestrateur (MED-2 S6.2)", () => {
 
   it("NotFoundError.noRetry === true (id ne va pas réapparaître)", () => {
     const err = new NotFoundError({ message: "missing" });
+    expect(err.noRetry).toBe(true);
+  });
+
+  it("ConflictError.noRetry === true (état ne va pas s'inverser)", () => {
+    const err = new ConflictError({ message: "already done" });
     expect(err.noRetry).toBe(true);
   });
 

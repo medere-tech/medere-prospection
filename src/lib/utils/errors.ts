@@ -12,6 +12,7 @@ export type ErrorCode =
   | "UNAUTHORIZED"
   | "FORBIDDEN"
   | "NOT_FOUND"
+  | "CONFLICT"
   | "RATE_LIMITED"
   | "COMPLIANCE_BLOCKED"
   | "EXTERNAL_SERVICE"
@@ -120,6 +121,29 @@ export class NotFoundError extends AppError {
   override readonly noRetry = true;
   constructor(options: AppErrorOptions) {
     super({ clientMessage: "Ressource introuvable.", ...options });
+  }
+}
+
+/**
+ * 409 — conflit sur une ressource (race condition, état déjà atteint qui
+ * empêche la mutation demandée). Exemples : 2 commerciaux qui prennent
+ * simultanément le même hand-off, tentative de re-handoff d'une
+ * conversation déjà assignée, etc.
+ *
+ * Opérationnel (4xx métier attendu) mais non-retryable : si on retry, on
+ * va re-throw le même conflit puisque l'état n'a aucune raison de revenir
+ * en arrière.
+ */
+export class ConflictError extends AppError {
+  readonly code = "CONFLICT" as const;
+  readonly statusCode = 409;
+  /** Un retry sur conflit ne résout rien (l'état ne va pas s'inverser). */
+  override readonly noRetry = true;
+  constructor(options: AppErrorOptions) {
+    super({
+      clientMessage: "Ressource déjà dans cet état.",
+      ...options,
+    });
   }
 }
 
