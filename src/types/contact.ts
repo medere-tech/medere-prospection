@@ -3,13 +3,21 @@
  * Firestore et synchronisé avec HubSpot. Aligné sur la skill
  * `medere-firestore-schema` (source de vérité du schéma Firestore).
  *
+ * ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ * Convention projet (arbitrée Déthié S6.3) :
+ *   - `src/types/**`         : types purs TypeScript, ZÉRO dépendance Zod
+ *                              → consommables côté frontend (App Router
+ *                                client) sans tirer Zod dans le bundle.
+ *   - `src/lib/firestore/**` : schémas Zod + validation runtime
+ *                              (ex: `ContactSchema` vit dans
+ *                                `lib/firestore/contacts.ts` à partir de S6.3).
+ *
  * `Timestamp` est importé en TYPE seulement → erasé à la compilation. Le code
  * client peut importer ces types sans tirer le SDK firebase-admin dans le
  * bundle (les valeurs `Timestamp` viennent du backend ou sont reconstruites
  * via les helpers de `lib/firestore/`).
  */
 import type { Timestamp } from "firebase-admin/firestore";
-import { z } from "zod";
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Unions (réutilisées par les écrans dashboard et les wrappers)
@@ -50,7 +58,7 @@ export type ContactEnrichmentSource = "lusha" | "hubspot" | "manual";
 export type ContactOptOutChannel = "sms" | "manual" | "dashboard";
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Forme du document Firestore
+// Forme du document Firestore (interface pure, aucune validation runtime)
 // ─────────────────────────────────────────────────────────────────────────────
 
 export interface ContactPhone {
@@ -70,7 +78,8 @@ export interface ContactConsent {
   /**
    * Texte documentant l'intérêt légitime (RGPD art. 6.1.f) pour ce contact :
    * d'où vient la donnée, pourquoi on a le droit de le contacter. Doit être
-   * précis (cf. validation Zod : 20 chars min).
+   * précis (cf. validation Zod : 20 chars min, validée par `ContactSchema`
+   * dans `lib/firestore/contacts.ts`).
    */
   legitimateInterest: string;
   optedOut: boolean;
@@ -117,71 +126,3 @@ export interface Contact {
   createdAt: Timestamp;
   updatedAt: Timestamp;
 }
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Schéma Zod pour la validation runtime (entrées API, données lues Firestore)
-// ─────────────────────────────────────────────────────────────────────────────
-
-/**
- * `z.unknown()` pour les Timestamps : Firestore renvoie un objet `Timestamp`
- * dont la forme est gérée par firebase-admin (instance de classe, pas
- * sérialisable directement en JSON Zod). On valide la PRÉSENCE, pas la forme.
- */
-const TimestampLike = z.unknown();
-
-export const ContactPhoneSchema = z.object({
-  e164: z.string().regex(/^\+\d{10,15}$/, "Doit être au format E.164"),
-  raw: z.string(),
-  type: z.enum(["mobile", "landline", "voip", "unknown"]),
-  carrier: z.string().optional(),
-  valid: z.boolean(),
-  lookupAt: TimestampLike,
-});
-
-export const ContactConsentSchema = z.object({
-  legitimateInterest: z.string().min(20, "Documente précisément l'intérêt légitime (20 chars min)"),
-  optedOut: z.boolean(),
-  optedOutAt: TimestampLike.optional(),
-  optedOutReason: z.string().optional(),
-  optedOutChannel: z.enum(["sms", "manual", "dashboard"]).optional(),
-});
-
-export const ContactEnrichmentSchema = z.object({
-  source: z.enum(["lusha", "hubspot", "manual"]),
-  enrichedAt: TimestampLike,
-  raw: z.record(z.string(), z.unknown()).optional(),
-});
-
-export const ContactSchema = z.object({
-  hubspotId: z.string().min(1),
-  firstName: z.string().min(1),
-  lastName: z.string().min(1),
-  civilite: z.enum(["Dr", "Pr", "M.", "Mme"]).optional(),
-  speciality: z.enum(["dentiste", "generaliste", "ide", "autre"]),
-  city: z.string(),
-  postalCode: z.string(),
-  email: z.email().optional(),
-  phone: ContactPhoneSchema,
-  segment: z.enum(["b2b_cabinet", "b2c_mobile_perso", "unknown"]),
-  bloctelChecked: z.boolean(),
-  bloctelOptOut: z.boolean(),
-  bloctelCheckedAt: TimestampLike.optional(),
-  consent: ContactConsentSchema,
-  enrichment: ContactEnrichmentSchema,
-  status: z.enum([
-    "pending",
-    "enriched",
-    "ready",
-    "in_conversation",
-    "qualified",
-    "opted_out",
-    "archived",
-  ]),
-  campaignId: z.string(),
-  assignedTo: z.string().optional(),
-  createdAt: TimestampLike,
-  updatedAt: TimestampLike,
-});
-
-/** Type inféré depuis le schéma Zod (à privilégier pour les inputs validés). */
-export type ContactValidated = z.infer<typeof ContactSchema>;

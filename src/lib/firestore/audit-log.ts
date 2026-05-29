@@ -34,7 +34,7 @@
  * des écritures « libres » d'autres callers ; mais il reste actif
  * partout en filet de sécurité.
  */
-import { Timestamp } from "firebase-admin/firestore";
+import { Timestamp, type Transaction } from "firebase-admin/firestore";
 import { z } from "zod";
 
 import { getAdminDb } from "@/lib/firestore/admin";
@@ -77,6 +77,7 @@ const ACTIONS = [
   "role_changed",
   "compliance_check",
   "long_form_opt_out_candidate",
+  "status_changed",
 ] as const;
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -99,17 +100,22 @@ const AuditLogInputSchema = z.object({
 // ─────────────────────────────────────────────────────────────────────────────
 
 /**
- * Écrit une entrée dans `audit_log/`. Retourne le docId Firestore généré.
+ * Source de vérité UNIQUE pour la validation Zod + scrubber PII de toute
+ * écriture dans `audit_log/`. Utilisé par `appendAuditLog` (autonome) ET
+ * `appendAuditLogTx` (transactionnel) → impossible d'avoir 2 chemins de
+ * validation divergents (décision Déthié S6.3, leçon des 11 findings
+ * security du 1er review S6.2).
  *
- * Throw possible (DANS L'ORDRE) :
- *   - `ValidationError` : payload structurellement invalide (Zod).
- *   - `AuditPiiError` : PII détecté dans `payload` (phone/email en clair).
- *   - Erreur Firestore native : échec d'écriture I/O (timeout, perm, etc.).
+ * Throw (dans l'ordre) :
+ *   1. `ValidationError` si Zod fail.
+ *   2. `AuditPiiError` si une PII en clair est détectée dans `payload`.
  *
- * @returns docId Firestore (utilisable pour corréler l'entrée plus tard,
- *          ex: réponse de webhook → audit_log doc).
+ * @internal Exposé pour faciliter les tests unitaires de la branche
+ *           validation sans toucher à Firestore. NE PAS utiliser côté
+ *           caller applicatif : utiliser `appendAuditLog` ou
+ *           `appendAuditLogTx`.
  */
-export async function appendAuditLog(entry: AuditLogInput): Promise<string> {
+function validateAndScrub(entry: AuditLogInput): AuditLogInput {
   const parsed = AuditLogInputSchema.safeParse(entry);
   if (!parsed.success) {
     // ⚠️  NE PAS ajouter cause: parsed.error — la ZodError contient la
@@ -136,7 +142,8 @@ export async function appendAuditLog(entry: AuditLogInput): Promise<string> {
         "Audit log refuse les PII en clair. Utiliser hashPii() pour les identifiants sensibles.",
       context: {
         // `violations` est déjà sanitisée par `detectPiiInPayload` :
-        // path + kind + sample tronqué. Aucune valeur d'origine n'y figure.
+        // path + kind + sample = "[redacted]" constant. Aucune valeur
+        // d'origine n'y figure.
         violations,
         action: parsed.data.action,
         targetType: parsed.data.targetType,
@@ -144,13 +151,62 @@ export async function appendAuditLog(entry: AuditLogInput): Promise<string> {
     });
   }
 
+  return parsed.data;
+}
+
+/**
+ * Écrit une entrée dans `audit_log/`. Retourne le docId Firestore généré.
+ *
+ * Throw possible (DANS L'ORDRE) :
+ *   - `ValidationError` : payload structurellement invalide (Zod).
+ *   - `AuditPiiError` : PII détecté dans `payload` (phone/email en clair).
+ *   - Erreur Firestore native : échec d'écriture I/O (timeout, perm, etc.).
+ *
+ * @returns docId Firestore (utilisable pour corréler l'entrée plus tard,
+ *          ex: réponse de webhook → audit_log doc).
+ */
+export async function appendAuditLog(entry: AuditLogInput): Promise<string> {
+  const validated = validateAndScrub(entry);
   const docRef = await getAdminDb()
     .collection(AUDIT_COLLECTION)
     .add({
-      ...parsed.data,
+      ...validated,
       timestamp: Timestamp.now(),
     });
+  return docRef.id;
+}
 
+/**
+ * Variante TRANSACTIONNELLE de `appendAuditLog`. À utiliser quand on a
+ * besoin d'écrire un audit log dans la même transaction qu'une autre
+ * mutation (ex: `markOptedOut` qui update `contacts/{id}` + log
+ * `action: "opt_out"` → atomique, pas de trou forensic possible si le
+ * process crash entre les 2 writes).
+ *
+ * Réutilise EXACTEMENT la même `validateAndScrub` que `appendAuditLog`
+ * → aucune divergence possible des règles Zod / scrubber PII entre les
+ * 2 voies d'écriture.
+ *
+ * Retourne le docId généré côté serveur (string, pas DocumentReference).
+ * Décision Déthié S6.3 : `DocumentReference` exposerait `.set/.update/.delete`
+ * et romprait la promesse append-only. Le caller a tout ce qu'il faut avec
+ * la string.
+ *
+ * Throw possible (DANS L'ORDRE) :
+ *   - `ValidationError` : payload structurellement invalide (Zod).
+ *   - `AuditPiiError` : PII détecté dans `payload`.
+ *
+ * @param tx     transaction Firestore en cours (Admin SDK).
+ * @param entry  même contrat que `appendAuditLog`.
+ * @returns      docId Firestore (string).
+ */
+export function appendAuditLogTx(tx: Transaction, entry: AuditLogInput): string {
+  const validated = validateAndScrub(entry);
+  const docRef = getAdminDb().collection(AUDIT_COLLECTION).doc();
+  tx.create(docRef, {
+    ...validated,
+    timestamp: Timestamp.now(),
+  });
   return docRef.id;
 }
 

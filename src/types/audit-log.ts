@@ -51,7 +51,8 @@ export type AuditAction =
   | "login"
   | "role_changed"
   | "compliance_check"
-  | "long_form_opt_out_candidate";
+  | "long_form_opt_out_candidate"
+  | "status_changed";
 
 export type AuditActorType = "system" | "ai" | "human";
 

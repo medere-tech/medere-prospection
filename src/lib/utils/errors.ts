@@ -116,6 +116,8 @@ export class ForbiddenError extends AppError {
 export class NotFoundError extends AppError {
   readonly code = "NOT_FOUND" as const;
   readonly statusCode = 404;
+  /** Retry sur un id qui n'existe pas est inutile (id ne va pas apparaître). */
+  override readonly noRetry = true;
   constructor(options: AppErrorOptions) {
     super({ clientMessage: "Ressource introuvable.", ...options });
   }

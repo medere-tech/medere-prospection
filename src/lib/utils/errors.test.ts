@@ -119,6 +119,11 @@ describe("noRetry — marqueur orchestrateur (MED-2 S6.2)", () => {
     expect(err.noRetry).toBe(false);
   });
 
+  it("NotFoundError.noRetry === true (id ne va pas réapparaître)", () => {
+    const err = new NotFoundError({ message: "missing" });
+    expect(err.noRetry).toBe(true);
+  });
+
   it("ExternalServiceError.noRetry === false (transient, retry pertinent)", () => {
     const err = new ExternalServiceError({ message: "ovh down" });
     expect(err.noRetry).toBe(false);
