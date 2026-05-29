@@ -174,6 +174,22 @@ const clerkEnvSchema = z.object({
   CLERK_SECRET_KEY: z.string().startsWith("sk_"),
 });
 
+/**
+ * Secret HMAC (pepper) pour `hashPii()` — irréversibilité forensic des
+ * identifiants stockés dans `audit_log/`. Sans accès au pepper, un
+ * attaquant qui exfiltre la collection ne peut PAS retrouver les
+ * téléphones / emails par reverse lookup (l'espace ~80M FR mobiles
+ * casserait sous GPU avec un SHA-256 nu).
+ *
+ * Génération : `openssl rand -hex 32` (32 bytes = 64 chars hex).
+ * Rotation : OUI possible, MAIS tous les hashes pré-rotation deviennent
+ * orphelins (impossible de les corréler aux nouveaux). Cf. BACKLOG-002
+ * Notion pour la procédure et l'impact archives.
+ */
+const auditEnvSchema = z.object({
+  AUDIT_PII_PEPPER: z.string().min(32),
+});
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Sanitisation des erreurs Zod (CŒUR de la garantie anti-fuite)
 // ─────────────────────────────────────────────────────────────────────────────
@@ -230,6 +246,7 @@ interface EnvCache {
   sentry?: z.infer<typeof sentryEnvSchema>;
   upstash?: z.infer<typeof upstashEnvSchema>;
   clerk?: z.infer<typeof clerkEnvSchema>;
+  audit?: z.infer<typeof auditEnvSchema>;
 }
 
 const cache: EnvCache = {};
@@ -296,6 +313,10 @@ export function getClerkEnv() {
   return memoize("clerk", () => parseOrThrow(clerkEnvSchema, "clerk"));
 }
 
+export function getAuditEnv() {
+  return memoize("audit", () => parseOrThrow(auditEnvSchema, "audit"));
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Helpers
 // ─────────────────────────────────────────────────────────────────────────────
@@ -338,6 +359,7 @@ const DEFAULT_SERVICES: EnvServiceEntry[] = [
   { name: "sentry", fn: getSentryEnv },
   { name: "upstash", fn: getUpstashEnv },
   { name: "clerk", fn: getClerkEnv },
+  { name: "audit", fn: getAuditEnv },
 ];
 
 /**

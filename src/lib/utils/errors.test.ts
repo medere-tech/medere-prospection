@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 
 import {
   AppError,
+  AuditPiiError,
   ComplianceError,
   ConfigError,
   ExternalServiceError,
@@ -26,6 +27,12 @@ describe("AppError subclasses", () => {
     { Cls: ExternalServiceError, code: "EXTERNAL_SERVICE", status: 502, operational: true },
     { Cls: ConfigError, code: "CONFIG", status: 500, operational: false },
     { Cls: InternalError, code: "INTERNAL", status: 500, operational: false },
+    {
+      Cls: AuditPiiError,
+      code: "AUDIT_PII_DETECTED",
+      status: 500,
+      operational: false,
+    },
   ] as const;
 
   it.each(cases)(
@@ -89,6 +96,37 @@ describe("AppError serialization", () => {
     expect(err.toClientBody()).toEqual({
       error: { code: "NOT_FOUND", message: "Ressource introuvable." },
     });
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// noRetry (MED-2 S6.2 — signal aux orchestrateurs Inngest/BullMQ/...)
+// ─────────────────────────────────────────────────────────────────────────────
+
+describe("noRetry — marqueur orchestrateur (MED-2 S6.2)", () => {
+  it("AuditPiiError.noRetry === true (payload corrompu, retry inutile)", () => {
+    const err = new AuditPiiError({ message: "pii detected" });
+    expect(err.noRetry).toBe(true);
+  });
+
+  it("ConfigError.noRetry === true (env manquante, retry inutile)", () => {
+    const err = new ConfigError({ message: "missing var" });
+    expect(err.noRetry).toBe(true);
+  });
+
+  it("ValidationError.noRetry === false (défaut — input client peut être corrigé)", () => {
+    const err = new ValidationError({ message: "invalid" });
+    expect(err.noRetry).toBe(false);
+  });
+
+  it("ExternalServiceError.noRetry === false (transient, retry pertinent)", () => {
+    const err = new ExternalServiceError({ message: "ovh down" });
+    expect(err.noRetry).toBe(false);
+  });
+
+  it("InternalError.noRetry === false par défaut (bug peut être transient)", () => {
+    const err = new InternalError({ message: "boom" });
+    expect(err.noRetry).toBe(false);
   });
 });
 

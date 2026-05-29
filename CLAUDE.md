@@ -224,6 +224,7 @@ Toutes définies dans `.env.example`. Au boot, validation stricte via `src/lib/s
 | Stocker données de santé | INTERDIT — uniquement coordonnées professionnelles |
 | Husky v9 : `core.hooksPath = .husky/_` | Normal (wrappers générés). Ne PAS forcer `.husky` |
 | Hooks Husky qui plantent via GitHub Desktop (Windows) | Voir BUG-001 ci-dessous. Jamais d'appel `npx`/`npm` dans un hook |
+| Audit log avec PII en clair dans `payload` | INTERDIT — `appendAuditLog` throw `AuditPiiError` (S6.2). Utiliser `hashPii()` (HMAC-SHA256 + pepper) si besoin d'un identifiant traçable. Cf. GUARD-002 + BACKLOG-002 (rotation pepper) |
 
 ### BUG-001 — Hooks Husky cassés via GitHub Desktop sur Windows
 
