@@ -48,7 +48,7 @@
  *      `notes` brut (commercial peut écrire "Dr Dupont 06...") même si
  *      le scrubber S6.2 le détecterait. Défense en profondeur.
  */
-import { Timestamp } from "firebase-admin/firestore";
+import { type DocumentReference, Timestamp, type Transaction } from "firebase-admin/firestore";
 import { z } from "zod";
 
 import { getAdminDb } from "@/lib/firestore/admin";
@@ -164,6 +164,78 @@ function parseConversationOrThrow(raw: unknown, conversationId: string): Convers
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Helpers transactionnels partagés (S6.5)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * Wrapper public de `parseConversationOrThrow` pour usage cross-module
+ * dans `lib/firestore/`. Identique en sémantique au helper privé — c'est
+ * juste un point d'accès stable pour `messages.ts` (et S6.6+) afin d'éviter
+ * de dupliquer la logique Zod + ValidationError. NE JAMAIS faire de
+ * surcouche ici : toute évolution du parsing doit rester dans
+ * `parseConversationOrThrow`.
+ *
+ * @internal Helper inter-modules `firestore/`. NE PAS appeler depuis du
+ *           code applicatif : utiliser `getConversation()` pour une
+ *           lecture standalone (avec retour `null` en cas d'absence).
+ */
+export function _parseConversationOrThrow(raw: unknown, conversationId: string): Conversation {
+  return parseConversationOrThrow(raw, conversationId);
+}
+
+/**
+ * Bumpe atomiquement les compteurs de cadence d'une conversation (sans audit).
+ *
+ * **Helper transactionnel partagé** extrait en S6.5 pour être réutilisé par
+ * `addOutbound` / `addInbound` (`lib/firestore/messages.ts`) — qui posent
+ * leur propre audit `sms_sent` / `sms_received` enrichi avec `messageId` —
+ * sans dupliquer la logique compteurs.
+ *
+ * Champs mis à jour (en une seule `tx.update`) :
+ *   - `messageCount` : +1
+ *   - `outboundCount` ou `inboundCount` selon `direction` : +1
+ *   - `lastMessageAt`, `lastOutboundAt` | `lastInboundAt` : `now`
+ *   - `firstMessageAt` : posé UNIQUEMENT si absent (cadence stable
+ *     pour les jobs de relance followup_3d / followup_7d)
+ *   - `updatedAt` : `now`
+ *
+ * **Préconditions caller (non vérifiées ici) :**
+ *   1. La conversation `conv` a été lue dans `tx` et validée par
+ *      `parseConversationOrThrow` au préalable.
+ *   2. Le caller pose son propre audit log dans la même `tx` (pas posé
+ *      ici pour permettre des payloads enrichis selon le contexte —
+ *      `incrementMessageCount` posé `{direction}`, `addOutbound` posé
+ *      `{direction, messageId}`).
+ *
+ * @internal Helper inter-modules `firestore/`. NE PAS appeler depuis du
+ *           code applicatif (Inngest, API routes) : utiliser
+ *           `incrementMessageCount`, `addOutbound` ou `addInbound`.
+ */
+export function _bumpConversationCountersTx(
+  tx: Transaction,
+  ref: DocumentReference,
+  conv: Conversation,
+  direction: "outbound" | "inbound",
+  now: Timestamp,
+): void {
+  const isOutbound = direction === "outbound";
+  const updates: Record<string, unknown> = {
+    messageCount: conv.messageCount + 1,
+    [isOutbound ? "outboundCount" : "inboundCount"]:
+      (isOutbound ? conv.outboundCount : conv.inboundCount) + 1,
+    lastMessageAt: now,
+    [isOutbound ? "lastOutboundAt" : "lastInboundAt"]: now,
+    updatedAt: now,
+  };
+  // `firstMessageAt` posé UNE SEULE FOIS — historique de cadence stable
+  // pour les jobs de relance (followup_3d / followup_7d).
+  if (!conv.firstMessageAt) {
+    updates.firstMessageAt = now;
+  }
+  tx.update(ref, updates);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // API publique
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -219,27 +291,12 @@ export async function incrementMessageCount(
     const conv = parseConversationOrThrow(doc.data(), conversationId);
 
     const now = Timestamp.now();
-    const isOutbound = direction === "outbound";
-    const updates: Record<string, unknown> = {
-      messageCount: conv.messageCount + 1,
-      [isOutbound ? "outboundCount" : "inboundCount"]:
-        (isOutbound ? conv.outboundCount : conv.inboundCount) + 1,
-      lastMessageAt: now,
-      [isOutbound ? "lastOutboundAt" : "lastInboundAt"]: now,
-      updatedAt: now,
-    };
-    // `firstMessageAt` posé UNE SEULE FOIS — historique de cadence stable
-    // pour les jobs de relance (followup_3d / followup_7d).
-    if (!conv.firstMessageAt) {
-      updates.firstMessageAt = now;
-    }
-
-    tx.update(ref, updates);
+    _bumpConversationCountersTx(tx, ref, conv, direction, now);
 
     appendAuditLogTx(tx, {
       actorId: "system",
       actorType: "system",
-      action: isOutbound ? "sms_sent" : "sms_received",
+      action: direction === "outbound" ? "sms_sent" : "sms_received",
       targetType: "conversation",
       targetId: conversationId,
       payload: { direction },
