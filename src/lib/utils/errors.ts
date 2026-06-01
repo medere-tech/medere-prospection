@@ -12,11 +12,13 @@ export type ErrorCode =
   | "UNAUTHORIZED"
   | "FORBIDDEN"
   | "NOT_FOUND"
+  | "CONFLICT"
   | "RATE_LIMITED"
   | "COMPLIANCE_BLOCKED"
   | "EXTERNAL_SERVICE"
   | "CONFIG"
-  | "INTERNAL";
+  | "INTERNAL"
+  | "AUDIT_PII_DETECTED";
 
 export interface AppErrorOptions {
   /** Message technique pour les logs serveur (détaillé, jamais renvoyé au client). */
@@ -45,6 +47,13 @@ export abstract class AppError extends Error {
   abstract readonly statusCode: number;
   /** true = erreur attendue/gérable (4xx métier) ; false = bug inattendu (5xx). */
   readonly isOperational: boolean = true;
+  /**
+   * true si retry inutile (erreur déterministe, payload corrompu, config
+   * absente). Lu par les orchestrateurs (Inngest S6.6, BullMQ, Temporal,
+   * etc.) pour mapper vers `NonRetriableError` côté worker — évite les
+   * boucles de retry sur des erreurs qui ne se résolvent pas avec le temps.
+   */
+  readonly noRetry: boolean = false;
   readonly clientMessage: string;
   readonly context?: Record<string, unknown>;
 
@@ -108,8 +117,33 @@ export class ForbiddenError extends AppError {
 export class NotFoundError extends AppError {
   readonly code = "NOT_FOUND" as const;
   readonly statusCode = 404;
+  /** Retry sur un id qui n'existe pas est inutile (id ne va pas apparaître). */
+  override readonly noRetry = true;
   constructor(options: AppErrorOptions) {
     super({ clientMessage: "Ressource introuvable.", ...options });
+  }
+}
+
+/**
+ * 409 — conflit sur une ressource (race condition, état déjà atteint qui
+ * empêche la mutation demandée). Exemples : 2 commerciaux qui prennent
+ * simultanément le même hand-off, tentative de re-handoff d'une
+ * conversation déjà assignée, etc.
+ *
+ * Opérationnel (4xx métier attendu) mais non-retryable : si on retry, on
+ * va re-throw le même conflit puisque l'état n'a aucune raison de revenir
+ * en arrière.
+ */
+export class ConflictError extends AppError {
+  readonly code = "CONFLICT" as const;
+  readonly statusCode = 409;
+  /** Un retry sur conflit ne résout rien (l'état ne va pas s'inverser). */
+  override readonly noRetry = true;
+  constructor(options: AppErrorOptions) {
+    super({
+      clientMessage: "Ressource déjà dans cet état.",
+      ...options,
+    });
   }
 }
 
@@ -154,6 +188,8 @@ export class ConfigError extends AppError {
   readonly code = "CONFIG" as const;
   readonly statusCode = 500;
   override readonly isOperational = false;
+  /** Un retry ne fera pas apparaître la variable d'env manquante : déterministe. */
+  override readonly noRetry = true;
   constructor(options: AppErrorOptions) {
     super({ clientMessage: DEFAULT_CLIENT_MESSAGE, ...options });
   }
@@ -164,6 +200,31 @@ export class InternalError extends AppError {
   readonly code = "INTERNAL" as const;
   readonly statusCode = 500;
   override readonly isOperational = false;
+  constructor(options: AppErrorOptions) {
+    super({ clientMessage: DEFAULT_CLIENT_MESSAGE, ...options });
+  }
+}
+
+/**
+ * 500 — PII détecté dans un payload d'audit log avant écriture Firestore.
+ * NON opérationnel : c'est un bug code du caller qui aurait dû hash
+ * l'identifiant via `hashPii()` ou utiliser un docId à la place AVANT
+ * d'appeler `appendAuditLog`. Cf. GUARD-002 + S6.2 arbitrage Déthié.
+ *
+ * `context.violations` contient la liste sanitisée (path + kind + sample
+ * tronqué) — JAMAIS la valeur d'origine. Le logger peut consommer le
+ * context tel quel sans risque de fuite.
+ *
+ * Côté Inngest (S6.6) : cette erreur doit être traitée `no-retry` +
+ * alerte Sentry/Slack. Un retry infini sur un payload corrompu serait
+ * pire que d'arrêter la chaîne d'envoi pour ce job.
+ */
+export class AuditPiiError extends AppError {
+  readonly code = "AUDIT_PII_DETECTED" as const;
+  readonly statusCode = 500;
+  override readonly isOperational = false;
+  /** Payload corrompu : un retry échouera identiquement sur la même PII. */
+  override readonly noRetry = true;
   constructor(options: AppErrorOptions) {
     super({ clientMessage: DEFAULT_CLIENT_MESSAGE, ...options });
   }

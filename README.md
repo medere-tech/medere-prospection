@@ -522,6 +522,98 @@ Confirme que tu as compris le projet et propose la première étape concrète
 selon la roadmap d'implémentation. Ne code rien encore.
 ```
 
+### Firestore emulator local (Phase 1 — S6)
+
+Toute la suite `lib/firestore/` se teste contre l'**emulator Firestore réel** (port 8085), pas contre un mock. Cela couvre vraiment les Timestamps, transactions, FieldValue et règles de sécurité — un mock raterait ces invariants.
+
+**Prérequis** :
+
+- **Java 17+** sur le PATH (`java -version`). Firebase emulator est un JAR.
+- **`firebase-tools`** en devDependency (déjà dans `package.json`, installé via `npm install`). Pas d'install globale nécessaire.
+- **Port 8085 libre** (cf. check ci-dessous).
+
+**Vérifier que le port 8085 est libre** :
+
+```bash
+# Windows (PowerShell ou Git Bash)
+netstat -ano | findstr :8085
+
+# Mac/Linux
+lsof -i :8085
+```
+
+Si le port est occupé : modifier `firebase.json` (`emulators.firestore.port`) ET `FIRESTORE_EMULATOR_HOST` dans `.env.local` en cohérence.
+
+**Cache Firebase — IMPORTANT sur Windows avec home accentué** :
+
+Si ton home utilisateur contient un caractère non-ASCII (ex: `C:\Users\Déthié\`), Firebase casse le téléchargement du JAR emulator. Le script `scripts/setup-firebase-cache.mjs` (appelé automatiquement par `npm run test:firestore` et `npm run emulator:firestore`) détecte le cas et exige de définir `FIREBASE_CACHE_DIR` vers un path ASCII pur.
+
+```powershell
+# PowerShell — persistant pour l'utilisateur
+[Environment]::SetEnvironmentVariable("FIREBASE_CACHE_DIR","C:/firebase-cache","User")
+# Ouvrir un nouveau terminal pour que la variable soit prise en compte.
+```
+
+```bash
+# Git Bash / WSL — session courante
+export FIREBASE_CACHE_DIR=C:/firebase-cache
+```
+
+Le script crée le dossier automatiquement (mkdir recursive). Si tu n'as pas d'accent dans ton home (CI, Mac, Linux), tu peux ignorer cette variable.
+
+**Firewall Windows** :
+
+Au premier `npm run emulator:firestore`, Windows demande d'autoriser Java et Node sur le réseau privé. Accepter une fois. Pas applicable en CI.
+
+**Commandes utiles** :
+
+```bash
+# Vérification pré-flight du cache uniquement (rapide)
+npm run emulator:check
+
+# Démarrer l'emulator en interactif (Ctrl+C pour stop)
+npm run emulator:firestore
+
+# Lancer les tests Firestore (start emulator → run tests → stop)
+npm run test:firestore
+
+# Workaround BUG-004 : tuer un emulator zombie qui tient encore le port
+# 8085 après un run précédent (verbose, identifie le PID avant de killer).
+npm run emulator:kill
+```
+
+#### Emulator zombie après crash (Windows uniquement) — BUG-004
+
+Sur Windows, après un `npm run test:firestore` (même réussi), le process
+`java.exe` du Firestore emulator peut rester en `LISTENING` sur le port 8085
+**plusieurs minutes** après le SIGINT envoyé par `firebase emulators:exec`.
+`firebase-tools` reporte « exited upon SIGINT » mais le JVM n'est pas tué
+dans le même groupe de processus que le parent (différence comportementale
+Windows vs Unix, où SIGINT propage au PGID complet).
+
+**Symptôme** : ton run suivant fail avec :
+
+```
+! firestore: Port 8085 is not open on 127.0.0.1, could not start Firestore Emulator.
+Error: Could not start Firestore Emulator, port taken.
+```
+
+**Workaround** :
+
+```bash
+npm run emulator:kill   # identifie le PID + taskkill /F (verbose)
+# puis relance ton test
+npm run test:firestore
+```
+
+Le script est verbeux par design : il affiche exactement quel PID est
+ciblé. Il NE tourne PAS en `pretest:firestore` automatiquement — un kill
+silent au démarrage de chaque run pourrait masquer des emulators
+légitimes (multi-projets, sessions de dev long-running).
+
+Sur Mac/Linux/CI : le script affiche un message « rien à faire » et exit 0,
+puisque le bug ne se reproduit pas (SIGINT propage correctement au PGID).
+
 ---
 
 ## 9. Schéma Firestore

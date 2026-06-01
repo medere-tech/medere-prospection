@@ -224,6 +224,7 @@ Toutes définies dans `.env.example`. Au boot, validation stricte via `src/lib/s
 | Stocker données de santé | INTERDIT — uniquement coordonnées professionnelles |
 | Husky v9 : `core.hooksPath = .husky/_` | Normal (wrappers générés). Ne PAS forcer `.husky` |
 | Hooks Husky qui plantent via GitHub Desktop (Windows) | Voir BUG-001 ci-dessous. Jamais d'appel `npx`/`npm` dans un hook |
+| Audit log avec PII en clair dans `payload` | INTERDIT — `appendAuditLog` throw `AuditPiiError` (S6.2). Utiliser `hashPii()` (HMAC-SHA256 + pepper) si besoin d'un identifiant traçable. Cf. GUARD-002 + BACKLOG-002 (rotation pepper) |
 
 ### BUG-001 — Hooks Husky cassés via GitHub Desktop sur Windows
 
@@ -264,6 +265,33 @@ donc la condition est doublement fausse → la ligne `export` n'est jamais attei
 (`.cmd` non exécutable de façon fiable depuis `sh`), ni en modifiant `.husky/_/h`
 (régénéré par Husky). Pour un correctif par-machine non partagé, `~/.config/husky/init.sh`
 existe (sourcé par `h`) mais ne suffit pas seul : il règle le PATH, pas l'absence de bash.
+
+### BUG-004 — Firestore emulator zombie après SIGINT (Windows)
+
+> Réf. Notion : projet → **Backlog technique → BUG-004**. Découvert le 29 mai 2026.
+> **Sévérité** : 🟡 Moyenne (workaround `npm run emulator:kill` ou taskkill manuel).
+
+**Symptôme** : après un `npm run test:firestore` réussi (exit 0), un process
+`java.exe` reste `LISTENING` sur le port 8085 pendant 30s à plusieurs minutes.
+Tout run enchaîné fail avec `Could not start Firestore Emulator, port taken`.
+
+**Cause** : `firebase emulators:exec` envoie SIGINT à firebase-tools, qui reporte
+« exited upon SIGINT », mais le JVM enfant n'est pas tué dans le même processus
+group sur Windows (différence comportementale vs Unix où SIGINT propage au PGID
+complet, donc le bug ne se reproduit pas sur Mac/Linux/CI).
+
+**Workaround** : `npm run emulator:kill` (verbose, identifie le PID avant kill).
+Sur Mac/Linux le script est un no-op + message explicatif.
+
+**Pourquoi pas de fix auto en `pretest:firestore`** : un kill silent au démarrage
+de chaque test pourrait masquer des bugs où plusieurs emulators tournent en
+parallèle pour des raisons légitimes (multi-projets, dev long-running). On
+préfère faire surface le problème explicitement.
+
+**À ne pas faire** : pas de `pretest:firestore: emulator:kill` automatique, pas
+de retry loop interne au test runner, pas de timeout fallback sur le port.
+Quand le port est pris : on lit le message d'erreur, on lance `emulator:kill`,
+on relance.
 
 ---
 

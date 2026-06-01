@@ -1,79 +1,137 @@
 rules_version = '2';
 
+// ═══════════════════════════════════════════════════════════════════════════
+// MÉDÉRÉ PROSPECTION — Firestore Security Rules (S6.7, Phase 1 MVP)
+//
+// MVP — OPTION A RADICALE : DENY ALL CLIENT
+//
+// Toutes les writes/reads client sont refusées (`if false` partout).
+// L'Admin SDK utilisé par le code serveur Médéré (Next.js API routes,
+// Inngest functions) bypass complètement ces rules — c'est le seul
+// chemin d'accès à Firestore en production MVP.
+//
+// Justification :
+//   - Clerk/Firebase Auth ne sont PAS encore câblés (S9+).
+//   - Aucun dashboard client ne lit Firestore directement (S9+).
+//   - Tout passe par Next.js API routes (Clerk-protected) qui utilisent
+//     l'Admin SDK serveur.
+//   - Surface d'attaque client = ZÉRO. Si un attaquant compromet une
+//     session client, il ne peut RIEN faire côté Firestore (pas même
+//     lire les contacts).
+//
+// Les helpers ci-dessous (signedIn / hasRole / isAdmin / isCommercial /
+// isAssignedToMe) sont CONSERVÉS EN COMMENTAIRE pour documenter l'intention
+// de la skill `medere-firestore-schema`. Migration prévue en S9+ quand
+// Clerk Custom Claims seront propagés au Firebase ID Token — réactivation
+// des permissions différenciées admin / commercial via ce token.
+//
+// CLOSURE INFO-1 (S6.2 security-reviewer) : `audit_log/` est strictement
+// inaccessible client (ni read, ni write), MÊME pour un futur admin
+// Custom Claim. Append-only via Admin SDK serveur UNIQUEMENT. Forensic
+// préservé. Quand S9+ exposera un audit viewer dashboard, ce sera via
+// une API Next.js route protégée Clerk qui lira via Admin SDK, JAMAIS
+// via Firestore client SDK. Voir tests `tests/firestore-rules/rules.test.ts`
+// pour le sentinel runtime "admin Custom Claim ne peut PAS bypass".
+// ═══════════════════════════════════════════════════════════════════════════
+
 service cloud.firestore {
   match /databases/{database}/documents {
 
-    // Helpers
-    function signedIn() {
-      return request.auth != null;
-    }
+    /* ─────────────────────────────────────────────────────────────────────
+       HELPERS (DÉSACTIVÉS EN MVP — RÉACTIVER EN S9+ AVEC CLERK CUSTOM CLAIMS)
 
-    function hasRole(role) {
-      return signedIn() && request.auth.token.role == role;
-    }
+       function signedIn() {
+         return request.auth != null;
+       }
 
-    function isAdmin() {
-      return hasRole('admin');
-    }
+       function hasRole(role) {
+         return signedIn() && request.auth.token.role == role;
+       }
 
-    function isCommercial() {
-      return hasRole('commercial') || isAdmin();
-    }
+       function isAdmin() {
+         return hasRole('admin');
+       }
 
-    function isAssignedToMe(resource) {
-      return signedIn() && resource.data.handoff.assignedTo == request.auth.uid;
-    }
+       function isCommercial() {
+         return hasRole('commercial') || isAdmin();
+       }
+
+       function isAssignedToMe(resource) {
+         return signedIn() && resource.data.handoff.assignedTo == request.auth.uid;
+       }
+       ───────────────────────────────────────────────────────────────────── */
 
     // === Contacts ===
+    // Skill : reads commerciaux, writes admin.
+    // MVP : deny all client. Toutes les opérations via Admin SDK (S6.3).
     match /contacts/{contactId} {
-      // Lecture : tous les commerciaux
-      allow read: if isCommercial();
-      // Écriture : admin uniquement (le reste se fait via API + Admin SDK)
-      allow create, update, delete: if isAdmin();
+      allow read: if false;                       // S9+ : isCommercial()
+      allow create, update, delete: if false;     // S9+ : isAdmin()
     }
 
     // === Conversations ===
+    // Skill : reads commerciaux, update commercial-assigné OU admin,
+    // create/delete admin.
+    // MVP : deny all client. Toutes les opérations via Admin SDK (S6.4).
     match /conversations/{convId} {
-      allow read: if isCommercial();
-      // Update limité : commercial peut update SA conversation, admin peut tout
-      allow update: if isAdmin() || isAssignedToMe(resource);
-      allow create, delete: if isAdmin();
+      allow read: if false;                       // S9+ : isCommercial()
+      allow update: if false;                     // S9+ : isAdmin() || isAssignedToMe(resource)
+      allow create, delete: if false;             // S9+ : isAdmin()
 
-      // Sous-collection messages
+      // === Sous-collection messages ===
+      // Skill : reads commerciaux, create commercial (saisie manuelle),
+      // update/delete admin (historique append-only).
+      // MVP : deny all client. Toutes les opérations via Admin SDK (S6.5).
       match /messages/{messageId} {
-        allow read: if isCommercial();
-        allow create: if isCommercial();       // Pour les messages humains commerciaux
-        allow update, delete: if isAdmin();    // Pas de modification d'historique
+        allow read: if false;                     // S9+ : isCommercial()
+        allow create: if false;                   // S9+ : isCommercial()
+        allow update, delete: if false;           // S9+ : isAdmin()
       }
     }
 
-    // === Audit log ===
+    // === Audit log === [CLOSURE INFO-1 S6.2]
+    //
+    // append-only via Admin SDK UNIQUEMENT. JAMAIS accessible client
+    // (ni read ni write), MÊME pour un futur admin Custom Claim. Test
+    // sentinel `rules.test.ts` prouve runtime que la garantie tient.
+    //
+    // En S9+ : lecture audit_log via API serveur dédiée (Next.js route
+    // protégée Clerk + Admin SDK), JAMAIS relaxation client direct.
     match /audit_log/{logId} {
-      allow read: if isAdmin();
-      allow write: if false;                   // Admin SDK seulement (bypass rules)
+      allow read: if false;                       // STRICTEMENT JAMAIS côté client
+      allow write: if false;                      // STRICTEMENT JAMAIS côté client
     }
 
     // === Prompts ===
+    // Skill : reads commerciaux, create/update admin, delete jamais.
+    // MVP : deny all client. Collection pas implémentée en MVP (S7+).
     match /prompts/{promptId} {
-      allow read: if isCommercial();
-      allow create, update: if isAdmin();
-      allow delete: if false;                  // Versioning : pas de suppression
+      allow read: if false;                       // S9+ : isCommercial()
+      allow create, update: if false;             // S9+ : isAdmin()
+      allow delete: if false;                     // STRICTEMENT JAMAIS (versioning append-only)
     }
 
     // === Campaigns ===
+    // Skill : reads commerciaux, writes admin.
+    // MVP : deny all client. Collection pas implémentée en MVP (S8+).
     match /campaigns/{campaignId} {
-      allow read: if isCommercial();
-      allow write: if isAdmin();
+      allow read: if false;                       // S9+ : isCommercial()
+      allow write: if false;                      // S9+ : isAdmin()
     }
 
     // === Blacklist ===
+    // Skill : reads commerciaux, create commerciaux, update/delete admin.
+    // MVP : deny all client. Collection reportée S9+ (BACKLOG-001 Notion).
     match /blacklist/{phoneE164} {
-      allow read: if isCommercial();
-      allow create: if isCommercial();         // Tout commercial peut blacklister
-      allow update, delete: if isAdmin();      // Modification réservée à admin
+      allow read: if false;                       // S9+ : isCommercial()
+      allow create: if false;                     // S9+ : isCommercial()
+      allow update, delete: if false;             // S9+ : isAdmin()
     }
 
-    // === Deny everything else ===
+    // === Catchall ===
+    // Toute collection non listée ci-dessus est INACCESSIBLE côté client.
+    // Protection contre l'ajout futur d'une collection qu'on aurait
+    // oublié de scope explicitement (ex: cache_, temp_, _migration_).
     match /{document=**} {
       allow read, write: if false;
     }

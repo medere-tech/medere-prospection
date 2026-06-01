@@ -2,8 +2,10 @@ import { describe, expect, it } from "vitest";
 
 import {
   AppError,
+  AuditPiiError,
   ComplianceError,
   ConfigError,
+  ConflictError,
   ExternalServiceError,
   ForbiddenError,
   InternalError,
@@ -21,11 +23,18 @@ describe("AppError subclasses", () => {
     { Cls: UnauthorizedError, code: "UNAUTHORIZED", status: 401, operational: true },
     { Cls: ForbiddenError, code: "FORBIDDEN", status: 403, operational: true },
     { Cls: NotFoundError, code: "NOT_FOUND", status: 404, operational: true },
+    { Cls: ConflictError, code: "CONFLICT", status: 409, operational: true },
     { Cls: RateLimitError, code: "RATE_LIMITED", status: 429, operational: true },
     { Cls: ComplianceError, code: "COMPLIANCE_BLOCKED", status: 422, operational: true },
     { Cls: ExternalServiceError, code: "EXTERNAL_SERVICE", status: 502, operational: true },
     { Cls: ConfigError, code: "CONFIG", status: 500, operational: false },
     { Cls: InternalError, code: "INTERNAL", status: 500, operational: false },
+    {
+      Cls: AuditPiiError,
+      code: "AUDIT_PII_DETECTED",
+      status: 500,
+      operational: false,
+    },
   ] as const;
 
   it.each(cases)(
@@ -89,6 +98,47 @@ describe("AppError serialization", () => {
     expect(err.toClientBody()).toEqual({
       error: { code: "NOT_FOUND", message: "Ressource introuvable." },
     });
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// noRetry (MED-2 S6.2 — signal aux orchestrateurs Inngest/BullMQ/...)
+// ─────────────────────────────────────────────────────────────────────────────
+
+describe("noRetry — marqueur orchestrateur (MED-2 S6.2)", () => {
+  it("AuditPiiError.noRetry === true (payload corrompu, retry inutile)", () => {
+    const err = new AuditPiiError({ message: "pii detected" });
+    expect(err.noRetry).toBe(true);
+  });
+
+  it("ConfigError.noRetry === true (env manquante, retry inutile)", () => {
+    const err = new ConfigError({ message: "missing var" });
+    expect(err.noRetry).toBe(true);
+  });
+
+  it("ValidationError.noRetry === false (défaut — input client peut être corrigé)", () => {
+    const err = new ValidationError({ message: "invalid" });
+    expect(err.noRetry).toBe(false);
+  });
+
+  it("NotFoundError.noRetry === true (id ne va pas réapparaître)", () => {
+    const err = new NotFoundError({ message: "missing" });
+    expect(err.noRetry).toBe(true);
+  });
+
+  it("ConflictError.noRetry === true (état ne va pas s'inverser)", () => {
+    const err = new ConflictError({ message: "already done" });
+    expect(err.noRetry).toBe(true);
+  });
+
+  it("ExternalServiceError.noRetry === false (transient, retry pertinent)", () => {
+    const err = new ExternalServiceError({ message: "ovh down" });
+    expect(err.noRetry).toBe(false);
+  });
+
+  it("InternalError.noRetry === false par défaut (bug peut être transient)", () => {
+    const err = new InternalError({ message: "boom" });
+    expect(err.noRetry).toBe(false);
   });
 });
 

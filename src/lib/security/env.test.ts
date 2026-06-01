@@ -5,6 +5,7 @@ import { ConfigError } from "@/lib/utils/errors";
 import {
   __resetEnvCacheForTests,
   getAnthropicEnv,
+  getAuditEnv,
   getClerkEnv,
   getCoreEnv,
   getFirebaseEnv,
@@ -604,6 +605,46 @@ describe("cache et reset", () => {
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
+// AUDIT (HMAC pepper pour hashPii — irréversibilité forensic)
+// ─────────────────────────────────────────────────────────────────────────────
+
+describe("getAuditEnv", () => {
+  it("ok avec pepper >= 32 chars", () => {
+    setEnv({ AUDIT_PII_PEPPER: "a".repeat(64) });
+    expect(getAuditEnv().AUDIT_PII_PEPPER).toHaveLength(64);
+  });
+
+  it("throws si AUDIT_PII_PEPPER manquant (jamais optional, fail-fast)", () => {
+    setEnv({ AUDIT_PII_PEPPER: undefined });
+    expect(() => getAuditEnv()).toThrow(ConfigError);
+  });
+
+  it("throws si AUDIT_PII_PEPPER < 32 chars (force entropie minimum)", () => {
+    setEnv({ AUDIT_PII_PEPPER: "tooshort" });
+    expect(() => getAuditEnv()).toThrow(ConfigError);
+  });
+
+  it("erreur SANITISÉE : ne fuite ni la valeur ni le pattern attendu", () => {
+    // Régression critique : si on logge ConfigError dans Sentry, on ne
+    // doit JAMAIS voir la valeur du pepper (même partielle), même quand
+    // c'est juste "tooshort" — par principe.
+    const secret = "leaked-pepper-value-do-not-log-me-x";
+    setEnv({ AUDIT_PII_PEPPER: "short" });
+    try {
+      getAuditEnv();
+      expect.fail("should have thrown");
+    } catch (e) {
+      expect(e).toBeInstanceOf(ConfigError);
+      const payload = captureErrorPayload(e);
+      expect(payload).not.toContain("short");
+      expect(payload).not.toContain(secret);
+      // En revanche on doit voir le NOM du champ (debug aidé).
+      expect(payload).toContain("AUDIT_PII_PEPPER");
+    }
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
 // validateAllEnvNow
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -636,6 +677,7 @@ describe("validateAllEnvNow", () => {
       UPSTASH_REDIS_REST_TOKEN: undefined,
       NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY: undefined,
       CLERK_SECRET_KEY: undefined,
+      AUDIT_PII_PEPPER: undefined,
     });
 
     const report = validateAllEnvNow();
@@ -646,6 +688,8 @@ describe("validateAllEnvNow", () => {
     expect(Array.isArray(report.anthropic)).toBe(true);
     expect(report.ovh).not.toBe("ok");
     expect(report.firebase).not.toBe("ok");
+    expect(report.audit).not.toBe("ok"); // requis (jamais optional)
+    expect(Array.isArray(report.audit)).toBe(true);
   });
 
   it("propage une erreur non-ConfigError sans l'absorber (filet anti-bug)", () => {
