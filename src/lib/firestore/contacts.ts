@@ -175,6 +175,29 @@ function parseContactOrThrow(raw: unknown, contactId: string): Contact {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Helpers transactionnels partagés (S6.6)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * Wrapper public de `parseContactOrThrow` pour usage cross-module dans
+ * `lib/firestore/`. Identique en sémantique au helper privé — c'est juste
+ * un point d'accès stable pour `transactions.ts` (`withContactLock`) afin
+ * d'éviter de dupliquer la logique Zod + ValidationError. NE JAMAIS faire
+ * de surcouche ici : toute évolution du parsing doit rester dans
+ * `parseContactOrThrow`.
+ *
+ * Aligné sur le même pattern que `_parseConversationOrThrow` exposé par
+ * `conversations.ts` en S6.5.
+ *
+ * @internal Helper inter-modules `firestore/`. NE PAS appeler depuis du
+ *           code applicatif : utiliser `getContact()` pour une lecture
+ *           standalone (avec retour `null` en cas d'absence).
+ */
+export function _parseContactOrThrow(raw: unknown, contactId: string): Contact {
+  return parseContactOrThrow(raw, contactId);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // API publique
 // ─────────────────────────────────────────────────────────────────────────────
 
