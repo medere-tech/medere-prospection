@@ -31,6 +31,10 @@ export default defineConfig({
     exclude: [
       "src/lib/firestore/**/*.{test,spec}.{ts,tsx}",
       "tests/firestore/**",
+      // Tests `firestore.rules` (S6.7) — utilisent `@firebase/rules-unit-testing`
+      // qui exige un emulator up + un projectId distinct. Exécutés via
+      // `npm run test:firestore-rules` (config dédiée).
+      "tests/firestore-rules/**",
       "node_modules/**",
       "dist/**",
       ".next/**",
@@ -40,7 +44,7 @@ export default defineConfig({
       reporter: ["text", "html", "lcov"],
       // On exclut lib/firestore du périmètre couverture de cette config :
       // ces fichiers ne tournent pas ici, ils seraient marqués 0% à tort.
-      exclude: ["src/lib/firestore/**", "tests/firestore/**"],
+      exclude: ["src/lib/firestore/**", "tests/firestore/**", "tests/firestore-rules/**"],
       thresholds: {
         lines: 0,
         functions: 0,
