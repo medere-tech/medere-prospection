@@ -62,6 +62,15 @@ export default defineConfig({
           branches: 100,
           statements: 100,
         },
+        // S7a — wrapper Claude. Baseline 95% (I/O critique). S7a.2
+        // remontera intent-classifier.ts et prompts/** à 100% (compliance
+        // GUARD-001 — verrouillé par sentinelles).
+        "src/lib/claude/**/*.ts": {
+          lines: 95,
+          functions: 95,
+          branches: 95,
+          statements: 95,
+        },
       },
     },
   },
