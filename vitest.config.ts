@@ -85,6 +85,15 @@ export default defineConfig({
           branches: 100,
           statements: 100,
         },
+        // S7a.3 — wrapper OVH SMS. Baseline 95% (I/O critique, mapping
+        // erreurs HTTP/errno/OAuth). Pas de compliance gate (orchestration
+        // métier déportée Inngest S8+).
+        "src/lib/ovh/**/*.ts": {
+          lines: 95,
+          functions: 95,
+          branches: 95,
+          statements: 95,
+        },
       },
     },
   },
