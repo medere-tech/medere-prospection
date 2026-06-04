@@ -32,11 +32,21 @@ import { type Timestamp } from "firebase-admin/firestore";
  *   - `long_form_opt_out_candidate` — signal de surveillance manuel
  *     (S7, GUARD-001). Logge un message entrant > 50 chars contenant un
  *     signal négatif (`stop`, `refuse`, etc.) pour suivi quantitatif.
+ *   - `sms_provider_dispatched` — acquittement du provider SMS (OVH)
+ *     APRÈS appel API réussi. Distinct de `sms_sent` (posé par
+ *     `addOutbound` lors de l'enqueue Firestore status="queued") pour
+ *     permettre un forensic distinct enqueue-vs-dispatch + corréler
+ *     `messageId` Firestore ↔ `ovhMessageId` provider. Payload =
+ *     `{ ovhMessageId, conversationId, contactId, campaignId, sender,
+ *        bodyLength, dryRun, creditsRemoved? }`. Tous scrubber-safe.
+ *     Posé par `lib/inngest/functions/send-first-sms` (S8.4, voie
+ *     minimaliste Voie 2 — cf. Notion INFRA-DETTE-001).
  */
 export type AuditAction =
   | "sms_sent"
   | "sms_received"
   | "sms_failed"
+  | "sms_provider_dispatched"
   | "send_blocked"
   | "opt_out"
   | "handoff"
