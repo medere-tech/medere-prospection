@@ -68,14 +68,7 @@
  * en S8.4.
  */
 import { getInngestClient } from "@/lib/inngest/client";
-
-/**
- * Nom de l'event qui déclenche cette function. Aligné `medere-claude-prompts`
- * convention (kebab-case avec préfixe domaine). En S8.3, un `eventType`
- * Zod-typé sera défini dans `lib/inngest/events.ts` et remplacera cette
- * string par la référence typée.
- */
-const TRIGGER_EVENT_NAME = "medere/sms.send-first.requested";
+import { smsSendFirstRequested } from "@/lib/inngest/events";
 
 /**
  * ID Inngest stable de la function. Apparaît dans le dashboard cloud et
@@ -102,7 +95,7 @@ const FUNCTION_ID = "send-first-sms";
 export const sendFirstSms = getInngestClient().createFunction(
   {
     id: FUNCTION_ID,
-    triggers: [{ event: TRIGGER_EVENT_NAME }],
+    triggers: [{ event: smsSendFirstRequested }],
     // [GF1] Verrouillé par test sentinelle S8.4 — ne PAS retirer ni
     // modifier sans payer la dette INFRA-DETTE-001 (cf. JSDoc en-tête).
     concurrency: {
@@ -128,7 +121,5 @@ export const sendFirstSms = getInngestClient().createFunction(
 // Exposés pour tests sentinelles
 // ─────────────────────────────────────────────────────────────────────────────
 
-/** @internal */
-export const __TRIGGER_EVENT_NAME_FOR_TESTS = TRIGGER_EVENT_NAME;
 /** @internal */
 export const __FUNCTION_ID_FOR_TESTS = FUNCTION_ID;

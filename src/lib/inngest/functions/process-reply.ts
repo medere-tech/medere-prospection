@@ -61,12 +61,7 @@
  * Claude) est déjà testé bout-en-bout dans S7a.2 — on s'appuie dessus.
  */
 import { getInngestClient } from "@/lib/inngest/client";
-
-/**
- * Nom de l'event qui déclenchera cette function (émis par le webhook OVH
- * inbound, S9). Zod schema défini en S8.3 dans `lib/inngest/events.ts`.
- */
-const TRIGGER_EVENT_NAME = "medere/sms.reply.received";
+import { smsReplyReceived } from "@/lib/inngest/events";
 
 /**
  * ID Inngest stable de la function. NE PAS modifier après le premier
@@ -88,7 +83,7 @@ const FUNCTION_ID = "process-reply";
 export const processReply = getInngestClient().createFunction(
   {
     id: FUNCTION_ID,
-    triggers: [{ event: TRIGGER_EVENT_NAME }],
+    triggers: [{ event: smsReplyReceived }],
     // Retry désactivé : le stub ne deviendra pas implémenté en réessayant.
     // Quand l'implémentation réelle arrivera (S9), retirer cette ligne →
     // retour à la policy retry Inngest par défaut (4 tentatives).
@@ -113,7 +108,5 @@ export const processReply = getInngestClient().createFunction(
 // Exposés pour tests sentinelles
 // ─────────────────────────────────────────────────────────────────────────────
 
-/** @internal */
-export const __TRIGGER_EVENT_NAME_FOR_TESTS = TRIGGER_EVENT_NAME;
 /** @internal */
 export const __FUNCTION_ID_FOR_TESTS = FUNCTION_ID;
