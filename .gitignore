@@ -49,3 +49,9 @@ ui-debug.log
 # typescript
 *.tsbuildinfo
 next-env.d.ts
+
+
+# Firebase service account credentials (JAMAIS COMMIT — clés privées admin SDK)
+firebase-service-account.json
+firebase-service-account*.json
+*-firebase-adminsdk-*.json
