@@ -43,6 +43,39 @@ const coreEnvSchema = z.object({
   NEXT_PUBLIC_APP_URL: z.url().optional(),
   /** Optional Phase 1 : non utilisée (signatures internes à venir en P2+). */
   APP_SECRET: z.string().min(32).optional(),
+  /**
+   * Mode dry-run pour les envois SMS Inngest (S8). `"true"` → on logue le
+   * payload qu'on aurait envoyé à OVH puis on retourne un faux messageId,
+   * AUCUN appel HTTP OVH réel n'est fait.
+   *
+   * **Default `"true"` = filet anti-envoi-accidentel.** Une variable
+   * manquante sur un environnement mal configuré (CI, preview Vercel mal
+   * câblé, dev local fraîchement cloné, prod en cours de migration) ne
+   * DOIT JAMAIS basculer vers un envoi réel par omission. C'est l'acte
+   * délibéré de set `"false"` côté infra qui ouvre l'envoi.
+   *
+   * Stratégie de déploiement Vercel :
+   *   - Preview                : DRY_RUN_SMS=true   (jamais d'envoi sur PRs)
+   *   - Production             : DRY_RUN_SMS=false  (envoi réel)
+   *   - Local (.env.local)     : DRY_RUN_SMS=true   (dev sans surprise)
+   *
+   * Type d'usage côté caller :
+   *   ```ts
+   *   const { DRY_RUN_SMS } = getCoreEnv();
+   *   if (DRY_RUN_SMS) {
+   *     log("DRY RUN — would send: ...");
+   *     return { messageIds: ["dry-run-..."], dryRun: true };
+   *   }
+   *   await sendSms(payload);
+   *   ```
+   *
+   * Le `transform` Zod convertit la string env en boolean → typage caller
+   * propre (pas de comparaison `=== "true"` à se rappeler ailleurs).
+   */
+  DRY_RUN_SMS: z
+    .enum(["true", "false"])
+    .default("true")
+    .transform((v) => v === "true"),
 });
 
 const anthropicEnvSchema = z.object({
