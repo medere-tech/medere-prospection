@@ -70,15 +70,81 @@ import { smsReplyReceived } from "@/lib/inngest/events";
 const FUNCTION_ID = "process-reply";
 
 /**
- * Inngest function — STUB jusqu'à S9 (webhook OVH inbound live).
+ * Code de blocage stable. Référence Notion `INFRA-SMS-001` (Backlog
+ * technique) — décision sender SMS (short code vs numéro virtuel) en
+ * attente Harry + Olivier. Permet aux tests d'asserter par constante
+ * plutôt que par chaîne magique.
+ */
+const NOT_IMPLEMENTED_REASON = "inbound_pending_INFRA_SMS_001";
+
+/**
+ * Résultat du stub. Type discriminant `"not_implemented"` réservé à cette
+ * fonction tant que l'implémentation réelle (S9) n'est pas livrée.
+ *
+ * Quand la vraie implémentation arrivera, le type retour deviendra
+ * discriminé sur `intent` (`INTERESSE | NEUTRE | OBJECTION | STOP`) +
+ * actions effectuées (`handoff_created`, `opt_out_recorded`, etc.).
+ */
+export interface ProcessReplyStubResult {
+  status: "not_implemented";
+  reason: typeof NOT_IMPLEMENTED_REASON;
+  note: string;
+}
+
+/**
+ * Forme minimale du contexte Inngest reçu par le handler. Sert au
+ * typage de `processReplyHandler` exporté et à la fabrication d'un
+ * fake context en tests.
+ */
+export interface ProcessReplyHandlerContext {
+  event: {
+    id?: string;
+    name: string;
+    data: {
+      phone: string;
+      body: string;
+      ovhMessageId: string;
+    };
+  };
+  logger: {
+    info: (...args: unknown[]) => void;
+    warn: (...args: unknown[]) => void;
+    error: (...args: unknown[]) => void;
+    debug: (...args: unknown[]) => void;
+  };
+}
+
+/**
+ * Handler stub du job `process-reply`. Extrait en fonction nommée pour
+ * faciliter les tests (peut être invoqué avec un fake context).
  *
  * **Comportement actuel** : log structuré (sans le body, anti-PII) +
  * retour explicite `{ status: "not_implemented", reason }`. PAS de throw,
  * PAS de retry — un retry serait inutile (la cause n'est pas transitoire,
- * c'est une feature non livrée).
+ * c'est une feature non livrée — cf. INFRA-SMS-001).
  *
  * **Effets de bord** : aucun (pas de Firestore, pas de Claude, pas de
  * Slack, pas d'OVH).
+ */
+export async function processReplyHandler(
+  ctx: ProcessReplyHandlerContext,
+): Promise<ProcessReplyStubResult> {
+  ctx.logger.info("[process-reply] stub invoked", {
+    eventId: ctx.event.id,
+    name: ctx.event.name,
+    // PAS de logging du body, du phone ni du ovhMessageId (PII inbound /
+    // identifiants externes — cf. JSDoc `firestore/messages.ts:36-54`
+    // invariants + règle CLAUDE.md "Logs sans PII").
+  });
+  return {
+    status: "not_implemented",
+    reason: NOT_IMPLEMENTED_REASON,
+    note: "Stub Inngest function — real implementation blocked on OVH inbound webhook (see Notion INFRA-SMS-001). Classifier wiring will follow S7a.2 contract (GUARD-001).",
+  };
+}
+
+/**
+ * Inngest function — STUB jusqu'à S9 (webhook OVH inbound live).
  */
 export const processReply = getInngestClient().createFunction(
   {
@@ -89,19 +155,7 @@ export const processReply = getInngestClient().createFunction(
     // retour à la policy retry Inngest par défaut (4 tentatives).
     retries: 0,
   },
-  async ({ event, logger }) => {
-    logger.info("[process-reply] stub invoked", {
-      eventId: event.id,
-      name: event.name,
-      // PAS de logging du body ni du phone (PII inbound — cf. JSDoc
-      // `firestore/messages.ts:36-54` invariants).
-    });
-    return {
-      status: "not_implemented" as const,
-      reason: "inbound_pending_INFRA_SMS_001",
-      note: "Stub Inngest function — real implementation blocked on OVH inbound webhook (see Notion INFRA-SMS-001). Classifier wiring will follow S7a.2 contract (GUARD-001).",
-    };
-  },
+  processReplyHandler,
 );
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -110,3 +164,5 @@ export const processReply = getInngestClient().createFunction(
 
 /** @internal */
 export const __FUNCTION_ID_FOR_TESTS = FUNCTION_ID;
+/** @internal */
+export const __NOT_IMPLEMENTED_REASON_FOR_TESTS = NOT_IMPLEMENTED_REASON;
