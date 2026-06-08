@@ -29,7 +29,7 @@ vi.mock("@/lib/compliance/pre-send-check-with-audit", () => ({
   preSendCheckWithAudit: vi.fn(),
 }));
 vi.mock("@/lib/ovh/send-sms", () => ({ sendSms: vi.fn() }));
-vi.mock("@/lib/security/env", () => ({ getCoreEnv: vi.fn() }));
+vi.mock("@/lib/security/env", () => ({ getCoreEnv: vi.fn(), getOvhEnv: vi.fn() }));
 
 // Imports AFTER mocks
 import { preSendCheckWithAudit } from "@/lib/compliance/pre-send-check-with-audit";
@@ -39,10 +39,10 @@ import { getContact } from "@/lib/firestore/contacts";
 import { getConversation } from "@/lib/firestore/conversations";
 import { addOutbound, listRecentOutbound } from "@/lib/firestore/messages";
 import { sendSms } from "@/lib/ovh/send-sms";
-import { getCoreEnv } from "@/lib/security/env";
+import { getCoreEnv, getOvhEnv } from "@/lib/security/env";
 
 import {
-  __AUDIT_SENDER_NAME_FOR_TESTS,
+  __AUDIT_SENDER_DRY_RUN_FOR_TESTS,
   __FUNCTION_ID_FOR_TESTS,
   type InngestHandlerContext,
   sendFirstSms,
@@ -170,9 +170,13 @@ describe("Sentinelles structurelles (GF3 + INFRA-DETTE-001)", () => {
     expect(__FUNCTION_ID_FOR_TESTS).toBe("send-first-sms");
   });
 
-  it("AUDIT_SENDER_NAME est figé à 'MEDERE'", () => {
-    // Aligné CLAUDE.md > Sender alphanumérique cible : MEDERE.
-    expect(__AUDIT_SENDER_NAME_FOR_TESTS).toBe("MEDERE");
+  it("AUDIT_SENDER_DRY_RUN est figé à 'DRY_RUN_SENDER' (littéral neutre, ≠ vrai sender OVH)", () => {
+    // Sentinelle INFRA-FIX-AUDIT-SENDER (S8.10) : le littéral utilisé en
+    // dry-run NE DOIT PAS ressembler à un sender alphanumérique OVH valide
+    // (ex: "MEDERE", "NESF") sous peine d'induire en erreur le forensic
+    // Firestore. "DRY_RUN_SENDER" signale explicitement l'absence de
+    // dispatch OVH réel.
+    expect(__AUDIT_SENDER_DRY_RUN_FOR_TESTS).toBe("DRY_RUN_SENDER");
   });
 
   it("ACTIONS contient 'sms_provider_dispatched' (audit-log whitelist)", () => {
@@ -228,7 +232,7 @@ describe("sendFirstSmsHandler — happy path DRY_RUN", () => {
         conversationId: "contact-123_campaign-xyz",
         contactId: "contact-123",
         campaignId: "campaign-xyz",
-        sender: "MEDERE",
+        sender: "DRY_RUN_SENDER",
         bodyLength: 10,
         dryRun: true,
         creditsRemoved: 0,
@@ -251,6 +255,12 @@ describe("sendFirstSmsHandler — happy path RÉEL (DRY_RUN=false)", () => {
     (getCoreEnv as ReturnType<typeof vi.fn>).mockReturnValue({
       NODE_ENV: "production",
       DRY_RUN_SMS: false,
+    });
+    // Mode réel → le step 4 lit getOvhEnv().OVH_SMS_SENDER. Default "MEDERE"
+    // ici suffit pour les tests existants ; les sentinelles env-driven
+    // ci-dessous overrident avec des valeurs custom.
+    (getOvhEnv as ReturnType<typeof vi.fn>).mockReturnValue({
+      OVH_SMS_SENDER: "MEDERE",
     });
   });
 
@@ -402,5 +412,72 @@ describe("sendFirstSmsHandler — ordre du pipeline 4 steps", () => {
     const stepRun = ctx.step.run as ReturnType<typeof vi.fn>;
     const names = stepRun.mock.calls.map((c) => c[0]);
     expect(names).toEqual(["get-contact-and-history", "compliance-pre-send-check"]);
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Sentinelles INFRA-FIX-AUDIT-SENDER (S8.10)
+//
+// Bug initial : `AUDIT_SENDER_NAME = "MEDERE"` hardcoded dans le payload
+// audit `sms_provider_dispatched`, alors que la config réelle env peut être
+// "NESF" (sender validé MVP) ou autre. Forensic trompeur.
+//
+// Fix S8.10 (Option A) : env-driven en branche !DRY_RUN, littéral neutre
+// "DRY_RUN_SENDER" en dry-run pour ne pas crasher en dev local sans OVH env.
+// ─────────────────────────────────────────────────────────────────────────────
+
+describe("Sentinelles INFRA-FIX-AUDIT-SENDER (S8.10)", () => {
+  it("[S8.10] audit reflète env.OVH_SMS_SENDER en mode RÉEL, JAMAIS un littéral hardcoded", async () => {
+    // ⚠️ Sentinelle anti-régression : si quelqu'un réintroduit un sender
+    // hardcoded au lieu de lire l'env, ce test casse. La valeur "TESTSDR"
+    // est choisie volontairement DIFFÉRENTE de "MEDERE" et "NESF" pour
+    // détecter un re-hardcoding sur l'une ou l'autre.
+    (getCoreEnv as ReturnType<typeof vi.fn>).mockReturnValue({
+      NODE_ENV: "production",
+      DRY_RUN_SMS: false,
+    });
+    (getOvhEnv as ReturnType<typeof vi.fn>).mockReturnValue({
+      OVH_SMS_SENDER: "TESTSDR",
+    });
+
+    await sendFirstSmsHandler(makeFakeCtx());
+
+    expect(appendAuditLog).toHaveBeenCalledWith(
+      expect.objectContaining({
+        action: "sms_provider_dispatched",
+        payload: expect.objectContaining({
+          sender: "TESTSDR",
+        }),
+      }),
+    );
+    // Anti-hardcoding fort : on assert que la valeur env passée triomphe
+    // d'éventuelles valeurs littérales que quelqu'un aurait pu réintroduire.
+    const payloadSender = (appendAuditLog as ReturnType<typeof vi.fn>).mock.calls[0]?.[0]?.payload
+      ?.sender;
+    expect(payloadSender).not.toBe("MEDERE");
+    expect(payloadSender).not.toBe("NESF");
+  });
+
+  it("[S8.10] N'appelle PAS getOvhEnv() en branche DRY_RUN (garde anti-crash dev local)", async () => {
+    // ⚠️ Sentinelle anti-régression : un dev local SANS env OVH set doit
+    // pouvoir tourner en dry-run (default DRY_RUN_SMS=true). Si on lit
+    // getOvhEnv() en dry-run, ConfigError throw → dev planté inutilement.
+    // Le défaut beforeEach() global pose déjà DRY_RUN_SMS=true.
+    await sendFirstSmsHandler(makeFakeCtx());
+    expect(getOvhEnv).not.toHaveBeenCalled();
+  });
+
+  it("[S8.10] En dry-run, le sender forensic est le littéral neutre 'DRY_RUN_SENDER'", async () => {
+    // Le littéral DOIT être facilement identifiable côté forensic Firestore
+    // pour signaler l'absence de dispatch OVH réel — ≠ d'un vrai sender
+    // alphanumérique (max 11 chars OVH).
+    await sendFirstSmsHandler(makeFakeCtx());
+    expect(appendAuditLog).toHaveBeenCalledWith(
+      expect.objectContaining({
+        payload: expect.objectContaining({
+          sender: "DRY_RUN_SENDER",
+        }),
+      }),
+    );
   });
 });

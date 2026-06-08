@@ -45,6 +45,34 @@
  * Test sentinelle (events.test.ts) verrouille les noms par chaîne literal.
  *
  * ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ * ⚠️ `event.id` — NE JAMAIS y mettre de PII (S8.10, security review)
+ *
+ * Le champ `event.id` (optionnel à l'émission, sinon UUID v4 généré par le
+ * SDK Inngest) sert à l'idempotence — et il est affiché tel quel dans le
+ * dashboard Inngest cloud + dans tous les `logger.info` qui l'incluent
+ * (cf. `send-first-sms.ts:215, 229`). Le scrubber PII de l'audit log
+ * Firestore (`detectPiiInPayload`) NE COUVRE PAS Inngest cloud — un
+ * `event.id` mal forgé fuiterait directement dans l'UI.
+ *
+ * Règles pour les émetteurs (`inngest.send()`) :
+ *
+ *   ❌ NE JAMAIS forger `event.id` à partir de :
+ *     - téléphone E.164 ou national FR (`+33775...`, `0775...`)
+ *     - email (`...@...`)
+ *     - nom + prénom du PS
+ *     - ovhMessageId (identifiant externe stocké dans `messages.externalId`,
+ *       traité comme semi-sensible cf. `messages.ts:36-54`)
+ *
+ *   ✅ FORMES ACCEPTÉES si on a besoin d'idempotence explicite :
+ *     - laisser le SDK générer un UUID v4 (default)
+ *     - `<contactId>-<campaignId>-<nonce>` où `contactId` = hubspotId
+ *       (string opaque scrubber-safe par construction, cf. `contacts.ts`)
+ *     - hash HMAC-SHA256 d'un tuple sensible (avec pepper AUDIT_PII_PEPPER)
+ *
+ * Voir aussi : `process-reply.ts:132-138` qui documente la même règle
+ * pour le payload du stub inbound.
+ *
+ * ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
  * Bornes des `body` SMS (cohérence cross-module S6.5 + S7a)
  *
  * Le `body` d'un SMS — qu'il soit sortant (outbound) ou entrant (inbound)

@@ -92,7 +92,10 @@
  *                                    construction (vérifié S8.4 pré-flight).
  *
  * En dry-run, `finalOvhMessageId = "dry-run-<firestoreMessageId>"` (le
- * messageId Firestore est `[A-Za-z0-9]{20}` → scrubber-safe).
+ * messageId Firestore est `[A-Za-z0-9]{20}` → scrubber-safe) et
+ * `sender = "DRY_RUN_SENDER"` (littéral neutre). En mode réel, `sender`
+ * est lu via `getOvhEnv().OVH_SMS_SENDER` → reflète EXACTEMENT le sender
+ * utilisé par OVH (cf. INFRA-FIX-AUDIT-SENDER, S8.10).
  *
  * Forensic disponible côté Firestore :
  *   - Doc `messages/{messageId}` : body, createdAt, status="queued"
@@ -111,7 +114,7 @@ import { addOutbound, listRecentOutbound } from "@/lib/firestore/messages";
 import { getInngestClient } from "@/lib/inngest/client";
 import { smsSendFirstRequested } from "@/lib/inngest/events";
 import { sendSms } from "@/lib/ovh/send-sms";
-import { getCoreEnv } from "@/lib/security/env";
+import { getCoreEnv, getOvhEnv } from "@/lib/security/env";
 import { ConfigError, ValidationError } from "@/lib/utils/errors";
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -126,18 +129,30 @@ import { ConfigError, ValidationError } from "@/lib/utils/errors";
 const FUNCTION_ID = "send-first-sms";
 
 /**
- * Nom de l'émetteur (sender ID OVH) capturé dans l'audit pour forensic.
- * Aligné `CLAUDE.md > Sender alphanumérique cible : MEDERE` + skill
- * `medere-ovh-sms`.
+ * Sender symbolique posé dans l'audit `sms_provider_dispatched` lorsqu'on
+ * tourne en DRY_RUN_SMS=true (aucun appel OVH réel n'est fait).
  *
- * Pourquoi hardcoded plutôt que `getOvhEnv().OVH_SMS_SENDER` :
- * - Dev local peut être en dry-run sans env OVH set → `getOvhEnv()`
- *   throw ConfigError, ferait planter le step 4 même en dry-run.
- * - L'env OVH_SMS_SENDER est figée à "MEDERE" pour le MVP. Quand on
- *   bascule sur un autre sender (S9+ avec INFRA-SMS-001), mettre à jour
- *   les 2 endroits en cohérence (env + cette constante).
+ * Pourquoi un littéral et pas `getOvhEnv().OVH_SMS_SENDER` :
+ * - Le dry-run doit pouvoir tourner en dev local SANS env OVH set
+ *   (cf. `getCoreEnv().DRY_RUN_SMS` default `true`). Si on appelait
+ *   `getOvhEnv()` ici, un dev sans `OVH_*` configuré crasherait sur un
+ *   `ConfigError` au step 4 alors qu'aucun envoi réel n'a lieu.
+ * - Le littéral choisi (`"DRY_RUN_SENDER"`) signale EXPLICITEMENT dans le
+ *   forensic Firestore qu'aucun OVH dispatch n'a eu lieu (≠ d'un vrai
+ *   sender alphanumérique qui aurait été utilisé côté OVH).
+ *
+ * En branche RÉELLE (`!DRY_RUN_SMS`), on lit `getOvhEnv().OVH_SMS_SENDER`
+ * → l'audit reflète exactement le sender utilisé par OVH, par construction
+ * (cf. INFRA-FIX-AUDIT-SENDER, S8.10 — bug initial : sender hardcoded
+ * "MEDERE" alors que la config réelle peut différer, ex: "NESF").
+ *
+ * Test sentinelle :
+ *   - "audit reflects env.OVH_SMS_SENDER (env-driven, non hardcoded)"
+ *     verrouille le contrat env→audit en mode réel.
+ *   - "getOvhEnv n'est pas appelé en branche DRY_RUN" verrouille la garde
+ *     anti-crash dev local.
  */
-const AUDIT_SENDER_NAME = "MEDERE";
+const AUDIT_SENDER_DRY_RUN = "DRY_RUN_SENDER";
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Types de retour du handler
@@ -276,6 +291,21 @@ export async function sendFirstSmsHandler(ctx: InngestHandlerContext): Promise<S
     // de faux positif RE_FR_NATIONAL ~0.00002%).
     const finalOvhMessageId = dispatch.ovhMessageId ?? `dry-run-${messageId}`;
 
+    // Sender env-driven en mode réel, littéral neutre en dry-run.
+    // Cf. INFRA-FIX-AUDIT-SENDER (S8.10) : on NE LIT PAS getOvhEnv() en
+    // dry-run pour ne pas crasher en dev local sans config OVH.
+    //
+    // Contrat implicite step3 → step4 (security review S8.10) : si on
+    // arrive ici en branche !dryRun, c'est que `sendSms()` (step 3) a
+    // appelé `getOvhEnv()` avec succès AVANT — donc l'env OVH est
+    // forcément valide à ce point. Pas de try/catch défensif nécessaire
+    // ici, mais si quelqu'un refactore `sendSms()` pour ne plus lire
+    // l'env au boot, ce contrat doit être préservé sinon le step 4
+    // pourrait throw ConfigError après un SMS déjà parti côté OVH
+    // (audit jamais posé → trou forensic). Cf. piège noté dans le
+    // rapport security-reviewer S8.10.
+    const sender = dispatch.dryRun ? AUDIT_SENDER_DRY_RUN : getOvhEnv().OVH_SMS_SENDER;
+
     const auditId = await appendAuditLog({
       actorId: "system",
       actorType: "system",
@@ -287,7 +317,7 @@ export async function sendFirstSmsHandler(ctx: InngestHandlerContext): Promise<S
         conversationId: loaded.conversationId,
         contactId,
         campaignId,
-        sender: AUDIT_SENDER_NAME,
+        sender,
         bodyLength: body.length,
         dryRun: dispatch.dryRun,
         creditsRemoved: dispatch.creditsRemoved,
@@ -384,4 +414,4 @@ interface DispatchResult {
 export const __FUNCTION_ID_FOR_TESTS = FUNCTION_ID;
 
 /** @internal */
-export const __AUDIT_SENDER_NAME_FOR_TESTS = AUDIT_SENDER_NAME;
+export const __AUDIT_SENDER_DRY_RUN_FOR_TESTS = AUDIT_SENDER_DRY_RUN;
