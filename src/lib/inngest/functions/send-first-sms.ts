@@ -3,45 +3,40 @@
  * SMS d'une campagne à un contact (Phase 1 MVP, S8.4).
  *
  * ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
- * ⚠️ DETTE TECHNIQUE INFRA-DETTE-001 — race condition rate-limit
+ * INFRA-DETTE-001 + INFRA-DETTE-004 — PAYÉES par DEBT-001 (DEBT-001.5)
  *
- * Cette implémentation MVP repose sur **Inngest concurrency par
+ * L'implémentation Phase 1 S8 reposait sur **Inngest concurrency par
  * `event.data.contactId`** (limit 1) pour sérialiser les envois sur un
- * même contact et ainsi éviter la race condition rate-limit 3 SMS / 30j.
+ * même contact. DEBT-001 (DEBT-001.1 → .5) a payé la dette en composant
+ * une transaction Firestore unique via `sendOutboundWithLock` qui ferme
+ * la race condition rate-limit by-construction côté Firestore :
  *
- * Pour scaler en prod >200 contacts simultanés et fermer la race
- * by-construction Firestore-side, PAYER la dette S6.6 AVANT de scaler :
+ *   - `addOutboundInTx` extrait de `addOutbound`          (DEBT-001.2)
+ *   - `listRecentOutboundInTx`                            (DEBT-001.2)
+ *   - `ComplianceConcurrencyError` retry-friendly         (DEBT-001.1)
+ *   - `sendOutboundWithLock` (compose tout en 1 tx atomique) (DEBT-001.3)
+ *   - Step 4 migré vers `sendOutboundWithLock`            (DEBT-001.5)
  *
- *   1. Extraire `addOutboundInTx(tx, ...)` de `addOutbound`
- *      (`firestore/messages.ts` actuel = transaction enveloppante figée).
- *   2. Exposer `listRecentOutboundInTx(tx, conversationId)` (variant
- *      tx-aware de `listRecentOutbound`).
- *   3. Exposer `updateMessageStatus(conversationId, messageId, status,
- *      externalId?)` (mentionné `messages.ts:25-26` comme reporté S7).
- *   4. Migrer le pipeline 4 steps actuel vers le pattern 5 steps :
+ * Le concurrency Inngest `key=contactId, limit=1` (GF1) est **conservé**
+ * en defense-in-depth : il évite de mobiliser Firestore pour rien quand
+ * 2 events arrivent en burst sur le même contact (la 2ème queue côté
+ * Inngest et lit l'état réel après commit de la 1ère). C'est une
+ * optimisation, plus une exigence de correctness.
  *
- *        - get-contact-and-history       (HORS tx)
- *        - compliance-pre-send-check     (audit auto, HORS tx)
- *        - reserve-outbound-in-firestore (`withContactLock` PURE :
- *                                          re-check rate-limit + addOutboundInTx
- *                                          `status="queued"`)
- *        - ovh-send                      (HORS tx — DRY_RUN ou réel)
- *        - mark-message-sent             (updateMessageStatus → "sent",
- *                                          pose externalId = ovhMessageIds[0])
- *
- *   5. Retirer la dépendance à `concurrency: { key, limit: 1 }` SI la
- *      transaction Firestore garantit l'exclusion mutuelle (mais
- *      conserver `key` pour rate-limiting global Inngest reste prudent).
- *
- * Cf. Notion `INFRA-DETTE-001` (Backlog technique) pour le plan complet
- * de migration + critères Done.
+ * INFRA-DETTE-004 (atomicité audit `sms_provider_dispatched`) est aussi
+ * payée par DEBT-001.3 : `sendOutboundWithLock` pose le message + les
+ * 2 audits (`sms_sent` interne + `sms_provider_dispatched`) DANS la
+ * MÊME transaction Firestore. Plus de window de retry Inngest qui
+ * laisserait un message orphelin sans audit dispatch.
  *
  * ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
- * GARDE-FOUS S8 (non-négociables — modifier nécessite issue Notion)
+ * GARDE-FOUS S8 (conservés en defense-in-depth post-DEBT-001)
  *
  *   [GF1] `concurrency: { key: "event.data.contactId", limit: 1 }`
- *         → sérialise les jobs d'un MÊME contact. C'est CE qui ferme la
- *           race condition rate-limit en l'absence de withContactLock.
+ *         → optimisation : évite un Firestore round-trip + retry pour
+ *           rien quand 2 events arrivent en burst sur le même contact.
+ *           POST-DEBT-001 : la correctness ne dépend plus de GF1, mais
+ *           le retirer aurait un coût d'efficacité opérationnelle.
  *           Test sentinelle dans `send-first-sms.test.ts` verrouille la
  *           présence de cette config par inspection structurelle.
  *
@@ -51,7 +46,7 @@
  *         `sendFirstSms.opts.concurrency.{key, limit}` ne sont pas
  *         retirés ou modifiés silencieusement (cf. `send-first-sms.test.ts`).
  *
- *   [GF4] Référence Notion `INFRA-DETTE-001` dans tous les commits S8
+ *   [GF4] Référence Notion `INFRA-DETTE-001` dans tous les commits S8+
  *         qui touchent ce fichier.
  *
  * ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -80,16 +75,18 @@
  *                                      propagées telles quelles → retry
  *                                      Inngest par défaut.
  *
- *   4. `record-outbound-message`  : `addOutbound()` enqueue Firestore
- *                                    (status="queued" FIGÉ par S6.5 — OK
- *                                    pour MVP, fix sémantique en S9 via
- *                                    `updateMessageStatus`). Puis pose
- *                                    audit `sms_provider_dispatched` avec
- *                                    `{ovhMessageId, conversationId,
- *                                    contactId, campaignId, sender,
- *                                    bodyLength, dryRun, creditsRemoved}`.
- *                                    Tous les champs scrubber-safe par
- *                                    construction (vérifié S8.4 pré-flight).
+ *   4. `record-outbound-message`  : `sendOutboundWithLock(args)` —
+ *                                    composition tx atomique (DEBT-001.3).
+ *                                    Acquiert lock contact, re-check
+ *                                    rate-limit DANS la tx, write message
+ *                                    (status="queued") + 2 audits
+ *                                    (`sms_sent` interne + `sms_provider_
+ *                                    dispatched`) → tout commit ou tout
+ *                                    rollback. Si `ComplianceConcurrencyError`
+ *                                    thrown (race au commit), audit
+ *                                    `send_blocked` posé HORS tx pour
+ *                                    forensique puis erreur re-thrown
+ *                                    → Inngest retry naturel.
  *
  * En dry-run, `finalOvhMessageId = "dry-run-<firestoreMessageId>"` (le
  * messageId Firestore est `[A-Za-z0-9]{20}` → scrubber-safe) et
@@ -107,15 +104,17 @@
 import { NonRetriableError } from "inngest";
 
 import { preSendCheckWithAudit } from "@/lib/compliance/pre-send-check-with-audit";
+import { RATE_LIMIT_MAX_MESSAGES } from "@/lib/compliance/rate-limits";
 import { appendAuditLog } from "@/lib/firestore/audit-log";
 import { getContact } from "@/lib/firestore/contacts";
 import { conversationDocId, getConversation } from "@/lib/firestore/conversations";
-import { addOutbound, listRecentOutbound } from "@/lib/firestore/messages";
+import { listRecentOutbound } from "@/lib/firestore/messages";
+import { sendOutboundWithLock } from "@/lib/firestore/transactions";
 import { getInngestClient } from "@/lib/inngest/client";
 import { smsSendFirstRequested } from "@/lib/inngest/events";
 import { sendSms } from "@/lib/ovh/send-sms";
 import { getCoreEnv, getOvhEnv } from "@/lib/security/env";
-import { ConfigError, ValidationError } from "@/lib/utils/errors";
+import { ComplianceConcurrencyError, ConfigError, ValidationError } from "@/lib/utils/errors";
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Constantes
@@ -153,6 +152,22 @@ const FUNCTION_ID = "send-first-sms";
  *     anti-crash dev local.
  */
 const AUDIT_SENDER_DRY_RUN = "DRY_RUN_SENDER";
+
+/**
+ * `ovhMessageId` symbolique posé dans l'audit `sms_provider_dispatched`
+ * lorsqu'on tourne en DRY_RUN_SMS=true (aucun appel OVH réel n'est fait).
+ *
+ * Post-DEBT-001.5 : la composition `dry-run-${messageId}` HORS tx n'est
+ * plus possible car le messageId Firestore est généré DANS la tx atomique
+ * (`sendOutboundWithLock`). Le littéral neutre `"DRY_RUN_OVH_MESSAGE_ID"`
+ * signale EXPLICITEMENT côté forensic Firestore qu'aucun dispatch OVH
+ * réel n'a eu lieu — corrélation préservée via `targetId` de l'audit qui
+ * contient le messageId Firestore.
+ *
+ * Le RETOUR de la function (`sendFirstSmsHandler.result.ovhMessageId`)
+ * continue d'exposer `dry-run-${messageId}` (back-compat S8.4).
+ */
+const AUDIT_OVH_MESSAGE_ID_DRY_RUN = "DRY_RUN_OVH_MESSAGE_ID";
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Types de retour du handler
@@ -273,24 +288,19 @@ export async function sendFirstSmsHandler(ctx: InngestHandlerContext): Promise<S
     }
   });
 
-  // ── Step 4 : record-outbound-message ──────────────────────────────────
-  // 4a. Enqueue Firestore via addOutbound (status="queued" figé S6.5).
-  //     Pose AUSSI audit "sms_sent" {direction, messageId} (S6.5 contract).
-  // 4b. Pose audit "sms_provider_dispatched" avec corrélation forensic
-  //     ovhMessageId ↔ messageId Firestore ↔ contact ↔ campagne.
+  // ── Step 4 : record-outbound-message (DEBT-001.5 — sendOutboundWithLock) ──
+  // Composition tx atomique unique :
+  //   - withContactLock(contactId) — lock optimiste Firestore
+  //   - re-check rate-limit DANS la tx via listRecentOutboundInTx
+  //   - addOutboundInTx — message + audit sms_sent interne
+  //   - appendAuditLogTx — audit sms_provider_dispatched
+  // Tout commit OU tout rollback (DETTE-001 + DETTE-004 fermées).
+  //
+  // Si `ComplianceConcurrencyError` thrown DANS la tx (race au commit, autre
+  // tx a saturé le plafond entre pre-check HORS tx et notre commit) :
+  // on log audit `send_blocked` forensique HORS tx PUIS on re-throw pour
+  // que Inngest retry naturellement (ComplianceConcurrencyError.noRetry=false).
   const recorded = await step.run("record-outbound-message", async () => {
-    const messageId = await addOutbound(loaded.conversationId, {
-      body,
-      channel: "sms",
-      generatedBy: "ai",
-      externalReceiver: loaded.contact.phone.e164,
-    });
-
-    // En dry-run, on construit un id stable basé sur le messageId Firestore
-    // (qui est `[A-Za-z0-9]{20}` → scrubber-safe par construction, proba
-    // de faux positif RE_FR_NATIONAL ~0.00002%).
-    const finalOvhMessageId = dispatch.ovhMessageId ?? `dry-run-${messageId}`;
-
     // Sender env-driven en mode réel, littéral neutre en dry-run.
     // Cf. INFRA-FIX-AUDIT-SENDER (S8.10) : on NE LIT PAS getOvhEnv() en
     // dry-run pour ne pas crasher en dev local sans config OVH.
@@ -298,33 +308,111 @@ export async function sendFirstSmsHandler(ctx: InngestHandlerContext): Promise<S
     // Contrat implicite step3 → step4 (security review S8.10) : si on
     // arrive ici en branche !dryRun, c'est que `sendSms()` (step 3) a
     // appelé `getOvhEnv()` avec succès AVANT — donc l'env OVH est
-    // forcément valide à ce point. Pas de try/catch défensif nécessaire
-    // ici, mais si quelqu'un refactore `sendSms()` pour ne plus lire
-    // l'env au boot, ce contrat doit être préservé sinon le step 4
-    // pourrait throw ConfigError après un SMS déjà parti côté OVH
-    // (audit jamais posé → trou forensic). Cf. piège noté dans le
-    // rapport security-reviewer S8.10.
+    // forcément valide à ce point.
     const sender = dispatch.dryRun ? AUDIT_SENDER_DRY_RUN : getOvhEnv().OVH_SMS_SENDER;
 
-    const auditId = await appendAuditLog({
-      actorId: "system",
-      actorType: "system",
-      action: "sms_provider_dispatched",
-      targetType: "message",
-      targetId: messageId,
-      payload: {
-        ovhMessageId: finalOvhMessageId,
-        conversationId: loaded.conversationId,
+    // ovhMessageId à enregistrer dans l'audit `sms_provider_dispatched` :
+    //   - mode réel : l'ID OVH renvoyé par sendSms() (step 3)
+    //   - dry-run   : littéral neutre AUDIT_OVH_MESSAGE_ID_DRY_RUN
+    //                 (cohérent avec AUDIT_SENDER_DRY_RUN — signale
+    //                 EXPLICITEMENT côté forensic Firestore qu'aucun
+    //                 dispatch OVH réel n'a eu lieu). Le targetId de
+    //                 l'audit contient le messageId Firestore (posé par
+    //                 addOutboundInTx) — corrélation forensique préservée
+    //                 par cette voie.
+    //
+    // Pré-DEBT-001.5 : on composait `dry-run-${messageId}` HORS tx après
+    // l'enqueue Firestore. Avec sendOutboundWithLock, le messageId est
+    // généré DANS la tx — on ne le connaît pas au moment de construire
+    // les args. Le passage à un littéral neutre est l'arbitrage le plus
+    // simple (targetId de l'audit assure la corrélation).
+    const auditOvhMessageId = dispatch.dryRun
+      ? AUDIT_OVH_MESSAGE_ID_DRY_RUN
+      : (dispatch.ovhMessageId ?? AUDIT_OVH_MESSAGE_ID_DRY_RUN);
+
+    // Quota restant lu HORS tx par pre-send-check / get-contact-and-history
+    // (step 1 + step 2). Hydratera ComplianceConcurrencyError.context si
+    // la race est détectée DANS la tx. Décision Déthié Q-S5.1 DEBT-001.5 :
+    // RATE_LIMIT_MAX_MESSAGES exporté de lib/compliance/rate-limits.ts —
+    // single source of truth, anti-drift.
+    const expectedRemainingQuota = RATE_LIMIT_MAX_MESSAGES - loaded.recentOutboundMessages.length;
+
+    try {
+      const result = await sendOutboundWithLock({
         contactId,
         campaignId,
-        sender,
-        bodyLength: body.length,
-        dryRun: dispatch.dryRun,
-        creditsRemoved: dispatch.creditsRemoved,
-      },
-    });
+        conversationId: loaded.conversationId,
+        input: {
+          body,
+          channel: "sms",
+          generatedBy: "ai",
+          externalReceiver: loaded.contact.phone.e164,
+        },
+        dispatch: {
+          ovhMessageId: auditOvhMessageId,
+          sender,
+          bodyLength: body.length,
+          creditsRemoved: dispatch.creditsRemoved,
+          dryRun: dispatch.dryRun,
+        },
+        expectedRemainingQuota,
+      });
 
-    return { messageId, auditId, finalOvhMessageId };
+      // Pour le RETOUR de la function (consommé par tests + Inngest
+      // dashboard), on expose le format historique :
+      //   - mode réel : l'ID OVH réel
+      //   - dry-run   : `dry-run-${messageId}` (back-compat S8.4 — le
+      //                 messageId Firestore existe maintenant qu'addOutbound
+      //                 a commit, donc on peut composer).
+      const exposedOvhMessageId = dispatch.ovhMessageId ?? `dry-run-${result.messageId}`;
+
+      return {
+        messageId: result.messageId,
+        auditId: result.auditId,
+        finalOvhMessageId: exposedOvhMessageId,
+      };
+    } catch (err) {
+      if (err instanceof ComplianceConcurrencyError) {
+        // Forensique : on enregistre la race détectée AVANT de re-throw
+        // pour Inngest retry. Le retry naturel relira l'état Firestore
+        // mis à jour côté pre-check et soit passera, soit re-bloquera
+        // proprement via ComplianceError("rate_limit_exceeded") HORS tx.
+        logger.warn("[send-first-sms] rate_limit race detected — re-throw for Inngest retry", {
+          eventId: event.id,
+          contactId,
+          conversationId: loaded.conversationId,
+          ruleName: err.context.ruleName,
+          // PAS de phone, PAS de body content — cf. règle CLAUDE.md.
+        });
+        await appendAuditLog({
+          actorId: "system",
+          actorType: "system",
+          action: "send_blocked",
+          targetType: "contact",
+          targetId: contactId,
+          payload: {
+            rule: "rate_limit_concurrency",
+            contactId: err.context.contactId,
+            conversationId: loaded.conversationId,
+            campaignId,
+            ruleName: err.context.ruleName,
+            attemptedAt: err.context.attemptedAt.toISOString(),
+            expectedRemainingQuota: err.context.expectedRemainingQuota,
+            observedRemainingQuota: err.context.observedRemainingQuota,
+            // dryRun + ovhMessageId du dispatch HORS tx — corrélation
+            // forensique : "OVH a déjà accepté l'envoi côté provider
+            // (ou aurait dry-run) MAIS Firestore a rollback côté
+            // persistance suite à la race".
+            dryRun: dispatch.dryRun,
+            ovhMessageIdAttempted: dispatch.ovhMessageId ?? null,
+          },
+        });
+      }
+      // Re-throw : Inngest retry naturel pour ComplianceConcurrencyError
+      // (noRetry=false) ; les autres erreurs (NotFoundError, ValidationError,
+      // AuditPiiError) propagent selon leur noRetry respectif.
+      throw err;
+    }
   });
 
   return {
@@ -415,3 +503,6 @@ export const __FUNCTION_ID_FOR_TESTS = FUNCTION_ID;
 
 /** @internal */
 export const __AUDIT_SENDER_DRY_RUN_FOR_TESTS = AUDIT_SENDER_DRY_RUN;
+
+/** @internal */
+export const __AUDIT_OVH_MESSAGE_ID_DRY_RUN_FOR_TESTS = AUDIT_OVH_MESSAGE_ID_DRY_RUN;

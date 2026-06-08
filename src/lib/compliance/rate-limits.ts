@@ -32,8 +32,21 @@ export type OutboundMessageRecord = SentMessageRecord & {
   direction: "outbound";
 };
 
-/** Plafond strict en nombre de messages dans la fenêtre. */
-const RATE_LIMIT_MAX_MESSAGES = 3;
+/**
+ * Plafond strict en nombre de messages dans la fenêtre.
+ *
+ * **Exposée publique** (DEBT-001.5) : les callers transactionnels
+ * (typiquement `send-first-sms.ts` step 4 qui appelle
+ * `sendOutboundWithLock`) en ont besoin pour calculer
+ * `expectedRemainingQuota = RATE_LIMIT_MAX_MESSAGES - recent.length` côté
+ * pre-flight et le passer à `sendOutboundWithLock`. Hardcoder en 2
+ * endroits = drift garanti à terme — décision Déthié Q-S5.1 DEBT-001.5.
+ *
+ * ⚠️  Modifier cette valeur impacte la conformité L.34-5 CPCE. La loi
+ * autorise jusqu'à 4 SMS/30j ; on garde une marge de sécurité à 3.
+ * Toute modification PASSE par compliance-auditor (subagent obligatoire).
+ */
+export const RATE_LIMIT_MAX_MESSAGES = 3;
 
 /** Largeur de la fenêtre en jours (glissante, calculée vs `now`). */
 const RATE_LIMIT_WINDOW_DAYS = 30;

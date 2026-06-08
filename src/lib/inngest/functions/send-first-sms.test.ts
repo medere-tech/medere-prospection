@@ -1,7 +1,12 @@
 import { NonRetriableError } from "inngest";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-import { ConfigError, ExternalServiceError, ValidationError } from "@/lib/utils/errors";
+import {
+  ComplianceConcurrencyError,
+  ConfigError,
+  ExternalServiceError,
+  ValidationError,
+} from "@/lib/utils/errors";
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Mocks (DOIVENT être déclarés AVANT l'import de send-first-sms).
@@ -13,8 +18,10 @@ vi.mock("@/lib/firestore/conversations", () => ({
   conversationDocId: vi.fn((contactId: string, campaignId: string) => `${contactId}_${campaignId}`),
 }));
 vi.mock("@/lib/firestore/messages", () => ({
-  addOutbound: vi.fn(),
   listRecentOutbound: vi.fn(),
+}));
+vi.mock("@/lib/firestore/transactions", () => ({
+  sendOutboundWithLock: vi.fn(),
 }));
 // `__ACTIONS_FOR_TESTS` doit garder sa vraie valeur pour la sentinelle.
 // On preserve les vrais exports via importActual, on ne mock que `appendAuditLog`.
@@ -37,11 +44,13 @@ import { preSendCheckWithAudit } from "@/lib/compliance/pre-send-check-with-audi
 import { __ACTIONS_FOR_TESTS as ACTIONS_ACTUAL, appendAuditLog } from "@/lib/firestore/audit-log";
 import { getContact } from "@/lib/firestore/contacts";
 import { getConversation } from "@/lib/firestore/conversations";
-import { addOutbound, listRecentOutbound } from "@/lib/firestore/messages";
+import { listRecentOutbound } from "@/lib/firestore/messages";
+import { sendOutboundWithLock } from "@/lib/firestore/transactions";
 import { sendSms } from "@/lib/ovh/send-sms";
 import { getCoreEnv, getOvhEnv } from "@/lib/security/env";
 
 import {
+  __AUDIT_OVH_MESSAGE_ID_DRY_RUN_FOR_TESTS,
   __AUDIT_SENDER_DRY_RUN_FOR_TESTS,
   __FUNCTION_ID_FOR_TESTS,
   type InngestHandlerContext,
@@ -132,8 +141,16 @@ beforeEach(() => {
   (getConversation as ReturnType<typeof vi.fn>).mockResolvedValue(makeFakeConversation());
   (listRecentOutbound as ReturnType<typeof vi.fn>).mockResolvedValue([]);
   (preSendCheckWithAudit as ReturnType<typeof vi.fn>).mockResolvedValue({ ok: true });
-  (addOutbound as ReturnType<typeof vi.fn>).mockResolvedValue("msg-firestore-id-abc123");
-  (appendAuditLog as ReturnType<typeof vi.fn>).mockResolvedValue("audit-id-xyz");
+  // DEBT-001.5 : sendOutboundWithLock remplace addOutbound + appendAuditLog.
+  // Retourne le shape attendu { messageId, auditId } (compose les 2 audits
+  // internes — sms_sent + sms_provider_dispatched — atomiquement).
+  (sendOutboundWithLock as ReturnType<typeof vi.fn>).mockResolvedValue({
+    messageId: "msg-firestore-id-abc123",
+    auditId: "audit-id-xyz",
+  });
+  // appendAuditLog reste utilisé pour l'audit `send_blocked` HORS tx
+  // posé après catch ComplianceConcurrencyError.
+  (appendAuditLog as ReturnType<typeof vi.fn>).mockResolvedValue("audit-blocked-id");
   (sendSms as ReturnType<typeof vi.fn>).mockResolvedValue({
     messageIds: ["111222333444"],
     creditsRemoved: 1,
@@ -200,44 +217,47 @@ describe("sendFirstSmsHandler — happy path DRY_RUN", () => {
     if (result.status === "sent") {
       expect(result.dryRun).toBe(true);
       expect(result.messageId).toBe("msg-firestore-id-abc123");
+      // Le RETOUR de la function continue d'exposer dry-run-${messageId}
+      // pour back-compat S8.4 (PAS le littéral AUDIT_OVH_MESSAGE_ID_DRY_RUN
+      // qui va, lui, dans le payload audit).
       expect(result.ovhMessageId).toBe("dry-run-msg-firestore-id-abc123");
       expect(result.auditId).toBe("audit-id-xyz");
     }
     expect(sendSms).not.toHaveBeenCalled();
   });
 
-  it("appelle addOutbound avec channel='sms', generatedBy='ai', externalReceiver=phone.e164", async () => {
+  it("appelle sendOutboundWithLock avec input shape attendu (channel/generatedBy/externalReceiver)", async () => {
     await sendFirstSmsHandler(makeFakeCtx());
-    expect(addOutbound).toHaveBeenCalledWith(
-      "contact-123_campaign-xyz",
+    expect(sendOutboundWithLock).toHaveBeenCalledWith(
       expect.objectContaining({
-        body: expect.any(String),
-        channel: "sms",
-        generatedBy: "ai",
-        externalReceiver: "+33775745453",
+        contactId: "contact-123",
+        campaignId: "campaign-xyz",
+        conversationId: "contact-123_campaign-xyz",
+        input: expect.objectContaining({
+          body: expect.any(String),
+          channel: "sms",
+          generatedBy: "ai",
+          externalReceiver: "+33775745453",
+        }),
       }),
     );
   });
 
-  it("pose un audit 'sms_provider_dispatched' avec payload zéro-PII et dryRun=true", async () => {
+  it("passe dispatch + expectedRemainingQuota à sendOutboundWithLock (DRY_RUN — sender = DRY_RUN_SENDER, ovhMessageId = DRY_RUN_OVH_MESSAGE_ID)", async () => {
     await sendFirstSmsHandler(makeFakeCtx({ body: "Hello body" }));
-    expect(appendAuditLog).toHaveBeenCalledWith({
-      actorId: "system",
-      actorType: "system",
-      action: "sms_provider_dispatched",
-      targetType: "message",
-      targetId: "msg-firestore-id-abc123",
-      payload: {
-        ovhMessageId: "dry-run-msg-firestore-id-abc123",
-        conversationId: "contact-123_campaign-xyz",
-        contactId: "contact-123",
-        campaignId: "campaign-xyz",
-        sender: "DRY_RUN_SENDER",
-        bodyLength: 10,
-        dryRun: true,
-        creditsRemoved: 0,
-      },
-    });
+    expect(sendOutboundWithLock).toHaveBeenCalledWith(
+      expect.objectContaining({
+        dispatch: {
+          ovhMessageId: __AUDIT_OVH_MESSAGE_ID_DRY_RUN_FOR_TESTS,
+          sender: __AUDIT_SENDER_DRY_RUN_FOR_TESTS,
+          bodyLength: 10,
+          dryRun: true,
+          creditsRemoved: 0,
+        },
+        // recentOutboundMessages mock = [] → expectedRemaining = 3 - 0 = 3.
+        expectedRemainingQuota: 3,
+      }),
+    );
   });
 
   it("ne logue ni phone, ni body content dans le log info DRY_RUN", async () => {
@@ -281,12 +301,11 @@ describe("sendFirstSmsHandler — happy path RÉEL (DRY_RUN=false)", () => {
     }
   });
 
-  it("audit payload contient dryRun=false + creditsRemoved réel", async () => {
+  it("sendOutboundWithLock dispatch contient ovhMessageId réel + dryRun=false + creditsRemoved réel", async () => {
     await sendFirstSmsHandler(makeFakeCtx());
-    expect(appendAuditLog).toHaveBeenCalledWith(
+    expect(sendOutboundWithLock).toHaveBeenCalledWith(
       expect.objectContaining({
-        action: "sms_provider_dispatched",
-        payload: expect.objectContaining({
+        dispatch: expect.objectContaining({
           ovhMessageId: "111222333444",
           dryRun: false,
           creditsRemoved: 1,
@@ -322,10 +341,10 @@ describe("sendFirstSmsHandler — compliance blocked", () => {
     }
   });
 
-  it("n'appelle ni sendSms, ni addOutbound, ni appendAuditLog (compliance wrapper a déjà loggé)", async () => {
+  it("n'appelle ni sendSms, ni sendOutboundWithLock, ni appendAuditLog (compliance wrapper a déjà loggé)", async () => {
     await sendFirstSmsHandler(makeFakeCtx());
     expect(sendSms).not.toHaveBeenCalled();
-    expect(addOutbound).not.toHaveBeenCalled();
+    expect(sendOutboundWithLock).not.toHaveBeenCalled();
     expect(appendAuditLog).not.toHaveBeenCalled();
   });
 });
@@ -426,12 +445,14 @@ describe("sendFirstSmsHandler — ordre du pipeline 4 steps", () => {
 // "DRY_RUN_SENDER" en dry-run pour ne pas crasher en dev local sans OVH env.
 // ─────────────────────────────────────────────────────────────────────────────
 
-describe("Sentinelles INFRA-FIX-AUDIT-SENDER (S8.10)", () => {
-  it("[S8.10] audit reflète env.OVH_SMS_SENDER en mode RÉEL, JAMAIS un littéral hardcoded", async () => {
+describe("Sentinelles INFRA-FIX-AUDIT-SENDER (S8.10, post-DEBT-001.5)", () => {
+  it("[S8.10] dispatch.sender reflète env.OVH_SMS_SENDER en mode RÉEL, JAMAIS un littéral hardcoded", async () => {
     // ⚠️ Sentinelle anti-régression : si quelqu'un réintroduit un sender
     // hardcoded au lieu de lire l'env, ce test casse. La valeur "TESTSDR"
     // est choisie volontairement DIFFÉRENTE de "MEDERE" et "NESF" pour
-    // détecter un re-hardcoding sur l'une ou l'autre.
+    // détecter un re-hardcoding sur l'une ou l'autre. Post-DEBT-001.5,
+    // le sender est passé via `sendOutboundWithLock(args.dispatch.sender)`
+    // au lieu de `appendAuditLog(payload.sender)`.
     (getCoreEnv as ReturnType<typeof vi.fn>).mockReturnValue({
       NODE_ENV: "production",
       DRY_RUN_SMS: false,
@@ -442,20 +463,19 @@ describe("Sentinelles INFRA-FIX-AUDIT-SENDER (S8.10)", () => {
 
     await sendFirstSmsHandler(makeFakeCtx());
 
-    expect(appendAuditLog).toHaveBeenCalledWith(
+    expect(sendOutboundWithLock).toHaveBeenCalledWith(
       expect.objectContaining({
-        action: "sms_provider_dispatched",
-        payload: expect.objectContaining({
+        dispatch: expect.objectContaining({
           sender: "TESTSDR",
         }),
       }),
     );
     // Anti-hardcoding fort : on assert que la valeur env passée triomphe
     // d'éventuelles valeurs littérales que quelqu'un aurait pu réintroduire.
-    const payloadSender = (appendAuditLog as ReturnType<typeof vi.fn>).mock.calls[0]?.[0]?.payload
-      ?.sender;
-    expect(payloadSender).not.toBe("MEDERE");
-    expect(payloadSender).not.toBe("NESF");
+    const dispatchSender = (sendOutboundWithLock as ReturnType<typeof vi.fn>).mock.calls[0]?.[0]
+      ?.dispatch?.sender;
+    expect(dispatchSender).not.toBe("MEDERE");
+    expect(dispatchSender).not.toBe("NESF");
   });
 
   it("[S8.10] N'appelle PAS getOvhEnv() en branche DRY_RUN (garde anti-crash dev local)", async () => {
@@ -472,12 +492,109 @@ describe("Sentinelles INFRA-FIX-AUDIT-SENDER (S8.10)", () => {
     // pour signaler l'absence de dispatch OVH réel — ≠ d'un vrai sender
     // alphanumérique (max 11 chars OVH).
     await sendFirstSmsHandler(makeFakeCtx());
-    expect(appendAuditLog).toHaveBeenCalledWith(
+    expect(sendOutboundWithLock).toHaveBeenCalledWith(
       expect.objectContaining({
-        payload: expect.objectContaining({
+        dispatch: expect.objectContaining({
           sender: "DRY_RUN_SENDER",
         }),
       }),
     );
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Path race rate-limit (DEBT-001.5) — ComplianceConcurrencyError handling
+// ─────────────────────────────────────────────────────────────────────────────
+
+describe("sendFirstSmsHandler — race rate-limit (DEBT-001.5 ComplianceConcurrencyError)", () => {
+  // Pré-condition : sendOutboundWithLock throw ComplianceConcurrencyError
+  // (la race a été détectée DANS la tx Firestore). Step 4 catch, log audit
+  // `send_blocked` HORS tx, puis re-throw pour Inngest retry naturel.
+  function setupRaceError() {
+    const raceError = new ComplianceConcurrencyError({
+      message: "Rate-limit race detected on contact contact-123",
+      context: {
+        contactId: "contact-123",
+        ruleName: "rate_limit_30d",
+        attemptedAt: new Date("2026-06-08T10:30:00.000Z"),
+        expectedRemainingQuota: 1,
+        observedRemainingQuota: 0,
+      },
+    });
+    (sendOutboundWithLock as ReturnType<typeof vi.fn>).mockRejectedValue(raceError);
+    return raceError;
+  }
+
+  it("re-throw l'erreur (Inngest retry naturel, noRetry=false sur ComplianceConcurrencyError)", async () => {
+    setupRaceError();
+    await expect(sendFirstSmsHandler(makeFakeCtx())).rejects.toBeInstanceOf(
+      ComplianceConcurrencyError,
+    );
+  });
+
+  it("pose un audit 'send_blocked' AVANT le re-throw (forensic trace de la race)", async () => {
+    setupRaceError();
+    await expect(sendFirstSmsHandler(makeFakeCtx())).rejects.toThrow();
+    // appendAuditLog appelé exactement 1x avec action="send_blocked"
+    expect(appendAuditLog).toHaveBeenCalledTimes(1);
+    expect(appendAuditLog).toHaveBeenCalledWith(
+      expect.objectContaining({
+        action: "send_blocked",
+        targetType: "contact",
+        targetId: "contact-123",
+      }),
+    );
+  });
+
+  it("payload send_blocked contient les 5 champs forensiques (rule, ruleName, quotas, attemptedAt) — anti-PII", async () => {
+    setupRaceError();
+    await expect(sendFirstSmsHandler(makeFakeCtx())).rejects.toThrow();
+
+    const auditCall = (appendAuditLog as ReturnType<typeof vi.fn>).mock.calls[0]?.[0];
+    expect(auditCall?.payload).toEqual(
+      expect.objectContaining({
+        rule: "rate_limit_concurrency",
+        contactId: "contact-123",
+        conversationId: "contact-123_campaign-xyz",
+        campaignId: "campaign-xyz",
+        ruleName: "rate_limit_30d",
+        attemptedAt: "2026-06-08T10:30:00.000Z",
+        expectedRemainingQuota: 1,
+        observedRemainingQuota: 0,
+        dryRun: true, // Default DRY_RUN_SMS=true en beforeEach global.
+        ovhMessageIdAttempted: null, // null en dry-run (dispatch.ovhMessageId=null).
+      }),
+    );
+
+    // Anti-PII : pas de phone (E.164), pas de body content.
+    const serialized = JSON.stringify(auditCall);
+    expect(serialized).not.toContain("+33775745453");
+    expect(serialized).not.toContain("Bonjour, Léa");
+  });
+
+  it("ORDRE : audit send_blocked posé AVANT le throw (pas après — sinon retry sans trace)", async () => {
+    setupRaceError();
+    // On capture l'ordre via timestamps : appendAuditLog mock posé avant
+    // que l'erreur ne propage hors du step.run.
+    let appendAuditLogResolved = false;
+    (appendAuditLog as ReturnType<typeof vi.fn>).mockImplementation(async () => {
+      appendAuditLogResolved = true;
+      return "audit-blocked-id";
+    });
+
+    try {
+      await sendFirstSmsHandler(makeFakeCtx());
+    } catch {
+      // Au moment du catch, l'audit DOIT avoir résolu.
+      expect(appendAuditLogResolved).toBe(true);
+    }
+  });
+
+  it("ne propage PAS l'erreur sous status='sent' ni 'blocked' (le retry Inngest décide)", async () => {
+    setupRaceError();
+    // L'erreur doit remonter telle quelle pour qu'Inngest retry. PAS de
+    // wrap en NonRetriableError (sinon retry désactivé → race perdue à
+    // jamais).
+    await expect(sendFirstSmsHandler(makeFakeCtx())).rejects.not.toBeInstanceOf(NonRetriableError);
   });
 });
