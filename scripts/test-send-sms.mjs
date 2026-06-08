@@ -42,7 +42,7 @@ const TEST_CAMPAIGN_ID = "test-campaign-mvp-s8";
 // (pas de prospection commerciale réelle — important si TEST_PHONE_NUMBER est
 // un vrai numéro et que DRY_RUN_SMS=false).
 const TEST_BODY =
-  "Bonjour Dr Test, ceci est un message de test automatisé envoyé par Médéré dans le cadre du MVP de prospection IA. Vous pouvez ignorer ce message.";
+  "Bonjour Dr Test, je suis Léa, assistante virtuelle de Médéré. Ceci est un message de test du MVP de prospection. Répondez STOP pour ne plus être contacté.";
 
 // Regex E.164 (alignée `inngest/events.ts`, `types/contact.ts`, `twilio/lookup`)
 const E164_REGEX = /^\+[1-9]\d{6,14}$/;
