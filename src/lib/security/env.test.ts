@@ -99,6 +99,43 @@ describe("getCoreEnv", () => {
     setEnv({ NODE_ENV: "test", NEXT_PUBLIC_APP_URL: "not-a-url" });
     expect(() => getCoreEnv()).toThrow(ConfigError);
   });
+
+  // ── DRY_RUN_SMS (S8) ────────────────────────────────────────────────────
+  // Default "true" = filet anti-envoi-accidentel. Le caller utilise un
+  // boolean (transform Zod), pas une string.
+
+  it("DRY_RUN_SMS default=true si la var est absente", () => {
+    setEnv({ NODE_ENV: "test", DRY_RUN_SMS: undefined });
+    expect(getCoreEnv().DRY_RUN_SMS).toBe(true);
+  });
+
+  it("DRY_RUN_SMS=true (string) → boolean true", () => {
+    setEnv({ NODE_ENV: "test", DRY_RUN_SMS: "true" });
+    expect(getCoreEnv().DRY_RUN_SMS).toBe(true);
+  });
+
+  it("DRY_RUN_SMS=false (string) → boolean false (seul cas qui ouvre l'envoi)", () => {
+    setEnv({ NODE_ENV: "production", DRY_RUN_SMS: "false" });
+    expect(getCoreEnv().DRY_RUN_SMS).toBe(false);
+  });
+
+  it("DRY_RUN_SMS=yes (hors enum) → throw ConfigError (pas de fallback silencieux)", () => {
+    setEnv({ NODE_ENV: "test", DRY_RUN_SMS: "yes" });
+    expect(() => getCoreEnv()).toThrow(ConfigError);
+  });
+
+  it("DRY_RUN_SMS=1 (hors enum, piège classique env booléen) → throw ConfigError", () => {
+    setEnv({ NODE_ENV: "test", DRY_RUN_SMS: "1" });
+    expect(() => getCoreEnv()).toThrow(ConfigError);
+  });
+
+  it("DRY_RUN_SMS=TRUE (casse différente) → throw ConfigError (case-sensitive)", () => {
+    // Sentinelle : Zod.enum est case-sensitive. Le typo "TRUE" (caps) ne
+    // doit pas être interprété comme "true" — on veut un signal d'erreur
+    // explicite plutôt qu'une bascule silencieuse à dry-run en prod.
+    setEnv({ NODE_ENV: "test", DRY_RUN_SMS: "TRUE" });
+    expect(() => getCoreEnv()).toThrow(ConfigError);
+  });
 });
 
 // ─────────────────────────────────────────────────────────────────────────────

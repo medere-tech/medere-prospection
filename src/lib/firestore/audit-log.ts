@@ -62,6 +62,7 @@ const ACTIONS = [
   "sms_sent",
   "sms_received",
   "sms_failed",
+  "sms_provider_dispatched",
   "send_blocked",
   "opt_out",
   "handoff",
@@ -215,3 +216,14 @@ export function appendAuditLogTx(tx: Transaction, entry: AuditLogInput): string 
  * @internal
  */
 export const __AUDIT_COLLECTION_FOR_TESTS = AUDIT_COLLECTION;
+
+/**
+ * Whitelist des actions auditables, exposée pour les tests sentinelles
+ * (anti-régression sur les ajouts d'action côté S8+ qui doivent rester
+ * synchrones avec `src/types/audit-log.ts::AuditAction`).
+ *
+ * Lecture-only par construction TypeScript (`as const` + `readonly`).
+ *
+ * @internal
+ */
+export const __ACTIONS_FOR_TESTS: readonly string[] = ACTIONS;

@@ -132,8 +132,18 @@ import type { SmsPayload, SmsResult } from "./types";
  */
 const BODY_MAX_LENGTH = 1600;
 
-/** Classe SMS : 1 = standard (stocké SIM, lu par destinataire). */
-const SMS_CLASS_STANDARD = 1;
+/**
+ * Classe SMS OVH : "phoneDisplay" = SMS standard affiché au destinataire.
+ * (vs "flash" = affichage transitoire non stocké).
+ *
+ * ⚠️ FIX 5 juin 2026 : la valeur précédente `1` (référence GSM 03.38 DCS)
+ * était invalide pour l'API OVH `POST /sms/{serviceName}/jobs` qui attend
+ * un string énuméré ("phoneDisplay" | "flash"). Confirmation via 3 sources
+ * doc OVH indépendantes (ovh/php-ovh issue #135, Fotolia/ovh-rest README,
+ * gierschv/node-ovh issue #3). Bug détecté au premier vrai envoi OVH
+ * en cloud Vercel (HTTP 400 "bad input"). Tracé INFRA-FIX-OVH-CLASS.
+ */
+const SMS_CLASS_STANDARD = "phoneDisplay";
 
 /** Durée de validité du SMS côté OVH avant expiration (minutes — 48h default). */
 const SMS_VALIDITY_PERIOD_MINUTES = 2880;

@@ -158,15 +158,15 @@ describe("sendSms — happy paths", () => {
     expect(body.noStopClause).toBe(false);
   });
 
-  it("envoie class: 1 (SMS standard, lu destinataire)", async () => {
+  it('envoie class: "phoneDisplay" (SMS standard affiché destinataire)', async () => {
     const { client, requestPromised } = makeFakeClient();
     requestPromised.mockResolvedValueOnce(makeOkResponse());
     __setOvhClientForTests(client);
 
     await sendSms({ receivers: [TEST_RECEIVER], message: TEST_MESSAGE });
 
-    const body = requestPromised.mock.calls[0]![2] as { class: number };
-    expect(body.class).toBe(1);
+    const body = requestPromised.mock.calls[0]![2] as { class: string };
+    expect(body.class).toBe("phoneDisplay");
   });
 
   it("envoie validityPeriod: 2880 minutes (48h default)", async () => {
