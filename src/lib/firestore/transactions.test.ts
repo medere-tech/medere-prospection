@@ -498,10 +498,16 @@ describe("transactions.ts — sendOutboundWithLock (DEBT-001.3)", () => {
     );
   });
 
-  it("sentinel : RATE_LIMIT_WINDOW_DAYS === 30 (alignement S4)", () => {
-    // Pas de couplage direct avec lib/compliance/rate-limits.ts (constante
-    // privée non exportée — décision DEBT-001.3). Si divergence, ce test
-    // signale.
+  it("sentinel Q-S6.3 (DEBT-001.6) : RATE_LIMIT_WINDOW_DAYS === 30 hardcodé — anti-drift CNIL", () => {
+    // Cible CNIL B2B = 30 jours (L.34-5 CPCE, contrainte LÉGALE stable).
+    // Si vous changez cette valeur, vérifier l'alignement avec
+    // lib/compliance/rate-limits.ts (window également hardcodé en const
+    // privée, non exportée — décision DEBT-001.3 Q-S2 : pas d'export pour
+    // éviter un point de tentation de modification programmatique).
+    //
+    // Justification du double hardcoding vs export : la valeur 30 est
+    // figée par la loi, ne devrait jamais bouger. Hardcoder + sentinel
+    // anti-drift est plus sain qu'un export qui invite à paramétrer.
     expect(__TRANSACTIONS_RATE_LIMIT_WINDOW_DAYS_FOR_TESTS).toBe(30);
   });
 
