@@ -597,4 +597,29 @@ describe("sendFirstSmsHandler — race rate-limit (DEBT-001.5 ComplianceConcurre
     // jamais).
     await expect(sendFirstSmsHandler(makeFakeCtx())).rejects.not.toBeInstanceOf(NonRetriableError);
   });
+
+  it("DEBT-001.7 MED-1 : si appendAuditLog(send_blocked) throw, propage la ComplianceConcurrencyError ORIGINALE (pas l'audit fail)", async () => {
+    // Sentinelle anti-régression security-reviewer MED-1 : best-effort
+    // autour de l'audit `send_blocked`. Si l'audit fail (Firestore I/O
+    // transient, AuditPiiError sur payload futur mal posé), la cause
+    // racine ComplianceConcurrencyError DOIT remonter à Inngest pour
+    // déclencher le retry naturel. Si on remplaçait la pile par l'audit
+    // fail, Sentry verrait la mauvaise erreur et le mapping retry-friendly
+    // pourrait diverger.
+    const raceError = setupRaceError();
+    const auditError = new Error("simulated Firestore I/O fail on send_blocked audit");
+    (appendAuditLog as ReturnType<typeof vi.fn>).mockRejectedValue(auditError);
+
+    const ctx = makeFakeCtx();
+    await expect(sendFirstSmsHandler(ctx)).rejects.toBe(raceError);
+
+    // Le logger.error DOIT avoir tracé l'audit fail pour Sentry (sans PII).
+    const errorCalls = (ctx.logger.error as ReturnType<typeof vi.fn>).mock.calls;
+    const serialized = JSON.stringify(errorCalls);
+    expect(serialized).toContain("failed to write send_blocked audit");
+    expect(serialized).toContain("simulated Firestore I/O fail");
+    // Anti-PII : pas de phone, pas de body content
+    expect(serialized).not.toContain("+33775745453");
+    expect(serialized).not.toContain("Bonjour, Léa");
+  });
 });

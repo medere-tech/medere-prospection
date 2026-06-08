@@ -384,29 +384,53 @@ export async function sendFirstSmsHandler(ctx: InngestHandlerContext): Promise<S
           ruleName: err.context.ruleName,
           // PAS de phone, PAS de body content — cf. règle CLAUDE.md.
         });
-        await appendAuditLog({
-          actorId: "system",
-          actorType: "system",
-          action: "send_blocked",
-          targetType: "contact",
-          targetId: contactId,
-          payload: {
-            rule: "rate_limit_concurrency",
-            contactId: err.context.contactId,
-            conversationId: loaded.conversationId,
-            campaignId,
-            ruleName: err.context.ruleName,
-            attemptedAt: err.context.attemptedAt.toISOString(),
-            expectedRemainingQuota: err.context.expectedRemainingQuota,
-            observedRemainingQuota: err.context.observedRemainingQuota,
-            // dryRun + ovhMessageId du dispatch HORS tx — corrélation
-            // forensique : "OVH a déjà accepté l'envoi côté provider
-            // (ou aurait dry-run) MAIS Firestore a rollback côté
-            // persistance suite à la race".
-            dryRun: dispatch.dryRun,
-            ovhMessageIdAttempted: dispatch.ovhMessageId ?? null,
-          },
-        });
+
+        // DEBT-001.7 security-reviewer MED-1 : best-effort autour de
+        // l'audit `send_blocked`. Si `appendAuditLog` throw (Firestore
+        // I/O transient, AuditPiiError sur un payload futur mal posé),
+        // on DOIT toujours propager la `ComplianceConcurrencyError`
+        // originale à Inngest pour déclencher le retry naturel — pas
+        // remplacer la pile d'exception par l'erreur d'audit qui
+        // masquerait la cause racine côté Sentry et empêcherait le
+        // mapping retry-friendly correct. L'audit `send_blocked` est
+        // forensiquement précieux mais NON essentiel à la correctness
+        // (le retry naturel rejouera et convergera).
+        try {
+          await appendAuditLog({
+            actorId: "system",
+            actorType: "system",
+            action: "send_blocked",
+            targetType: "contact",
+            targetId: contactId,
+            payload: {
+              rule: "rate_limit_concurrency",
+              contactId: err.context.contactId,
+              conversationId: loaded.conversationId,
+              campaignId,
+              ruleName: err.context.ruleName,
+              attemptedAt: err.context.attemptedAt.toISOString(),
+              expectedRemainingQuota: err.context.expectedRemainingQuota,
+              observedRemainingQuota: err.context.observedRemainingQuota,
+              // dryRun + ovhMessageId du dispatch HORS tx — corrélation
+              // forensique : "OVH a déjà accepté l'envoi côté provider
+              // (ou aurait dry-run) MAIS Firestore a rollback côté
+              // persistance suite à la race".
+              dryRun: dispatch.dryRun,
+              ovhMessageIdAttempted: dispatch.ovhMessageId ?? null,
+            },
+          });
+        } catch (auditErr) {
+          // L'audit a fail — on log pour Sentry mais on continue le
+          // re-throw de l'erreur originale (ComplianceConcurrencyError).
+          // Cf. DEBT-001.7 MED-1 : trou forensique acceptable, la
+          // correctness Firestore reste préservée par le retry naturel.
+          logger.error("[send-first-sms] failed to write send_blocked audit", {
+            eventId: event.id,
+            contactId,
+            // pas de phone/body — cf. CLAUDE.md règle sécurité #9.
+            auditError: auditErr instanceof Error ? auditErr.message : "unknown",
+          });
+        }
       }
       // Re-throw : Inngest retry naturel pour ComplianceConcurrencyError
       // (noRetry=false) ; les autres erreurs (NotFoundError, ValidationError,
