@@ -3,20 +3,40 @@
  * `conversations/{convId}/messages/`.
  *
  * ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
- * API EXPOSÉE (S6.5 — MVP) :
+ * API EXPOSÉE (S6.5 + DEBT-001.2) :
  *
- *   - `addOutbound(conversationId, input)`
- *         → crée le doc message (status="queued") + bump compteurs
- *           conversation + audit `sms_sent` payload `{direction, messageId}`,
- *           le tout en 1 transaction Firestore.
- *   - `addInbound(conversationId, input)`
+ *   - `addOutbound(conversationId, input)`                       (S6.5)
+ *         → wrapper standalone qui ouvre sa propre `runTransaction`,
+ *           lit + parse la conversation, et délègue à `addOutboundInTx`.
+ *           Pour callers SANS tx ouverte (follow-ups S9+, scripts).
+ *
+ *   - `addOutboundInTx(tx, conversationId, conv, input)` (DEBT-001.2)
+ *         → version tx-aware d'addOutbound. NE crée PAS sa propre tx —
+ *           pose `tx.create message` + `_bumpConversationCountersTx`
+ *           + `appendAuditLogTx("sms_sent")` dans la tx fournie. Caller
+ *           primaire : `sendOutboundWithLock` (DEBT-001.5) qui compose
+ *           l'envoi atomique avec re-check rate-limit DANS la tx.
+ *           `conversationId` est EXPLICITE (source de vérité = la doc
+ *           location, fournie par le caller). `conv` est l'état validé
+ *           lu à cette location DANS la tx.
+ *
+ *   - `addInbound(conversationId, input)`                        (S6.5)
  *         → crée le doc message (status="received") + bump compteurs
  *           conversation + audit `sms_received` payload `{direction,
  *           messageId}`, le tout en 1 transaction Firestore.
- *   - `listRecentOutbound(conversationId, days?, now?)`
+ *
+ *   - `listRecentOutbound(conversationId, days?, now?)`          (S6.5)
  *         → retourne les messages outbound de la fenêtre, mappés en
  *           `OutboundMessageRecord[]` consommable par `lib/compliance/
- *           rate-limits` (S4). Conversation absente → `[]`.
+ *           rate-limits` (S4). Conversation absente → `[]`. Query HORS tx
+ *           (perf optimale pour le pre-check S5). Pour le pattern
+ *           tx-aware avec read lock anti-race, voir `listRecentOutboundInTx`.
+ *
+ *   - `listRecentOutboundInTx(tx, convId, days?, now?)`   (DEBT-001.2)
+ *         → version tx-aware de `listRecentOutbound`. Utilise `tx.get`
+ *           au lieu de `.get()` direct → LOCK le READ SET dans la tx
+ *           parente. Permet le re-check rate-limit DANS la tx (fix
+ *           DETTE-001 race condition rate-limit 3 SMS / 30j).
  *
  * Hors périmètre S6.5 (reportés explicitement) :
  *   - `updateMessageStatus` (queued→sending→sent→delivered, failed,
@@ -85,6 +105,7 @@ import {
   _parseConversationOrThrow,
 } from "@/lib/firestore/conversations";
 import { NotFoundError, ValidationError } from "@/lib/utils/errors";
+import type { Conversation } from "@/types/conversation";
 import type { Message, MessageAITokens, MessageChannel, MessageGeneratedBy } from "@/types/message";
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -312,17 +333,157 @@ async function readConversationInTxOrThrow(
 // ─────────────────────────────────────────────────────────────────────────────
 
 /**
+ * Version TRANSACTIONNELLE d'`addOutbound` (DEBT-001.2). NE crée PAS sa
+ * propre transaction — opère dans la `tx` fournie par le caller.
+ *
+ * ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ * CAS D'USAGE PRIMAIRE — `sendOutboundWithLock` (DEBT-001.5)
+ *
+ * Le caller (`sendOutboundWithLock` dans `lib/firestore/transactions.ts`)
+ * compose l'envoi atomique :
+ *
+ *   await withContactLock(contactId, async (tx, contact) => {
+ *     const recentInTx = await listRecentOutboundInTx(tx, conversationId)
+ *     if (!canSendMessage(recentInTx).allowed) {
+ *       throw new ComplianceConcurrencyError({...})
+ *     }
+ *     const conv = await tx.get(convRef)
+ *       .then(d => _parseConversationOrThrow(d.data(), conversationId))
+ *     return addOutboundInTx(tx, conversationId, conv, input)
+ *   })
+ *
+ * Re-check rate-limit DANS la tx + write message + audits = TOUT atomique.
+ * Si l'une de ces étapes throw, Firestore rollback tout (pas de message
+ * orphelin, pas de compteur incohérent, pas de SMS parti côté OVH —
+ * l'ovh-send arrive APRÈS commit de cette tx).
+ *
+ * ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ * EFFETS POSÉS DANS LA TX (ordre strict, vérifié par tests sentinelles)
+ *
+ *   1. `tx.create(messageRef, messageDoc)`                — sous-collection
+ *      messages : doc avec `direction="outbound"`, `status="queued"`,
+ *      `createdAt=Timestamp.now()`, et les optionnels fournis.
+ *   2. `_bumpConversationCountersTx(tx, convRef, conv, "outbound", now)`
+ *      — bumpe `messageCount`, `outboundCount`, `lastMessageAt`,
+ *      `lastOutboundAt`, et pose `firstMessageAt` si absent.
+ *   3. `appendAuditLogTx(tx, action: "sms_sent", payload:
+ *      { direction: "outbound", messageId })` — audit forensique.
+ *
+ * Champs FIGÉS (PAS modifiables via input) : `direction="outbound"`,
+ * `status="queued"`, `createdAt=Timestamp.now()` (serveur). Les champs
+ * `sentAt`/`deliveredAt`/`error`/`cost` seront posés par
+ * `updateMessageStatus()` en S7 à réception du webhook OVH.
+ *
+ * ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ * PRÉCONDITIONS CALLER
+ *
+ *   1. **`conversationId` doit pointer le doc EXISTANT et déjà lu DANS
+ *      la tx**. Source de vérité = la doc location fournie par le caller.
+ *      Le bump des compteurs se fait sur `conversations/{conversationId}`.
+ *
+ *   2. **`conv` doit avoir été lu DANS la tx** (via `tx.get(convRef)` puis
+ *      `_parseConversationOrThrow`). Si le caller a lu `conv` HORS tx
+ *      avant `withContactLock`, le bump des compteurs sera CALCULÉ à
+ *      partir de la valeur stale → risque de compteur incohérent si une
+ *      autre tx a bumpé entre-temps. Cette fonction NE vérifie PAS cette
+ *      précondition — elle assume la responsabilité du caller.
+ *
+ *   3. **Le contact lié à `conv` doit avoir été locké via
+ *      `withContactLock(conv.contactId, ...)`** — sérialise les tx
+ *      concurrentes sur le même contact, garantit la cohérence du
+ *      re-check rate-limit qui précède l'appel.
+ *
+ * @param tx              Transaction Firestore ouverte par le caller.
+ * @param conversationId  docId composite `${contactId}_${campaignId}`,
+ *                        fourni explicitement par le caller (source de
+ *                        vérité = la doc location, pas une dérivation).
+ * @param conv            `Conversation` déjà lue + parsée DANS `tx` par
+ *                        le caller au chemin `conversations/{conversationId}`.
+ * @param input           Champs métier du message. Cf. `AddOutboundInput`.
+ *
+ * @returns L'ID Firestore (auto-généré, 20 chars `[A-Za-z0-9]`) du
+ *          message créé. Disponible immédiatement côté caller pour la
+ *          composition (ex: audit `sms_provider_dispatched` ultérieur
+ *          dans la même tx, avec `targetId = messageId`).
+ *
+ * @throws ValidationError  si `body` vide ou > `BODY_MAX_LENGTH`. La tx
+ *                          rollback automatiquement (aucune écriture
+ *                          partielle, Firestore défait les `tx.create`
+ *                          déjà queuées si elles n'ont pas encore commit).
+ */
+export async function addOutboundInTx(
+  tx: Transaction,
+  conversationId: string,
+  conv: Conversation,
+  input: AddOutboundInput,
+): Promise<string> {
+  validateBodyOrThrow(input.body, conversationId);
+
+  const convRef = getAdminDb().collection(CONVERSATIONS_COLLECTION).doc(conversationId);
+  const messageRef = messagesSubcollectionRef(conversationId).doc(); // auto-ID
+  const now = Timestamp.now();
+
+  // Construction explicite : NE PAS spreader `input` brut — risque
+  // qu'un champ inattendu (introduit côté caller via `as any`) passe.
+  // Les undefined optionnels sont volontairement absents de l'objet
+  // (Firestore n'a PAS `ignoreUndefinedProperties` activé côté admin.ts).
+  const messageDoc: Message = {
+    direction: "outbound",
+    body: input.body,
+    status: "queued",
+    channel: input.channel,
+    generatedBy: input.generatedBy,
+    createdAt: now,
+    ...(input.externalReceiver !== undefined && {
+      externalReceiver: input.externalReceiver,
+    }),
+    ...(input.aiModel !== undefined && { aiModel: input.aiModel }),
+    ...(input.aiPromptVersion !== undefined && {
+      aiPromptVersion: input.aiPromptVersion,
+    }),
+    ...(input.aiTemperature !== undefined && {
+      aiTemperature: input.aiTemperature,
+    }),
+    ...(input.aiTokens !== undefined && { aiTokens: input.aiTokens }),
+  };
+  tx.create(messageRef, messageDoc);
+
+  _bumpConversationCountersTx(tx, convRef, conv, "outbound", now);
+
+  appendAuditLogTx(tx, {
+    actorId: "system",
+    actorType: "system",
+    action: "sms_sent",
+    targetType: "message",
+    targetId: messageRef.id,
+    // `direction` + `messageId` UNIQUEMENT. Le messageId est un
+    // Firestore auto-ID alphanumérique de 20 chars → pas PII (test
+    // sentinel dans messages.test.ts vérifie le pattern).
+    payload: { direction: "outbound", messageId: messageRef.id },
+  });
+
+  return messageRef.id;
+}
+
+/**
  * Crée un message sortant dans la sous-collection
  * `conversations/{conversationId}/messages/`, bumpe les compteurs de la
  * conversation, et pose un audit `sms_sent`. Atomique (1 transaction).
+ *
+ * **Wrapper standalone de `addOutboundInTx` (DEBT-001.2)** : ouvre une
+ * `runTransaction`, lit + parse la conversation DANS la tx, puis délègue
+ * la composition message + bump + audit à `addOutboundInTx`. Toute la
+ * logique métier vit dans `addOutboundInTx` (single source of truth).
+ *
+ * Pour les callers qui ont DÉJÀ une tx ouverte (typiquement
+ * `sendOutboundWithLock` qui re-check rate-limit DANS la tx) : appeler
+ * `addOutboundInTx` directement, PAS `addOutbound` (qui ouvrirait une
+ * tx imbriquée — refusé par Firestore Admin SDK).
  *
  * Champs FIGÉS par la fonction (PAS modifiables via input) :
  *   - `direction = "outbound"`
  *   - `status = "queued"`
  *   - `createdAt = Timestamp.now()` (serveur)
- *
- * Les champs `sentAt`, `deliveredAt`, `error`, `cost` seront posés plus
- * tard par `updateMessageStatus()` (S7) à réception du webhook OVH.
  *
  * Audit payload = `{ direction: "outbound", messageId }`. Jamais `body`,
  * `bodyLength`, ni le contenu. Cf. invariant 3 du module.
@@ -344,55 +505,15 @@ export async function addOutbound(
   conversationId: string,
   input: AddOutboundInput,
 ): Promise<string> {
+  // Pre-flight validation HORS tx → fail-fast sans ouvrir de tx si body
+  // invalide. `addOutboundInTx` re-valide en défense en profondeur pour
+  // les callers directs (sendOutboundWithLock).
   validateBodyOrThrow(input.body, conversationId);
 
   return await getAdminDb().runTransaction(async (tx) => {
     const convRef = getAdminDb().collection(CONVERSATIONS_COLLECTION).doc(conversationId);
     const conv = await readConversationInTxOrThrow(tx, convRef, conversationId);
-
-    const messageRef = messagesSubcollectionRef(conversationId).doc(); // auto-ID
-    const now = Timestamp.now();
-
-    // Construction explicite : NE PAS spreader `input` brut — risque
-    // qu'un champ inattendu (introduit côté caller via `as any`) passe.
-    // Les undefined optionnels sont volontairement absents de l'objet
-    // (Firestore n'a PAS `ignoreUndefinedProperties` activé côté admin.ts).
-    const messageDoc: Message = {
-      direction: "outbound",
-      body: input.body,
-      status: "queued",
-      channel: input.channel,
-      generatedBy: input.generatedBy,
-      createdAt: now,
-      ...(input.externalReceiver !== undefined && {
-        externalReceiver: input.externalReceiver,
-      }),
-      ...(input.aiModel !== undefined && { aiModel: input.aiModel }),
-      ...(input.aiPromptVersion !== undefined && {
-        aiPromptVersion: input.aiPromptVersion,
-      }),
-      ...(input.aiTemperature !== undefined && {
-        aiTemperature: input.aiTemperature,
-      }),
-      ...(input.aiTokens !== undefined && { aiTokens: input.aiTokens }),
-    };
-    tx.create(messageRef, messageDoc);
-
-    _bumpConversationCountersTx(tx, convRef, conv, "outbound", now);
-
-    appendAuditLogTx(tx, {
-      actorId: "system",
-      actorType: "system",
-      action: "sms_sent",
-      targetType: "message",
-      targetId: messageRef.id,
-      // `direction` + `messageId` UNIQUEMENT. Le messageId est un
-      // Firestore auto-ID alphanumérique de 20 chars → pas PII (test
-      // sentinel dans messages.test.ts vérifie le pattern).
-      payload: { direction: "outbound", messageId: messageRef.id },
-    });
-
-    return messageRef.id;
+    return addOutboundInTx(tx, conversationId, conv, input);
   });
 }
 
@@ -468,6 +589,11 @@ export async function addInbound(conversationId: string, input: AddInboundInput)
  * temporelle (par défaut 30 jours), mappés en `OutboundMessageRecord[]`
  * consommable directement par `canSendMessage()` (S4, `rate-limits.ts`).
  *
+ * **Query HORS tx (`.get()` direct)** — perf optimale pour le pre-check
+ * S5 qui s'exécute HORS toute transaction (orchestration Inngest). Pour
+ * le pattern tx-aware avec read lock anti-race (re-check rate-limit
+ * DANS une tx parente), voir `listRecentOutboundInTx` (DEBT-001.2).
+ *
  * **IMPORTANT — filtrage `createdAt` (PAS `sentAt`)** :
  *
  * La query Firestore filtre sur `createdAt`, pas `sentAt`. Justification :
@@ -518,6 +644,92 @@ export async function listRecentOutbound(
     const msg = parseMessageOrThrow(doc.data(), conversationId, doc.id);
     // Mapping cf. JSDoc : `sentAt` exposé = `msg.sentAt ?? msg.createdAt`.
     // Le cast `Timestamp` est sûr car les 2 viennent du SDK Firestore.
+    const sentAt = (msg.sentAt ?? msg.createdAt) as OutboundMessageRecord["sentAt"];
+    return {
+      direction: "outbound",
+      sentAt,
+    };
+  });
+}
+
+/**
+ * Version TRANSACTIONNELLE de `listRecentOutbound` (DEBT-001.2). Utilise
+ * `tx.get(query)` au lieu de `.get()` direct → LOCK le READ SET dans la
+ * transaction parente.
+ *
+ * ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ * RAISON D'ÊTRE — Fix DETTE-001 race rate-limit
+ *
+ * `listRecentOutbound` (HORS tx) lit l'historique outbound 30j en query
+ * directe `.get()`. Si 2 events Inngest concurrents arrivent sur le même
+ * contact, ils lisent EN PARALLÈLE l'historique (état "2/3 SMS dans la
+ * fenêtre"), passent tous les deux le pre-check S5, et créent CHACUN un
+ * 3e message → 4 SMS au total → sanction CNIL.
+ *
+ * Cette fonction permet de re-checker rate-limit DANS une tx parente
+ * ouverte par `withContactLock`. Firestore optimistic concurrency
+ * détecte le conflit au commit : si une autre tx a écrit dans la
+ * sous-collection messages entre `tx.get(query)` et le commit, le
+ * commit est rejeté et la tx retry. Au retry, la query relit
+ * l'historique mis à jour (3/3 → bloqué).
+ *
+ * Pattern complet (cf. `concurrency.test.ts` qui valide en emulator) :
+ *
+ *   await withContactLock(contactId, async (tx) => {
+ *     const recentInTx = await listRecentOutboundInTx(tx, conversationId)
+ *     if (!canSendMessage(recentInTx).allowed) {
+ *       throw new ComplianceConcurrencyError({...})
+ *     }
+ *     // tx.create message + audit DANS la même tx → atomique
+ *     return addOutboundInTx(tx, conv, input)
+ *   })
+ *
+ * ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ * SÉMANTIQUE IDENTIQUE À `listRecentOutbound`
+ *
+ *   - Filtre `direction == "outbound" AND createdAt >= now - days`
+ *   - Ordre DESC par `createdAt`
+ *   - Mapping `sentAt = msg.sentAt ?? msg.createdAt`
+ *   - Conversation absente → `[]` (PAS `NotFoundError`)
+ *   - Doc corrompu → throw `ValidationError` au parse Zod
+ *
+ * SEULE différence : `tx.get(query)` au lieu de `.get()`. Pour les tests
+ * sentinelles : si quelqu'un remplace `tx.get(query)` par `.get()`
+ * direct (régression), la race rate-limit redevient possible.
+ *
+ * @param tx              Transaction Firestore ouverte par le caller
+ *                        (typiquement via `withContactLock`).
+ * @param conversationId  docId composite `${contactId}_${campaignId}`.
+ * @param days            Largeur de fenêtre en jours. Défaut 30 (S4).
+ * @param now             Référence temporelle. Défaut `new Date()`.
+ *
+ * @returns Liste ordonnée DESC par `createdAt`. Identique à
+ *          `listRecentOutbound` côté shape.
+ *
+ * @throws ValidationError  si un doc message dans le résultat est
+ *                          corrompu (Zod fail). La tx rollback.
+ */
+export async function listRecentOutboundInTx(
+  tx: Transaction,
+  conversationId: string,
+  days: number = DEFAULT_LIST_DAYS,
+  now: Date = new Date(),
+): Promise<OutboundMessageRecord[]> {
+  const fromTs = Timestamp.fromDate(new Date(now.getTime() - days * MS_PER_DAY));
+
+  const query = messagesSubcollectionRef(conversationId)
+    .where("direction", "==", "outbound")
+    .where("createdAt", ">=", fromTs)
+    .orderBy("createdAt", "desc");
+
+  // ⚠️  `tx.get(query)` — verrouille le READ SET dans la tx parente.
+  // Si refactor en `.get()` direct, la race rate-limit DETTE-001 revient.
+  // Test sentinelle dans `messages.test.ts` mock `tx.get` + assert
+  // `query.get` n'est PAS appelé.
+  const snap = await tx.get(query);
+
+  return snap.docs.map((doc) => {
+    const msg = parseMessageOrThrow(doc.data(), conversationId, doc.id);
     const sentAt = (msg.sentAt ?? msg.createdAt) as OutboundMessageRecord["sentAt"];
     return {
       direction: "outbound",

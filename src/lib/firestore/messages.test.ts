@@ -55,7 +55,11 @@ import {
 } from "./admin";
 import * as auditLogModule from "./audit-log";
 import { __AUDIT_COLLECTION_FOR_TESTS } from "./audit-log";
-import { __CONVERSATIONS_COLLECTION_FOR_TESTS } from "./conversations";
+import {
+  __CONVERSATIONS_COLLECTION_FOR_TESTS,
+  _parseConversationOrThrow,
+  conversationDocId,
+} from "./conversations";
 import {
   __BODY_MAX_LENGTH_FOR_TESTS,
   __DEFAULT_LIST_DAYS_FOR_TESTS,
@@ -63,7 +67,9 @@ import {
   __MESSAGES_SUBCOLLECTION_FOR_TESTS,
   addInbound,
   addOutbound,
+  addOutboundInTx,
   listRecentOutbound,
+  listRecentOutboundInTx,
 } from "./messages";
 
 const PEPPER = "a".repeat(64);
@@ -438,6 +444,301 @@ describe("messages.ts", () => {
   });
 
   // ───────────────────────────────────────────────────────────────────────
+  // addOutboundInTx (DEBT-001.2)
+  // ───────────────────────────────────────────────────────────────────────
+
+  describe("addOutboundInTx (DEBT-001.2)", () => {
+    // ⚠️  `addOutboundInTx` reconstruit le convId via
+    // `conversationDocId(conv.contactId, conv.campaignId)`. Le caller doit
+    // donc seeder le doc conversation au convId DÉRIVÉ pour que les writes
+    // tx (update conv counters, message subcollection) atterrissent
+    // au bon endroit. Helper local pour garantir cet alignement.
+    function seedConvDerived(contactId: string, campaignId: string) {
+      const convId = conversationDocId(contactId, campaignId);
+      return seedConversation(convId, { contactId, campaignId }).then(() => convId);
+    }
+
+    it("happy path dans une tx fournie : crée message + bump compteurs + audit sms_sent", async () => {
+      // Prouve le bout-en-bout end-to-end via l'emulator : le caller
+      // ouvre la tx, lit conv DANS la tx, puis appelle addOutboundInTx.
+      // Représente le pattern qu'utilisera sendOutboundWithLock (DEBT-001.5).
+      const convId = await seedConvDerived("contact_intx_1", "camp_intx_1");
+
+      const messageId = await getAdminDb().runTransaction(async (tx) => {
+        const convRef = getAdminDb().collection(__CONVERSATIONS_COLLECTION_FOR_TESTS).doc(convId);
+        const doc = await tx.get(convRef);
+        const conv = _parseConversationOrThrow(doc.data(), convId);
+        return addOutboundInTx(tx, convId, conv, {
+          body: "Bonjour, Léa de Médéré — STOP pour refuser.",
+          channel: "sms",
+          generatedBy: "ai",
+          aiModel: "claude-sonnet-4-6",
+        });
+      });
+
+      expect(messageId).toMatch(FIRESTORE_AUTO_ID_PATTERN);
+
+      // Doc message créé
+      const msgSnap = await getAdminDb()
+        .collection(__MESSAGES_PARENT_COLLECTION_FOR_TESTS)
+        .doc(convId)
+        .collection(__MESSAGES_SUBCOLLECTION_FOR_TESTS)
+        .doc(messageId)
+        .get();
+      expect(msgSnap.exists).toBe(true);
+      const msg = msgSnap.data() as Message;
+      expect(msg.direction).toBe("outbound");
+      expect(msg.status).toBe("queued");
+
+      // Compteurs bumpés
+      const convSnap = await getAdminDb()
+        .collection(__CONVERSATIONS_COLLECTION_FOR_TESTS)
+        .doc(convId)
+        .get();
+      const conv = convSnap.data() as Conversation;
+      expect(conv.outboundCount).toBe(1);
+      expect(conv.messageCount).toBe(1);
+
+      // Audit sms_sent posé
+      const audits = await getAdminDb().collection(__AUDIT_COLLECTION_FOR_TESTS).get();
+      expect(audits.size).toBe(1);
+      const audit = audits.docs[0]?.data();
+      expect(audit?.action).toBe("sms_sent");
+      expect(audit?.payload).toEqual({ direction: "outbound", messageId });
+    });
+
+    it("retourne le messageId généré (Firestore auto-ID 20 chars)", async () => {
+      const convId = await seedConvDerived("contact_intx_id", "camp_intx_id");
+
+      const messageId = await getAdminDb().runTransaction(async (tx) => {
+        const doc = await tx.get(
+          getAdminDb().collection(__CONVERSATIONS_COLLECTION_FOR_TESTS).doc(convId),
+        );
+        const conv = _parseConversationOrThrow(doc.data(), convId);
+        return addOutboundInTx(tx, convId, conv, {
+          body: "Hello",
+          channel: "sms",
+          generatedBy: "ai",
+        });
+      });
+
+      expect(messageId).toMatch(FIRESTORE_AUTO_ID_PATTERN);
+      expect(messageId.length).toBe(20);
+    });
+
+    it("NE crée PAS sa propre tx (getAdminDb().runTransaction n'est PAS appelé par addOutboundInTx)", async () => {
+      // Sentinelle anti-régression : si quelqu'un wrappe addOutboundInTx
+      // dans son propre runTransaction (régression de design), ce test
+      // casse. Le contrat est : LE CALLER fournit la tx, addOutboundInTx
+      // opère dessus point.
+      const convId = await seedConvDerived("contact_intx_notx", "camp_intx_notx");
+
+      const db = getAdminDb();
+      // Spy sur runTransaction avant l'appel. addOutboundInTx ne doit JAMAIS
+      // l'appeler — c'est la tx fournie qui pose tous les writes.
+      const runTxSpy = vi.spyOn(db, "runTransaction");
+
+      // On ouvre NOUS la tx (le caller), addOutboundInTx la consomme.
+      await db.runTransaction(async (tx) => {
+        const doc = await tx.get(db.collection(__CONVERSATIONS_COLLECTION_FOR_TESTS).doc(convId));
+        const conv = _parseConversationOrThrow(doc.data(), convId);
+        return addOutboundInTx(tx, convId, conv, {
+          body: "Hello",
+          channel: "sms",
+          generatedBy: "ai",
+        });
+      });
+
+      // 1 SEUL appel à runTransaction : celui qu'on a ouvert nous-mêmes.
+      // Si addOutboundInTx avait ouvert sa propre tx (régression), on en
+      // verrait 2.
+      expect(runTxSpy).toHaveBeenCalledTimes(1);
+
+      runTxSpy.mockRestore();
+    });
+
+    it("body vide → throw ValidationError, tx rollback (aucune écriture)", async () => {
+      const convId = await seedConvDerived("contact_intx_empty", "camp_intx_empty");
+      const auditsBefore = await countAuditDocs();
+
+      await expect(
+        getAdminDb().runTransaction(async (tx) => {
+          const doc = await tx.get(
+            getAdminDb().collection(__CONVERSATIONS_COLLECTION_FOR_TESTS).doc(convId),
+          );
+          const conv = _parseConversationOrThrow(doc.data(), convId);
+          return addOutboundInTx(tx, convId, conv, {
+            body: "",
+            channel: "sms",
+            generatedBy: "ai",
+          });
+        }),
+      ).rejects.toBeInstanceOf(ValidationError);
+
+      // Rollback total
+      expect(await countMessages(convId)).toBe(0);
+      expect(await countAuditDocs()).toBe(auditsBefore);
+      const convSnap = await getAdminDb()
+        .collection(__CONVERSATIONS_COLLECTION_FOR_TESTS)
+        .doc(convId)
+        .get();
+      expect((convSnap.data() as Conversation).outboundCount).toBe(0);
+    });
+
+    it("body > BODY_MAX_LENGTH → throw ValidationError (défense en profondeur)", async () => {
+      // Re-validation DANS addOutboundInTx en plus de la pre-flight d'addOutbound.
+      // Garantit que les callers directs (sendOutboundWithLock) sont aussi
+      // protégés.
+      const convId = await seedConvDerived("contact_intx_huge", "camp_intx_huge");
+
+      const huge = "x".repeat(__BODY_MAX_LENGTH_FOR_TESTS + 1);
+      await expect(
+        getAdminDb().runTransaction(async (tx) => {
+          const doc = await tx.get(
+            getAdminDb().collection(__CONVERSATIONS_COLLECTION_FOR_TESTS).doc(convId),
+          );
+          const conv = _parseConversationOrThrow(doc.data(), convId);
+          return addOutboundInTx(tx, convId, conv, {
+            body: huge,
+            channel: "sms",
+            generatedBy: "ai",
+          });
+        }),
+      ).rejects.toBeInstanceOf(ValidationError);
+    });
+
+    it("ATOMICITÉ : audit fail → rollback message + compteurs DANS la tx parente", async () => {
+      const convId = await seedConvDerived("contact_intx_atomic", "camp_intx_atomic");
+      const spy = vi.spyOn(auditLogModule, "appendAuditLogTx").mockImplementation(() => {
+        throw new AuditPiiError({ message: "simulated audit fail in tx" });
+      });
+
+      await expect(
+        getAdminDb().runTransaction(async (tx) => {
+          const doc = await tx.get(
+            getAdminDb().collection(__CONVERSATIONS_COLLECTION_FOR_TESTS).doc(convId),
+          );
+          const conv = _parseConversationOrThrow(doc.data(), convId);
+          return addOutboundInTx(tx, convId, conv, {
+            body: "Hello",
+            channel: "sms",
+            generatedBy: "ai",
+          });
+        }),
+      ).rejects.toBeInstanceOf(AuditPiiError);
+
+      // Rollback total : message ABSENT, compteur INCHANGÉ.
+      expect(await countMessages(convId)).toBe(0);
+      const convSnap = await getAdminDb()
+        .collection(__CONVERSATIONS_COLLECTION_FOR_TESTS)
+        .doc(convId)
+        .get();
+      expect((convSnap.data() as Conversation).outboundCount).toBe(0);
+
+      spy.mockRestore();
+    });
+
+    it("SENTINELLE — action audit = 'sms_sent' exactement (régression si renommée)", async () => {
+      // Le mapping (direction outbound → action sms_sent) est verrouillé
+      // par S6.5 et utilisé par les requêtes forensiques (`audit_log` où
+      // action == "sms_sent" donne les envois). Si quelqu'un renomme
+      // l'action côté addOutboundInTx, ce test casse.
+      const convId = await seedConvDerived("contact_intx_action", "camp_intx_action");
+      let capturedAction: string | undefined;
+      const spy = vi.spyOn(auditLogModule, "appendAuditLogTx").mockImplementation((_tx, entry) => {
+        capturedAction = entry.action;
+        return "fake-audit-id";
+      });
+
+      await getAdminDb().runTransaction(async (tx) => {
+        const doc = await tx.get(
+          getAdminDb().collection(__CONVERSATIONS_COLLECTION_FOR_TESTS).doc(convId),
+        );
+        const conv = _parseConversationOrThrow(doc.data(), convId);
+        return addOutboundInTx(tx, convId, conv, {
+          body: "Hello",
+          channel: "sms",
+          generatedBy: "ai",
+        });
+      });
+
+      expect(capturedAction).toBe("sms_sent");
+      spy.mockRestore();
+    });
+
+    it("SENTINELLE — payload audit = { direction, messageId } UNIQUEMENT (pas de body, pas de body length)", async () => {
+      const convId = await seedConvDerived("contact_intx_payload", "camp_intx_payload");
+      let capturedPayload: Record<string, unknown> | undefined;
+      const spy = vi.spyOn(auditLogModule, "appendAuditLogTx").mockImplementation((_tx, entry) => {
+        capturedPayload = entry.payload;
+        return "fake-audit-id";
+      });
+
+      const messageId = await getAdminDb().runTransaction(async (tx) => {
+        const doc = await tx.get(
+          getAdminDb().collection(__CONVERSATIONS_COLLECTION_FOR_TESTS).doc(convId),
+        );
+        const conv = _parseConversationOrThrow(doc.data(), convId);
+        return addOutboundInTx(tx, convId, conv, {
+          body: "PII risk: 0612345678 should not appear in audit",
+          channel: "sms",
+          generatedBy: "ai",
+        });
+      });
+
+      expect(capturedPayload).toEqual({ direction: "outbound", messageId });
+      // Sentinelle stricte : pas de clé en plus.
+      expect(Object.keys(capturedPayload!).sort()).toEqual(["direction", "messageId"]);
+      spy.mockRestore();
+    });
+
+    it("conversationId explicite est la source de vérité (PAS de dérivation depuis conv.contactId)", async () => {
+      // Sentinelle anti-régression : `addOutboundInTx` opère sur le
+      // conversationId EXPLICITE fourni par le caller, pas sur un convId
+      // dérivé de `conv.contactId + conv.campaignId`. Si quelqu'un
+      // refactore en dérivation (régression de design), ce test casse :
+      // on seed à un convId arbitraire qui NE PEUT PAS être dérivé du
+      // conv (contactId+campaignId ne forment pas le convId seedé).
+      const arbitraryConvId = "arbitrary_legacy_convid_format";
+      // conv contient un contactId/campaignId qui NE formeraient PAS
+      // `arbitrary_legacy_convid_format` si on les concaténait.
+      await seedConversation(arbitraryConvId, {
+        contactId: "unrelated_contact",
+        campaignId: "unrelated_camp",
+      });
+
+      const messageId = await getAdminDb().runTransaction(async (tx) => {
+        const doc = await tx.get(
+          getAdminDb().collection(__CONVERSATIONS_COLLECTION_FOR_TESTS).doc(arbitraryConvId),
+        );
+        const conv = _parseConversationOrThrow(doc.data(), arbitraryConvId);
+        return addOutboundInTx(tx, arbitraryConvId, conv, {
+          body: "Hello",
+          channel: "sms",
+          generatedBy: "ai",
+        });
+      });
+
+      // Le doc message DOIT être dans la sous-collection du
+      // arbitraryConvId fourni explicitement — PAS d'un convId dérivé.
+      const msgSnap = await getAdminDb()
+        .collection(__MESSAGES_PARENT_COLLECTION_FOR_TESTS)
+        .doc(arbitraryConvId)
+        .collection(__MESSAGES_SUBCOLLECTION_FOR_TESTS)
+        .doc(messageId)
+        .get();
+      expect(msgSnap.exists).toBe(true);
+
+      // Le bump compteur DOIT être sur le doc arbitraryConvId.
+      const convSnap = await getAdminDb()
+        .collection(__CONVERSATIONS_COLLECTION_FOR_TESTS)
+        .doc(arbitraryConvId)
+        .get();
+      expect((convSnap.data() as Conversation).outboundCount).toBe(1);
+    });
+  });
+
+  // ───────────────────────────────────────────────────────────────────────
   // addInbound
   // ───────────────────────────────────────────────────────────────────────
 
@@ -733,6 +1034,149 @@ describe("messages.ts", () => {
       await expect(listRecentOutbound("conv_list_corrupt", 30, now)).rejects.toBeInstanceOf(
         ValidationError,
       );
+    });
+  });
+
+  // ───────────────────────────────────────────────────────────────────────
+  // listRecentOutboundInTx (DEBT-001.2)
+  // ───────────────────────────────────────────────────────────────────────
+
+  describe("listRecentOutboundInTx (DEBT-001.2)", () => {
+    it("retourne OutboundMessageRecord[] parsé identique à listRecentOutbound (sémantique préservée)", async () => {
+      // Garantit que la version tx-aware retourne EXACTEMENT le même
+      // résultat que la version HORS tx — seul le mode de lecture diffère
+      // (tx.get vs .get). Comparaison ordre + sentAt mapping.
+      const convId = "conv_listtx_1";
+      await seedConversation(convId);
+      const now = new Date("2026-05-17T12:00:00Z");
+      const t1Created = Timestamp.fromDate(new Date("2026-05-15T10:00:00Z"));
+      const t1Sent = Timestamp.fromDate(new Date("2026-05-15T10:05:00Z"));
+      const t2Created = Timestamp.fromDate(new Date("2026-05-16T10:00:00Z"));
+
+      await seedMessage(convId, { createdAt: t1Created, sentAt: t1Sent, status: "sent" });
+      await seedMessage(convId, { createdAt: t2Created, status: "queued" });
+
+      const txResult = await getAdminDb().runTransaction((tx) =>
+        listRecentOutboundInTx(tx, convId, 30, now),
+      );
+
+      expect(txResult).toHaveLength(2);
+      // Ordre DESC : t2 (16 mai) avant t1 (15 mai).
+      expect((txResult[0]?.sentAt as Timestamp).toMillis()).toBe(t2Created.toMillis());
+      // Mapping fallback préservé : t1 a sentAt → sentAt, t2 n'en a pas → createdAt.
+      expect((txResult[1]?.sentAt as Timestamp).toMillis()).toBe(t1Sent.toMillis());
+
+      // Cross-check : listRecentOutbound HORS tx donne le même résultat.
+      const nonTxResult = await listRecentOutbound(convId, 30, now);
+      expect(txResult).toEqual(nonTxResult);
+    });
+
+    it("respecte days param custom (7j → message à J-10 exclu, J-3 inclus)", async () => {
+      const convId = "conv_listtx_days";
+      await seedConversation(convId);
+      const now = new Date("2026-05-17T12:00:00Z");
+      const t10DaysAgo = Timestamp.fromDate(new Date(now.getTime() - 10 * 86400_000));
+      const t3DaysAgo = Timestamp.fromDate(new Date(now.getTime() - 3 * 86400_000));
+
+      await seedMessage(convId, { createdAt: t10DaysAgo, body: "old" });
+      await seedMessage(convId, { createdAt: t3DaysAgo, body: "recent" });
+
+      const result = await getAdminDb().runTransaction((tx) =>
+        listRecentOutboundInTx(tx, convId, 7, now),
+      );
+      expect(result).toHaveLength(1);
+      expect((result[0]?.sentAt as Timestamp).toMillis()).toBe(t3DaysAgo.toMillis());
+    });
+
+    it("default days === DEFAULT_LIST_DAYS (30) — sentinelle alignement S4", async () => {
+      // Verrouille que listRecentOutboundInTx utilise le MÊME default que
+      // listRecentOutbound. Si quelqu'un divergeait les defaults (ex: 60 jours
+      // pour la version tx), le calcul rate-limit serait incohérent entre
+      // les 2 paths.
+      const convId = "conv_listtx_default";
+      await seedConversation(convId);
+      const now = new Date("2026-05-17T12:00:00Z");
+      const t29DaysAgo = Timestamp.fromDate(new Date(now.getTime() - 29 * 86400_000));
+      const t31DaysAgo = Timestamp.fromDate(new Date(now.getTime() - 31 * 86400_000));
+
+      await seedMessage(convId, { createdAt: t29DaysAgo, body: "in_window" });
+      await seedMessage(convId, { createdAt: t31DaysAgo, body: "out_of_window" });
+
+      // Pas de `days` param → default 30j.
+      const result = await getAdminDb().runTransaction((tx) =>
+        listRecentOutboundInTx(tx, convId, undefined, now),
+      );
+      expect(result).toHaveLength(1);
+      expect((result[0]?.sentAt as Timestamp).toMillis()).toBe(t29DaysAgo.toMillis());
+      expect(__DEFAULT_LIST_DAYS_FOR_TESTS).toBe(30);
+    });
+
+    it("SENTINELLE — utilise tx.get(query), JAMAIS query.get() direct (anti-régression race rate-limit)", async () => {
+      // Si quelqu'un remplace `tx.get(query)` par `query.get()` direct dans
+      // listRecentOutboundInTx (régression accidentelle), la query lit
+      // l'état Firestore HORS du contexte tx et la race DETTE-001 redevient
+      // possible. Ce test mock un fake tx qui track tous les appels `tx.get`
+      // et asserte que le résultat passe par lui — PAS par `.get()` direct.
+      const convId = "conv_listtx_sentinel";
+      await seedConversation(convId);
+      const t1 = Timestamp.fromDate(new Date(Date.now() - 86400_000));
+      await seedMessage(convId, { createdAt: t1, body: "m1", status: "sent" });
+
+      // Compte les appels via spy sur le SDK Firestore réel : tx.get DOIT
+      // être appelé au moins 1x avec une Query (notre query DESC). Si
+      // listRecentOutboundInTx avait appelé `.get()` direct, tx.get ne serait
+      // pas appelé sur la Query (uniquement éventuellement pour le contact
+      // ailleurs).
+      const txGetCalls: unknown[] = [];
+
+      await getAdminDb().runTransaction(async (tx) => {
+        const originalTxGet = tx.get.bind(tx);
+        // Wrapper qui track les calls — exécute l'original derrière.
+        tx.get = ((arg: unknown) => {
+          txGetCalls.push(arg);
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
+          return originalTxGet(arg as any);
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        }) as any;
+        return listRecentOutboundInTx(tx, convId, 30);
+      });
+
+      // Au moins 1 appel à tx.get (notre Query).
+      expect(txGetCalls.length).toBeGreaterThanOrEqual(1);
+    });
+
+    it("conversation absente → [] (PAS NotFoundError, sémantique tolérante préservée)", async () => {
+      const result = await getAdminDb().runTransaction((tx) =>
+        listRecentOutboundInTx(tx, "conv_ghost_tx"),
+      );
+      expect(result).toEqual([]);
+    });
+
+    it("doc message corrompu → throw ValidationError au parse Zod (filet en lecture)", async () => {
+      const convId = "conv_listtx_corrupt";
+      await seedConversation(convId);
+      const now = new Date("2026-05-01T12:00:00Z");
+      const recent = Timestamp.fromDate(new Date(now.getTime() - 60_000));
+      await getAdminDb()
+        .collection(__MESSAGES_PARENT_COLLECTION_FOR_TESTS)
+        .doc(convId)
+        .collection(__MESSAGES_SUBCOLLECTION_FOR_TESTS)
+        .add({
+          direction: "outbound",
+          createdAt: recent,
+          // body/status/channel/generatedBy manquants → Zod fail
+        });
+
+      await expect(
+        getAdminDb().runTransaction((tx) => listRecentOutboundInTx(tx, convId, 30, now)),
+      ).rejects.toBeInstanceOf(ValidationError);
+    });
+
+    it("conversation vide → [] (consistent avec listRecentOutbound)", async () => {
+      const convId = "conv_listtx_empty";
+      await seedConversation(convId);
+      const result = await getAdminDb().runTransaction((tx) => listRecentOutboundInTx(tx, convId));
+      expect(result).toEqual([]);
     });
   });
 

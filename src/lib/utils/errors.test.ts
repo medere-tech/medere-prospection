@@ -3,6 +3,7 @@ import { describe, expect, it } from "vitest";
 import {
   AppError,
   AuditPiiError,
+  ComplianceConcurrencyError,
   ComplianceError,
   ConfigError,
   ConflictError,
@@ -149,6 +150,178 @@ describe("isAppError", () => {
     expect(isAppError("x")).toBe(false);
     expect(isAppError(null)).toBe(false);
     expect(isAppError(undefined)).toBe(false);
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// ComplianceConcurrencyError (S6.6 / DEBT-001.1)
+// ─────────────────────────────────────────────────────────────────────────────
+
+describe("ComplianceConcurrencyError (DEBT-001.1)", () => {
+  // `attemptedAt` est fixé dans un beforeAll pour rester déterministe ;
+  // toutes les assertions context utilisent CE Date strictement.
+  const FIXED_AT = new Date("2026-06-08T10:30:00.000Z");
+
+  function makeValidContext() {
+    return {
+      contactId: "hubspot_12345",
+      ruleName: "rate_limit",
+      attemptedAt: FIXED_AT,
+      expectedRemainingQuota: 1,
+      observedRemainingQuota: 0,
+    } as const;
+  }
+
+  it("constructor accepte un context valide et expose les 5 clés forensiques", () => {
+    const err = new ComplianceConcurrencyError({
+      message: "rate_limit race detected at commit",
+      context: makeValidContext(),
+    });
+    expect(err.context).toEqual({
+      contactId: "hubspot_12345",
+      ruleName: "rate_limit",
+      attemptedAt: FIXED_AT,
+      expectedRemainingQuota: 1,
+      observedRemainingQuota: 0,
+    });
+  });
+
+  it("est instanceof ComplianceError ET AppError ET Error", () => {
+    const err = new ComplianceConcurrencyError({
+      message: "race",
+      context: makeValidContext(),
+    });
+    expect(err).toBeInstanceOf(ComplianceConcurrencyError);
+    expect(err).toBeInstanceOf(ComplianceError);
+    expect(err).toBeInstanceOf(AppError);
+    expect(err).toBeInstanceOf(Error);
+  });
+
+  it("code === 'COMPLIANCE_CONCURRENCY' (sentinelle anti-régression)", () => {
+    const err = new ComplianceConcurrencyError({
+      message: "race",
+      context: makeValidContext(),
+    });
+    expect(err.code).toBe("COMPLIANCE_CONCURRENCY");
+    // Sentinelle structurelle : si quelqu'un renomme le code, ce check
+    // strict casse. Le pattern Inngest noRetry mapping (S6.6+) compte
+    // sur ce code exact pour distinguer la concurrence d'un blocage stable.
+    expect(err.code).not.toBe("COMPLIANCE_BLOCKED");
+  });
+
+  it("statusCode === 422 (sentinelle anti-régression — cohérence ComplianceError)", () => {
+    const err = new ComplianceConcurrencyError({
+      message: "race",
+      context: makeValidContext(),
+    });
+    // 422 cohérent avec ComplianceError (Unprocessable Entity). Pas 409
+    // (ConflictError), pas 429 (RateLimitError). Si quelqu'un change ça,
+    // la signification métier change → tests dépendants doivent péter.
+    expect(err.statusCode).toBe(422);
+  });
+
+  it("noRetry === false (retry-friendly, défaut hérité — Q3 DEBT-001)", () => {
+    // Décision Déthié Q3 : 2 events Inngest concurrents = scénario
+    // opérationnel légitime. Inngest doit retry → noRetry=false.
+    // Le code prod (sendOutboundWithLock S6.6+) propage l'erreur telle
+    // quelle, PAS de wrap NonRetriableError.
+    const err = new ComplianceConcurrencyError({
+      message: "race",
+      context: makeValidContext(),
+    });
+    expect(err.noRetry).toBe(false);
+  });
+
+  it("isOperational === true (4xx métier attendu, pas un bug)", () => {
+    const err = new ComplianceConcurrencyError({
+      message: "race",
+      context: makeValidContext(),
+    });
+    expect(err.isOperational).toBe(true);
+  });
+
+  it("clientMessage === 'Envoi non autorisé.' et NE fuit NI contactId NI compteurs", () => {
+    const err = new ComplianceConcurrencyError({
+      message: "rate_limit race: hubspot_12345 expected=1 observed=0",
+      context: makeValidContext(),
+    });
+    // Anti-fuite info technique : le clientMessage doit être strictement
+    // identique au cas pre-vérif HORS tx (cohérence côté client).
+    expect(err.clientMessage).toBe("Envoi non autorisé.");
+    // Sentinelle exhaustive — aucun champ technique ne doit transiter
+    // par le clientMessage, même si le message technique en contient.
+    expect(err.clientMessage).not.toContain("hubspot_12345");
+    expect(err.clientMessage).not.toContain("rate_limit");
+    expect(err.clientMessage).not.toContain("expected");
+    expect(err.clientMessage).not.toContain("observed");
+  });
+
+  it("toClientBody() ne renvoie QUE code + clientMessage générique", () => {
+    const err = new ComplianceConcurrencyError({
+      message: "race",
+      context: makeValidContext(),
+    });
+    // Sentinelle structurelle : la forme renvoyée au client est strictement
+    // { error: { code, message } } — pas de context, pas de statusCode,
+    // pas de stack, pas de PII contactId.
+    expect(err.toClientBody()).toEqual({
+      error: { code: "COMPLIANCE_CONCURRENCY", message: "Envoi non autorisé." },
+    });
+  });
+
+  it("toLogObject() expose les champs techniques + context forensique pour les logs", () => {
+    const err = new ComplianceConcurrencyError({
+      message: "race detected",
+      context: makeValidContext(),
+    });
+    expect(err.toLogObject()).toEqual({
+      name: "ComplianceConcurrencyError",
+      code: "COMPLIANCE_CONCURRENCY",
+      statusCode: 422,
+      message: "race detected",
+      context: {
+        contactId: "hubspot_12345",
+        ruleName: "rate_limit",
+        attemptedAt: FIXED_AT,
+        expectedRemainingQuota: 1,
+        observedRemainingQuota: 0,
+      },
+      isOperational: true,
+    });
+  });
+
+  it("err.name === 'ComplianceConcurrencyError' (set via new.target.name)", () => {
+    const err = new ComplianceConcurrencyError({
+      message: "race",
+      context: makeValidContext(),
+    });
+    expect(err.name).toBe("ComplianceConcurrencyError");
+  });
+
+  it("conserve cause via super (chaînage Firestore tx exception → forensique)", () => {
+    const rootCause = new Error("Firestore tx aborted (revision conflict)");
+    const err = new ComplianceConcurrencyError({
+      message: "race",
+      context: makeValidContext(),
+      cause: rootCause,
+    });
+    expect(err.cause).toBe(rootCause);
+  });
+
+  it("isAppError(ComplianceConcurrencyError) === true", () => {
+    const err = new ComplianceConcurrencyError({
+      message: "race",
+      context: makeValidContext(),
+    });
+    expect(isAppError(err)).toBe(true);
+  });
+
+  it("toAppError ne re-wrap pas (déjà AppError)", () => {
+    const err = new ComplianceConcurrencyError({
+      message: "race",
+      context: makeValidContext(),
+    });
+    expect(toAppError(err)).toBe(err);
   });
 });
 

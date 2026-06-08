@@ -15,6 +15,7 @@ export type ErrorCode =
   | "CONFLICT"
   | "RATE_LIMITED"
   | "COMPLIANCE_BLOCKED"
+  | "COMPLIANCE_CONCURRENCY"
   | "EXTERNAL_SERVICE"
   | "CONFIG"
   | "INTERNAL"
@@ -162,12 +163,138 @@ export class RateLimitError extends AppError {
 /**
  * 422 — envoi bloqué par une règle de conformité (opt-out, plafond 3/30j,
  * plage horaire, Bloctel…). Utilisée par `lib/compliance/`.
+ *
+ * Le type de `code` est volontairement élargi à l'union
+ * `"COMPLIANCE_BLOCKED" | "COMPLIANCE_CONCURRENCY"` pour permettre à la
+ * sous-classe `ComplianceConcurrencyError` (S6.6 / DEBT-001) de narrow
+ * `code` à `"COMPLIANCE_CONCURRENCY"` tout en restant sous-type de
+ * `ComplianceError` (instanceof preservé). Le défaut à l'instanciation
+ * directe reste `"COMPLIANCE_BLOCKED"` — comportement S6 inchangé.
  */
 export class ComplianceError extends AppError {
-  readonly code = "COMPLIANCE_BLOCKED" as const;
+  readonly code: "COMPLIANCE_BLOCKED" | "COMPLIANCE_CONCURRENCY" = "COMPLIANCE_BLOCKED";
   readonly statusCode = 422;
   constructor(options: AppErrorOptions) {
     super({ clientMessage: "Envoi non autorisé.", ...options });
+  }
+}
+
+/**
+ * Contexte structuré obligatoire d'une `ComplianceConcurrencyError`.
+ *
+ * Garantie anti-PII par typage : aucune clé n'est PII par construction.
+ *   - `contactId`              : hubspotId (= docId Firestore, identifiant
+ *                                interne stable, déjà utilisé partout).
+ *   - `ruleName`               : nom de la règle compliance qui a re-check
+ *                                fail DANS la tx (ex: `"rate_limit"`).
+ *                                Pas de string libre — alignement S4 names.
+ *   - `attemptedAt`            : `Date` (référence temporelle de la
+ *                                tentative qui a perdu la race). Pas PII.
+ *   - `expectedRemainingQuota` : quota restant LU HORS tx (pre-check S5).
+ *   - `observedRemainingQuota` : quota restant LU DANS la tx (re-check).
+ *                                Si < `expectedRemainingQuota` → preuve
+ *                                de la race (une tx concurrente a commit
+ *                                entre temps).
+ */
+export interface ComplianceConcurrencyContext {
+  contactId: string;
+  ruleName: string;
+  attemptedAt: Date;
+  expectedRemainingQuota: number;
+  observedRemainingQuota: number;
+  // Index signature explicite : permet l'assignation à
+  // `AppError.context: Record<string, unknown>` sans cast (cf. TS limitation
+  // structurelle — un interface SANS index signature ne match PAS un
+  // Record<string, unknown>, même quand toutes ses valeurs sont assignables
+  // à unknown). C'est un no-op runtime — TS-level only.
+  readonly [k: string]: unknown;
+}
+
+/**
+ * Options d'instanciation d'une `ComplianceConcurrencyError`. Diffère de
+ * `AppErrorOptions` en rendant `context` OBLIGATOIRE et typé strict
+ * (`ComplianceConcurrencyContext`) — empêche au compile-time tout caller
+ * d'omettre les champs forensiques ou d'y glisser une PII par accident.
+ */
+export interface ComplianceConcurrencyErrorOptions extends Omit<AppErrorOptions, "context"> {
+  context: ComplianceConcurrencyContext;
+}
+
+/**
+ * 422 — concurrence détectée DANS une transaction Firestore : le re-check
+ * de la règle compliance (typiquement `rate_limit` 3 SMS / 30j) a échoué
+ * parce qu'une autre transaction a commit AVANT nous entre temps. La tx
+ * courante a rollback proprement — aucun SMS n'est parti côté OVH, aucun
+ * message Firestore n'a été créé.
+ *
+ * ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ * RAISON D'ÊTRE (S6.6 / DEBT-001 / INFRA-DETTE-001)
+ *
+ * Distincte de `ComplianceError("rate_limit_exceeded")` :
+ *
+ *   - `ComplianceError` (code `COMPLIANCE_BLOCKED`) = la pré-vérif HORS tx
+ *     a détecté un blocage stable (le contact EST déjà au plafond). Retry
+ *     ne va pas changer le résultat ; l'orchestrateur doit logger un
+ *     audit `send_blocked` et passer à la suite.
+ *
+ *   - `ComplianceConcurrencyError` (code `COMPLIANCE_CONCURRENCY`) = la
+ *     pré-vérif HORS tx a dit OK, mais la transaction Firestore qui
+ *     enrobe l'envoi a perdu une race contre une autre tx concurrente
+ *     juste avant le commit. Retry pertinent : la prochaine itération
+ *     relira l'historique mis à jour et soit passera (place dispo —
+ *     improbable si un 4ème événement arrive 30j+ après les 3 précédents,
+ *     mais possible), soit se transformera proprement en
+ *     `ComplianceError("rate_limit_exceeded")` lue HORS tx au tour
+ *     suivant (avec son audit `send_blocked` complet).
+ *
+ * ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ * RETRY-FRIENDLY (`noRetry = false`)
+ *
+ * `noRetry` reste à `false` (défaut hérité de `AppError`). Côté Inngest
+ * (S6.6+ / DEBT-001), cette erreur N'EST PAS wrappée en `NonRetriableError`
+ * — elle propage telle quelle, ce qui déclenche la politique retry par
+ * défaut Inngest (4 tentatives, backoff exponentiel). C'est un scénario
+ * opérationnel légitime (2 events concurrents sur le même contact, ex:
+ * re-émission manuelle d'une campagne), PAS une attaque ni un payload
+ * corrompu — le retry naturel résout le problème en lisant l'état final.
+ *
+ * ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ * QUI THROW / QUI CATCH
+ *
+ *   - **Throw** : `sendOutboundWithLock()` (`lib/firestore/transactions.ts`,
+ *     S6.6 / DEBT-001) — quand `canSendMessage(recordsInTx)` retourne
+ *     `allowed: false` DANS la transaction après que la pré-vérif HORS tx
+ *     ait dit OK. La tx Firestore rollback automatiquement (write
+ *     message + audits jamais commit).
+ *
+ *   - **Catch** : `send-first-sms` Inngest function (DEBT-001.5) — laisse
+ *     propager l'erreur (pas de wrapping `NonRetriableError`), Inngest
+ *     retry le step après backoff. Le caller logue UNIQUEMENT un audit
+ *     `send_blocked` AVANT de throw pour traçabilité forensique.
+ *
+ * ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ * CLIENT MESSAGE
+ *
+ * Hérite de `ComplianceError` : `"Envoi non autorisé."` — strictement
+ * identique au cas pre-vérif HORS tx. AUCUN champ technique (contactId,
+ * quotas, ruleName) ne doit fuir côté client : ils restent dans `context`
+ * pour les logs serveur uniquement (et seront redactés par le scrubber
+ * S6.2 lors de l'écriture en audit log si jamais).
+ */
+export class ComplianceConcurrencyError extends ComplianceError {
+  override readonly code = "COMPLIANCE_CONCURRENCY" as const;
+  // Narrowed type pour les callers (compile-time). Le runtime value est
+  // posé par le constructeur parent `AppError` via `super({...context})`
+  // — pas besoin de réassigner ici. `!` informe TS qu'on assume la
+  // définite assignment via super().
+  override readonly context!: ComplianceConcurrencyContext;
+  constructor(options: ComplianceConcurrencyErrorOptions) {
+    super({
+      clientMessage: "Envoi non autorisé.",
+      message: options.message,
+      cause: options.cause,
+      context: options.context,
+    });
   }
 }
 
