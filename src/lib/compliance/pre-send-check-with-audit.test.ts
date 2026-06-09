@@ -100,6 +100,7 @@ function buildPassingArgs(): {
     deps: {
       hasAIDisclosure: vi.fn(() => true),
       hasOptOut: vi.fn(() => true),
+      hasAdvertiserIdentification: vi.fn(() => true),
       canSendMessage: vi.fn(() => ({ allowed: true })),
       isAllowedSendTime: vi.fn(() => ({ allowed: true })),
       canSendB2C: vi.fn(() => ({ allowed: true })),
@@ -274,6 +275,21 @@ describe("preSendCheckWithAudit", () => {
         result: "blocked",
         code: "stop_optout_missing",
         rule: "stop_present",
+        context: {},
+      });
+    });
+
+    it("advertiser_identification_missing → payload context: {} (GUARD-003 L.34-5 CPCE)", async () => {
+      const { args, deps } = buildPassingArgs();
+      deps.hasAdvertiserIdentification = vi.fn(() => false);
+
+      await preSendCheckWithAudit(args, deps);
+
+      const call = appendSpy.mock.calls[0]?.[0];
+      expect(call?.payload).toEqual({
+        result: "blocked",
+        code: "advertiser_identification_missing",
+        rule: "advertiser_identification",
         context: {},
       });
     });

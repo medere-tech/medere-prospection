@@ -122,7 +122,7 @@ export type CompliancePayload = CompliancePayloadAllowed | CompliancePayloadBloc
 // ─────────────────────────────────────────────────────────────────────────────
 
 /**
- * Vérifie les 8 règles compliance via `preSendCheck` (S5) et pose
+ * Vérifie les 9 règles compliance via `preSendCheck` (S5) et pose
  * INCONDITIONNELLEMENT un audit log `action: "compliance_check"` avec
  * le résultat. Cf. JSDoc en tête de fichier pour les invariants.
  *

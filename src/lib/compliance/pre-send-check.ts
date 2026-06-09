@@ -1,17 +1,22 @@
 /**
- * Orchestrateur des 8 règles compliance avant tout envoi SMS.
+ * Orchestrateur des 9 règles compliance avant tout envoi SMS.
  *
  * ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
- * ORDRE STRICT DES RÈGLES (décision Déthié S5, alignée skill)
+ * ORDRE STRICT DES RÈGLES (décision Déthié S5 + GUARD-003 ajout règle 4)
  *
- *   1. `opted_out`                  — court-circuit immédiat si le PS a opté-out
- *   2. `ai_disclosure`              — annonce IA dans le 1er SMS (AI Act art. 50)
- *   3. `stop_present`               — STOP dans le SMS sortant (L.34-5 CPCE)
- *   4. `rate_limit`                 — plafond 3 / 30 jours
- *   5. `hours`                      — plages horaires L-V/sam, dimanche/fériés
- *   6. `bloctel`                    — vérif Bloctel si B2C mobile perso
- *   7. `legitimate_interest`        — intérêt légitime documenté (min 20 chars)
- *   8. `phone_validity`             — téléphone valide + non VoIP
+ *   1. `opted_out`                       — court-circuit immédiat si le PS a opté-out
+ *   2. `ai_disclosure`                   — annonce IA dans le 1er SMS (AI Act art. 50)
+ *   3. `stop_present`                    — STOP dans le SMS sortant (L.34-5 CPCE)
+ *   4. `advertiser_identification`       — mention "Médéré" dans le SMS (L.34-5 al. 5 CPCE)
+ *   5. `rate_limit`                      — plafond 3 / 30 jours
+ *   6. `hours`                           — plages horaires L-V/sam, dimanche/fériés
+ *   7. `bloctel`                         — vérif Bloctel si B2C mobile perso
+ *   8. `legitimate_interest`             — intérêt légitime documenté (min 20 chars)
+ *   9. `phone_validity`                  — téléphone valide + non VoIP
+ *
+ * Les règles 2, 3 et 4 ciblent toutes le **contenu du body** (regex O(1))
+ * et sont groupées en début de chaîne ; les règles 5-9 ciblent le **contexte
+ * d'envoi** (historique, dates, état contact — O(n)) et sont évaluées après.
  *
  * Court-circuit : dès qu'une règle refuse, on s'arrête et on renvoie le
  * `ComplianceFailure` correspondant. Les règles suivantes ne sont PAS
@@ -66,6 +71,7 @@ import { differenceInDays } from "date-fns";
 import type { Contact } from "@/types/contact";
 import type { Conversation } from "@/types/conversation";
 
+import { hasAdvertiserIdentification } from "./advertiser-identification";
 import { hasAIDisclosure } from "./ai-disclosure";
 import { BLOCTEL_REASONS, canSendB2C } from "./bloctel";
 import { isAllowedSendTime, MAX_VERIFIED_HOLIDAYS_YEAR } from "./hours";
@@ -84,6 +90,7 @@ export type ComplianceFailCode =
   | "opted_out"
   | "ai_disclosure_missing"
   | "stop_optout_missing"
+  | "advertiser_identification_missing"
   | "rate_limit_exceeded"
   | "outside_hours"
   | "saturday_out_of_range"
@@ -101,6 +108,7 @@ export type ComplianceRule =
   | "opt_out"
   | "ai_disclosure"
   | "stop_present"
+  | "advertiser_identification"
   | "rate_limit"
   | "hours"
   | "bloctel"
@@ -116,6 +124,8 @@ export const HUMAN_REASONS: Record<ComplianceFailCode, string> = {
   opted_out: "Contact a explicitement opté-out",
   ai_disclosure_missing: "Annonce IA absente du premier SMS (AI Act art. 50)",
   stop_optout_missing: "Mot-clé STOP absent du SMS sortant (L.34-5 CPCE)",
+  advertiser_identification_missing:
+    'Identification de l\'annonceur "Médéré" absente du SMS (L.34-5 al. 5 CPCE)',
   rate_limit_exceeded: "Plafond 3 SMS sur 30 jours atteint",
   outside_hours: "Hors plage L-V 10-13h / 14-20h (Europe/Paris)",
   saturday_out_of_range: "Hors plage samedi 10-13h (Europe/Paris)",
@@ -155,6 +165,12 @@ export type ComplianceFailure =
   | {
       code: "stop_optout_missing";
       rule: "stop_present";
+      humanReason: string;
+      context: Record<string, never>;
+    }
+  | {
+      code: "advertiser_identification_missing";
+      rule: "advertiser_identification";
       humanReason: string;
       context: Record<string, never>;
     }
@@ -264,6 +280,7 @@ export interface PreSendCheckArgs {
 export interface PreSendCheckDeps {
   hasAIDisclosure?: (message: string) => boolean;
   hasOptOut?: (message: string) => boolean;
+  hasAdvertiserIdentification?: (message: string) => boolean;
   canSendMessage?: (msgs: OutboundMessageRecord[], now?: Date) => ComplianceCheckResult;
   isAllowedSendTime?: (date?: Date) => ComplianceCheckResult;
   canSendB2C?: (contact: Contact, now?: Date) => ComplianceCheckResult;
@@ -427,7 +444,7 @@ function classifyBloctelFailure(
 // ─────────────────────────────────────────────────────────────────────────────
 
 /**
- * Vérifie les 8 règles compliance avant tout envoi. Renvoie soit `{ ok: true }`
+ * Vérifie les 9 règles compliance avant tout envoi. Renvoie soit `{ ok: true }`
  * (autorisé), soit `{ ok: false, failure }` avec une `ComplianceFailure`
  * typée (code, rule, humanReason constante, context structuré sans PII).
  *
@@ -439,6 +456,7 @@ export function preSendCheck(
 ): PreSendCheckResult {
   const _hasAI = deps.hasAIDisclosure ?? hasAIDisclosure;
   const _hasOpt = deps.hasOptOut ?? hasOptOut;
+  const _hasAdvertiser = deps.hasAdvertiserIdentification ?? hasAdvertiserIdentification;
   const _rate = deps.canSendMessage ?? canSendMessage;
   const _hours = deps.isAllowedSendTime ?? isAllowedSendTime;
   const _bloctel = deps.canSendB2C ?? canSendB2C;
@@ -483,7 +501,20 @@ export function preSendCheck(
     };
   }
 
-  // ── 4. Rate-limit 3 / 30 jours ─────────────────────────────────────────
+  // ── 4. Identification annonceur "Médéré" (L.34-5 al. 5 CPCE) ───────────
+  if (!_hasAdvertiser(args.message)) {
+    return {
+      ok: false,
+      failure: {
+        code: "advertiser_identification_missing",
+        rule: "advertiser_identification",
+        humanReason: HUMAN_REASONS.advertiser_identification_missing,
+        context: {},
+      },
+    };
+  }
+
+  // ── 5. Rate-limit 3 / 30 jours ─────────────────────────────────────────
   const rateResult = _rate(args.recentOutboundMessages, now);
   if (!rateResult.allowed) {
     return {
@@ -501,7 +532,7 @@ export function preSendCheck(
     };
   }
 
-  // ── 5. Plages horaires ─────────────────────────────────────────────────
+  // ── 6. Plages horaires ─────────────────────────────────────────────────
   const hoursResult = _hours(now);
   if (!hoursResult.allowed) {
     return {
@@ -510,7 +541,7 @@ export function preSendCheck(
     };
   }
 
-  // ── 6. Bloctel ─────────────────────────────────────────────────────────
+  // ── 7. Bloctel ─────────────────────────────────────────────────────────
   const bloctelResult = _bloctel(args.contact, now);
   if (!bloctelResult.allowed) {
     return {
@@ -519,7 +550,7 @@ export function preSendCheck(
     };
   }
 
-  // ── 7. Intérêt légitime documenté (min 20 chars, inclusif) ─────────────
+  // ── 8. Intérêt légitime documenté (min 20 chars, inclusif) ─────────────
   // `legitimateInterest` est typé `string` (S1) → toujours présent. Pas de
   // garde `?? 0` qui serait inatteignable.
   const li = args.contact.consent.legitimateInterest;
@@ -535,7 +566,7 @@ export function preSendCheck(
     };
   }
 
-  // ── 8. Téléphone valide + non VoIP ─────────────────────────────────────
+  // ── 9. Téléphone valide + non VoIP ─────────────────────────────────────
   if (!args.contact.phone.valid) {
     return {
       ok: false,
