@@ -18,7 +18,16 @@ Cette skill est ta checklist juridique. Si tu génères du code qui envoie un SM
 | Loi 30 juin 2025 | applicable 11 août 2026 | Bascule opt-in pour démarchage B2C |
 | Bloctel | jusqu'au 11 août 2026 | Vérif obligatoire pour mobiles persos B2C |
 
-## Les 8 règles non négociables
+## Les 9 règles non négociables
+
+> **Note de structure** — Au sein de l'orchestrateur `preSendCheck`
+> (`src/lib/compliance/pre-send-check.ts`), la règle ajoutée par GUARD-003
+> (identification de l'annonceur "Médéré") est évaluée en **position 4**
+> (après `stop_present`, avant `rate_limit`). La numérotation de cette skill
+> suit l'organisation **par thème** (règles d'envoi 1-6 puis règles transverses
+> 7-9), **pas l'ordre d'exécution** de l'orchestrateur. Pour la séquence
+> exacte d'exécution, cf. le code example en fin de fichier (« Checklist
+> avant chaque envoi »).
 
 ### Règle 1 — Annonce IA obligatoire dans le premier message
 
@@ -231,70 +240,152 @@ await auditLog.create({
 });
 ```
 
-## Checklist avant chaque envoi
+### Règle 9 — Identification de l'annonceur "Médéré"
 
-Avant qu'une fonction n'appelle OVH pour envoyer un SMS, ces 8 vérifications passent obligatoirement :
+Tout SMS sortant DOIT contenir une mention reconnaissable de l'annonceur « Médéré » (le nom commercial sous lequel les communications sont émises). Validation à effectuer côté code APRÈS la génération par Claude, AVANT l'envoi via OVH.
+
+**Fondement juridique principal** — article L.34-5 alinéa 5 du Code des postes et des communications électroniques (CPCE), version en vigueur depuis le **26 juillet 2020** (LOI n°2020-901 du 24 juillet 2020). Texte exact :
+
+> « Il est également interdit de dissimuler l'identité de la personne pour le compte de laquelle la communication est émise et de mentionner un objet sans rapport avec la prestation ou le service proposé. »
+
+**Doctrine consolidée** — CNIL, fiche « La prospection commerciale par SMS-MMS » :
+
+> « Chaque message électronique doit obligatoirement préciser l'identité de l'annonceur. »
+
+**Précédent** — sanction CNIL **SOLOCAL MARKETING SERVICES** du 15 mai 2025, amende de **900 000 €**, prononcée notamment pour démarchage SMS sans consentement valide et défaut d'identification claire de l'annonceur. La CNIL impose désormais aux routeurs/annonceurs un dispositif d'audit autonome de la traçabilité du consentement ET de l'identification.
+
+**Contexte politique (PAS le fondement)** — la loi n° 2025-594 du 30 juin 2025 contre toutes les fraudes aux aides publiques (article 13) bascule le démarchage téléphonique VOIX B2C vers l'opt-in au 11 août 2026 et supprime Bloctel. Elle modifie L.223-1 du Code de la consommation, **PAS L.34-5 CPCE** — elle n'est donc PAS le fondement de cette règle. Elle motive seulement le timing de la mise en conformité Médéré anticipée (deadline interne 1er juillet 2026).
+
+**Champ d'application** : B2C **ET** B2B. En B2B, l'intérêt légitime remplace l'opt-in préalable, mais l'identification de l'annonceur reste obligatoire dans chaque SMS sortant (la loi ne dispense personne d'identifier l'émetteur).
+
+**Pattern de détection** (regex insensible à la casse, tolérant les variantes d'accent en GSM-7) :
 
 ```typescript
-// src/lib/compliance/pre-send-check.ts
-export async function preSendCheck(
-  contact: Contact,
-  message: string,
-  conversation: Conversation
-): Promise<{ ok: true } | { ok: false; reason: string }> {
-  
-  // 1. Annonce IA dans le premier SMS
-  if (conversation.messageCount === 0 && !hasAIDisclosure(message)) {
-    return { ok: false, reason: 'AI disclosure missing in first SMS' };
+/** 🔒 SENTINEL GUARD-003 — modification interdite sans (a) Déthié,
+ *  (b) compliance-auditor, (c) update Notion GUARD-003. */
+export const ADVERTISER_PATTERN: RegExp = /m[ée]d[ée]r[ée]/i;
+
+export function hasAdvertiserIdentification(message: string): boolean {
+  return ADVERTISER_PATTERN.test(message);
+}
+```
+
+Variantes **acceptées** : `Médéré`, `Medere`, `MEDERE`, `médéré`, `Médere`, `MédéRé` — toutes combinaisons {é,e}³ × casse libre.
+
+Variantes **rejetées** (anti-typosquatting) : `Mederro`, `Medera`, `Médéro`, `Médecin`, `Modere`, `Méduse`.
+
+**Fichier de référence** : `src/lib/compliance/advertiser-identification.ts`
+
+**Tests sentinelles** (12 tests dans `advertiser-identification.test.ts`) :
+
+| describe | Nombre | Exemples |
+|---|---|---|
+| `ADVERTISER_PATTERN — sentinelle GUARD-003` | 1 | `verrouille la source exacte du pattern (anti-drift)` — assert `source === "m[ée]d[ée]r[ée]"` + flag `"i"`. Modification du pattern → build cassé. |
+| `variantes acceptées` | 4 | `forme canonique 'Médéré' → true`, `forme sans accent 'Medere' (strip GSM-7) → true` |
+| `positions dans le body` | 2 | `mention en fin de message → true`, `mention en début de message → true` (loi n'impose pas de position) |
+| `anti-typosquatting` | 3 | `rejette 'Mederro' → false`, `rejette 'Medera' → false`, `rejette 'Médéro' → false` |
+| `robustesse linguistique` | 2 | `rejette 'Médecin' (mot du lexique médical) → false`, `rejette un body vide → false` |
+
+**Position dans `preSendCheck`** : évaluée en **position 4** (après `stop_present`, avant `rate_limit`). Court-circuit immédiat si la mention est absente — les règles 5-9 (rate_limit, hours, bloctel, legitimate_interest, phone_validity) ne sont PAS évaluées.
+
+**Sanctions** — article L.34-5 alinéa 8 CPCE :
+- Personne physique : jusqu'à **75 000 €**
+- Personne morale : jusqu'à **375 000 €**
+- Cumul RGPD possible : jusqu'à **20 M€ ou 4 % du CA mondial** (CNIL).
+
+**Action si manquant** : refuser l'envoi, logger l'erreur dans `audit_log` avec `action: 'compliance_check'`, `result: 'blocked'`, `code: 'advertiser_identification_missing'`, `rule: 'advertiser_identification'`, `context: {}`. Retourner au caller (Inngest function) qui décidera de regénérer le message via Claude ou de remonter l'erreur Slack.
+
+## Checklist avant chaque envoi
+
+Avant qu'une fonction n'appelle OVH pour envoyer un SMS, ces 9 vérifications passent obligatoirement :
+
+```typescript
+// src/lib/compliance/pre-send-check.ts (résumé pédagogique — voir le fichier
+// source pour la JSDoc complète et les variantes typées de ComplianceFailure).
+// Orchestrateur des 9 règles compliance — fonction PURE, court-circuit immédiat
+// dès qu'une règle refuse. L'audit log est posé INCONDITIONNELLEMENT par le
+// wrapper preSendCheckWithAudit (cf. src/lib/compliance/pre-send-check-with-audit.ts).
+
+export type PreSendCheckResult =
+  | { ok: true }
+  | { ok: false; failure: ComplianceFailure };
+
+export function preSendCheck(
+  args: PreSendCheckArgs,
+  deps: PreSendCheckDeps = {},
+): PreSendCheckResult {
+  // Injection optionnelle des règles (tests) — fallback impl prod en production.
+  const _hasAI = deps.hasAIDisclosure ?? hasAIDisclosure;
+  const _hasOpt = deps.hasOptOut ?? hasOptOut;
+  const _hasAdvertiser = deps.hasAdvertiserIdentification ?? hasAdvertiserIdentification;
+  const _rate = deps.canSendMessage ?? canSendMessage;
+  const _hours = deps.isAllowedSendTime ?? isAllowedSendTime;
+  const _bloctel = deps.canSendB2C ?? canSendB2C;
+  const now = args.now ?? new Date();
+
+  // ── 1. Opt-out — court-circuit immédiat si le PS a opté-out ──────────
+  if (args.contact.consent.optedOut) {
+    return { ok: false, failure: { code: "opted_out", rule: "opt_out", humanReason: HUMAN_REASONS.opted_out, context: {} } };
   }
-  
-  // 2. Opt-out STOP présent
-  if (!hasOptOut(message)) {
-    return { ok: false, reason: 'STOP opt-out missing' };
+
+  // ── 2. AI disclosure dans le 1er SMS (AI Act art. 50) ────────────────
+  if (args.conversation.messageCount === 0 && !_hasAI(args.message)) {
+    return { ok: false, failure: { code: "ai_disclosure_missing", rule: "ai_disclosure", humanReason: HUMAN_REASONS.ai_disclosure_missing, context: {} } };
   }
-  
-  // 3. Contact pas opted-out
-  if (contact.consent.optedOut) {
-    return { ok: false, reason: 'Contact has opted out' };
+
+  // ── 3. STOP dans le SMS sortant (L.34-5 CPCE — TOUS les SMS) ─────────
+  if (!_hasOpt(args.message)) {
+    return { ok: false, failure: { code: "stop_optout_missing", rule: "stop_present", humanReason: HUMAN_REASONS.stop_optout_missing, context: {} } };
   }
-  
-  // 4. Plafond 3/30j
-  const recentMessages = await getRecentOutbound(contact.id, 30);
-  const rateCheck = canSendMessage(recentMessages);
-  if (!rateCheck.allowed) {
-    return { ok: false, reason: rateCheck.reason! };
+
+  // ── 4. Identification annonceur "Médéré" (L.34-5 al. 5 CPCE — GUARD-003) ──
+  if (!_hasAdvertiser(args.message)) {
+    return { ok: false, failure: { code: "advertiser_identification_missing", rule: "advertiser_identification", humanReason: HUMAN_REASONS.advertiser_identification_missing, context: {} } };
   }
-  
-  // 5. Plage horaire
-  if (!isAllowedSendTime()) {
-    return { ok: false, reason: 'Outside allowed sending hours' };
+
+  // ── 5. Rate-limit 3 / 30 jours ───────────────────────────────────────
+  if (!_rate(args.recentOutboundMessages, now).allowed) {
+    return { ok: false, failure: { code: "rate_limit_exceeded", rule: "rate_limit", humanReason: HUMAN_REASONS.rate_limit_exceeded, context: { count: args.recentOutboundMessages.length, maxAllowed: 3, windowDays: 30 } } };
   }
-  
-  // 6. Bloctel si B2C
-  const bloctelCheck = canSendB2C(contact);
-  if (!bloctelCheck.allowed) {
-    return { ok: false, reason: bloctelCheck.reason! };
+
+  // ── 6. Plages horaires (Europe/Paris, L-V 10-13h / 14-20h, sam 10-13h) ──
+  // Sous-codes typés selon reason : outside_hours / saturday_out_of_range
+  // / sunday / holiday / holidays_not_verified (cf. classifyHoursFailure).
+  const hoursResult = _hours(now);
+  if (!hoursResult.allowed) {
+    return { ok: false, failure: classifyHoursFailure(hoursResult.reason ?? "", now) };
   }
-  
-  // 7. Intérêt légitime documenté
-  if (!contact.consent.legitimateInterest || contact.consent.legitimateInterest.length < 20) {
-    return { ok: false, reason: 'Legitimate interest not documented' };
+
+  // ── 7. Bloctel (segment b2c_mobile_perso uniquement) ─────────────────
+  // Sous-codes : bloctel_not_checked / bloctel_opted_out / bloctel_check_expired.
+  const bloctelResult = _bloctel(args.contact, now);
+  if (!bloctelResult.allowed) {
+    return { ok: false, failure: classifyBloctelFailure(bloctelResult.reason ?? "", args.contact, now) };
   }
-  
-  // 8. Numéro valide
-  if (!contact.phone.valid || contact.phone.type === 'voip') {
-    return { ok: false, reason: 'Invalid or VoIP phone number' };
+
+  // ── 8. Intérêt légitime documenté (≥ 20 chars, inclusif) ─────────────
+  const li = args.contact.consent.legitimateInterest;
+  if (li.length < 20) {
+    return { ok: false, failure: { code: "legitimate_interest_undocumented", rule: "legitimate_interest", humanReason: HUMAN_REASONS.legitimate_interest_undocumented, context: { documentedLength: li.length, minLength: 20 } } };
   }
-  
+
+  // ── 9. Téléphone valide + non VoIP ───────────────────────────────────
+  if (!args.contact.phone.valid) {
+    return { ok: false, failure: { code: "phone_invalid", rule: "phone_validity", humanReason: HUMAN_REASONS.phone_invalid, context: {} } };
+  }
+  if (args.contact.phone.type === "voip") {
+    return { ok: false, failure: { code: "phone_voip", rule: "phone_validity", humanReason: HUMAN_REASONS.phone_voip, context: {} } };
+  }
+
   return { ok: true };
 }
 ```
 
 **Si une vérification échoue** :
-1. Logger l'erreur dans `audit_log` avec `action: 'send_blocked'`
-2. Passer le statut conversation à `blocked` avec la raison
+1. Logger dans `audit_log` avec `action: 'compliance_check'`, `payload: { result: 'blocked', code: failure.code, rule: failure.rule, context: failure.context }` (typé sans PII grâce à la discriminated union FERMÉE — cf. `pre-send-check-with-audit.ts`)
+2. Passer le statut conversation à `blocked` avec `failure.code` + `failure.humanReason` (constante figée par `HUMAN_REASONS`, jamais d'interpolation runtime)
 3. NE PAS envoyer le SMS
-4. NE PAS retenter automatiquement
+4. NE PAS retenter automatiquement (sauf si la failure est temporelle — `outside_hours` / `saturday_out_of_range` / `sunday` / `holiday` → reschedule via Inngest `step.sleepUntil()`, cf. `classifyHoursFailure`)
 
 ## Tests obligatoires
 
