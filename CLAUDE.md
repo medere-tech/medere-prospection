@@ -295,6 +295,12 @@ on relance.
 
 ---
 
+## Documentation technique
+
+Docs spécialisées (à lire AVANT de modifier les zones concernées) :
+
+- **Index Firestore et déploiement** : `docs/firestore-indexes.md`
+
 ## Modèles Claude à utiliser
 
 - **`claude-sonnet-4-6`** — par défaut pour toutes les tâches IA (génération SMS, classification, réponses)
