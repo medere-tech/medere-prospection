@@ -115,7 +115,9 @@ describe("preSendCheck — un test par code de failure", () => {
   it("ai_disclosure pas requise sur 2e SMS et + (autorisé)", () => {
     const r = preSendCheck(
       makeArgs({
-        message: "Réponse simple. STOP",
+        // Pas d'annonce IA (skip car messageCount > 0) ; "Médéré" présent
+        // pour passer la règle 4 GUARD-003 ; STOP présent pour règle 3.
+        message: "Réponse simple Médéré. STOP",
         conversation: { messageCount: 5 },
       }),
     );
@@ -128,6 +130,23 @@ describe("preSendCheck — un test par code de failure", () => {
     );
     expect(r.ok).toBe(false);
     if (!r.ok) expect(r.failure.code).toBe("stop_optout_missing");
+  });
+
+  it("advertiser_identification_missing : SMS sans mention 'Médéré' dans le body", () => {
+    // Message contient annonce IA + STOP mais PAS de mention Médéré.
+    // conversation.messageCount = 1 pour passer ai_disclosure.
+    const r = preSendCheck(
+      makeArgs({
+        message: "Bonjour Dr X, je suis Léa, assistante IA. Formation DPC gratuite. STOP",
+        conversation: { messageCount: 1 },
+      }),
+    );
+    expect(r.ok).toBe(false);
+    if (!r.ok) {
+      expect(r.failure.code).toBe("advertiser_identification_missing");
+      expect(r.failure.rule).toBe("advertiser_identification");
+      expect(r.failure.context).toEqual({});
+    }
   });
 
   it("rate_limit_exceeded : 3 envois dans la fenêtre 30j", () => {
@@ -361,7 +380,7 @@ describe("preSendCheck — ordre des règles et court-circuit", () => {
     if (!r.ok) expect(r.failure.code).toBe("opted_out");
   });
 
-  it("stop_optout_missing l'emporte sur rate_limit_exceeded (priorité 3 avant 4)", () => {
+  it("stop_optout_missing l'emporte sur rate_limit_exceeded (priorité 3 avant 5)", () => {
     const r = preSendCheck(
       makeArgs({
         message: "Bonjour Dr X, je suis Léa, assistante IA Médéré.", // pas de STOP
@@ -370,6 +389,17 @@ describe("preSendCheck — ordre des règles et court-circuit", () => {
     );
     expect(r.ok).toBe(false);
     if (!r.ok) expect(r.failure.code).toBe("stop_optout_missing");
+  });
+
+  it("advertiser_identification_missing l'emporte sur rate_limit_exceeded (priorité 4 avant 5)", () => {
+    const r = preSendCheck(
+      makeArgs({
+        message: "Bonjour Dr X, je suis Léa, assistante IA. STOP", // STOP mais pas de "Médéré"
+        recentOutboundMessages: [outbound(daysAgo(1)), outbound(daysAgo(2)), outbound(daysAgo(3))],
+      }),
+    );
+    expect(r.ok).toBe(false);
+    if (!r.ok) expect(r.failure.code).toBe("advertiser_identification_missing");
   });
 
   it("COURT-CIRCUIT RÉEL via DI : opted_out → spies des règles suivantes NON appelés", () => {
@@ -402,6 +432,31 @@ describe("preSendCheck — ordre des règles et court-circuit", () => {
     // Court-circuit RÉEL : aucune règle subséquente n'a été évaluée.
     expect(hasAIDisclosureSpy).not.toHaveBeenCalled();
     expect(hasOptOutSpy).not.toHaveBeenCalled();
+    expect(canSendMessageSpy).not.toHaveBeenCalled();
+    expect(isAllowedSendTimeSpy).not.toHaveBeenCalled();
+    expect(canSendB2CSpy).not.toHaveBeenCalled();
+  });
+
+  it("COURT-CIRCUIT RÉEL : advertiser_identification_missing → rate_limit/hours/bloctel NON appelés", () => {
+    const canSendMessageSpy = vi.fn().mockReturnValue({ allowed: true });
+    const isAllowedSendTimeSpy = vi.fn().mockReturnValue({ allowed: true });
+    const canSendB2CSpy = vi.fn().mockReturnValue({ allowed: true });
+
+    // Message contient STOP + annonce IA (passe règles 2-3) mais PAS de "Médéré"
+    // → bloque sur règle 4 (position 4 dans l'orchestrateur).
+    const r = preSendCheck(
+      makeArgs({
+        message: "Bonjour Dr X, je suis Léa, assistante IA. STOP",
+      }),
+      {
+        canSendMessage: canSendMessageSpy,
+        isAllowedSendTime: isAllowedSendTimeSpy,
+        canSendB2C: canSendB2CSpy,
+      },
+    );
+
+    expect(r.ok).toBe(false);
+    if (!r.ok) expect(r.failure.code).toBe("advertiser_identification_missing");
     expect(canSendMessageSpy).not.toHaveBeenCalled();
     expect(isAllowedSendTimeSpy).not.toHaveBeenCalled();
     expect(canSendB2CSpy).not.toHaveBeenCalled();
@@ -483,6 +538,19 @@ describe("preSendCheck — humanReason est CONSTANT par code (anti-PII)", () => 
       code: "stop_optout_missing",
       a: () => makeArgs({ message: "Bonjour, assistante IA Médéré." }),
       b: () => makeArgs({ message: "Hello, agent virtuel Médéré." }),
+    },
+    {
+      code: "advertiser_identification_missing",
+      a: () =>
+        makeArgs({
+          message: "Bonjour, je suis Léa, assistante IA. STOP",
+          conversation: { messageCount: 1 },
+        }),
+      b: () =>
+        makeArgs({
+          message: "Hello, agent virtuel ici. Une question rapide. STOP",
+          conversation: { messageCount: 3 },
+        }),
     },
     {
       code: "rate_limit_exceeded",
@@ -702,6 +770,7 @@ describe("preSendCheck — failure.rule mappé correctement à failure.code", ()
     opted_out: "opt_out",
     ai_disclosure_missing: "ai_disclosure",
     stop_optout_missing: "stop_present",
+    advertiser_identification_missing: "advertiser_identification",
     rate_limit_exceeded: "rate_limit",
     outside_hours: "hours",
     saturday_out_of_range: "hours",
@@ -716,8 +785,8 @@ describe("preSendCheck — failure.rule mappé correctement à failure.code", ()
     phone_voip: "phone_validity",
   };
 
-  it("le mapping est documenté pour tous les 15 codes", () => {
-    expect(Object.keys(CODE_TO_RULE)).toHaveLength(15);
+  it("le mapping est documenté pour tous les 16 codes", () => {
+    expect(Object.keys(CODE_TO_RULE)).toHaveLength(16);
   });
 });
 
