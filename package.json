@@ -22,6 +22,7 @@
     "emulator:firestore": "node scripts/setup-firebase-cache.mjs && firebase emulators:start --only firestore --project medere-test",
     "emulator:check": "node scripts/setup-firebase-cache.mjs",
     "emulator:kill": "node scripts/kill-emulator-port.mjs",
+    "firebase:deploy:indexes": "firebase deploy --only firestore:indexes",
     "prepare": "husky"
   },
   "dependencies": {
