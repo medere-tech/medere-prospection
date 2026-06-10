@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import { inferPhoneType, isValidE164, maskPhone, parsePhone, toE164 } from "./phone";
+import { E164_REGEX, inferPhoneType, isValidE164, maskPhone, parsePhone, toE164 } from "./phone";
 
 describe("toE164", () => {
   it("normalise un mobile FR en format national vers E.164", () => {
@@ -69,6 +69,51 @@ describe("parsePhone", () => {
 
   it("renvoie null pour une saisie non interprétable", () => {
     expect(parsePhone("xxxxx")).toBeNull();
+  });
+});
+
+describe("E164_REGEX (sentinelles anti-drift)", () => {
+  // 🔒 Sentinelle source de vérité unique. Si quelqu'un modifie la régex
+  // dans phone.ts sans bumper ces tests, le build casse — c'est volontaire.
+  // Tout drift cross-module (events.ts, contacts.ts) compromettrait la
+  // validation E.164 de bout en bout (compliance L.34-5 CPCE + Bloctel).
+
+  it("accepte un mobile FR valide (+33612345678, 12 chars)", () => {
+    expect(E164_REGEX.test("+33612345678")).toBe(true);
+  });
+
+  it("accepte un mobile UK valide (+447400123456, 13 chars)", () => {
+    expect(E164_REGEX.test("+447400123456")).toBe(true);
+  });
+
+  it("refuse leading zero après le + (+0612345678) — invariant strict E.164", () => {
+    expect(E164_REGEX.test("+0612345678")).toBe(false);
+  });
+
+  it("refuse format national sans + (0612345678)", () => {
+    expect(E164_REGEX.test("0612345678")).toBe(false);
+  });
+
+  it("refuse format trop court (< 8 chars total : + + 7 chiffres)", () => {
+    expect(E164_REGEX.test("+331234")).toBe(false);
+  });
+
+  it("refuse format trop long (> 16 chars : + + 15 chiffres + 1)", () => {
+    // 16 chiffres après le + = au-delà de la borne max ITU-T E.164.
+    expect(E164_REGEX.test("+3361234567890123")).toBe(false);
+  });
+
+  it("refuse chaîne vide / non-numérique", () => {
+    expect(E164_REGEX.test("")).toBe(false);
+    expect(E164_REGEX.test("+abc")).toBe(false);
+    expect(E164_REGEX.test("not a phone")).toBe(false);
+  });
+
+  it("est figée en regex compilée (typeof RegExp)", () => {
+    // Sentinelle structurelle : si quelqu'un refactore en string ou en
+    // fonction, ce test casse.
+    expect(E164_REGEX).toBeInstanceOf(RegExp);
+    expect(E164_REGEX.source).toBe("^\\+[1-9]\\d{6,14}$");
   });
 });
 

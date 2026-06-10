@@ -12,7 +12,7 @@ import { Timestamp } from "firebase-admin/firestore";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { __resetEnvCacheForTests } from "@/lib/security/env";
-import { NotFoundError, ValidationError } from "@/lib/utils/errors";
+import { InternalError, NotFoundError, ValidationError } from "@/lib/utils/errors";
 import type { Contact } from "@/types/contact";
 
 import {
@@ -25,6 +25,7 @@ import { __AUDIT_COLLECTION_FOR_TESTS } from "./audit-log";
 import {
   __CONTACTS_COLLECTION_FOR_TESTS,
   getContact,
+  getContactByPhone,
   markOptedOut,
   updateContactStatus,
 } from "./contacts";
@@ -158,6 +159,121 @@ describe("contacts.ts", () => {
         const ctx = (e as ValidationError).context as { contactId: string };
         expect(ctx.contactId).toBe("contact_X");
       }
+    });
+  });
+
+  // ───────────────────────────────────────────────────────────────────────
+  // getContactByPhone (S9.1)
+  // ───────────────────────────────────────────────────────────────────────
+
+  describe("getContactByPhone (S9.1)", () => {
+    it("trouve un contact unique par phone.e164 → retourne le Contact parsé", async () => {
+      await seedContact("contact_byphone_1", {
+        hubspotId: "hs_byphone_1",
+        phone: {
+          e164: "+33611112222",
+          raw: "06 11 11 22 22",
+          type: "mobile",
+          valid: true,
+          lookupAt: Timestamp.now(),
+        },
+      });
+      const got = await getContactByPhone("+33611112222");
+      expect(got).not.toBeNull();
+      expect(got?.hubspotId).toBe("hs_byphone_1");
+      expect(got?.phone.e164).toBe("+33611112222");
+    });
+
+    it("aucun contact → retourne null (PAS NotFoundError, cohérent getContact)", async () => {
+      // Sentinelle sémantique : null pour absence légitime, identique à
+      // getContact. Le caller process-reply (S9.2) traite null en branche
+      // "reply_dropped" (PS inconnu).
+      const got = await getContactByPhone("+33699999999");
+      expect(got).toBeNull();
+    });
+
+    it("input format INVALIDE (leading zero après +) → throw ValidationError AVANT query", async () => {
+      // Defense-in-depth Q2 brief Déthié S9.1 : régex E.164 STRICTE
+      // refuse leading zero. `+0612345678` n'a aucune sémantique ITU-T E.164
+      // → ValidationError sans même querier Firestore.
+      await expect(getContactByPhone("+0612345678")).rejects.toBeInstanceOf(ValidationError);
+    });
+
+    it("input format INVALIDE (national sans +) → throw ValidationError", async () => {
+      await expect(getContactByPhone("0612345678")).rejects.toBeInstanceOf(ValidationError);
+    });
+
+    it("input format INVALIDE (trop court) → throw ValidationError", async () => {
+      await expect(getContactByPhone("+331")).rejects.toBeInstanceOf(ValidationError);
+    });
+
+    it("ValidationError contient inputLength mais PAS le téléphone (anti-PII)", async () => {
+      try {
+        await getContactByPhone("+0612345678");
+        expect.fail("should have thrown");
+      } catch (e) {
+        expect(e).toBeInstanceOf(ValidationError);
+        const ctx = (e as ValidationError).context as { op: string; inputLength: number };
+        expect(ctx.op).toBe("getContactByPhone");
+        expect(ctx.inputLength).toBe(11);
+        // Sentinelle anti-PII : le téléphone ne doit JAMAIS apparaître
+        // dans le context sérialisé.
+        const serialized = JSON.stringify((e as ValidationError).context);
+        expect(serialized).not.toContain("0612345678");
+      }
+    });
+
+    it("invariant cassé (>1 contact même E.164) → throw InternalError, PAS de phone dans context", async () => {
+      // Defense-in-depth Q1 brief Déthié S9.1. On corrompt sciemment la
+      // base avec 2 contacts qui partagent le même phone.e164. La fonction
+      // doit refuser de choisir arbitrairement.
+      const samePhone = {
+        e164: "+33611113333",
+        raw: "06 11 11 33 33",
+        type: "mobile" as const,
+        valid: true,
+        lookupAt: Timestamp.now(),
+      };
+      await seedContact("contact_dup_1", { hubspotId: "hs_dup_1", phone: samePhone });
+      await seedContact("contact_dup_2", { hubspotId: "hs_dup_2", phone: samePhone });
+
+      try {
+        await getContactByPhone("+33611113333");
+        expect.fail("should have thrown InternalError");
+      } catch (e) {
+        expect(e).toBeInstanceOf(InternalError);
+        const ctx = (e as InternalError).context as { op: string; count: number };
+        expect(ctx.op).toBe("getContactByPhone");
+        expect(ctx.count).toBeGreaterThanOrEqual(2);
+        // Sentinelle anti-PII renforcée : ni le phone, ni les contactIds
+        // (semi-sensibles).
+        const serialized = JSON.stringify((e as InternalError).context);
+        expect(serialized).not.toContain("0611113333");
+        expect(serialized).not.toContain("33611113333");
+        expect(serialized).not.toContain("hs_dup_1");
+        expect(serialized).not.toContain("hs_dup_2");
+      }
+    });
+
+    it("doc trouvé mais corrompu (Zod fail) → throw ValidationError forensic contactId", async () => {
+      // On contourne le seed normal et on écrit un doc partiel direct.
+      // phone.e164 correct (pour matcher la query) mais legitimateInterest
+      // trop court → Zod fail au parsing.
+      await getAdminDb()
+        .collection(__CONTACTS_COLLECTION_FOR_TESTS)
+        .doc("contact_byphone_corrupt")
+        .set({
+          hubspotId: "hs_corrupt",
+          phone: {
+            e164: "+33611114444",
+            raw: "06 11 11 44 44",
+            type: "mobile",
+            valid: true,
+            lookupAt: Timestamp.now(),
+          },
+          // pas de firstName/lastName/speciality/etc → Zod throw.
+        });
+      await expect(getContactByPhone("+33611114444")).rejects.toBeInstanceOf(ValidationError);
     });
   });
 

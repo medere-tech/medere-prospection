@@ -55,29 +55,46 @@ const TARGET_TYPES = ["contact", "conversation", "message", "campaign", "user", 
 /**
  * Liste fermée des actions auditables — alignée sur `src/types/audit-log.ts`
  * (qui est lui-même aligné skill `medere-firestore-schema` + extensions
- * S5/S6.6). Garder synchronisé : si une action est ajoutée au type, ELLE
- * DOIT l'être ici aussi, sinon Zod refuse l'écriture.
+ * S5/S6.6/S9.1). Garder synchronisé : si une action est ajoutée au type,
+ * ELLE DOIT l'être ici aussi, sinon Zod refuse l'écriture.
+ *
+ * 🔒 **Sentinelle S9.1** : `audit-log.test.ts` verrouille l'égalité
+ * ensembliste entre cette whitelist et `AuditAction` (TS) via un test
+ * hardcodé. Tout ajout d'un seul côté casse le build — c'est volontaire.
+ *
+ * Organisation visuelle alignée sur `src/types/audit-log.ts` (sections par
+ * cycle de vie). Cf. JSDoc du type pour le détail des sections.
  */
 const ACTIONS = [
+  // ── SMS OUTBOUND ───────────────────────────────────────────────────────
   "sms_sent",
-  "sms_received",
   "sms_failed",
   "sms_provider_dispatched",
   "send_blocked",
+  // ── SMS INBOUND (S9.1 — process-reply) ─────────────────────────────────
+  "sms_received",
+  "intent_classified",
+  "reply_processed",
+  "reply_dropped",
+  "long_form_opt_out_candidate",
+  // ── CONVERSATION lifecycle ─────────────────────────────────────────────
   "opt_out",
   "handoff",
   "handoff_accepted",
+  // ── CAMPAIGN / ADMIN ───────────────────────────────────────────────────
   "manual_override",
   "prompt_changed",
+  "campaign_started",
+  "campaign_paused",
+  // ── DATA ───────────────────────────────────────────────────────────────
   "bloctel_imported",
   "contact_deleted",
   "contact_anonymized",
-  "campaign_started",
-  "campaign_paused",
+  // ── AUTH ───────────────────────────────────────────────────────────────
   "login",
   "role_changed",
+  // ── TRANSVERSE ─────────────────────────────────────────────────────────
   "compliance_check",
-  "long_form_opt_out_candidate",
   "status_changed",
 ] as const;
 

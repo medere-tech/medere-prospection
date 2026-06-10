@@ -14,7 +14,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { __resetEnvCacheForTests } from "@/lib/security/env";
 import { AuditPiiError, ValidationError } from "@/lib/utils/errors";
-import type { AuditLogInput } from "@/types/audit-log";
+import type { AuditAction, AuditLogInput } from "@/types/audit-log";
 
 import {
   __APP_NAME_FOR_TESTS,
@@ -22,7 +22,7 @@ import {
   __resetFirestoreAdminForTests,
   getAdminDb,
 } from "./admin";
-import { __AUDIT_COLLECTION_FOR_TESTS, appendAuditLog } from "./audit-log";
+import { __ACTIONS_FOR_TESTS, __AUDIT_COLLECTION_FOR_TESTS, appendAuditLog } from "./audit-log";
 
 const PEPPER = "a".repeat(64);
 
@@ -51,6 +51,86 @@ async function countAuditDocs(): Promise<number> {
   const snap = await getAdminDb().collection(__AUDIT_COLLECTION_FOR_TESTS).get();
   return snap.size;
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Sentinelle S9.1 — anti-drift TS type vs runtime whitelist
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * 🔒 SENTINELLE GAP-S9.1 — verrouille l'égalité ensembliste entre
+ * `AuditAction` (type TS, `src/types/audit-log.ts`) et `ACTIONS` (whitelist
+ * runtime Zod, `src/lib/firestore/audit-log.ts`).
+ *
+ * Pourquoi un hardcoded `Set<AuditAction>` :
+ *   - Un type TS est effacé au compile-time → impossible de comparer
+ *     programmatiquement `AuditAction` (type) avec `ACTIONS` (runtime).
+ *   - Le hardcoded set typé `Set<AuditAction>` force le dev à éditer
+ *     3 endroits cohérents :
+ *       (a) le type TS (src/types/audit-log.ts)
+ *       (b) la whitelist runtime (src/lib/firestore/audit-log.ts::ACTIONS)
+ *       (c) ce hardcoded EXPECTED (ce fichier)
+ *     Si l'un des 3 dérive, le build casse — c'est l'objectif explicite.
+ *
+ * Le typage `ReadonlySet<AuditAction>` côté EXPECTED rend la première
+ * ligne de défense : si une string ne fait pas partie de AuditAction,
+ * TS refuse au compile-time. Si AuditAction grandit mais pas EXPECTED,
+ * l'assertion runtime casse (Set inégal).
+ */
+const EXPECTED_AUDIT_ACTIONS: ReadonlySet<AuditAction> = new Set<AuditAction>([
+  // SMS OUTBOUND
+  "sms_sent",
+  "sms_failed",
+  "sms_provider_dispatched",
+  "send_blocked",
+  // SMS INBOUND (S9.1)
+  "sms_received",
+  "intent_classified",
+  "reply_processed",
+  "reply_dropped",
+  "long_form_opt_out_candidate",
+  // CONVERSATION lifecycle
+  "opt_out",
+  "handoff",
+  "handoff_accepted",
+  // CAMPAIGN / ADMIN
+  "manual_override",
+  "prompt_changed",
+  "campaign_started",
+  "campaign_paused",
+  // DATA
+  "bloctel_imported",
+  "contact_deleted",
+  "contact_anonymized",
+  // AUTH
+  "login",
+  "role_changed",
+  // TRANSVERSE
+  "compliance_check",
+  "status_changed",
+]);
+
+describe("ACTIONS whitelist — sentinelle anti-drift TS ↔ runtime (S9.1)", () => {
+  it("égalité ensembliste : __ACTIONS_FOR_TESTS === EXPECTED_AUDIT_ACTIONS", () => {
+    // Si un dev ajoute une action côté types/audit-log.ts sans la mirorer
+    // côté lib/firestore/audit-log.ts (ou inversement), ce test casse.
+    // L'opérateur Set préserve l'identité de chaque string indépendamment
+    // de l'ordre dans la définition.
+    const runtimeSet = new Set(__ACTIONS_FOR_TESTS);
+    expect(runtimeSet).toEqual(EXPECTED_AUDIT_ACTIONS);
+  });
+
+  it("nombre d'actions correspond (sanity check)", () => {
+    expect(__ACTIONS_FOR_TESTS.length).toBe(EXPECTED_AUDIT_ACTIONS.size);
+  });
+
+  it("contient les 3 actions inbound S9.1 (sentinelles dédiées)", () => {
+    // Verrouillage spécifique pour repérer un revert/squash accidentel
+    // des 3 ajouts S9.1.
+    expect(EXPECTED_AUDIT_ACTIONS.has("intent_classified")).toBe(true);
+    expect(EXPECTED_AUDIT_ACTIONS.has("reply_processed")).toBe(true);
+    expect(EXPECTED_AUDIT_ACTIONS.has("reply_dropped")).toBe(true);
+  });
+});
 
 describe("appendAuditLog", () => {
   beforeEach(async () => {
