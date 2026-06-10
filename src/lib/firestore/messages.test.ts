@@ -904,9 +904,9 @@ describe("messages.ts", () => {
   // ───────────────────────────────────────────────────────────────────────
 
   describe("findInboundByExternalId (S9.1)", () => {
-    it("doublon webhook OVH → retourne le Message inbound existant", async () => {
+    it("doublon webhook OVH → retourne { messageId, message } du doublon", async () => {
       await seedConversation("conv_dedup_1");
-      const messageId = await addInbound("conv_dedup_1", {
+      const seededMessageId = await addInbound("conv_dedup_1", {
         body: "Oui ça m'intéresse",
         channel: "sms",
         externalId: "ovh-webhook-dedup-001",
@@ -915,11 +915,13 @@ describe("messages.ts", () => {
 
       const found = await findInboundByExternalId("conv_dedup_1", "ovh-webhook-dedup-001");
       expect(found).not.toBeNull();
-      expect(found?.direction).toBe("inbound");
-      expect(found?.externalId).toBe("ovh-webhook-dedup-001");
-      expect(found?.body).toBe("Oui ça m'intéresse");
-      // Sanity : on a bien retrouvé le message qu'on a créé.
-      expect(messageId).toMatch(FIRESTORE_AUTO_ID_PATTERN);
+      // Retour S9.2.1 : { messageId, message } pour permettre l'audit
+      // reply_dropped duplicate avec duplicateOfMessageId.
+      expect(found?.messageId).toBe(seededMessageId);
+      expect(found?.messageId).toMatch(FIRESTORE_AUTO_ID_PATTERN);
+      expect(found?.message.direction).toBe("inbound");
+      expect(found?.message.externalId).toBe("ovh-webhook-dedup-001");
+      expect(found?.message.body).toBe("Oui ça m'intéresse");
     });
 
     it("aucun doublon → retourne null (PAS NotFoundError, sémantique lecture tolérante)", async () => {

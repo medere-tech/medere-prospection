@@ -194,6 +194,81 @@ describe("detectPiiInPayload — faux positifs BUG-003 exclus", () => {
     const v = detectPiiInPayload({ url: "https://medere.fr/api/v1" });
     expect(v).toEqual([]);
   });
+
+  // ───────────────────────────────────────────────────────────────────────
+  // 🔒 Sentinelle HIGH-1 S9.2.1 — collision scrubber sur hash HMAC hex pur
+  // ───────────────────────────────────────────────────────────────────────
+
+  it("MATCHE un hash HMAC hex pur pathologique (cas réel +33600000103 → 0d2aad...0869433987)", () => {
+    // Documente l'INVARIANT du scrubber : `RE_FR_NATIONAL` matche bien
+    // toute sous-séquence `0[1-9]\d{8}` avec frontières anti-digit
+    // satisfaites par les bornes de la string. Un hash HMAC-SHA256 hex
+    // pur (32 chars) a ~0.3% de probabilité de contenir une telle
+    // sous-séquence.
+    //
+    // Exemple confirmé par security-reviewer S9.2.1 :
+    //   hashPii("+33600000103") = "0d2aad1497f4a9118e800a0869433987"
+    //   → match RE_FR_NATIONAL sur "0869433987" (positions 22-31).
+    //
+    // Ce test n'est PAS une régression à corriger côté scrubber — c'est
+    // un INVARIANT du scrubber qui est correct (la regex doit matcher
+    // tout 0[1-9]\d{8} dans les frontières, sinon trou PII).
+    //
+    // La protection se fait CÔTÉ CALLER : préfixer le hash avec un
+    // marker non-digit (cf. test suivant) — pattern process-reply.ts
+    // `PHONE_HASH_PREFIX = "hph_"`.
+    const v = detectPiiInPayload({ phoneHash: "0d2aad1497f4a9118e800a0869433987" });
+    expect(v.length).toBeGreaterThan(0);
+    expect(v.some((violation) => violation.kind === "phone_fr_national")).toBe(true);
+  });
+
+  it("ne MATCHE PAS le hash si préfixé `hph_` + chunké tous les 4 chars (fix HIGH-1)", () => {
+    // 🔒 Sentinelle anti-régression : le préfixe `hph_` SEUL ne suffit
+    // PAS (la frontière `(?<!\d)` est satisfaite par le caractère
+    // non-digit qui précède la sous-séquence problématique DANS le
+    // hash). Le chunking par underscore tous les 4 chars garantit
+    // qu'AUCUNE sous-séquence de 10 digits consécutifs ne peut exister
+    // dans la string finale.
+    //
+    // Le hash pathologique connu (security-reviewer S9.2.1) :
+    //   hashPii("+33600000103") = "0d2aad1497f4a9118e800a0869433987"
+    //   match RE_FR_NATIONAL sur "0869433987" en STANDALONE.
+    //   Format process-reply.ts safePhoneHash() :
+    //   "hph_0d2a_ad14_97f4_a911_8e80_0a08_6943_3987"
+    //   → max 4 digits consécutifs → 0 match.
+    const v = detectPiiInPayload({
+      phoneHash: "hph_0d2a_ad14_97f4_a911_8e80_0a08_6943_3987",
+    });
+    expect(v).toEqual([]);
+  });
+
+  it("ne MATCHE PAS un panel de hashes pathologiques en format chunké safePhoneHash", () => {
+    // Sentinelle élargie : plusieurs hashes contenant des sous-séquences
+    // PII en format hex pur. Même format chunké → 0 match garanti.
+    const pathologicalHashesChunked = [
+      // 0123456789abcdef0123456789abcdef → chunké
+      "hph_0123_4567_89ab_cdef_0123_4567_89ab_cdef",
+      // deadbeef0612345678abcdefabcdefab → chunké (contient 0612345678)
+      "hph_dead_beef_0612_3456_78ab_cdef_abcd_efab",
+      // fedcba9876543210e29b41d4a7160000 → chunké
+      "hph_fedc_ba98_7654_3210_e29b_41d4_a716_0000",
+    ];
+    for (const phoneHash of pathologicalHashesChunked) {
+      const v = detectPiiInPayload({ phoneHash });
+      expect(v).toEqual([]);
+    }
+  });
+
+  it("DÉMONTRE que le préfixe SEUL (sans chunking) ne suffit PAS — anti-régression du fix", () => {
+    // 🔒 Sentinelle qui prouve POURQUOI le chunking est nécessaire.
+    // Si quelqu'un retire le chunking dans process-reply.ts en pensant
+    // que le préfixe `hph_` suffit, ce test démontre l'erreur.
+    const v = detectPiiInPayload({
+      phoneHash: "hph_0d2aad1497f4a9118e800a0869433987", // préfixe seul, hex pur
+    });
+    expect(v.length).toBeGreaterThan(0);
+    expect(v.some((violation) => violation.kind === "phone_fr_national")).toBe(true);
+  });
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
