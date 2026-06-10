@@ -68,6 +68,7 @@ import {
   addInbound,
   addOutbound,
   addOutboundInTx,
+  findInboundByExternalId,
   listRecentOutbound,
   listRecentOutboundInTx,
 } from "./messages";
@@ -895,6 +896,110 @@ describe("messages.ts", () => {
       expect(serialized).not.toContain("0612345678");
       expect(serialized).not.toContain("numéro");
       expect(Object.keys(audit?.payload as object).sort()).toEqual(["direction", "messageId"]);
+    });
+  });
+
+  // ───────────────────────────────────────────────────────────────────────
+  // findInboundByExternalId (S9.1)
+  // ───────────────────────────────────────────────────────────────────────
+
+  describe("findInboundByExternalId (S9.1)", () => {
+    it("doublon webhook OVH → retourne le Message inbound existant", async () => {
+      await seedConversation("conv_dedup_1");
+      const messageId = await addInbound("conv_dedup_1", {
+        body: "Oui ça m'intéresse",
+        channel: "sms",
+        externalId: "ovh-webhook-dedup-001",
+        externalReceiver: "+33611112222",
+      });
+
+      const found = await findInboundByExternalId("conv_dedup_1", "ovh-webhook-dedup-001");
+      expect(found).not.toBeNull();
+      expect(found?.direction).toBe("inbound");
+      expect(found?.externalId).toBe("ovh-webhook-dedup-001");
+      expect(found?.body).toBe("Oui ça m'intéresse");
+      // Sanity : on a bien retrouvé le message qu'on a créé.
+      expect(messageId).toMatch(FIRESTORE_AUTO_ID_PATTERN);
+    });
+
+    it("aucun doublon → retourne null (PAS NotFoundError, sémantique lecture tolérante)", async () => {
+      await seedConversation("conv_dedup_2");
+      // Aucun message créé. La query doit retourner null sans throw.
+      const found = await findInboundByExternalId("conv_dedup_2", "ovh-webhook-never-seen");
+      expect(found).toBeNull();
+    });
+
+    it("EXCLUT les messages OUTBOUND (filtre direction == inbound)", async () => {
+      // Sentinelle anti-régression : si quelqu'un retire le filtre
+      // `.where("direction", "==", "inbound")`, un message outbound qui
+      // partagerait l'externalId (ex: ovhMessageId réutilisé) ferait
+      // matcher la query → faux positif dédup → SMS inbound jamais traité.
+      await seedConversation("conv_dedup_3");
+      // Seed un outbound DIRECT avec externalId = celui qu'on va chercher.
+      await seedMessage("conv_dedup_3", {
+        direction: "outbound",
+        externalId: "ovh-shared-id-001",
+        status: "sent",
+        body: "outbound msg",
+      });
+
+      const found = await findInboundByExternalId("conv_dedup_3", "ovh-shared-id-001");
+      expect(found).toBeNull();
+    });
+
+    it("EXCLUT les inbound d'autres conversations (scope sous-collection)", async () => {
+      // Sentinelle anti-régression : la query doit être scopée à la
+      // sous-collection de la conversation cible, pas un collectionGroup.
+      await seedConversation("conv_dedup_4a");
+      await seedConversation("conv_dedup_4b");
+
+      await addInbound("conv_dedup_4a", {
+        body: "msg dans 4a",
+        channel: "sms",
+        externalId: "ovh-cross-conv-001",
+        externalReceiver: "+33611112222",
+      });
+
+      // Recherche le même externalId mais dans la conversation 4b.
+      const found = await findInboundByExternalId("conv_dedup_4b", "ovh-cross-conv-001");
+      expect(found).toBeNull();
+    });
+
+    it("externalId vide → throw ValidationError AVANT query", async () => {
+      // Defense-in-depth : signal d'un bug d'orchestration côté caller.
+      // L'event Inngest valide déjà `min(1)` côté Zod, donc ce cas
+      // n'arrive jamais en flow normal — mais on ne fait pas confiance.
+      await expect(findInboundByExternalId("conv_x", "")).rejects.toBeInstanceOf(ValidationError);
+    });
+
+    it("conversation inexistante → null (lecture tolérante, PAS NotFoundError)", async () => {
+      // Cohérent avec `listRecentOutbound` (l.612-618 : "conversation
+      // absente → []"). La sémantique "y a-t-il un doublon ?" se traduit
+      // logiquement en "non" quand la conversation n'existe pas — c'est
+      // le caller process-reply qui décide quoi en faire en amont.
+      const found = await findInboundByExternalId("conv_ghost", "ovh-1");
+      expect(found).toBeNull();
+    });
+
+    it("doc trouvé mais corrompu → throw ValidationError au parse Zod", async () => {
+      // Écrit un doc partiel direct dans la sous-collection avec
+      // externalId qui matche la query. Doit fail au parse Zod (body
+      // manquant, status manquant, etc.).
+      await seedConversation("conv_dedup_corrupt");
+      await getAdminDb()
+        .collection(__MESSAGES_PARENT_COLLECTION_FOR_TESTS)
+        .doc("conv_dedup_corrupt")
+        .collection(__MESSAGES_SUBCOLLECTION_FOR_TESTS)
+        .add({
+          direction: "inbound",
+          externalId: "ovh-corrupt-001",
+          createdAt: Timestamp.now(),
+          // body / status / channel / generatedBy manquants → Zod fail.
+        });
+
+      await expect(
+        findInboundByExternalId("conv_dedup_corrupt", "ovh-corrupt-001"),
+      ).rejects.toBeInstanceOf(ValidationError);
     });
   });
 

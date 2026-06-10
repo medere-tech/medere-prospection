@@ -41,27 +41,67 @@ import { type Timestamp } from "firebase-admin/firestore";
  *        bodyLength, dryRun, creditsRemoved? }`. Tous scrubber-safe.
  *     Posé par `lib/inngest/functions/send-first-sms` (S8.4, voie
  *     minimaliste Voie 2 — cf. Notion INFRA-DETTE-001).
+ *
+ * Extensions S9.1 (pipeline process-reply) :
+ *   - `intent_classified` — décision du classifier Claude après chaque
+ *     `classifyReply` (S7a.2). Payload = `{ intent, confidence, fallback,
+ *      promptVersion, model }`. Tous scrubber-safe (intent ∈ enum fermé,
+ *     pas de reasoning ni de body).
+ *   - `reply_processed` — pipeline `process-reply` terminé avec branche
+ *     déterministe prise. Payload = `{ branch, conversationId,
+ *      messageId }`.
+ *   - `reply_dropped` — pipeline `process-reply` court-circuité (PS
+ *     inconnu, dédup webhook, body invalide). Payload = `{ reason,
+ *      ovhMessageIdHash? }`.
+ *
+ * ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ * ORGANISATION VISUELLE (S9.1) — sections par cycle de vie
+ *
+ * L'ordre des valeurs est SÉMANTIQUE (pas alphabétique). Si tu ajoutes
+ * une action, place-la dans la section adéquate :
+ *
+ *   - SMS OUTBOUND  : envoi côté nous (sortant)
+ *   - SMS INBOUND   : réception côté nous (entrant, process-reply S9)
+ *   - CONVERSATION  : cycle de vie d'une conversation (handoff, opt-out)
+ *   - CAMPAIGN/ADMIN: gestion campagnes + override manuels
+ *   - DATA          : import / suppression / anonymisation
+ *   - AUTH          : login / rôle
+ *   - TRANSVERSE    : compliance check, status changes
+ *
+ * Tout ajout DOIT être miroré dans `src/lib/firestore/audit-log.ts::ACTIONS`
+ * — sentinelle anti-drift dans `audit-log.test.ts` qui force l'égalité
+ * ensembliste entre ce type TS et la whitelist runtime.
  */
 export type AuditAction =
+  // ── SMS OUTBOUND ───────────────────────────────────────────────────────
   | "sms_sent"
-  | "sms_received"
   | "sms_failed"
   | "sms_provider_dispatched"
   | "send_blocked"
+  // ── SMS INBOUND (S9.1 — process-reply) ─────────────────────────────────
+  | "sms_received"
+  | "intent_classified"
+  | "reply_processed"
+  | "reply_dropped"
+  | "long_form_opt_out_candidate"
+  // ── CONVERSATION lifecycle ─────────────────────────────────────────────
   | "opt_out"
   | "handoff"
   | "handoff_accepted"
+  // ── CAMPAIGN / ADMIN ───────────────────────────────────────────────────
   | "manual_override"
   | "prompt_changed"
+  | "campaign_started"
+  | "campaign_paused"
+  // ── DATA ───────────────────────────────────────────────────────────────
   | "bloctel_imported"
   | "contact_deleted"
   | "contact_anonymized"
-  | "campaign_started"
-  | "campaign_paused"
+  // ── AUTH ───────────────────────────────────────────────────────────────
   | "login"
   | "role_changed"
+  // ── TRANSVERSE ─────────────────────────────────────────────────────────
   | "compliance_check"
-  | "long_form_opt_out_candidate"
   | "status_changed";
 
 export type AuditActorType = "system" | "ai" | "human";

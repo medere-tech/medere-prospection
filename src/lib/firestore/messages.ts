@@ -653,6 +653,133 @@ export async function listRecentOutbound(
 }
 
 /**
+ * Recherche un message INBOUND par son `externalId` (= `ovhMessageId` du
+ * webhook OVH) dans la sous-collection d'une conversation. Sert à la
+ * dédup webhook côté pipeline `process-reply` (S9.2).
+ *
+ * ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ * RAISON D'ÊTRE (S9.1 — pré-requis process-reply)
+ *
+ * OVH peut double-livrer un webhook inbound (retry après timeout réseau,
+ * incident provider, etc.). Sans dédup, le pipeline `process-reply`
+ * traiterait 2× le même SMS PS → 2 appels classifier Claude + 2 audits
+ * `reply_processed` + potentiellement 2 réponses générées au PS.
+ *
+ * `externalId` est posé comme idempotency key sur chaque doc message
+ * inbound par `addInbound` (cf. `AddInboundInput.externalId` REQUIS,
+ * l.237). Querier `direction == "inbound" AND externalId == X` permet
+ * de détecter le doublon AVANT `addInbound`.
+ *
+ * ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ * INDEX FIRESTORE COMPOSITE REQUIS (S9.1)
+ *
+ * La query combine 2 `where` égalité (`direction` + `externalId`) →
+ * Firestore exige un index composite. Déclaré dans
+ * `firestore.indexes.json` (S9.1) :
+ *
+ *   { "collectionGroup": "messages", "queryScope": "COLLECTION",
+ *     "fields": [
+ *       { "fieldPath": "direction", "order": "ASCENDING" },
+ *       { "fieldPath": "externalId", "order": "ASCENDING" }
+ *     ] }
+ *
+ * Sans déploiement de cet index, la query throw `FAILED_PRECONDITION` —
+ * cf. `docs/firestore-indexes.md` section "Index 2".
+ *
+ * ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ * SÉMANTIQUE Q2 brief Déthié S9.1 — retour `Message | null`
+ *
+ *   - Pas de doublon trouvé → `null`. Le caller process-reply peut
+ *     procéder à `addInbound` normalement.
+ *
+ *   - 1 doublon trouvé → retourne le `Message` complet. Le caller peut :
+ *     - audit `reply_dropped` avec `{reason: "dedup_webhook"}` (l'audit
+ *       NE doit PAS contenir le messageId du doublon — cf. anti-PII
+ *       audit_log invariant : pas d'identifiant Firestore semi-sensible
+ *       en clair sans nécessité).
+ *     - logger côté serveur pour forensic.
+ *
+ *   - Si 2+ docs match (cas anormal — webhook OVH livré 3+ fois ET
+ *     `addInbound` n'a pas verrouillé entre 2 retries), on retourne le
+ *     premier doc trouvé. Pas de défense-in-depth strict ici (≠
+ *     `getContactByPhone`) car la sémantique métier est "y a-t-il déjà
+ *     un doublon ?" → présence d'au moins 1 suffit pour court-circuiter.
+ *     L'invariant unicité externalId par conversation reste à surveiller
+ *     manuellement (pas business-critical au sens compliance — la dédup
+ *     fonctionne quand même).
+ *
+ * ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ * ⚠️ PII DOWNSTREAM — `body` brut dans le retour
+ *
+ * Le `Message` retourné contient **`body` brut** (PII potentielle —
+ * un PS peut écrire "Mon numéro perso est 06..." dans son SMS de
+ * réponse). Le caller `process-reply` (S9.2) est responsable de :
+ *
+ *   1. **NE JAMAIS logger `msg.body`** via Pino/Sentry/console. Le
+ *      logger Pino S1 a un filet de redaction multicouche mais on ne
+ *      compte PAS dessus en défense-en-profondeur.
+ *
+ *   2. **NE JAMAIS inclure `body` ni `messageId` ni `externalId` dans
+ *      le payload audit `reply_dropped`**. Seul `{ reason:
+ *      "dedup_webhook" }` est acceptable (le scrubber `detectPiiInPayload`
+ *      attraperait le body et throw `AuditPiiError` → tx rollback,
+ *      mais autant être explicite côté contrat). Pour forensic
+ *      dédup côté admin, utiliser `targetId = conversationId` (opaque,
+ *      pas PII par construction).
+ *
+ *   3. **NE JAMAIS renvoyer le Message côté client / webhook réponse**
+ *      sans filtrage explicite des champs sensibles.
+ *
+ * ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ * GESTION INPUT
+ *
+ * Conversation absente → `[]` au snap (cohérent avec `listRecentOutbound`,
+ * lecture tolérante) → fonction retourne `null`. PAS `NotFoundError` —
+ * c'est une recherche, pas une mutation.
+ *
+ * `externalId` vide → `ValidationError` (signal d'un bug d'orchestration
+ * côté caller — l'event Inngest `SmsReplyReceivedDataSchema` valide
+ * `ovhMessageId: z.string().min(1)` AVANT le handler, donc on n'arrive
+ * jamais ici avec vide en flow normal).
+ *
+ * Doc trouvé mais Zod fail → throw `ValidationError` au parse (filet en
+ * lecture identique aux autres `listX`).
+ *
+ * @param conversationId  docId composite `${contactId}_${campaignId}`.
+ * @param externalId      ID OVH du message inbound. NON vide.
+ *
+ * @returns Le `Message` trouvé, ou `null` si aucun match.
+ *
+ * @throws ValidationError  si `externalId` est vide ou si un doc trouvé
+ *                          est corrompu (Zod fail).
+ */
+export async function findInboundByExternalId(
+  conversationId: string,
+  externalId: string,
+): Promise<Message | null> {
+  if (externalId.length === 0) {
+    throw new ValidationError({
+      message: "findInboundByExternalId: externalId is empty",
+      context: { conversationId, op: "findInboundByExternalId" },
+    });
+  }
+
+  const snap = await messagesSubcollectionRef(conversationId)
+    .where("direction", "==", "inbound")
+    .where("externalId", "==", externalId)
+    .limit(1)
+    .get();
+
+  if (snap.empty) {
+    return null;
+  }
+
+  // limit(1) garantit snap.docs[0] défini ici.
+  const doc = snap.docs[0]!;
+  return parseMessageOrThrow(doc.data(), conversationId, doc.id);
+}
+
+/**
  * Version TRANSACTIONNELLE de `listRecentOutbound` (DEBT-001.2). Utilise
  * `tx.get(query)` au lieu de `.get()` direct → LOCK le READ SET dans la
  * transaction parente.

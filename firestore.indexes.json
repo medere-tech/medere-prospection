@@ -7,6 +7,14 @@
         { "fieldPath": "direction", "order": "ASCENDING" },
         { "fieldPath": "createdAt", "order": "DESCENDING" }
       ]
+    },
+    {
+      "collectionGroup": "messages",
+      "queryScope": "COLLECTION",
+      "fields": [
+        { "fieldPath": "direction", "order": "ASCENDING" },
+        { "fieldPath": "externalId", "order": "ASCENDING" }
+      ]
     }
   ],
   "fieldOverrides": []

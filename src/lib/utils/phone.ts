@@ -14,6 +14,43 @@ import { parsePhoneNumberFromString } from "libphonenumber-js/max";
 
 export type PhoneType = "mobile" | "landline" | "voip" | "unknown";
 
+/**
+ * Régex E.164 STRICTE alignée ITU-T E.164 (max 15 chiffres significatifs,
+ * indicatif pays démarrant par 1-9, jamais de leading zero après le `+`).
+ *
+ * 🔒 **Source de vérité unique** pour la validation FORMELLE (regex pure,
+ * O(1)) d'un téléphone E.164 dans l'app. Utilisée par :
+ *
+ *   - `src/lib/inngest/events.ts` (validation Zod du payload `phone` des
+ *     events Inngest — `SmsReplyReceivedDataSchema`).
+ *   - `src/lib/firestore/contacts.ts` (`getContactByPhone` — pre-flight
+ *     validation de l'input AVANT la query Firestore).
+ *
+ * **Divergence assumée vs `ContactPhoneSchema.e164`** (`contacts.ts:89`) qui
+ * accepte une régex PLUS LARGE `/^\+\d{10,15}$/` (autorise un leading zero
+ * comme `+0612345678`). C'est intentionnel :
+ *
+ *   - `ContactPhoneSchema` valide ce qui est RELU depuis Firestore (filet
+ *     en lecture, tolère les contacts historiques mal-formés sans casser
+ *     le doc parsing).
+ *   - `E164_REGEX` valide ce qui est ÉCRIT / QUERIÉ (filet en entrée,
+ *     refuse strict — pas de leading zero, format ITU-T canonique).
+ *
+ * Conséquence : un contact historique stocké avec leading zero (rare,
+ * jamais observé en prod MVP) pourrait être introuvable via
+ * `getContactByPhone`. Acceptable MVP — documenté dans la JSDoc
+ * `getContactByPhone`.
+ *
+ * **NE PAS** redéfinir cette régex en local ailleurs (drift silencieux
+ * = bug compliance). Importer depuis ce module. Verrouillé par tests
+ * sentinelles dans `phone.test.ts`.
+ *
+ * Pour une validation SÉMANTIQUE (numéro réellement valide par carrier
+ * pour son pays), utiliser `isValidE164` (qui s'appuie sur
+ * `libphonenumber-js`). `E164_REGEX` ne valide que la FORME.
+ */
+export const E164_REGEX: RegExp = /^\+[1-9]\d{6,14}$/;
+
 /** Pays par défaut quand le numéro est en format national (sans indicatif). */
 const DEFAULT_COUNTRY: CountryCode = "FR";
 

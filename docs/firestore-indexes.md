@@ -57,6 +57,44 @@ create it here: <lien Firebase Console>`.
 - Aligné avec la JSDoc de `listRecentOutbound` (`messages.ts:619-621`)
   qui documente explicitement l'index requis.
 
+### 2. `messages` — `direction` ASC + `externalId` ASC (scope COLLECTION)
+
+**Requêtes qui en dépendent** :
+
+- `findInboundByExternalId(conversationId, externalId)`
+  → `src/lib/firestore/messages.ts` (S9.1)
+
+**Caller indirect** : pipeline Inngest `process-reply` (S9.2) qui appelle
+`findInboundByExternalId` AVANT chaque `addInbound` pour détecter les
+doublons webhook OVH (dédup idempotence).
+
+**Pattern de la query** :
+
+```typescript
+messagesSubcollectionRef(conversationId)
+  .where("direction", "==", "inbound")
+  .where("externalId", "==", externalId)
+  .limit(1);
+```
+
+**Pourquoi cet index** : Firestore exige un index composite pour toute
+requête combinant 2 `where` d'égalité sur des champs différents
+(`direction == "inbound"` ET `externalId == X`). Sans cet index, la query
+throw `FAILED_PRECONDITION: The query requires an index`.
+
+**Pourquoi pas un index single-field sur `externalId` seul** : la
+sémantique de la dédup exige `direction == "inbound"` (un message
+outbound qui partagerait un `externalId` ne doit JAMAIS matcher — cf.
+test sentinelle `messages.test.ts` "EXCLUT les messages OUTBOUND"). Sans
+le filtre direction, on aurait un faux positif dédup.
+
+**Historique** :
+
+- Index ajouté en S9.1 (pré-requis pipeline process-reply S9.2).
+- Déploiement prévu APRÈS le merge S9.1 sur `main` via
+  `npm run firebase:deploy:indexes` — pas pendant la branche pour éviter
+  le drift avec d'autres branches en cours (DEBT-001-FOLLOWUP, etc.).
+
 ## Déploiement
 
 ### Première installation sur un projet Firebase neuf

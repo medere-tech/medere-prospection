@@ -90,6 +90,8 @@
 import { eventType } from "inngest";
 import { z } from "zod";
 
+import { E164_REGEX } from "@/lib/utils/phone";
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Constantes — bornes & noms
 // ─────────────────────────────────────────────────────────────────────────────
@@ -103,13 +105,14 @@ import { z } from "zod";
 const BODY_MAX_LENGTH = 1600;
 
 /**
- * Regex E.164 stricte (cf. `src/types/contact.ts` + `lib/twilio/lookup`).
+ * Regex E.164 stricte. Source de vérité unique : `@/lib/utils/phone::E164_REGEX`
+ * (S9.1 — refactor anti-drift). NE PAS redéfinir en local.
+ *
  * Format : `+` + chiffre 1-9 (pas de leading zero) + 6 à 14 chiffres
  * complémentaires (longueur totale 8 à 16 caractères).
  *
  * Exemple FR mobile : `+33775745453` (12 chars).
  */
-const E164_REGEX = /^\+[1-9]\d{6,14}$/;
 
 /** Nom de l'event "premier SMS demandé pour un contact". Stable. */
 const SMS_SEND_FIRST_REQUESTED = "medere/sms.send-first.requested";
