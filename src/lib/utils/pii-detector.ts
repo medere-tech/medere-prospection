@@ -253,8 +253,110 @@ export function detectPiiInPayload(payload: unknown): PiiViolation[] {
  *
  * Throw `ConfigError` (propagation depuis `getAuditEnv`) si le pepper
  * n'est pas configuré ou trop court.
+ *
+ * ⚠️ **PIÈGE — collision scrubber AuditLog (HIGH-1 S9.2.1)** :
+ *
+ *   La sortie hex pure 32 chars a ~0.3% de probabilité de contenir
+ *   une sous-séquence `0[1-9]\d{8}` matchant `RE_FR_NATIONAL` du
+ *   scrubber `detectPiiInPayload`. Exemple confirmé :
+ *     hashPii("+33600000103") = "0d2aad1497f4a9118e800a0869433987"
+ *                                                  ^^^^^^^^^^ ← match
+ *
+ *   Sur 26k contacts MVP, ~74 contacts génèrent un hash piégé. Si ce
+ *   hash atterrit dans un `payload` qui passe par `validateAndScrub`
+ *   (= toute écriture `appendAuditLog`/`appendAuditLogTx`), Zod fail
+ *   → `AuditPiiError` no-retry → audit perdu en silence.
+ *
+ *   **Pour tout usage dans un payload audit, utiliser `safePhoneHash()`
+ *   à la place** (préfixe `hph_` + chunking par `_` tous les 4 chars
+ *   → max 4 digits consécutifs → match impossible). Documentation :
+ *   voir HIGH-1 S9.2.1 + JSDoc `safePhoneHash` ci-dessous.
  */
 export function hashPii(value: string): string {
   const { AUDIT_PII_PEPPER } = getAuditEnv();
   return createHmac("sha256", AUDIT_PII_PEPPER).update(value, "utf8").digest("hex").slice(0, 32);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// safePhoneHash — wrapper anti-collision scrubber pour audit payload
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * 🔒 Marker préfixé identifiant sémantiquement un phone hash dans un
+ * dump forensic. Le préfixe SEUL ne suffit PAS à protéger du scrubber
+ * (cf. JSDoc `safePhoneHash`) — le chunking par `_` est l'invariant
+ * critique. Marker non-digit ASCII conservé pour traçabilité humaine.
+ */
+export const PHONE_HASH_PREFIX = "hph_";
+
+/**
+ * Taille des chunks hex pour le split `safePhoneHash`.
+ * 4 chars → max 4 digits consécutifs entre underscores → << 10 → la
+ * regex `RE_FR_NATIONAL` (10 digits) ne peut plus matcher.
+ */
+export const PHONE_HASH_CHUNK_SIZE = 4;
+
+/**
+ * Hash safe pour audit payload : préfixe `hph_` + chunking par `_`
+ * tous les 4 chars de l'output `hashPii`. Garantit < 10 digits
+ * consécutifs → scrubber `RE_FR_NATIONAL` impossible à matcher.
+ * L'underscore n'est PAS dans `STRIP_CHARS` du scrubber → le chunking
+ * survit au `replace(STRIP_CHARS, "")` interne de `scanString`.
+ *
+ * RAISON D'ÊTRE (security-reviewer HIGH-1 S9.2.1) — empirique :
+ *
+ *   - `hashPii()` retourne 32 chars hex purs (HMAC-SHA256 tronqué).
+ *   - ~0.3% des hashes contiennent `0[1-9]\d{8}` (10 digits consécutifs)
+ *     qui matche `RE_FR_NATIONAL = /(?<!\d)0[1-9]\d{8}(?!\d)/`.
+ *   - Exemple confirmé : `hashPii("+33600000103")` =
+ *     `0d2aad1497f4a9118e800a0869433987` → matche `0869433987`
+ *     (positions 22-31).
+ *   - Sur 26k contacts MVP : ~74 contacts génèrent un hash piégé.
+ *
+ * IMPACT SANS FIX :
+ *
+ *   - `detectPiiInPayload({phoneHash: "0d2...0869433987"})` retourne
+ *     une violation `phone_fr_national`.
+ *   - `appendAuditLog` throw `AuditPiiError` (no-retry) → event perdu
+ *     en silence, AUCUN audit posé.
+ *
+ * POURQUOI LE SEUL PRÉFIXE NE SUFFIT PAS :
+ *
+ * Un préfixe casserait la frontière `(?<!\d)` UNIQUEMENT si le pattern
+ * `0[1-9]\d{8}` était en DÉBUT du hash. Si la sous-séquence problématique
+ * est au milieu ou en fin du hex (ex: `...a0869433987`), le caractère
+ * non-digit qui précède (`a` ici) satisfait déjà `(?<!\d)`. Le préfixe
+ * `hph_` ne change rien — la regex matche toujours sur la portion
+ * interne. Le chunking est l'invariant qui protège.
+ *
+ * PROPRIÉTÉS PRÉSERVÉES :
+ *
+ *   - **Déterministe** : même input → même output (HMAC déterministe +
+ *     chunking déterministe).
+ *   - **Reversible côté admin** : strip `_` après le préfixe → hash hex
+ *     32 chars d'origine, corrélable forensic.
+ *
+ * @param phone  téléphone E.164 ou autre identifiant à hasher.
+ * @param hashFn implémentation du hash sous-jacent. Injectable pour
+ *               tests d'isolation ; par défaut `hashPii` (production).
+ *               **Contrat** : toute implémentation passée DOIT produire
+ *               un output sans `+` interne (sinon `RE_E164` peut matcher
+ *               malgré le chunking) ; pour `hashPii` (hex pur) c'est
+ *               trivialement vrai. Le chunking par 4 chars suffit déjà
+ *               à neutraliser `RE_FR_NATIONAL` (10 digits requis > 4).
+ * @returns      `"hph_XXXX_XXXX_..._XXXX"` (typ. 8 chunks de 4 = 36 chars).
+ *
+ * @example
+ *   safePhoneHash("+33600000103") →
+ *   "hph_0d2a_ad14_97f4_a911_8e80_0a08_6943_3987"
+ */
+export function safePhoneHash(phone: string, hashFn: typeof hashPii = hashPii): string {
+  const hex = hashFn(phone);
+  // Regex `.{1,N}` capture des groupes de 1 à N chars (le dernier peut
+  // être < N si la longueur n'est pas multiple). `hashPii` retourne
+  // toujours 32 chars (8×4 exact), mais le pattern défensif gère un
+  // éventuel changement de taille en aval.
+  const chunkRegex = new RegExp(`.{1,${PHONE_HASH_CHUNK_SIZE}}`, "g");
+  const chunks = hex.match(chunkRegex) ?? [hex];
+  return PHONE_HASH_PREFIX + chunks.join("_");
 }

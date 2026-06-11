@@ -95,6 +95,46 @@ le filtre direction, on aurait un faux positif dédup.
   `npm run firebase:deploy:indexes` — pas pendant la branche pour éviter
   le drift avec d'autres branches en cours (DEBT-001-FOLLOWUP, etc.).
 
+### 3. `conversations` — `contactId` ASC + `status` ASC (scope COLLECTION)
+
+**Requêtes qui en dépendent** :
+
+- `getActiveConversationByContactId(contactId)`
+  → `src/lib/firestore/conversations.ts` (S9.2.1)
+
+**Caller indirect** : pipeline Inngest `process-reply` (S9.2.x) — step 2
+`resolve-conversation` qui résout `contactId → conversationId` à partir
+de l'event inbound (qui ne contient pas la `campaignId`).
+
+**Pattern de la query** :
+
+```typescript
+getAdminDb()
+  .collection("conversations")
+  .where("contactId", "==", contactId)
+  .where("status", "in", ["active", "awaiting_reply", "in_dialogue", "qualified"])
+  .limit(2);
+```
+
+**Pourquoi cet index** : Firestore exige un index composite pour une
+requête combinant une `where` d'égalité (`contactId`) ET un `where IN`
+sur un autre champ (`status`). Sans cet index, la query throw
+`FAILED_PRECONDITION`.
+
+**Pourquoi pas un index single-field sur `contactId` seul** : le filtre
+sur `status` est essentiel pour la sémantique du resolve — on cherche
+UNIQUEMENT les conversations actives (cf. Q1 brief Déthié S9.2.0). Sans
+ce filtre, on récupérerait aussi des conversations `closed`,
+`opted_out`, `handed_off`, `blocked` qui ne doivent pas re-rentrer dans
+le pipeline IA.
+
+**Historique** :
+
+- Index ajouté en S9.2.1 (pré-requis step 2 du pipeline process-reply).
+- Déploiement prévu APRÈS le merge S9.2 sur `main` via
+  `npm run firebase:deploy:indexes` — politique cohérente avec Index 2
+  (éviter le drift cross-branch durant le sprint).
+
 ## Déploiement
 
 ### Première installation sur un projet Firebase neuf

@@ -4,7 +4,14 @@ import { __resetEnvCacheForTests } from "@/lib/security/env";
 import { ConfigError } from "@/lib/utils/errors";
 import { logger } from "@/lib/utils/logger";
 
-import { detectPiiInPayload, hashPii, PII_WALK_MAX_DEPTH, type PiiViolation } from "./pii-detector";
+import {
+  detectPiiInPayload,
+  hashPii,
+  PHONE_HASH_PREFIX,
+  PII_WALK_MAX_DEPTH,
+  type PiiViolation,
+  safePhoneHash,
+} from "./pii-detector";
 
 const VALID_PEPPER = "a".repeat(64); // 32 bytes hex, simule openssl rand -hex 32
 
@@ -194,6 +201,81 @@ describe("detectPiiInPayload — faux positifs BUG-003 exclus", () => {
     const v = detectPiiInPayload({ url: "https://medere.fr/api/v1" });
     expect(v).toEqual([]);
   });
+
+  // ───────────────────────────────────────────────────────────────────────
+  // 🔒 Sentinelle HIGH-1 S9.2.1 — collision scrubber sur hash HMAC hex pur
+  // ───────────────────────────────────────────────────────────────────────
+
+  it("MATCHE un hash HMAC hex pur pathologique (cas réel +33600000103 → 0d2aad...0869433987)", () => {
+    // Documente l'INVARIANT du scrubber : `RE_FR_NATIONAL` matche bien
+    // toute sous-séquence `0[1-9]\d{8}` avec frontières anti-digit
+    // satisfaites par les bornes de la string. Un hash HMAC-SHA256 hex
+    // pur (32 chars) a ~0.3% de probabilité de contenir une telle
+    // sous-séquence.
+    //
+    // Exemple confirmé par security-reviewer S9.2.1 :
+    //   hashPii("+33600000103") = "0d2aad1497f4a9118e800a0869433987"
+    //   → match RE_FR_NATIONAL sur "0869433987" (positions 22-31).
+    //
+    // Ce test n'est PAS une régression à corriger côté scrubber — c'est
+    // un INVARIANT du scrubber qui est correct (la regex doit matcher
+    // tout 0[1-9]\d{8} dans les frontières, sinon trou PII).
+    //
+    // La protection se fait CÔTÉ CALLER : préfixer le hash avec un
+    // marker non-digit (cf. test suivant) — pattern process-reply.ts
+    // `PHONE_HASH_PREFIX = "hph_"`.
+    const v = detectPiiInPayload({ phoneHash: "0d2aad1497f4a9118e800a0869433987" });
+    expect(v.length).toBeGreaterThan(0);
+    expect(v.some((violation) => violation.kind === "phone_fr_national")).toBe(true);
+  });
+
+  it("ne MATCHE PAS le hash si préfixé `hph_` + chunké tous les 4 chars (fix HIGH-1)", () => {
+    // 🔒 Sentinelle anti-régression : le préfixe `hph_` SEUL ne suffit
+    // PAS (la frontière `(?<!\d)` est satisfaite par le caractère
+    // non-digit qui précède la sous-séquence problématique DANS le
+    // hash). Le chunking par underscore tous les 4 chars garantit
+    // qu'AUCUNE sous-séquence de 10 digits consécutifs ne peut exister
+    // dans la string finale.
+    //
+    // Le hash pathologique connu (security-reviewer S9.2.1) :
+    //   hashPii("+33600000103") = "0d2aad1497f4a9118e800a0869433987"
+    //   match RE_FR_NATIONAL sur "0869433987" en STANDALONE.
+    //   Format process-reply.ts safePhoneHash() :
+    //   "hph_0d2a_ad14_97f4_a911_8e80_0a08_6943_3987"
+    //   → max 4 digits consécutifs → 0 match.
+    const v = detectPiiInPayload({
+      phoneHash: "hph_0d2a_ad14_97f4_a911_8e80_0a08_6943_3987",
+    });
+    expect(v).toEqual([]);
+  });
+
+  it("ne MATCHE PAS un panel de hashes pathologiques en format chunké safePhoneHash", () => {
+    // Sentinelle élargie : plusieurs hashes contenant des sous-séquences
+    // PII en format hex pur. Même format chunké → 0 match garanti.
+    const pathologicalHashesChunked = [
+      // 0123456789abcdef0123456789abcdef → chunké
+      "hph_0123_4567_89ab_cdef_0123_4567_89ab_cdef",
+      // deadbeef0612345678abcdefabcdefab → chunké (contient 0612345678)
+      "hph_dead_beef_0612_3456_78ab_cdef_abcd_efab",
+      // fedcba9876543210e29b41d4a7160000 → chunké
+      "hph_fedc_ba98_7654_3210_e29b_41d4_a716_0000",
+    ];
+    for (const phoneHash of pathologicalHashesChunked) {
+      const v = detectPiiInPayload({ phoneHash });
+      expect(v).toEqual([]);
+    }
+  });
+
+  it("DÉMONTRE que le préfixe SEUL (sans chunking) ne suffit PAS — anti-régression du fix", () => {
+    // 🔒 Sentinelle qui prouve POURQUOI le chunking est nécessaire.
+    // Si quelqu'un retire le chunking dans process-reply.ts en pensant
+    // que le préfixe `hph_` suffit, ce test démontre l'erreur.
+    const v = detectPiiInPayload({
+      phoneHash: "hph_0d2aad1497f4a9118e800a0869433987", // préfixe seul, hex pur
+    });
+    expect(v.length).toBeGreaterThan(0);
+    expect(v.some((violation) => violation.kind === "phone_fr_national")).toBe(true);
+  });
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -365,5 +447,76 @@ describe("hashPii — HMAC-SHA256 avec pepper", () => {
       kind: "phone_e164",
       sample: expect.any(String),
     });
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// safePhoneHash — wrapper anti-collision scrubber (HIGH-1 S9.2.1)
+// ─────────────────────────────────────────────────────────────────────────────
+
+describe("safePhoneHash — wrapper anti-collision scrubber (HIGH-1 S9.2.1)", () => {
+  it("retourne le format 'hph_XXXX_XXXX_..._XXXX' (préfixe + 8 chunks de 4)", () => {
+    // hashPii retourne 32 chars hex → 8 chunks de 4 exact.
+    const out = safePhoneHash("+33612345678");
+    expect(out.startsWith(PHONE_HASH_PREFIX)).toBe(true);
+    // Forme totale : "hph_" (4) + 8 chunks (4 chars chacun) + 7 underscores
+    // séparateurs = 4 + 32 + 7 = 43 chars.
+    expect(out).toHaveLength(43);
+    // Structure exacte : préfixe + 8 groupes hex de 4 chars séparés par _.
+    expect(out).toMatch(/^hph_[0-9a-f]{4}(?:_[0-9a-f]{4}){7}$/);
+  });
+
+  it("🔒 ne match JAMAIS le scrubber RE_FR_NATIONAL — sentinelle anti-régression renforcée", () => {
+    // Si on retirait le chunking (= revenir à `hph_` + hex pur), ~0.3%
+    // des phones matcheraient. On stresse avec un panel large pour
+    // pousser la proba de collision quasi à 1 si le fix est cassé.
+    const phones = [
+      "+33600000103", // cas pathologique connu : hash = 0d2a...0869433987
+      "+33612345678",
+      "+33712345678",
+      "+33611112222",
+      "+33687654321",
+      "+33700000000",
+      "+33611223344",
+      "+33655667788",
+      "+33644556677",
+      "+33622334455",
+      "+33788990011",
+      "+33766554433",
+    ];
+    for (const phone of phones) {
+      const hashed = safePhoneHash(phone);
+      // Passe au scrubber complet (= validateAndScrub côté audit log).
+      const violations = detectPiiInPayload({ phoneHash: hashed });
+      expect(violations).toEqual([]);
+    }
+  });
+
+  it("déterministe : même input → même output (HMAC + chunking préservent l'invariant)", () => {
+    const a = safePhoneHash("+33612345678");
+    const b = safePhoneHash("+33612345678");
+    expect(a).toBe(b);
+  });
+
+  it("diffère de hashPii brut (préfixe + chunking appliqués)", () => {
+    const phone = "+33612345678";
+    const raw = hashPii(phone);
+    const safe = safePhoneHash(phone);
+    expect(safe).not.toBe(raw);
+    // Le hash brut DOIT être contenu dans la version safe (après strip
+    // des underscores) — sinon le chunking est cassé. Sentinelle de
+    // round-trip forensic : on peut retrouver le hash brut depuis le
+    // safe en strippant `hph_` + tous les `_`.
+    const reconstructed = safe.slice(PHONE_HASH_PREFIX.length).replace(/_/g, "");
+    expect(reconstructed).toBe(raw);
+  });
+
+  it("hashFn injectable pour test isolation (skip getAuditEnv pepper)", () => {
+    // Permet aux callers de tester safePhoneHash sans avoir besoin du
+    // pepper réel (cf. pattern deps process-reply.ts).
+    const fakeHash = (v: string) => v.padEnd(32, "x").slice(0, 32);
+    const out = safePhoneHash("+33612345678", fakeHash);
+    // L'input padé est "+33612345678xxxxxxxxxxxxxxxxxxxx" (32 chars).
+    expect(out).toBe("hph_+336_1234_5678_xxxx_xxxx_xxxx_xxxx_xxxx");
   });
 });

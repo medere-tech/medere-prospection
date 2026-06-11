@@ -53,8 +53,8 @@ import { z } from "zod";
 
 import { getAdminDb } from "@/lib/firestore/admin";
 import { appendAuditLogTx } from "@/lib/firestore/audit-log";
-import { ConflictError, NotFoundError, ValidationError } from "@/lib/utils/errors";
-import type { Conversation } from "@/types/conversation";
+import { ConflictError, InternalError, NotFoundError, ValidationError } from "@/lib/utils/errors";
+import type { Conversation, ConversationStatus } from "@/types/conversation";
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Constantes & helper public
@@ -63,6 +63,41 @@ import type { Conversation } from "@/types/conversation";
 const CONVERSATIONS_COLLECTION = "conversations";
 
 const HANDOFF_NOTES_MIN_LENGTH = 10;
+
+/**
+ * 🔒 SENTINELLE S9.2.1 (Q1 brief Déthié) — set des `status` considérés
+ * "actifs" pour `getActiveConversationByContactId`.
+ *
+ * Inclusion / exclusion documentée :
+ *
+ *   - `active`          : conv créée, 1er SMS pas encore envoyé. INCLUS
+ *                         pour fermer la race condition "inbound arrive
+ *                         AVANT que send-first-sms ait mis à jour le
+ *                         status à awaiting_reply" (Q1 décision Déthié).
+ *   - `awaiting_reply`  : cas nominal — 1er SMS envoyé, on attend.
+ *   - `in_dialogue`     : échange IA en cours, peut recevoir n-ième msg.
+ *   - `qualified`       : intent positif détecté, hand-off prochain.
+ *
+ * Exclus :
+ *
+ *   - `handed_off`      : déjà chez commercial humain. Un follow-up PS
+ *                         doit alerter le commercial via Slack S9.4+,
+ *                         pas re-rentrer dans le pipeline IA.
+ *   - `closed`          : conversation terminée.
+ *   - `opted_out`       : STOP déjà reçu. Un re-STOP serait idempotent
+ *                         côté markOptedOut mais déjà filtré ici.
+ *   - `blocked`         : bloquée par compliance.
+ *
+ * Modifier ce set nécessite arbitrage Déthié + re-validation
+ * compliance-auditor (impact direct sur quelles conversations reçoivent
+ * un traitement automatique vs sont droppées).
+ */
+const ACTIVE_CONVERSATION_STATUSES: readonly ConversationStatus[] = [
+  "active",
+  "awaiting_reply",
+  "in_dialogue",
+  "qualified",
+];
 
 /**
  * Construit le docId Firestore d'une conversation : `${contactId}_${campaignId}`
@@ -255,6 +290,122 @@ export async function getConversation(conversationId: string): Promise<Conversat
 }
 
 /**
+ * Résout `contactId → conversation active` pour le pipeline `process-reply`
+ * (S9.2).
+ *
+ * ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ * RAISON D'ÊTRE (S9.2.1 — process-reply)
+ *
+ * Le webhook OVH (futur S9.6) livre l'inbound avec `{phone, body,
+ * ovhMessageId}` sans `campaignId` ni `conversationId`. Après résolution
+ * `phone → contactId` (S9.1 `getContactByPhone`), il reste à trouver la
+ * conversation ACTIVE de ce contact (status dans
+ * `ACTIVE_CONVERSATION_STATUSES`).
+ *
+ * ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ * INVARIANT UNICITÉ — defense-in-depth (Q1 brief Déthié S9.2.0)
+ *
+ * Invariant business : 1 contact = max 1 conversation ACTIVE à un instant
+ * donné (un contact ne participe qu'à 1 campagne à la fois en MVP, et le
+ * docId composite `${contactId}_${campaignId}` empêche la dup naïve dans
+ * une même campagne).
+ *
+ * Si la query retourne :
+ *
+ *   - 0 doc → `null`. Caller (process-reply) drop avec audit
+ *     `reply_dropped` `{reason: "no_active_conversation"}` (Q3 brief
+ *     Déthié S9.2.0). Cohérent avec `getContactByPhone` qui retourne
+ *     `null` pour absence légitime.
+ *
+ *   - 1 doc → cas nominal. Retour `{ conversationId, conversation }`.
+ *
+ *   - >1 doc → throw `InternalError` (`isOperational: false`). Drift
+ *     d'invariant = bug d'orchestration campagne OU corruption. Le
+ *     pipeline doit arrêter et alerter — pas continuer avec un choix
+ *     arbitraire qui enverrait la réponse dans la mauvaise conv.
+ *     Pattern identique à `getContactByPhone` (S9.1).
+ *
+ * ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ * INDEX FIRESTORE COMPOSITE REQUIS (S9.2.1)
+ *
+ * La query combine 1 `where` égalité + 1 `where` IN → Firestore exige
+ * un index composite. Déclaré dans `firestore.indexes.json` (S9.2.1) :
+ *
+ *   { "collectionGroup": "conversations", "queryScope": "COLLECTION",
+ *     "fields": [
+ *       { "fieldPath": "contactId", "order": "ASCENDING" },
+ *       { "fieldPath": "status", "order": "ASCENDING" }
+ *     ] }
+ *
+ * Sans déploiement de cet index, la query throw `FAILED_PRECONDITION`.
+ * Cf. `docs/firestore-indexes.md` section "Index 3".
+ *
+ * ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ * ⚠️ PII DOWNSTREAM — responsabilité du caller
+ *
+ * Le retour `{ conversationId, conversation }` ne contient pas de PII
+ * directe (pas de phone, pas de email). Mais :
+ *
+ *   - `conversationId = ${contactId}_${campaignId}` est un identifiant
+ *     traçable. Acceptable en logs/audits par construction (scrubber-safe).
+ *
+ *   - `conversation.summary` peut contenir des éléments quasi-identifiants
+ *     (mention de cabinet, ville) si l'IA en a inséré. Le caller NE doit
+ *     PAS logger ni inclure `conversation.summary` dans un audit sans
+ *     re-validation prompt-engineer (le prompt actuel l'interdit, mais
+ *     defense-in-depth).
+ *
+ *   - `conversation.handoff.notes` peut contenir des notes commerciales
+ *     avec PII. Idem, NE PAS logger.
+ *
+ * @param contactId  ID Firestore du contact (= hubspotId, S6.3). NON vide.
+ *
+ * @returns `{ conversationId, conversation }` si trouvée, sinon `null`.
+ *
+ * @throws ValidationError  si `contactId` est vide.
+ * @throws InternalError    si >1 conv active trouvée (invariant cassé).
+ * @throws ValidationError  si un doc trouvé est corrompu (Zod fail).
+ */
+export async function getActiveConversationByContactId(
+  contactId: string,
+): Promise<{ conversationId: string; conversation: Conversation } | null> {
+  if (contactId.length === 0) {
+    throw new ValidationError({
+      message: "getActiveConversationByContactId: contactId is empty",
+      context: { op: "getActiveConversationByContactId", inputLength: 0 },
+    });
+  }
+
+  const snap = await getAdminDb()
+    .collection(CONVERSATIONS_COLLECTION)
+    .where("contactId", "==", contactId)
+    .where("status", "in", ACTIVE_CONVERSATION_STATUSES)
+    .limit(2) // limit(2) suffit pour détecter le drift invariant — économie I/O
+    .get();
+
+  if (snap.empty) {
+    return null;
+  }
+
+  if (snap.size > 1) {
+    throw new InternalError({
+      message:
+        "getActiveConversationByContactId: invariant violation — multiple active conversations for same contact",
+      context: {
+        op: "getActiveConversationByContactId",
+        contactId,
+        count: snap.size,
+      },
+    });
+  }
+
+  // snap.size === 1 — cas nominal.
+  const doc = snap.docs[0]!;
+  const conversation = parseConversationOrThrow(doc.data(), doc.id);
+  return { conversationId: doc.id, conversation };
+}
+
+/**
  * Incrémente atomiquement les compteurs de messages d'une conversation et
  * pose les timestamps de cadence pour `lib/compliance/rate-limits` et
  * `lib/compliance/hours`.
@@ -397,3 +548,6 @@ export const __CONVERSATIONS_COLLECTION_FOR_TESTS = CONVERSATIONS_COLLECTION;
 
 /** @internal */
 export const __HANDOFF_NOTES_MIN_LENGTH_FOR_TESTS = HANDOFF_NOTES_MIN_LENGTH;
+
+/** @internal */
+export const __ACTIVE_CONVERSATION_STATUSES_FOR_TESTS = ACTIVE_CONVERSATION_STATUSES;

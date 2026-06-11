@@ -687,17 +687,23 @@ export async function listRecentOutbound(
  * cf. `docs/firestore-indexes.md` section "Index 2".
  *
  * ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
- * SÉMANTIQUE Q2 brief Déthié S9.1 — retour `Message | null`
+ * SÉMANTIQUE Q2 brief Déthié S9.1 + S9.2.1 — retour `{messageId, message} | null`
  *
  *   - Pas de doublon trouvé → `null`. Le caller process-reply peut
  *     procéder à `addInbound` normalement.
  *
- *   - 1 doublon trouvé → retourne le `Message` complet. Le caller peut :
- *     - audit `reply_dropped` avec `{reason: "dedup_webhook"}` (l'audit
- *       NE doit PAS contenir le messageId du doublon — cf. anti-PII
- *       audit_log invariant : pas d'identifiant Firestore semi-sensible
- *       en clair sans nécessité).
- *     - logger côté serveur pour forensic.
+ *   - 1 doublon trouvé → retourne `{ messageId, message }` où :
+ *     - `messageId` = docId Firestore du doublon (`[A-Za-z0-9]{20}`,
+ *       scrubber-safe par construction). Sert au caller pour poser un
+ *       audit `reply_dropped` `duplicate` avec `duplicateOfMessageId`
+ *       en payload — forensic trace de quel doublon a été détecté.
+ *     - `message` = doc Firestore parsé via Zod (body + direction +
+ *       externalId + ... — voir invariants l.55-75 sur le body brut).
+ *
+ *   ⚠️ Changement S9.2.1 vs S9.1 initial : retour enrichi de `Message |
+ *   null` vers `{messageId, message} | null`. Le `messageId` n'est PAS
+ *   PII (Firestore auto-ID), peut être inclus dans payload audit sans
+ *   risque scrubber.
  *
  *   - Si 2+ docs match (cas anormal — webhook OVH livré 3+ fois ET
  *     `addInbound` n'a pas verrouillé entre 2 retries), on retourne le
@@ -748,7 +754,8 @@ export async function listRecentOutbound(
  * @param conversationId  docId composite `${contactId}_${campaignId}`.
  * @param externalId      ID OVH du message inbound. NON vide.
  *
- * @returns Le `Message` trouvé, ou `null` si aucun match.
+ * @returns `{ messageId, message }` du doublon trouvé, ou `null` si aucun
+ *          match. `messageId` est le docId Firestore (scrubber-safe).
  *
  * @throws ValidationError  si `externalId` est vide ou si un doc trouvé
  *                          est corrompu (Zod fail).
@@ -756,7 +763,7 @@ export async function listRecentOutbound(
 export async function findInboundByExternalId(
   conversationId: string,
   externalId: string,
-): Promise<Message | null> {
+): Promise<{ messageId: string; message: Message } | null> {
   if (externalId.length === 0) {
     throw new ValidationError({
       message: "findInboundByExternalId: externalId is empty",
@@ -776,7 +783,8 @@ export async function findInboundByExternalId(
 
   // limit(1) garantit snap.docs[0] défini ici.
   const doc = snap.docs[0]!;
-  return parseMessageOrThrow(doc.data(), conversationId, doc.id);
+  const message = parseMessageOrThrow(doc.data(), conversationId, doc.id);
+  return { messageId: doc.id, message };
 }
 
 /**

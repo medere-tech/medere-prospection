@@ -15,7 +15,13 @@ import { Timestamp } from "firebase-admin/firestore";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { __resetEnvCacheForTests } from "@/lib/security/env";
-import { AuditPiiError, ConflictError, NotFoundError, ValidationError } from "@/lib/utils/errors";
+import {
+  AuditPiiError,
+  ConflictError,
+  InternalError,
+  NotFoundError,
+  ValidationError,
+} from "@/lib/utils/errors";
 import type { Conversation } from "@/types/conversation";
 
 import {
@@ -27,9 +33,11 @@ import {
 import * as auditLogModule from "./audit-log";
 import { __AUDIT_COLLECTION_FOR_TESTS } from "./audit-log";
 import {
+  __ACTIVE_CONVERSATION_STATUSES_FOR_TESTS,
   __CONVERSATIONS_COLLECTION_FOR_TESTS,
   __HANDOFF_NOTES_MIN_LENGTH_FOR_TESTS,
   conversationDocId,
+  getActiveConversationByContactId,
   getConversation,
   incrementMessageCount,
   setHandoff,
@@ -157,6 +165,176 @@ describe("conversations.ts", () => {
         };
         expect(ctx.conversationId).toBe("conv_X");
       }
+    });
+  });
+
+  // ───────────────────────────────────────────────────────────────────────
+  // getActiveConversationByContactId (S9.2.1)
+  // ───────────────────────────────────────────────────────────────────────
+
+  describe("getActiveConversationByContactId (S9.2.1)", () => {
+    it("SENTINELLE — ACTIVE_CONVERSATION_STATUSES verrouillé à [active, awaiting_reply, in_dialogue, qualified]", () => {
+      // 🔒 Q1 brief Déthié S9.2.0 : modifier ce set = arbitrage compliance
+      // direct (quelles convs reçoivent un traitement IA vs sont droppées).
+      // Le test casse si quelqu'un retire `active` (race condition
+      // send-first-sms → inbound rapide redeviendrait possible).
+      expect([...__ACTIVE_CONVERSATION_STATUSES_FOR_TESTS].sort()).toEqual([
+        "active",
+        "awaiting_reply",
+        "in_dialogue",
+        "qualified",
+      ]);
+    });
+
+    it("happy path : 1 conv `awaiting_reply` → retourne { conversationId, conversation }", async () => {
+      const convId = conversationDocId("contact_active_1", "camp_a");
+      await seedConversation(convId, {
+        contactId: "contact_active_1",
+        campaignId: "camp_a",
+        status: "awaiting_reply",
+      });
+      const got = await getActiveConversationByContactId("contact_active_1");
+      expect(got).not.toBeNull();
+      expect(got?.conversationId).toBe(convId);
+      expect(got?.conversation.status).toBe("awaiting_reply");
+      expect(got?.conversation.contactId).toBe("contact_active_1");
+    });
+
+    it("conv `active` (1er SMS pas encore envoyé) → trouvée aussi (anti-race Q1)", async () => {
+      // Sentinelle race condition : un inbound qui arriverait JUSTE après
+      // que send-first-sms ait envoyé le SMS mais AVANT que le status
+      // ait été mis à jour à awaiting_reply doit quand même trouver la conv.
+      const convId = conversationDocId("contact_active_2", "camp_b");
+      await seedConversation(convId, {
+        contactId: "contact_active_2",
+        campaignId: "camp_b",
+        status: "active",
+      });
+      const got = await getActiveConversationByContactId("contact_active_2");
+      expect(got?.conversation.status).toBe("active");
+    });
+
+    it("conv `in_dialogue` → trouvée (cas n-ième message PS)", async () => {
+      await seedConversation(conversationDocId("contact_active_3", "camp_c"), {
+        contactId: "contact_active_3",
+        campaignId: "camp_c",
+        status: "in_dialogue",
+      });
+      const got = await getActiveConversationByContactId("contact_active_3");
+      expect(got?.conversation.status).toBe("in_dialogue");
+    });
+
+    it("conv `qualified` → trouvée (avant transition handoff)", async () => {
+      await seedConversation(conversationDocId("contact_active_4", "camp_d"), {
+        contactId: "contact_active_4",
+        campaignId: "camp_d",
+        status: "qualified",
+      });
+      const got = await getActiveConversationByContactId("contact_active_4");
+      expect(got?.conversation.status).toBe("qualified");
+    });
+
+    it("conv `closed` → null (PAS active, exclue)", async () => {
+      await seedConversation(conversationDocId("contact_inactive_1", "camp_e"), {
+        contactId: "contact_inactive_1",
+        campaignId: "camp_e",
+        status: "closed",
+      });
+      const got = await getActiveConversationByContactId("contact_inactive_1");
+      expect(got).toBeNull();
+    });
+
+    it("conv `opted_out` → null (exclue, anti-re-process opt-out)", async () => {
+      await seedConversation(conversationDocId("contact_inactive_2", "camp_f"), {
+        contactId: "contact_inactive_2",
+        campaignId: "camp_f",
+        status: "opted_out",
+      });
+      const got = await getActiveConversationByContactId("contact_inactive_2");
+      expect(got).toBeNull();
+    });
+
+    it("conv `handed_off` → null (sous responsabilité commercial humain)", async () => {
+      await seedConversation(conversationDocId("contact_inactive_3", "camp_g"), {
+        contactId: "contact_inactive_3",
+        campaignId: "camp_g",
+        status: "handed_off",
+      });
+      const got = await getActiveConversationByContactId("contact_inactive_3");
+      expect(got).toBeNull();
+    });
+
+    it("conv `blocked` → null (filtrée par compliance)", async () => {
+      await seedConversation(conversationDocId("contact_inactive_4", "camp_h"), {
+        contactId: "contact_inactive_4",
+        campaignId: "camp_h",
+        status: "blocked",
+      });
+      const got = await getActiveConversationByContactId("contact_inactive_4");
+      expect(got).toBeNull();
+    });
+
+    it("aucune conv pour ce contact → null", async () => {
+      const got = await getActiveConversationByContactId("contact_nonexistent");
+      expect(got).toBeNull();
+    });
+
+    it("contactId vide → throw ValidationError sans PII (inputLength only)", async () => {
+      try {
+        await getActiveConversationByContactId("");
+        expect.fail("should have thrown");
+      } catch (e) {
+        expect(e).toBeInstanceOf(ValidationError);
+        const ctx = (e as ValidationError).context as { op: string; inputLength: number };
+        expect(ctx.op).toBe("getActiveConversationByContactId");
+        expect(ctx.inputLength).toBe(0);
+      }
+    });
+
+    it("invariant cassé (>1 conv active même contact) → throw InternalError", async () => {
+      // Drift d'invariant business : un contact qui se retrouve dans
+      // 2 conversations actives simultanément (bug d'orchestration
+      // campagne). Le pipeline DOIT arrêter — pas choisir arbitrairement.
+      await seedConversation(conversationDocId("contact_dup", "camp_p"), {
+        contactId: "contact_dup",
+        campaignId: "camp_p",
+        status: "awaiting_reply",
+      });
+      await seedConversation(conversationDocId("contact_dup", "camp_q"), {
+        contactId: "contact_dup",
+        campaignId: "camp_q",
+        status: "in_dialogue",
+      });
+
+      try {
+        await getActiveConversationByContactId("contact_dup");
+        expect.fail("should have thrown InternalError");
+      } catch (e) {
+        expect(e).toBeInstanceOf(InternalError);
+        const ctx = (e as InternalError).context as {
+          op: string;
+          contactId: string;
+          count: number;
+        };
+        expect(ctx.op).toBe("getActiveConversationByContactId");
+        expect(ctx.contactId).toBe("contact_dup");
+        expect(ctx.count).toBeGreaterThanOrEqual(2);
+      }
+    });
+
+    it("doc trouvé mais corrompu → throw ValidationError au parse Zod", async () => {
+      await getAdminDb()
+        .collection(__CONVERSATIONS_COLLECTION_FOR_TESTS)
+        .doc("conv_active_corrupt")
+        .set({
+          contactId: "contact_corrupt",
+          campaignId: "camp_corrupt",
+          status: "awaiting_reply",
+          // messageCount manquant → Zod fail
+        });
+      await expect(getActiveConversationByContactId("contact_corrupt")).rejects.toBeInstanceOf(
+        ValidationError,
+      );
     });
   });
 

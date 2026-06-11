@@ -12,11 +12,14 @@
  *      nouvelle entrée `manual_override` qui la pointe — JAMAIS modifier.
  *
  *   2. **Pas de PII en clair dans `payload`**. Téléphone (E.164 ou FR),
- *      email, nom complet sont INTERDITS. Utiliser `hashPii()` (HMAC-SHA256
- *      avec pepper serveur, cf. lib/utils/pii-detector.ts) si on a besoin
- *      d'un identifiant traçable. Sinon : utiliser un docId Firestore.
- *      Le module `lib/firestore/audit-log.ts` (S6.2) throw `AuditPiiError`
- *      à l'écriture si la règle est violée → garantie technique.
+ *      email, nom complet sont INTERDITS. Pour téléphone : utiliser
+ *      `safePhoneHash()` (PAS `hashPii` brut — collision scrubber ~0.3%,
+ *      cf. warning JSDoc `hashPii` + HIGH-1 S9.2.1). Pour autre identifiant
+ *      traçable : `hashPii()` direct convient si la valeur ne risque pas
+ *      de matcher `RE_FR_NATIONAL` / `RE_E164` / `RE_EMAIL` du scrubber.
+ *      Sinon : utiliser un docId Firestore. Le module
+ *      `lib/firestore/audit-log.ts` (S6.2) throw `AuditPiiError` à
+ *      l'écriture si la règle est violée → garantie technique.
  *
  *   3. **Écriture exclusive via Admin SDK** côté serveur. Les rules
  *      Firestore refusent toute écriture client (`allow write: if false`).
@@ -125,8 +128,9 @@ export interface AuditLog {
   targetType: AuditTargetType;
   targetId: string;
   /**
-   * Contexte minimal. AUCUNE PII en clair. Utiliser des IDs ou des
-   * hashes (cf. `hashPii` de `lib/utils/pii-detector.ts`).
+   * Contexte minimal. AUCUNE PII en clair. Utiliser des IDs Firestore
+   * ou des hashes (cf. `safePhoneHash` pour téléphone, PAS `hashPii`
+   * brut — voir warning JSDoc `hashPii` de `lib/utils/pii-detector.ts`).
    */
   payload: Record<string, unknown>;
   ipAddress?: string;

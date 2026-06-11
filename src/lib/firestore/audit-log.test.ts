@@ -187,7 +187,7 @@ describe("appendAuditLog", () => {
       expect(await countAuditDocs()).toBe(0);
     });
 
-    it("le message d'erreur indique explicitement 'hashPii()' (guidance dev)", async () => {
+    it("le message d'erreur indique explicitement 'safePhoneHash()' (guidance dev, fix HIGH-1 S9.2.1)", async () => {
       const tainted: AuditLogInput = {
         ...validEntry,
         payload: { p: "+33612345678" },
@@ -197,7 +197,10 @@ describe("appendAuditLog", () => {
         expect.fail("should have thrown");
       } catch (e) {
         expect(e).toBeInstanceOf(AuditPiiError);
-        expect((e as Error).message).toContain("hashPii()");
+        // Pointe le dev vers la BONNE primitive : safePhoneHash (préfixe
+        // + chunking → scrubber-safe). `hashPii` brut a ~0.3% de
+        // collision sur RE_FR_NATIONAL (cf. JSDoc hashPii).
+        expect((e as Error).message).toContain("safePhoneHash()");
       }
     });
 

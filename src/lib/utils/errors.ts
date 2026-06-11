@@ -335,8 +335,10 @@ export class InternalError extends AppError {
 /**
  * 500 — PII détecté dans un payload d'audit log avant écriture Firestore.
  * NON opérationnel : c'est un bug code du caller qui aurait dû hash
- * l'identifiant via `hashPii()` ou utiliser un docId à la place AVANT
- * d'appeler `appendAuditLog`. Cf. GUARD-002 + S6.2 arbitrage Déthié.
+ * l'identifiant via `safePhoneHash()` (pour téléphones — PAS `hashPii`
+ * brut, cf. warning JSDoc + HIGH-1 S9.2.1) ou utiliser un docId à la
+ * place AVANT d'appeler `appendAuditLog`. Cf. GUARD-002 + S6.2 arbitrage
+ * Déthié.
  *
  * `context.violations` contient la liste sanitisée (path + kind + sample
  * tronqué) — JAMAIS la valeur d'origine. Le logger peut consommer le
