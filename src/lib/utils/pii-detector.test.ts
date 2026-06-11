@@ -4,7 +4,14 @@ import { __resetEnvCacheForTests } from "@/lib/security/env";
 import { ConfigError } from "@/lib/utils/errors";
 import { logger } from "@/lib/utils/logger";
 
-import { detectPiiInPayload, hashPii, PII_WALK_MAX_DEPTH, type PiiViolation } from "./pii-detector";
+import {
+  detectPiiInPayload,
+  hashPii,
+  PHONE_HASH_PREFIX,
+  PII_WALK_MAX_DEPTH,
+  type PiiViolation,
+  safePhoneHash,
+} from "./pii-detector";
 
 const VALID_PEPPER = "a".repeat(64); // 32 bytes hex, simule openssl rand -hex 32
 
@@ -440,5 +447,76 @@ describe("hashPii — HMAC-SHA256 avec pepper", () => {
       kind: "phone_e164",
       sample: expect.any(String),
     });
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// safePhoneHash — wrapper anti-collision scrubber (HIGH-1 S9.2.1)
+// ─────────────────────────────────────────────────────────────────────────────
+
+describe("safePhoneHash — wrapper anti-collision scrubber (HIGH-1 S9.2.1)", () => {
+  it("retourne le format 'hph_XXXX_XXXX_..._XXXX' (préfixe + 8 chunks de 4)", () => {
+    // hashPii retourne 32 chars hex → 8 chunks de 4 exact.
+    const out = safePhoneHash("+33612345678");
+    expect(out.startsWith(PHONE_HASH_PREFIX)).toBe(true);
+    // Forme totale : "hph_" (4) + 8 chunks (4 chars chacun) + 7 underscores
+    // séparateurs = 4 + 32 + 7 = 43 chars.
+    expect(out).toHaveLength(43);
+    // Structure exacte : préfixe + 8 groupes hex de 4 chars séparés par _.
+    expect(out).toMatch(/^hph_[0-9a-f]{4}(?:_[0-9a-f]{4}){7}$/);
+  });
+
+  it("🔒 ne match JAMAIS le scrubber RE_FR_NATIONAL — sentinelle anti-régression renforcée", () => {
+    // Si on retirait le chunking (= revenir à `hph_` + hex pur), ~0.3%
+    // des phones matcheraient. On stresse avec un panel large pour
+    // pousser la proba de collision quasi à 1 si le fix est cassé.
+    const phones = [
+      "+33600000103", // cas pathologique connu : hash = 0d2a...0869433987
+      "+33612345678",
+      "+33712345678",
+      "+33611112222",
+      "+33687654321",
+      "+33700000000",
+      "+33611223344",
+      "+33655667788",
+      "+33644556677",
+      "+33622334455",
+      "+33788990011",
+      "+33766554433",
+    ];
+    for (const phone of phones) {
+      const hashed = safePhoneHash(phone);
+      // Passe au scrubber complet (= validateAndScrub côté audit log).
+      const violations = detectPiiInPayload({ phoneHash: hashed });
+      expect(violations).toEqual([]);
+    }
+  });
+
+  it("déterministe : même input → même output (HMAC + chunking préservent l'invariant)", () => {
+    const a = safePhoneHash("+33612345678");
+    const b = safePhoneHash("+33612345678");
+    expect(a).toBe(b);
+  });
+
+  it("diffère de hashPii brut (préfixe + chunking appliqués)", () => {
+    const phone = "+33612345678";
+    const raw = hashPii(phone);
+    const safe = safePhoneHash(phone);
+    expect(safe).not.toBe(raw);
+    // Le hash brut DOIT être contenu dans la version safe (après strip
+    // des underscores) — sinon le chunking est cassé. Sentinelle de
+    // round-trip forensic : on peut retrouver le hash brut depuis le
+    // safe en strippant `hph_` + tous les `_`.
+    const reconstructed = safe.slice(PHONE_HASH_PREFIX.length).replace(/_/g, "");
+    expect(reconstructed).toBe(raw);
+  });
+
+  it("hashFn injectable pour test isolation (skip getAuditEnv pepper)", () => {
+    // Permet aux callers de tester safePhoneHash sans avoir besoin du
+    // pepper réel (cf. pattern deps process-reply.ts).
+    const fakeHash = (v: string) => v.padEnd(32, "x").slice(0, 32);
+    const out = safePhoneHash("+33612345678", fakeHash);
+    // L'input padé est "+33612345678xxxxxxxxxxxxxxxxxxxx" (32 chars).
+    expect(out).toBe("hph_+336_1234_5678_xxxx_xxxx_xxxx_xxxx_xxxx");
   });
 });

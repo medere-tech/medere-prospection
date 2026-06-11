@@ -126,7 +126,7 @@ import { getActiveConversationByContactId } from "@/lib/firestore/conversations"
 import { addInbound, findInboundByExternalId } from "@/lib/firestore/messages";
 import { getInngestClient } from "@/lib/inngest/client";
 import { smsReplyReceived } from "@/lib/inngest/events";
-import { hashPii } from "@/lib/utils/pii-detector";
+import { hashPii, PHONE_HASH_PREFIX, safePhoneHash } from "@/lib/utils/pii-detector";
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Constantes
@@ -138,83 +138,6 @@ import { hashPii } from "@/lib/utils/pii-detector";
  * dans `process-reply.test.ts`.
  */
 const FUNCTION_ID = "process-reply";
-
-/**
- * 🔒 Marker préfixé + chunking séparateur pour éviter les collisions
- * faux positif du scrubber PII sur le hash HMAC-SHA256 hex pur.
- *
- * RAISON D'ÊTRE (security-reviewer HIGH-1 S9.2.1) — empirique :
- *
- *   - `hashPii()` retourne 32 chars hex purs (HMAC-SHA256 tronqué).
- *   - Statistique : ~0.3% des hashes contiennent `0[1-9]\d{8}` (10 digits
- *     consécutifs) qui matche `RE_FR_NATIONAL = /(?<!\d)0[1-9]\d{8}(?!\d)/`
- *     du scrubber `lib/utils/pii-detector.ts`.
- *   - Exemple confirmé : `hashPii("+33600000103")` =
- *     `0d2aad1497f4a9118e800a0869433987` → matche `0869433987`
- *     (positions 22-31).
- *   - Sur 26k contacts MVP : ~74 contacts génèrent un hash piégé.
- *
- * IMPACT SANS FIX :
- *
- *   - `detectPiiInPayload({phoneHash: "0d2...0869433987"})` retourne
- *     une violation `phone_fr_national`.
- *   - `appendAuditLog` throw `AuditPiiError` → step.run rollback.
- *   - Avec `retries: 0` (S9.2.1) : event perdu, AUCUN audit posé.
- *   - Avec `retries: 4` (S9.2.3 prévu) : 4 retries identiques (hash
- *     déterministe) → bruit Inngest x4 sans résolution.
- *
- * POURQUOI LE SEUL PRÉFIXE NE SUFFIT PAS :
- *
- * Un préfixe casserait la frontière `(?<!\d)` UNIQUEMENT si le pattern
- * `0[1-9]\d{8}` est en DÉBUT du hash. Si la sous-séquence problématique
- * est au milieu ou en fin du hex (ex: `...a0869433987`), le caractère
- * non-digit qui précède (`a` ici) satisfait déjà `(?<!\d)`. Le préfixe
- * `hph_` ne change rien — la regex matche toujours sur la portion
- * interne du hash.
- *
- * FIX RÉEL — chunking par underscore tous les 4 chars :
- *
- *   - Le hash hex 32 chars est splitté en 8 groupes de 4 chars,
- *     joints par `_` → ex: `0d2a_ad14_97f4_a911_8e80_0a08_6943_3987`.
- *   - Garantit qu'AUCUNE sous-séquence de plus de 4 digits consécutifs
- *     n'est possible. La regex `RE_FR_NATIONAL` (10 digits) ne peut
- *     plus matcher.
- *   - L'underscore `_` n'est PAS dans `STRIP_CHARS = /[\s.\-()]/g` du
- *     scrubber → le scrubber teste la string AVEC les underscores intacts.
- *   - Le hash reste déterministe (même input → même output, propriété
- *     critique du HMAC préservée).
- *   - Le hash reste reversible côté admin si besoin (strip `_` →
- *     hash hex 32 chars d'origine).
- *
- * Marker préfixe `hph_` : conservé pour identifier sémantiquement
- * "ces 36 chars sont un phone hash" côté forensic. Sentinelles
- * `pii-detector.test.ts` prouvent que cette construction protège
- * contre tout hash pathologique connu.
- */
-const PHONE_HASH_PREFIX = "hph_";
-
-/** Taille des chunks hex. 4 chars → max 4 digits consécutifs → < 10. */
-const PHONE_HASH_CHUNK_SIZE = 4;
-
-/**
- * Hash sûr d'un téléphone E.164 pour usage en audit log. Wrap `hashPii`
- * + préfixe + chunking par underscore. Garanti scrubber-safe.
- *
- * Exemple :
- *   safePhoneHash("+33600000103", hashPii) →
- *   "hph_0d2a_ad14_97f4_a911_8e80_0a08_6943_3987"
- */
-function safePhoneHash(phone: string, hash: typeof hashPii): string {
-  const hex = hash(phone);
-  // Split tous les 4 chars + join par underscore.
-  // Regex `.{1,4}` capture des groupes de 1 à 4 chars (le dernier groupe
-  // peut être < 4 si la longueur n'est pas multiple). En pratique
-  // `hashPii` retourne toujours 32 chars donc 8 × 4 exact, mais le
-  // pattern défensif est plus robuste.
-  const chunkRegex = new RegExp(`.{1,${PHONE_HASH_CHUNK_SIZE}}`, "g");
-  const chunks = hex.match(chunkRegex) ?? [hex];
-  return PHONE_HASH_PREFIX + chunks.join("_");
-}
 
 /**
  * Raisons de drop possibles en S9.2.1. Discriminant du retour

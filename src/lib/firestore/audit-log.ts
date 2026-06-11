@@ -13,7 +13,9 @@
  *        b. `detectPiiInPayload` scrute récursif phone E.164 / FR /
  *           email AVANT toute écriture Firestore.
  *      Si violation : throw `AuditPiiError` AVEC le message explicite
- *      "Utiliser hashPii()". JAMAIS d'écriture partielle.
+ *      "Utiliser safePhoneHash()" (PAS hashPii brut — collision scrubber
+ *      ~0.3%, cf. warning JSDoc hashPii + HIGH-1 S9.2.1). JAMAIS
+ *      d'écriture partielle.
  *
  *   3. **Timestamp serveur**. Posé via `Timestamp.now()` côté serveur
  *      au moment du `.add()`. L'appelant NE PEUT PAS le forger (omis
@@ -157,7 +159,7 @@ function validateAndScrub(entry: AuditLogInput): AuditLogInput {
   if (violations.length > 0) {
     throw new AuditPiiError({
       message:
-        "Audit log refuse les PII en clair. Utiliser hashPii() pour les identifiants sensibles.",
+        "Audit log refuse les PII en clair. Utiliser safePhoneHash() pour les téléphones (PAS hashPii brut — collision scrubber, cf. JSDoc) ou un docId Firestore.",
       context: {
         // `violations` est déjà sanitisée par `detectPiiInPayload` :
         // path + kind + sample = "[redacted]" constant. Aucune valeur
