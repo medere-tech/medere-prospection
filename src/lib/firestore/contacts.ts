@@ -5,8 +5,13 @@
  * API EXPOSÉE (S6.3 — MVP) :
  *
  *   - `getContact(id)`              → lecture validée (Zod strict).
- *   - `markOptedOut(id, channel)`   → marque le consentement révoqué +
- *                                     audit log dans la MÊME transaction.
+ *   - `markOptedOut(id, channel, options?)` → marque le consentement révoqué
+ *                                     + audit log dans la MÊME transaction.
+ *                                     Variante S9.2.2.1 : si
+ *                                     `options.conversationId` fourni,
+ *                                     synchronise aussi la conversation
+ *                                     (intent=STOP, status=opted_out) dans
+ *                                     la même tx — atomicité étendue.
  *   - `updateContactStatus(id, f)`  → whitelist Pick<status|assignedTo>
  *                                     + audit log atomique.
  *
@@ -49,15 +54,44 @@ import { z } from "zod";
 
 import { getAdminDb } from "@/lib/firestore/admin";
 import { appendAuditLogTx } from "@/lib/firestore/audit-log";
+import { _parseConversationOrThrow } from "@/lib/firestore/conversations";
 import { InternalError, NotFoundError, ValidationError } from "@/lib/utils/errors";
 import { E164_REGEX } from "@/lib/utils/phone";
 import type { Contact } from "@/types/contact";
+import type { Conversation, ConversationStatus } from "@/types/conversation";
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Constantes & types internes
 // ─────────────────────────────────────────────────────────────────────────────
 
 const CONTACTS_COLLECTION = "contacts";
+
+/**
+ * Doit rester aligné avec `__CONVERSATIONS_COLLECTION_FOR_TESTS` de
+ * `conversations.ts`. Test sentinelle dans `contacts.test.ts` vérifie
+ * l'égalité — si quelqu'un renomme côté conversations.ts, le test casse.
+ * (Pattern identique à `messages.ts:120`.)
+ */
+const CONVERSATIONS_COLLECTION = "conversations";
+
+/**
+ * 🔒 Status conversation considérés "terminaux" — impossibles à transitionner
+ * vers `opted_out` via `markOptedOut` étendu (S9.2.2.1).
+ *
+ *   - `handed_off` : déjà chez commercial humain. Un STOP arrivant après
+ *                    handoff doit alerter le commercial via Slack, PAS
+ *                    rollback le handoff côté Firestore.
+ *   - `closed`     : conversation terminée explicitement.
+ *   - `blocked`    : bloquée par compliance (Bloctel, plafond...).
+ *
+ * `opted_out` est EXCLU de ce set car c'est l'état cible — le re-mark est
+ * traité comme idempotent (cf. JSDoc `markOptedOut`).
+ */
+const TERMINAL_CONV_STATUSES_FOR_OPT_OUT: readonly ConversationStatus[] = [
+  "handed_off",
+  "closed",
+  "blocked",
+];
 
 /**
  * Whitelist STRICTE des champs modifiables via `updateContactStatus`.
@@ -381,53 +415,157 @@ export async function getContactByPhone(e164: string): Promise<Contact | null> {
 /**
  * Marque un contact comme ayant explicitement opté-out de la prospection.
  *
- * Atomique : update contact + audit log `action: "opt_out"` dans la MÊME
- * transaction (impossible d'avoir un opt-out sans audit ou inversement).
+ * ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ * VARIANTE S9.2.2.1 — extension `options.conversationId`
  *
- * Idempotent : si `contact.consent.optedOut === true` à l'entrée, NO-OP
- * silencieux — pas de re-écriture, pas de re-audit. La date du 1er opt-out
+ * Si `options.conversationId` est fourni, la même transaction update
+ * ÉGALEMENT la conversation cible (`intent="STOP"`, `status="opted_out"`,
+ * `lastIntentChangeAt=now`). Ferme le trou de désynchronisation
+ * contact ↔ conversation qui existait depuis S9.2.1 (le step 5 fast-path
+ * marquait le contact opt-out mais laissait `conversation.status` à
+ * `awaiting_reply`/`in_dialogue` — incohérence forensic + bug futur si
+ * un follow-up tentait de reprendre la conversation).
+ *
+ * **Atomicité étendue** : si l'update conversation fail (transition
+ * interdite, conv inexistante, doc corrompu) → la transaction rollback
+ * et le contact N'EST PAS marqué opt-out non plus. Pas de demi-état
+ * possible.
+ *
+ * **Garde transitions terminales** : refuse l'opt-out si la conversation
+ * est en `handed_off`/`closed`/`blocked`. `opted_out` est OK (idempotent).
+ *
+ * ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ * IDEMPOTENCE — état final cible
+ *
+ * Si TOUT l'état final est déjà atteint (contact.consent.optedOut=true
+ * ET conv.status="opted_out" ET conv.intent="STOP"), le call est un
+ * NO-OP TOTAL : pas d'update, pas de re-audit. La date du 1er opt-out
  * et son canal sont juridiquement décisifs et ne sont jamais réécrasés.
- * (Décision Déthié S6.3 : la reconfirmation multi-canal sera tracée
- * séparément en Phase 2 si besoin, via une fonction dédiée.)
+ *
+ * **Cas désync (contact opt-out mais conv pas synchro)** : la conv est
+ * synchronisée (update intent + status), et un audit `opt_out` AVEC
+ * `payload.reason = "sync_conversation"` est posé pour traçabilité.
+ * Distingue clairement le flow initial du rattrapage cohérence.
+ *
+ * **Cas sans `options.conversationId`** : comportement strictement
+ * identique à pré-S9.2.2.1 (rétrocompat — process-reply.ts S9.2.1 step
+ * 5 fast-path continue à fonctionner sans modification le temps que
+ * S9.2.2.2 le migre vers la variante étendue).
  *
  * @param contactId  ID Firestore du contact.
  * @param channel    Canal de l'opt-out (sms = réponse STOP, manual = appel,
  *                   dashboard = action commerciale).
- * @param now        Référence temporelle injectable pour les tests.
- *                   Défaut : `new Date()` au moment de la transaction.
+ * @param options    Variante étendue S9.2.2.1 :
+ *                   - `conversationId` : si fourni, synchronise la conv
+ *                     dans la même tx (intent=STOP, status=opted_out).
+ *                   - `intent` : marker explicite au call site (toujours
+ *                     `"STOP"` quand `conversationId` fourni — c'est le
+ *                     seul intent qui déclenche l'opt-out).
+ *                   - `now` : référence temporelle injectable pour tests.
  *
- * @throws NotFoundError    si le contact n'existe pas (erreur d'orchestration).
- * @throws ValidationError  si le doc existe mais est corrompu.
+ * @throws NotFoundError    si le contact ou la conversation n'existe pas.
+ * @throws ValidationError  si la conv est en état terminal (handed_off,
+ *                          closed, blocked), ou si un doc est corrompu.
  */
 export async function markOptedOut(
   contactId: string,
   channel: "sms" | "manual" | "dashboard",
-  now?: Date,
+  options?: {
+    conversationId?: string;
+    intent?: "STOP";
+    now?: Date;
+  },
 ): Promise<void> {
+  const conversationId = options?.conversationId;
+  const now = options?.now;
+
   await getAdminDb().runTransaction(async (tx) => {
-    const ref = getAdminDb().collection(CONTACTS_COLLECTION).doc(contactId);
-    const doc = await tx.get(ref);
-    if (!doc.exists) {
+    const contactRef = getAdminDb().collection(CONTACTS_COLLECTION).doc(contactId);
+    const contactDoc = await tx.get(contactRef);
+    if (!contactDoc.exists) {
       throw new NotFoundError({
         message: `Contact not found: ${contactId}`,
         context: { contactId },
       });
     }
-    const contact = parseContactOrThrow(doc.data(), contactId);
+    const contact = parseContactOrThrow(contactDoc.data(), contactId);
 
-    // Idempotence : déjà opted-out → no-op total (pas d'update, pas d'audit).
-    if (contact.consent.optedOut) {
+    // Variante S9.2.2.1 : pré-fetch + parse + guard la conversation si
+    // conversationId fourni. tx.get DOIT précéder toutes les tx.update
+    // (règle Firestore : reads avant writes dans une transaction).
+    const convRef = conversationId
+      ? getAdminDb().collection(CONVERSATIONS_COLLECTION).doc(conversationId)
+      : null;
+    let conv: Conversation | null = null;
+
+    if (convRef && conversationId) {
+      const convDoc = await tx.get(convRef);
+      if (!convDoc.exists) {
+        throw new NotFoundError({
+          message: `Conversation not found: ${conversationId}`,
+          context: { conversationId, contactId },
+        });
+      }
+      conv = _parseConversationOrThrow(convDoc.data(), conversationId);
+
+      if (TERMINAL_CONV_STATUSES_FOR_OPT_OUT.includes(conv.status)) {
+        throw new ValidationError({
+          message: `Cannot mark opted_out, conversation in terminal state: ${conv.status}`,
+          context: {
+            conversationId,
+            contactId,
+            currentStatus: conv.status,
+          },
+        });
+      }
+    }
+
+    // Idempotence sur l'ÉTAT FINAL CIBLE COMPLET : si tout est déjà
+    // atteint, no-op total. Sinon, on traite ce qui manque.
+    const contactAlreadyOptedOut = contact.consent.optedOut;
+    const convAlreadyOptedOut =
+      conv !== null && conv.status === "opted_out" && conv.intent === "STOP";
+
+    // No-op total :
+    //   - cas legacy (conv === null) : contact déjà opt-out → no-op (rétrocompat)
+    //   - cas étendu (conv !== null) : contact opt-out ET conv synchro → no-op
+    if (contactAlreadyOptedOut && (conv === null || convAlreadyOptedOut)) {
       return;
     }
 
     const ts = now ? Timestamp.fromDate(now) : Timestamp.now();
-    tx.update(ref, {
-      status: "opted_out",
-      "consent.optedOut": true,
-      "consent.optedOutAt": ts,
-      "consent.optedOutChannel": channel,
-      updatedAt: ts,
-    });
+
+    if (!contactAlreadyOptedOut) {
+      tx.update(contactRef, {
+        status: "opted_out",
+        "consent.optedOut": true,
+        "consent.optedOutAt": ts,
+        "consent.optedOutChannel": channel,
+        updatedAt: ts,
+      });
+    }
+
+    if (convRef !== null && !convAlreadyOptedOut) {
+      tx.update(convRef, {
+        intent: "STOP",
+        status: "opted_out",
+        lastIntentChangeAt: ts,
+        updatedAt: ts,
+      });
+    }
+
+    // Payload audit : `channel` toujours présent (compat). `conversationId`
+    // ajouté si fourni (forensic). `reason: "sync_conversation"` si on
+    // est dans le cas de rattrapage désync (contact déjà opt, conv pas
+    // encore). Tous scrubber-safe (channel ∈ enum, conversationId opaque,
+    // reason ∈ string courte).
+    const payload: Record<string, unknown> = { channel };
+    if (conversationId !== undefined) {
+      payload.conversationId = conversationId;
+    }
+    if (contactAlreadyOptedOut && conv !== null && !convAlreadyOptedOut) {
+      payload.reason = "sync_conversation";
+    }
 
     appendAuditLogTx(tx, {
       actorId: "system",
@@ -435,7 +573,7 @@ export async function markOptedOut(
       action: "opt_out",
       targetType: "contact",
       targetId: contactId,
-      payload: { channel },
+      payload,
     });
   });
 }

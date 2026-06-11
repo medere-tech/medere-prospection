@@ -15,6 +15,11 @@
  *   - `setHandoff(id, assignedTo, notes)`
  *         → STRICTEMENT non-idempotent : throw `ConflictError` si la
  *           conversation est déjà handed_off (cf. arbitrage Déthié S6.4 Q2).
+ *   - `setConversationIntent(id, intent, options?)` (S9.2.2.1)
+ *         → update intent + (optionnellement) status pour les branches
+ *           INTERESSE/OBJECTION/NEUTRE du pipeline process-reply. STOP
+ *           explicitement exclu (passe par `markOptedOut` étendu pour
+ *           atomicité contact + conversation).
  *
  * Hors périmètre S6.4 (reportés explicitement) :
  *   - `createConversation`        → S7 (déclenchement campagne)
@@ -54,7 +59,7 @@ import { z } from "zod";
 import { getAdminDb } from "@/lib/firestore/admin";
 import { appendAuditLogTx } from "@/lib/firestore/audit-log";
 import { ConflictError, InternalError, NotFoundError, ValidationError } from "@/lib/utils/errors";
-import type { Conversation, ConversationStatus } from "@/types/conversation";
+import type { Conversation, ConversationStatus, Intent } from "@/types/conversation";
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Constantes & helper public
@@ -63,6 +68,52 @@ import type { Conversation, ConversationStatus } from "@/types/conversation";
 const CONVERSATIONS_COLLECTION = "conversations";
 
 const HANDOFF_NOTES_MIN_LENGTH = 10;
+
+/**
+ * 🔒 Status conversation considérés "terminaux" — refusent toute mutation
+ * d'intent via `setConversationIntent` (S9.2.2.1).
+ *
+ *   - `handed_off` : déjà chez commercial humain. Un re-classify Claude
+ *                    n'a pas à modifier l'intent — le commercial est en
+ *                    charge.
+ *   - `closed`     : conversation terminée explicitement.
+ *   - `opted_out`  : STOP déjà appliqué. L'intent est figé à "STOP".
+ *                    (Pour ré-appliquer un STOP, utiliser `markOptedOut`
+ *                    étendu — pas `setConversationIntent`.)
+ *   - `blocked`    : bloquée par compliance.
+ *
+ * Modifier ce set nécessite arbitrage Déthié + re-validation
+ * compliance-auditor (impact direct sur quelles conversations peuvent
+ * voir leur intent changer).
+ */
+const TERMINAL_CONV_STATUSES_FOR_INTENT_CHANGE: readonly ConversationStatus[] = [
+  "handed_off",
+  "closed",
+  "opted_out",
+  "blocked",
+];
+
+/**
+ * 🔒 Status non-terminaux autorisés comme cible de `options.nextStatus`
+ * dans `setConversationIntent`. Une transition vers un status terminal
+ * (handed_off/closed/opted_out/blocked) DOIT passer par la fonction
+ * dédiée (setHandoff / markOptedOut / etc.) — pas par cette voie.
+ */
+const NON_TERMINAL_NEXT_STATUSES: readonly ConversationStatus[] = [
+  "active",
+  "awaiting_reply",
+  "in_dialogue",
+  "qualified",
+];
+
+/**
+ * 🔒 Intents acceptés par `setConversationIntent`. `STOP` est explicitement
+ * EXCLU — l'opt-out passe par `markOptedOut` étendu pour garantir
+ * l'atomicité contact ↔ conversation. `unknown` est exclu aussi (état
+ * initial, pas une cible de mutation).
+ */
+const NON_STOP_INTENTS = ["INTERESSE", "OBJECTION", "NEUTRE"] as const;
+type NonStopIntent = (typeof NON_STOP_INTENTS)[number];
 
 /**
  * 🔒 SENTINELLE S9.2.1 (Q1 brief Déthié) — set des `status` considérés
@@ -539,6 +590,131 @@ export async function setHandoff(
   });
 }
 
+/**
+ * Met à jour `intent` (et optionnellement `status`) d'une conversation
+ * pour les branches `INTERESSE` / `OBJECTION` / `NEUTRE` du pipeline
+ * `process-reply` (S9.2.2).
+ *
+ * ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ * INVARIANT — `STOP` EXCLU
+ *
+ * La signature TypeScript exclut `intent: "STOP"` au compile-time
+ * (`NonStopIntent` = `"INTERESSE" | "OBJECTION" | "NEUTRE"` uniquement).
+ * **Pour appliquer un STOP, utiliser `markOptedOut` étendu** — qui pose
+ * atomiquement l'opt-out côté contact ET la synchro intent=STOP +
+ * status=opted_out côté conversation dans une seule transaction.
+ *
+ * Cette voie séparée est volontaire : un STOP est une décision
+ * juridiquement irréversible (L.34-5 CPCE) qui doit verrouiller le
+ * contact ET la conversation. Une fonction `setConversationIntent` qui
+ * accepterait STOP créerait un trou (update conv sans update contact →
+ * désynchronisation forensique).
+ *
+ * Defense-in-depth : un runtime guard vérifie que l'intent reçu N'EST
+ * PAS "STOP" (au cas où un caller bypasse le typage TS via `as any`).
+ *
+ * ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ * MATRICE DE TRANSITIONS
+ *
+ *   - **Status courant terminal** (`handed_off`/`closed`/`opted_out`/
+ *     `blocked`) → throw `ValidationError`. Ces états sont absorbants.
+ *
+ *   - **`options.nextStatus` fourni** → DOIT être non-terminal
+ *     (`active`/`awaiting_reply`/`in_dialogue`/`qualified`). Sinon throw
+ *     `ValidationError`. Une transition vers un état terminal doit
+ *     passer par sa fonction dédiée (`setHandoff` / `markOptedOut`).
+ *
+ *   - **`options.nextStatus` omis** → on met à jour `intent` seulement,
+ *     `status` reste inchangé.
+ *
+ * ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ * PAS D'AUDIT INTERNE
+ *
+ * Cette fonction NE pose PAS d'audit log elle-même — c'est le pipeline
+ * orchestrateur (`process-reply` S9.2.2.2) qui pose l'audit
+ * `intent_classified` avec le payload classifier complet (model,
+ * promptVersion, fallback, tokens…) AVANT d'appeler cette fonction.
+ *
+ * Conséquence : si tu utilises cette fonction dans un contexte hors
+ * pipeline, tu DOIS poser ton propre audit séparément ou justifier
+ * l'absence d'audit dans le commit message.
+ *
+ * @param conversationId  ID Firestore composite `${contactId}_${campaignId}`.
+ * @param intent          `"INTERESSE"` | `"OBJECTION"` | `"NEUTRE"`.
+ *                        **PAS `"STOP"`** (compile-time + runtime guards).
+ * @param options.nextStatus  Status cible non-terminal optionnel.
+ * @param options.now         Référence temporelle injectable pour tests.
+ *
+ * @throws ValidationError  si `intent === "STOP"` (runtime bypass guard),
+ *                          si le status courant est terminal, si
+ *                          `nextStatus` est terminal, ou si le doc est
+ *                          corrompu.
+ * @throws NotFoundError    si la conversation n'existe pas.
+ */
+export async function setConversationIntent(
+  conversationId: string,
+  intent: NonStopIntent,
+  options?: {
+    nextStatus?: ConversationStatus;
+    now?: Date;
+  },
+): Promise<void> {
+  // Runtime guard : si quelqu'un bypasse le typage TS (`as any`) avec
+  // intent="STOP", on refuse explicitement. Defense-in-depth pour un
+  // invariant critique (cf. JSDoc).
+  if ((intent as Intent) === "STOP" || (intent as Intent) === "unknown") {
+    throw new ValidationError({
+      message: `setConversationIntent refuse intent="${intent}". Utiliser markOptedOut pour STOP.`,
+      context: { conversationId, intent },
+    });
+  }
+
+  const nextStatus = options?.nextStatus;
+  const now = options?.now;
+
+  // Garde précoce sur nextStatus AVANT d'ouvrir la tx (économie I/O si
+  // le caller a fait une erreur évidente).
+  if (nextStatus !== undefined && !NON_TERMINAL_NEXT_STATUSES.includes(nextStatus)) {
+    throw new ValidationError({
+      message: `setConversationIntent refuse nextStatus="${nextStatus}" (status terminal). Utiliser la fonction dédiée (setHandoff/markOptedOut).`,
+      context: { conversationId, nextStatus },
+    });
+  }
+
+  await getAdminDb().runTransaction(async (tx) => {
+    const ref = getAdminDb().collection(CONVERSATIONS_COLLECTION).doc(conversationId);
+    const doc = await tx.get(ref);
+    if (!doc.exists) {
+      throw new NotFoundError({
+        message: `Conversation not found: ${conversationId}`,
+        context: { conversationId },
+      });
+    }
+    const conv = parseConversationOrThrow(doc.data(), conversationId);
+
+    if (TERMINAL_CONV_STATUSES_FOR_INTENT_CHANGE.includes(conv.status)) {
+      throw new ValidationError({
+        message: `Cannot set intent, conversation in terminal state: ${conv.status}`,
+        context: {
+          conversationId,
+          currentStatus: conv.status,
+        },
+      });
+    }
+
+    const ts = now ? Timestamp.fromDate(now) : Timestamp.now();
+    const updates: Record<string, unknown> = {
+      intent,
+      lastIntentChangeAt: ts,
+      updatedAt: ts,
+    };
+    if (nextStatus !== undefined) {
+      updates.status = nextStatus;
+    }
+    tx.update(ref, updates);
+  });
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Exposés pour tests
 // ─────────────────────────────────────────────────────────────────────────────
@@ -551,3 +727,13 @@ export const __HANDOFF_NOTES_MIN_LENGTH_FOR_TESTS = HANDOFF_NOTES_MIN_LENGTH;
 
 /** @internal */
 export const __ACTIVE_CONVERSATION_STATUSES_FOR_TESTS = ACTIVE_CONVERSATION_STATUSES;
+
+/** @internal */
+export const __TERMINAL_CONV_STATUSES_FOR_INTENT_CHANGE_FOR_TESTS =
+  TERMINAL_CONV_STATUSES_FOR_INTENT_CHANGE;
+
+/** @internal */
+export const __NON_TERMINAL_NEXT_STATUSES_FOR_TESTS = NON_TERMINAL_NEXT_STATUSES;
+
+/** @internal */
+export const __NON_STOP_INTENTS_FOR_TESTS = NON_STOP_INTENTS;
