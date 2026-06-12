@@ -147,6 +147,18 @@ function makeDeps(overrides: Partial<ProcessReplyDeps> = {}): ProcessReplyDeps {
     isOptOut: vi.fn().mockReturnValue(false),
     hashPii: vi.fn().mockReturnValue("hashed-pii-abcd1234abcd1234abcd1234"),
     appendAuditLog: vi.fn().mockResolvedValue("audit-id"),
+    // S9.2.2 — defaults : INTERESSE non-fallback → branche "classified"
+    // (les tests step 1-4 qui ne mockent pas classifyReply atterrissent
+    // ici par défaut au lieu de retourner pending_intent_classification).
+    classifyReply: vi.fn().mockResolvedValue({
+      intent: "INTERESSE",
+      confidence: 0.85,
+      // Sentinelle PII : reasoning est plausible mais ne doit JAMAIS
+      // fuiter dans logs/audit (defense-in-depth).
+      reasoning: "default-test-reasoning-must-not-leak",
+      fallback: false,
+    }),
+    setConversationIntent: vi.fn().mockResolvedValue(undefined),
     ...overrides,
   };
 }
@@ -196,7 +208,9 @@ describe("sentinelles structurelles process-reply (S9.2.1)", () => {
 // ─────────────────────────────────────────────────────────────────────────────
 
 describe("Step 1 — resolve-contact", () => {
-  it("contact trouvé → continue le pipeline (status pending_intent_classification)", async () => {
+  it("contact trouvé → continue le pipeline (status classified, intent default INTERESSE)", async () => {
+    // S9.2.2 — le pipeline va jusqu'au step 7 et retourne `classified`
+    // avec l'intent par défaut du mock classifyReply (= INTERESSE).
     const ctx = makeFakeCtx();
     const deps = makeDeps({
       getContactByPhone: vi.fn().mockResolvedValue(makeFakeContact("hubspot-123")),
@@ -208,9 +222,10 @@ describe("Step 1 — resolve-contact", () => {
 
     const result = await processReplyHandler(ctx, deps);
 
-    expect(result.status).toBe("pending_intent_classification");
-    if (result.status === "pending_intent_classification") {
+    expect(result.status).toBe("classified");
+    if (result.status === "classified") {
       expect(result.contactId).toBe("hubspot-123");
+      expect(result.intent).toBe("INTERESSE");
     }
     expect(deps.getContactByPhone).toHaveBeenCalledWith("+33775745453");
   });
@@ -263,8 +278,8 @@ describe("Step 2 — resolve-conversation", () => {
 
     const result = await processReplyHandler(ctx, deps);
 
-    expect(result.status).toBe("pending_intent_classification");
-    if (result.status === "pending_intent_classification") {
+    expect(result.status).toBe("classified");
+    if (result.status === "classified") {
       expect(result.conversationId).toBe("hubspot-456_camp-b");
     }
     expect(deps.getActiveConversationByContactId).toHaveBeenCalledWith("hubspot-456");
@@ -348,7 +363,7 @@ describe("Step 3 — dedup-by-external-id", () => {
 
     const result = await processReplyHandler(ctx, deps);
 
-    expect(result.status).toBe("pending_intent_classification");
+    expect(result.status).toBe("classified");
     expect(deps.addInbound).toHaveBeenCalled();
   });
 });
@@ -399,8 +414,8 @@ describe("Step 4 — store-inbound", () => {
 
     const result = await processReplyHandler(ctx, deps);
 
-    expect(result.status).toBe("pending_intent_classification");
-    if (result.status === "pending_intent_classification") {
+    expect(result.status).toBe("classified");
+    if (result.status === "classified") {
       expect(result.messageId).toBe("fresh-msgid-xyz");
     }
   });
@@ -411,7 +426,7 @@ describe("Step 4 — store-inbound", () => {
 // ─────────────────────────────────────────────────────────────────────────────
 
 describe("Step 5 — short-form-opt-out-check (fast-path)", () => {
-  it("isOptOut true → markOptedOut + status opt_out (PAS classify Claude)", async () => {
+  it("isOptOut true → markOptedOut ÉTENDU + status opt_out via=short_form (PAS classify Claude)", async () => {
     const ctx = makeFakeCtx({ body: "STOP" });
     const deps = makeDeps({
       getContactByPhone: vi.fn().mockResolvedValue(makeFakeContact("hs-stop")),
@@ -430,12 +445,22 @@ describe("Step 5 — short-form-opt-out-check (fast-path)", () => {
       contactId: "hs-stop",
       conversationId: "hs-stop_camp-z",
       messageId: "msgid-stop-001",
+      intent: "STOP",
+      via: "short_form",
     });
-    // markOptedOut appelé avec channel "sms"
-    expect(deps.markOptedOut).toHaveBeenCalledWith("hs-stop", "sms");
+    // S9.2.2.2 amendement step 5 — markOptedOut variante étendue :
+    // synchronise la conversation dans la même tx (ferme trou S9.2.1).
+    expect(deps.markOptedOut).toHaveBeenCalledWith("hs-stop", "sms", {
+      conversationId: "hs-stop_camp-z",
+      intent: "STOP",
+    });
+    // Classifier NON appelé (économie d'un appel Claude sur STOP courts).
+    expect(deps.classifyReply).not.toHaveBeenCalled();
+    // setConversationIntent NON appelé (STOP passe par markOptedOut).
+    expect(deps.setConversationIntent).not.toHaveBeenCalled();
   });
 
-  it("isOptOut false → status pending_intent_classification (transition S9.2.2)", async () => {
+  it("isOptOut false → status classified (via classifier — S9.2.2 transition)", async () => {
     const ctx = makeFakeCtx({ body: "Bonjour, ça m'intéresse" });
     const deps = makeDeps({
       getContactByPhone: vi.fn().mockResolvedValue(makeFakeContact("hs-noop")),
@@ -449,8 +474,11 @@ describe("Step 5 — short-form-opt-out-check (fast-path)", () => {
 
     const result = await processReplyHandler(ctx, deps);
 
-    expect(result.status).toBe("pending_intent_classification");
+    expect(result.status).toBe("classified");
     expect(deps.markOptedOut).not.toHaveBeenCalled();
+    // Le classifier ET setConversationIntent sont appelés.
+    expect(deps.classifyReply).toHaveBeenCalledWith("Bonjour, ça m'intéresse");
+    expect(deps.setConversationIntent).toHaveBeenCalled();
   });
 
   it("STORE-INBOUND avant opt-out check (forensic L.34-5 CPCE)", async () => {
@@ -486,20 +514,553 @@ describe("Step 5 — short-form-opt-out-check (fast-path)", () => {
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Step 6 — classify-intent (Claude + audit intent_classified)
+// ─────────────────────────────────────────────────────────────────────────────
+
+describe("Step 6 — classify-intent (Claude Haiku 4.5)", () => {
+  it("audit intent_classified posé AVANT branche, payload scrubber-safe", async () => {
+    const ctx = makeFakeCtx({ body: "Combien ça coûte ?" });
+    const deps = makeDeps({
+      getContactByPhone: vi.fn().mockResolvedValue(makeFakeContact("hs-clf-1")),
+      getActiveConversationByContactId: vi.fn().mockResolvedValue({
+        conversationId: "hs-clf-1_camp-c",
+        conversation: makeFakeConversation("hs-clf-1", "camp-c"),
+      }),
+      addInbound: vi.fn().mockResolvedValue("msgid-clf-1"),
+      classifyReply: vi.fn().mockResolvedValue({
+        intent: "INTERESSE",
+        confidence: 0.85,
+        reasoning: "question tarif factuelle = engagement actif",
+        fallback: false,
+      }),
+    });
+
+    await processReplyHandler(ctx, deps);
+
+    // L'audit intent_classified DOIT être posé.
+    expect(deps.appendAuditLog).toHaveBeenCalledWith(
+      expect.objectContaining({
+        actorId: "system",
+        actorType: "system",
+        action: "intent_classified",
+        targetType: "message",
+        targetId: "msgid-clf-1",
+        payload: {
+          contactId: "hs-clf-1",
+          conversationId: "hs-clf-1_camp-c",
+          intent: "INTERESSE",
+          confidence: 0.85,
+          fallback: false,
+          promptVersion: "1.0.1",
+          model: "claude-haiku-4-5-20251001",
+        },
+      }),
+    );
+  });
+
+  it("payload audit NE contient PAS reasoning/body/phone/tokens (defense-in-depth)", async () => {
+    const ctx = makeFakeCtx({
+      phone: "+33688889999",
+      body: "Mon perso 0612345678 — pas intéressé",
+      ovhMessageId: "ovh-secret-classifier-001",
+    });
+    const deps = makeDeps({
+      getContactByPhone: vi.fn().mockResolvedValue(makeFakeContact("hs-clf-2")),
+      getActiveConversationByContactId: vi.fn().mockResolvedValue({
+        conversationId: "hs-clf-2_camp-c",
+        conversation: makeFakeConversation("hs-clf-2", "camp-c"),
+      }),
+      addInbound: vi.fn().mockResolvedValue("msgid-clf-2"),
+      classifyReply: vi.fn().mockResolvedValue({
+        intent: "OBJECTION",
+        confidence: 0.88,
+        reasoning: "PII-secret-reasoning-should-never-leak",
+        fallback: false,
+      }),
+    });
+
+    await processReplyHandler(ctx, deps);
+
+    // Extraire spécifiquement l'appel `intent_classified`.
+    const calls = (deps.appendAuditLog as ReturnType<typeof vi.fn>).mock.calls;
+    const intentAuditCall = calls.find(
+      (c) => (c[0] as { action: string }).action === "intent_classified",
+    );
+    expect(intentAuditCall).toBeDefined();
+    const serialized = JSON.stringify(intentAuditCall);
+
+    // Sentinelle anti-PII payload audit.
+    expect(serialized).not.toContain("+33688889999");
+    expect(serialized).not.toContain("688889999");
+    expect(serialized).not.toContain("Mon perso");
+    expect(serialized).not.toContain("0612345678");
+    expect(serialized).not.toContain("ovh-secret-classifier-001");
+    expect(serialized).not.toContain("PII-secret-reasoning-should-never-leak");
+    // Q1 brief — tokens OMIS du payload (acceptable MVP).
+    expect(serialized).not.toContain("tokensInput");
+    expect(serialized).not.toContain("tokensOutput");
+  });
+
+  it("classifier fallback=true → logger.warn('classifier_fallback') posé", async () => {
+    const ctx = makeFakeCtx({ body: "Bonjour" });
+    const deps = makeDeps({
+      getContactByPhone: vi.fn().mockResolvedValue(makeFakeContact("hs-fb-warn")),
+      getActiveConversationByContactId: vi.fn().mockResolvedValue({
+        conversationId: "hs-fb-warn_camp-w",
+        conversation: makeFakeConversation("hs-fb-warn", "camp-w"),
+      }),
+      addInbound: vi.fn().mockResolvedValue("msgid-fb-warn"),
+      classifyReply: vi.fn().mockResolvedValue({
+        intent: "STOP",
+        confidence: 0,
+        reasoning: "fallback: classifier failed, defaulting to STOP",
+        fallback: true,
+      }),
+    });
+
+    await processReplyHandler(ctx, deps);
+
+    const warnCalls = (ctx.logger.warn as ReturnType<typeof vi.fn>).mock.calls;
+    const fallbackWarn = warnCalls.find((c) => String(c[0]).includes("classifier_fallback"));
+    expect(fallbackWarn).toBeDefined();
+  });
+
+  it("classifier fallback → audit intent_classified avec fallback: true (forensic)", async () => {
+    const ctx = makeFakeCtx({ body: "Bonjour" });
+    const deps = makeDeps({
+      getContactByPhone: vi.fn().mockResolvedValue(makeFakeContact("hs-fb-aud")),
+      getActiveConversationByContactId: vi.fn().mockResolvedValue({
+        conversationId: "hs-fb-aud_camp-w",
+        conversation: makeFakeConversation("hs-fb-aud", "camp-w"),
+      }),
+      addInbound: vi.fn().mockResolvedValue("msgid-fb-aud"),
+      classifyReply: vi.fn().mockResolvedValue({
+        intent: "STOP",
+        confidence: 0,
+        reasoning: "fallback",
+        fallback: true,
+      }),
+    });
+
+    await processReplyHandler(ctx, deps);
+
+    const calls = (deps.appendAuditLog as ReturnType<typeof vi.fn>).mock.calls;
+    const intentAudit = calls.find(
+      (c) => (c[0] as { action: string }).action === "intent_classified",
+    );
+    expect(intentAudit).toBeDefined();
+    expect((intentAudit?.[0] as { payload: { fallback: boolean } }).payload.fallback).toBe(true);
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Step 7 — branch-by-intent (4 branches)
+// ─────────────────────────────────────────────────────────────────────────────
+
+describe("Step 7 — branch-by-intent", () => {
+  it("INTERESSE → setConversationIntent(convId, 'INTERESSE', {nextStatus: 'in_dialogue'}) + status classified", async () => {
+    const ctx = makeFakeCtx({ body: "C'est combien ?" });
+    const deps = makeDeps({
+      getContactByPhone: vi.fn().mockResolvedValue(makeFakeContact("hs-i")),
+      getActiveConversationByContactId: vi.fn().mockResolvedValue({
+        conversationId: "hs-i_camp-i",
+        conversation: makeFakeConversation("hs-i", "camp-i"),
+      }),
+      addInbound: vi.fn().mockResolvedValue("msgid-i"),
+      classifyReply: vi.fn().mockResolvedValue({
+        intent: "INTERESSE",
+        confidence: 0.9,
+        reasoning: "demande tarif",
+        fallback: false,
+      }),
+    });
+
+    const result = await processReplyHandler(ctx, deps);
+
+    expect(result).toEqual({
+      status: "classified",
+      contactId: "hs-i",
+      conversationId: "hs-i_camp-i",
+      messageId: "msgid-i",
+      intent: "INTERESSE",
+    });
+    expect(deps.setConversationIntent).toHaveBeenCalledWith("hs-i_camp-i", "INTERESSE", {
+      nextStatus: "in_dialogue",
+    });
+    expect(deps.markOptedOut).not.toHaveBeenCalled();
+  });
+
+  it("OBJECTION → setConversationIntent('OBJECTION', in_dialogue) + classified", async () => {
+    const ctx = makeFakeCtx({ body: "Pas intéressé pour l'instant" });
+    const deps = makeDeps({
+      getContactByPhone: vi.fn().mockResolvedValue(makeFakeContact("hs-o")),
+      getActiveConversationByContactId: vi.fn().mockResolvedValue({
+        conversationId: "hs-o_camp-o",
+        conversation: makeFakeConversation("hs-o", "camp-o"),
+      }),
+      addInbound: vi.fn().mockResolvedValue("msgid-o"),
+      classifyReply: vi.fn().mockResolvedValue({
+        intent: "OBJECTION",
+        confidence: 0.9,
+        reasoning: "refus poli temporel",
+        fallback: false,
+      }),
+    });
+
+    const result = await processReplyHandler(ctx, deps);
+
+    expect(result.status).toBe("classified");
+    if (result.status === "classified") {
+      expect(result.intent).toBe("OBJECTION");
+    }
+    expect(deps.setConversationIntent).toHaveBeenCalledWith("hs-o_camp-o", "OBJECTION", {
+      nextStatus: "in_dialogue",
+    });
+  });
+
+  it("NEUTRE → setConversationIntent('NEUTRE', in_dialogue) + classified", async () => {
+    const ctx = makeFakeCtx({ body: "OK" });
+    const deps = makeDeps({
+      getContactByPhone: vi.fn().mockResolvedValue(makeFakeContact("hs-n")),
+      getActiveConversationByContactId: vi.fn().mockResolvedValue({
+        conversationId: "hs-n_camp-n",
+        conversation: makeFakeConversation("hs-n", "camp-n"),
+      }),
+      addInbound: vi.fn().mockResolvedValue("msgid-n"),
+      classifyReply: vi.fn().mockResolvedValue({
+        intent: "NEUTRE",
+        confidence: 0.7,
+        reasoning: "accusé réception ambigu",
+        fallback: false,
+      }),
+    });
+
+    const result = await processReplyHandler(ctx, deps);
+
+    expect(result.status).toBe("classified");
+    if (result.status === "classified") {
+      expect(result.intent).toBe("NEUTRE");
+    }
+    expect(deps.setConversationIntent).toHaveBeenCalledWith("hs-n_camp-n", "NEUTRE", {
+      nextStatus: "in_dialogue",
+    });
+  });
+
+  it("STOP via classifier → markOptedOut ÉTENDU + status opt_out via=classifier_long_form", async () => {
+    const ctx = makeFakeCtx({ body: "Foutez-moi la paix" });
+    const deps = makeDeps({
+      getContactByPhone: vi.fn().mockResolvedValue(makeFakeContact("hs-clf-stop-1")),
+      getActiveConversationByContactId: vi.fn().mockResolvedValue({
+        conversationId: "hs-clf-stop-1_camp-x",
+        conversation: makeFakeConversation("hs-clf-stop-1", "camp-x"),
+      }),
+      addInbound: vi.fn().mockResolvedValue("msgid-clf-stop-1"),
+      // isOptOut=false : le short-form ne détecte pas (long-form ou nuance)
+      isOptOut: vi.fn().mockReturnValue(false),
+      classifyReply: vi.fn().mockResolvedValue({
+        intent: "STOP",
+        confidence: 0.95,
+        reasoning: "hostilité = opt-out",
+        fallback: false,
+      }),
+    });
+
+    const result = await processReplyHandler(ctx, deps);
+
+    expect(result).toEqual({
+      status: "opt_out",
+      contactId: "hs-clf-stop-1",
+      conversationId: "hs-clf-stop-1_camp-x",
+      messageId: "msgid-clf-stop-1",
+      intent: "STOP",
+      via: "classifier_long_form", // ← discriminant distinct du short-form
+    });
+    expect(deps.markOptedOut).toHaveBeenCalledWith("hs-clf-stop-1", "sms", {
+      conversationId: "hs-clf-stop-1_camp-x",
+      intent: "STOP",
+    });
+    expect(deps.setConversationIntent).not.toHaveBeenCalled();
+  });
+
+  it("STORE-INBOUND avant classifier long-form opt-out (forensic L.34-5 CPCE — J1 compliance-auditor)", async () => {
+    // 🔒 Sentinelle CRITIQUE — équivalente au "STORE-INBOUND avant
+    // opt-out check" du step 5, étendue à la branche long-form du
+    // classifier (step 7 STOP). Si quelqu'un déplace `store-inbound`
+    // après `classify-intent`, le test casse et empêche la perte de
+    // la preuve écrite L.34-5 CPCE pour les opt-out longs.
+    const ctx = makeFakeCtx({
+      body: "Bonjour, je préfère ne plus recevoir de messages, merci de me retirer.",
+    });
+    const callOrder: string[] = [];
+    const deps = makeDeps({
+      getContactByPhone: vi.fn().mockResolvedValue(makeFakeContact("hs-ord-lf")),
+      getActiveConversationByContactId: vi.fn().mockResolvedValue({
+        conversationId: "hs-ord-lf_camp-lf",
+        conversation: makeFakeConversation("hs-ord-lf", "camp-lf"),
+      }),
+      addInbound: vi.fn().mockImplementation(async () => {
+        callOrder.push("addInbound");
+        return "msgid-ord-lf";
+      }),
+      isOptOut: vi.fn().mockReturnValue(false), // short-form ne détecte pas
+      classifyReply: vi.fn().mockImplementation(async () => {
+        callOrder.push("classifyReply");
+        return {
+          intent: "STOP",
+          confidence: 0.9,
+          reasoning: "demande retrait polie",
+          fallback: false,
+        };
+      }),
+      markOptedOut: vi.fn().mockImplementation(async () => {
+        callOrder.push("markOptedOut");
+      }),
+    });
+
+    await processReplyHandler(ctx, deps);
+
+    // L'ordre exact : addInbound DOIT précéder classifyReply ET markOptedOut.
+    expect(callOrder).toEqual(["addInbound", "classifyReply", "markOptedOut"]);
+  });
+
+  it("STOP via classifier — l'audit intent_classified est posé AVANT markOptedOut", async () => {
+    const ctx = makeFakeCtx({ body: "Bonjour merci de me retirer de votre liste" });
+    const callOrder: string[] = [];
+    const deps = makeDeps({
+      getContactByPhone: vi.fn().mockResolvedValue(makeFakeContact("hs-ord-stop")),
+      getActiveConversationByContactId: vi.fn().mockResolvedValue({
+        conversationId: "hs-ord-stop_camp-z",
+        conversation: makeFakeConversation("hs-ord-stop", "camp-z"),
+      }),
+      addInbound: vi.fn().mockResolvedValue("msgid-ord-stop"),
+      isOptOut: vi.fn().mockReturnValue(false),
+      classifyReply: vi.fn().mockResolvedValue({
+        intent: "STOP",
+        confidence: 0.9,
+        reasoning: "demande retrait explicite",
+        fallback: false,
+      }),
+      appendAuditLog: vi.fn().mockImplementation(async (entry: { action: string }) => {
+        if (entry.action === "intent_classified") {
+          callOrder.push("audit:intent_classified");
+        }
+        return "audit-id";
+      }),
+      markOptedOut: vi.fn().mockImplementation(async () => {
+        callOrder.push("markOptedOut");
+      }),
+    });
+
+    await processReplyHandler(ctx, deps);
+
+    // Sentinelle ordre forensic : on audit le verdict AVANT de l'appliquer.
+    const intentIdx = callOrder.indexOf("audit:intent_classified");
+    const markIdx = callOrder.indexOf("markOptedOut");
+    expect(intentIdx).toBeGreaterThanOrEqual(0);
+    expect(markIdx).toBeGreaterThan(intentIdx);
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 🔒 GUARD-001 — sentinelle anti-régression CRITIQUE
+// Long-form opt-out rattrapé par classifier
+// ─────────────────────────────────────────────────────────────────────────────
+
+describe("🔒 GUARD-001 — long-form opt-out rattrapé par classifier (anti-régression CRITIQUE)", () => {
+  it("body >50 chars sans keyword STOP + classifier intent=STOP → branche STOP empruntée", async () => {
+    // 🔒 Sentinelle CRITIQUE compliance L.34-5 CPCE (sanction CNIL 20 M€) :
+    // un PS qui écrit une demande d'arrêt longue, polie, sans mot-clé
+    // STOP/ARRET DOIT être traité comme un opt-out. C'est le rôle du
+    // classifier Claude (S7a.2). Le pipeline S9.2.2 doit emprunter la
+    // branche STOP via classifier_long_form.
+    const LONG_FORM_OPT_OUT =
+      "Arrêtez de me déranger je ne suis vraiment pas intéressé par cette formation merci";
+    expect(LONG_FORM_OPT_OUT.length).toBeGreaterThan(50);
+
+    // Sentinelle setup : isOptOut() court-form DOIT retourner false sur
+    // cet input (sinon le test ne stresse pas GUARD-001).
+    // On mock isOptOut=false explicitement pour ne pas dépendre de
+    // l'implémentation réelle (testée séparément).
+    const ctx = makeFakeCtx({ body: LONG_FORM_OPT_OUT });
+    const deps = makeDeps({
+      getContactByPhone: vi.fn().mockResolvedValue(makeFakeContact("hs-guard001")),
+      getActiveConversationByContactId: vi.fn().mockResolvedValue({
+        conversationId: "hs-guard001_camp-g",
+        conversation: makeFakeConversation("hs-guard001", "camp-g"),
+      }),
+      addInbound: vi.fn().mockResolvedValue("msgid-guard001"),
+      isOptOut: vi.fn().mockReturnValue(false), // ← rattrapé par classifier
+      classifyReply: vi.fn().mockResolvedValue({
+        intent: "STOP",
+        confidence: 0.92,
+        reasoning: "demande arrêt explicite polie",
+        fallback: false,
+      }),
+    });
+
+    const result = await processReplyHandler(ctx, deps);
+
+    // Sentinelle 1 — verdict
+    expect(result).toEqual({
+      status: "opt_out",
+      contactId: "hs-guard001",
+      conversationId: "hs-guard001_camp-g",
+      messageId: "msgid-guard001",
+      intent: "STOP",
+      via: "classifier_long_form",
+    });
+
+    // Sentinelle 2 — markOptedOut étendu appelé avec conversationId
+    expect(deps.markOptedOut).toHaveBeenCalledWith("hs-guard001", "sms", {
+      conversationId: "hs-guard001_camp-g",
+      intent: "STOP",
+    });
+
+    // Sentinelle 3 — le classifier a bien été appelé
+    expect(deps.classifyReply).toHaveBeenCalledWith(LONG_FORM_OPT_OUT);
+
+    // Sentinelle 4 — audit intent_classified posé avec intent=STOP
+    expect(deps.appendAuditLog).toHaveBeenCalledWith(
+      expect.objectContaining({
+        action: "intent_classified",
+        payload: expect.objectContaining({ intent: "STOP", fallback: false }),
+      }),
+    );
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Ordre des steps — sentinelle invocation
+// ─────────────────────────────────────────────────────────────────────────────
+
+describe("Ordre invocation steps (sentinelle pipeline)", () => {
+  it("intent non-STOP : steps 1→2→3→4→5(no-op)→6→7 dans l'ordre", async () => {
+    const callOrder: string[] = [];
+    const ctx = makeFakeCtx({ body: "OK je vais voir" });
+    const deps = makeDeps({
+      getContactByPhone: vi.fn().mockImplementation(async () => {
+        callOrder.push("1:resolve-contact");
+        return makeFakeContact("hs-ord");
+      }),
+      getActiveConversationByContactId: vi.fn().mockImplementation(async () => {
+        callOrder.push("2:resolve-conversation");
+        return {
+          conversationId: "hs-ord_camp-o",
+          conversation: makeFakeConversation("hs-ord", "camp-o"),
+        };
+      }),
+      findInboundByExternalId: vi.fn().mockImplementation(async () => {
+        callOrder.push("3:dedup");
+        return null;
+      }),
+      addInbound: vi.fn().mockImplementation(async () => {
+        callOrder.push("4:store-inbound");
+        return "msgid-ord";
+      }),
+      isOptOut: vi.fn().mockImplementation(() => {
+        callOrder.push("5:isOptOut(false)");
+        return false;
+      }),
+      classifyReply: vi.fn().mockImplementation(async () => {
+        callOrder.push("6:classify-intent");
+        return {
+          intent: "NEUTRE",
+          confidence: 0.7,
+          reasoning: "ambigu",
+          fallback: false,
+        };
+      }),
+      setConversationIntent: vi.fn().mockImplementation(async () => {
+        callOrder.push("7:setConversationIntent");
+      }),
+    });
+
+    await processReplyHandler(ctx, deps);
+
+    expect(callOrder).toEqual([
+      "1:resolve-contact",
+      "2:resolve-conversation",
+      "3:dedup",
+      "4:store-inbound",
+      "5:isOptOut(false)",
+      "6:classify-intent",
+      "7:setConversationIntent",
+    ]);
+  });
+
+  it("STOP short-form : steps 1→2→3→4→5(STOP) ; 6+7 PAS appelés (économie Claude)", async () => {
+    const callOrder: string[] = [];
+    const ctx = makeFakeCtx({ body: "STOP" });
+    const deps = makeDeps({
+      getContactByPhone: vi.fn().mockImplementation(async () => {
+        callOrder.push("1");
+        return makeFakeContact("hs-ord-sf");
+      }),
+      getActiveConversationByContactId: vi.fn().mockImplementation(async () => {
+        callOrder.push("2");
+        return {
+          conversationId: "hs-ord-sf_camp-s",
+          conversation: makeFakeConversation("hs-ord-sf", "camp-s"),
+        };
+      }),
+      findInboundByExternalId: vi.fn().mockImplementation(async () => {
+        callOrder.push("3");
+        return null;
+      }),
+      addInbound: vi.fn().mockImplementation(async () => {
+        callOrder.push("4");
+        return "msgid-ord-sf";
+      }),
+      isOptOut: vi.fn().mockImplementation(() => {
+        callOrder.push("5");
+        return true;
+      }),
+      markOptedOut: vi.fn().mockImplementation(async () => {
+        callOrder.push("5-markOptedOut");
+      }),
+      classifyReply: vi.fn().mockImplementation(async () => {
+        callOrder.push("6-SHOULD-NOT-RUN");
+        return {
+          intent: "INTERESSE",
+          confidence: 0,
+          reasoning: "",
+          fallback: false,
+        };
+      }),
+      setConversationIntent: vi.fn().mockImplementation(async () => {
+        callOrder.push("7-SHOULD-NOT-RUN");
+      }),
+    });
+
+    await processReplyHandler(ctx, deps);
+
+    expect(callOrder).toEqual(["1", "2", "3", "4", "5", "5-markOptedOut"]);
+    expect(callOrder).not.toContain("6-SHOULD-NOT-RUN");
+    expect(callOrder).not.toContain("7-SHOULD-NOT-RUN");
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Sentinelle anti-PII — pipeline complet
 // ─────────────────────────────────────────────────────────────────────────────
 
 describe("Anti-PII pipeline complet (sentinelle critique L.34-5 CPCE)", () => {
   /**
-   * 🔒 Sentinelle CRITIQUE — étendue du test S8 stub aux 5 steps.
-   * Vérifie que ni phone, ni body, ni ovhMessageId n'apparaissent dans
-   * AUCUN appel logger sur AUCUNE branche du pipeline. Si quelqu'un
-   * ajoute par mégarde `phone` ou `body` dans un `logger.X(...)`, ce
-   * test casse — c'est l'objectif explicite.
+   * 🔒 Sentinelle CRITIQUE — étendue S9.2.2 aux 7 steps.
+   * Vérifie qu'AUCUN champ PII (phone, body, ovhMessageId, reasoning
+   * classifier) n'apparaît dans AUCUN appel logger sur AUCUNE branche.
+   * Si quelqu'un ajoute par mégarde `phone`/`body`/`reasoning` dans un
+   * `logger.X(...)`, ce test casse — c'est l'objectif explicite.
    */
   const SECRET_PHONE = "+33687654321";
   const SECRET_BODY = "Mon numéro perso est 0612345678";
   const SECRET_OVH_MSGID = "ovh-secret-id-XYZ123";
+  // S9.2.2 — reasoning Claude pour stress-test fuite : contient un
+  // patronyme + une ville (semi-identifiants). Le prompt classifier
+  // interdit ces éléments, mais defense-in-depth : si pour une raison
+  // X le pipeline forwardait le reasoning vers logs/audit, ce test
+  // casse.
+  const SECRET_REASONING = "Dr Dupont à Lyon — refus poli explicite";
 
   function assertNoLeak(logger: ProcessReplyHandlerContext["logger"]) {
     const allCalls = [
@@ -515,6 +1076,10 @@ describe("Anti-PII pipeline complet (sentinelle critique L.34-5 CPCE)", () => {
     expect(serialized).not.toContain("Mon numéro");
     expect(serialized).not.toContain("0612345678");
     expect(serialized).not.toContain(SECRET_OVH_MSGID);
+    // S9.2.2 — reasoning Claude ne doit jamais apparaître.
+    expect(serialized).not.toContain(SECRET_REASONING);
+    expect(serialized).not.toContain("Dr Dupont");
+    expect(serialized).not.toContain("Lyon");
   }
 
   it("branche contact_unknown — aucune fuite phone/body/ovhMessageId", async () => {
@@ -581,7 +1146,11 @@ describe("Anti-PII pipeline complet (sentinelle critique L.34-5 CPCE)", () => {
     assertNoLeak(ctx.logger);
   });
 
-  it("branche pending_intent_classification — aucune fuite", async () => {
+  it("branche classified — aucune fuite (phone/body/ovh/reasoning)", async () => {
+    // S9.2.2 — pipeline va jusqu'au classifier + branch-by-intent.
+    // Mock reasoning enrichi pour stress-test : Dr Dupont à Lyon ne
+    // doit jamais arriver dans les logs même si Claude le posait
+    // (defense-in-depth contre une régression prompt classifier).
     const ctx = makeFakeCtx({
       phone: SECRET_PHONE,
       body: SECRET_BODY,
@@ -594,6 +1163,67 @@ describe("Anti-PII pipeline complet (sentinelle critique L.34-5 CPCE)", () => {
         conversation: makeFakeConversation("hs-pic", "camp-p"),
       }),
       isOptOut: vi.fn().mockReturnValue(false),
+      classifyReply: vi.fn().mockResolvedValue({
+        intent: "INTERESSE",
+        confidence: 0.85,
+        reasoning: SECRET_REASONING, // ← stress reasoning leak
+        fallback: false,
+      }),
+    });
+    await processReplyHandler(ctx, deps);
+    assertNoLeak(ctx.logger);
+  });
+
+  it("branche classifier_long_form opt_out — aucune fuite reasoning STOP", async () => {
+    // S9.2.2 — branche STOP rattrapé par classifier. Le reasoning
+    // Claude (e.g. "Dr Dupont à Lyon refus explicite") ne doit jamais
+    // remonter dans les logs, même si le fallback warn est posé.
+    const ctx = makeFakeCtx({
+      phone: SECRET_PHONE,
+      body:
+        "Je vous remercie mais je préfère ne plus recevoir de messages de votre part — " +
+        SECRET_BODY,
+      ovhMessageId: SECRET_OVH_MSGID,
+    });
+    const deps = makeDeps({
+      getContactByPhone: vi.fn().mockResolvedValue(makeFakeContact("hs-clf-stop")),
+      getActiveConversationByContactId: vi.fn().mockResolvedValue({
+        conversationId: "hs-clf-stop_camp-x",
+        conversation: makeFakeConversation("hs-clf-stop", "camp-x"),
+      }),
+      isOptOut: vi.fn().mockReturnValue(false), // long-form échappe au short-form
+      classifyReply: vi.fn().mockResolvedValue({
+        intent: "STOP",
+        confidence: 0.92,
+        reasoning: SECRET_REASONING,
+        fallback: false,
+      }),
+    });
+    await processReplyHandler(ctx, deps);
+    assertNoLeak(ctx.logger);
+  });
+
+  it("branche classifier fallback STOP — aucune fuite même sur log warn", async () => {
+    // S9.2.2 — fallback=true déclenche logger.warn("classifier_fallback").
+    // Le warn ne doit contenir AUCUNE PII (ni phone, ni body, ni reasoning).
+    const ctx = makeFakeCtx({
+      phone: SECRET_PHONE,
+      body: SECRET_BODY,
+      ovhMessageId: SECRET_OVH_MSGID,
+    });
+    const deps = makeDeps({
+      getContactByPhone: vi.fn().mockResolvedValue(makeFakeContact("hs-fb")),
+      getActiveConversationByContactId: vi.fn().mockResolvedValue({
+        conversationId: "hs-fb_camp-f",
+        conversation: makeFakeConversation("hs-fb", "camp-f"),
+      }),
+      isOptOut: vi.fn().mockReturnValue(false),
+      classifyReply: vi.fn().mockResolvedValue({
+        intent: "STOP",
+        confidence: 0,
+        reasoning: SECRET_REASONING,
+        fallback: true,
+      }),
     });
     await processReplyHandler(ctx, deps);
     assertNoLeak(ctx.logger);

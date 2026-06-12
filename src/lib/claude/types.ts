@@ -211,9 +211,12 @@ export type Intent = (typeof INTENT_VALUES)[number];
  *   trust l'intent). Une confidence basse sur "STOP" reste un STOP.
  *
  * - `reasoning` : explication courte (≤ 200 chars) écrite par Claude.
- *   Persistée dans l'audit log pour traçabilité juridique d'une coupure
- *   de conversation. Ne JAMAIS y inclure le message d'origine en clair
- *   (le prompt l'interdit côté Claude, le wrapper le tronque côté code).
+ *   Champ de traçabilité INTERNE retourné par `classifyReply` pour
+ *   observabilité ad-hoc (Pino logger côté wrapper, debugging local).
+ *   NON PERSISTÉE dans Firestore : volontairement exclue du payload
+ *   audit `intent_classified` (defense-in-depth anti-fuite PII, même si
+ *   le system prompt l'interdit côté Claude). Si tu veux exposer ce
+ *   champ ailleurs, valide d'abord avec `compliance-auditor`.
  *
  * - `fallback` : `true` SSI la classification Claude a échoué (timeout,
  *   tool_use invalide, intent hors-enum…) ET qu'on a forcé `STOP` par
