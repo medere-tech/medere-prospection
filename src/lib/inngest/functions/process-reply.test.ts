@@ -174,12 +174,17 @@ describe("sentinelles structurelles process-reply (S9.2.1)", () => {
     expect(__FUNCTION_ID_FOR_TESTS).toBe("process-reply");
   });
 
-  it("retries === 0 (relâchement prévu S9.2.3)", () => {
-    // S9.2.1 — pipeline déterministe pas encore validé en intégration
-    // sur la memoization step.run. Sentinelle bloquera la régression
-    // accidentelle qui relâcherait sans le test memoization.
+  it("retries === 3 (S9.2.3 — choix explicite, pas default implicite)", () => {
+    // S9.2.3 — relâché de 0 (S9.2.1/S9.2.2) à 3. Valeur EXPLICITE qui
+    // matche le default Inngest v4.x mais documente le choix dans le
+    // code (cf. process-reply.ts JSDoc retries section).
+    //
+    // La memoization step.run par (eventId, stepName) protège contre
+    // double-commit Firestore + double-audit + double-facturation
+    // Claude sur retry. Sentinelle anti-régression MED-1 dans
+    // process-reply.memoization.test.ts (S9.2.3.2).
     const opts = (processReply as unknown as { opts: { retries?: number } }).opts;
-    expect(opts.retries).toBe(0);
+    expect(opts.retries).toBe(3);
   });
 
   it("DROP_REASONS verrouillé à ['contact_unknown', 'no_active_conversation', 'duplicate']", () => {
@@ -258,6 +263,14 @@ describe("Step 1 — resolve-contact", () => {
     // Pas de message stocké, pas de conv résolue.
     expect(deps.addInbound).not.toHaveBeenCalled();
     expect(deps.getActiveConversationByContactId).not.toHaveBeenCalled();
+
+    // S9.2.3 — sentinelle négative : reply_processed JAMAIS posé sur
+    // les drops. reply_dropped suffit (forensic complet via reason +
+    // phoneHash). Éviter redondance + brouiller analytics "inbound
+    // traités vs abandonnés".
+    expect(deps.appendAuditLog).not.toHaveBeenCalledWith(
+      expect.objectContaining({ action: "reply_processed" }),
+    );
   });
 });
 
@@ -308,6 +321,11 @@ describe("Step 2 — resolve-conversation", () => {
       },
     });
     expect(deps.addInbound).not.toHaveBeenCalled();
+
+    // S9.2.3 — sentinelle négative reply_processed sur drop (cf. step 1).
+    expect(deps.appendAuditLog).not.toHaveBeenCalledWith(
+      expect.objectContaining({ action: "reply_processed" }),
+    );
   });
 });
 
@@ -348,6 +366,11 @@ describe("Step 3 — dedup-by-external-id", () => {
     });
     // store-inbound JAMAIS appelé sur doublon.
     expect(deps.addInbound).not.toHaveBeenCalled();
+
+    // S9.2.3 — sentinelle négative reply_processed sur drop (cf. step 1).
+    expect(deps.appendAuditLog).not.toHaveBeenCalledWith(
+      expect.objectContaining({ action: "reply_processed" }),
+    );
   });
 
   it("pas de doublon → continue le pipeline", async () => {
@@ -458,6 +481,34 @@ describe("Step 5 — short-form-opt-out-check (fast-path)", () => {
     expect(deps.classifyReply).not.toHaveBeenCalled();
     // setConversationIntent NON appelé (STOP passe par markOptedOut).
     expect(deps.setConversationIntent).not.toHaveBeenCalled();
+
+    // S9.2.3 — Step 8 audit-reply-processed posé en fin de branche.
+    // PAS de classifierFallback (court-circuit avant Claude).
+    expect(deps.appendAuditLog).toHaveBeenCalledWith({
+      actorId: "system",
+      actorType: "system",
+      action: "reply_processed",
+      targetType: "conversation",
+      targetId: "hs-stop_camp-z",
+      payload: expect.objectContaining({
+        contactId: "hs-stop",
+        conversationId: "hs-stop_camp-z",
+        messageId: "msgid-stop-001",
+        intent: "STOP",
+        branchTaken: "opt_out_short_form",
+        finalConversationStatus: "opted_out",
+        pipelineDurationMs: expect.any(Number),
+      }),
+    });
+    // Sentinelle distinctive short_form : pas de classifierFallback dans
+    // le payload (la branche n'est jamais passée par Claude).
+    const replyProcessedCall = (deps.appendAuditLog as ReturnType<typeof vi.fn>).mock.calls.find(
+      (c) => (c[0] as { action: string }).action === "reply_processed",
+    );
+    expect(replyProcessedCall).toBeDefined();
+    expect(
+      (replyProcessedCall?.[0] as { payload: Record<string, unknown> }).payload,
+    ).not.toHaveProperty("classifierFallback");
   });
 
   it("isOptOut false → status classified (via classifier — S9.2.2 transition)", async () => {
@@ -601,6 +652,62 @@ describe("Step 6 — classify-intent (Claude Haiku 4.5)", () => {
     expect(serialized).not.toContain("tokensOutput");
   });
 
+  it("payload audit reply_processed NE contient PAS reasoning/body/phone (defense-in-depth S9.2.3)", async () => {
+    // 🔒 Sentinelle CRITIQUE S9.2.3 — équivalente à la sentinelle
+    // intent_classified ci-dessus, mais sur le NOUVEAU step 8
+    // audit-reply-processed. Toute régression qui ferait fuiter
+    // body/phone/ovhMessageId/reasoning Claude dans le payload final
+    // doit casser ce test.
+    const ctx = makeFakeCtx({
+      phone: "+33688887777",
+      body: "Mon perso 0612348888 — pas intéressé désolé",
+      ovhMessageId: "ovh-secret-replyproc-001",
+    });
+    const deps = makeDeps({
+      getContactByPhone: vi.fn().mockResolvedValue(makeFakeContact("hs-rp-leak")),
+      getActiveConversationByContactId: vi.fn().mockResolvedValue({
+        conversationId: "hs-rp-leak_camp-r",
+        conversation: makeFakeConversation("hs-rp-leak", "camp-r"),
+      }),
+      addInbound: vi.fn().mockResolvedValue("msgid-rp-leak"),
+      classifyReply: vi.fn().mockResolvedValue({
+        intent: "OBJECTION",
+        confidence: 0.88,
+        reasoning: "PII-reasoning-must-not-leak-into-reply-processed",
+        fallback: false,
+      }),
+    });
+
+    await processReplyHandler(ctx, deps);
+
+    const calls = (deps.appendAuditLog as ReturnType<typeof vi.fn>).mock.calls;
+    const replyProcessedCall = calls.find(
+      (c) => (c[0] as { action: string }).action === "reply_processed",
+    );
+    expect(replyProcessedCall).toBeDefined();
+    const serialized = JSON.stringify(replyProcessedCall);
+
+    // Sentinelle anti-PII payload reply_processed (defense-in-depth).
+    expect(serialized).not.toContain("+33688887777");
+    expect(serialized).not.toContain("688887777");
+    expect(serialized).not.toContain("Mon perso");
+    expect(serialized).not.toContain("0612348888");
+    expect(serialized).not.toContain("ovh-secret-replyproc-001");
+    expect(serialized).not.toContain("PII-reasoning-must-not-leak-into-reply-processed");
+    expect(serialized).not.toContain("reasoning");
+    // Q1 brief — tokens OMIS du payload.
+    expect(serialized).not.toContain("tokensInput");
+    expect(serialized).not.toContain("tokensOutput");
+    // Sentinelle positive : les champs scrubber-safe sont bien là.
+    expect(serialized).toContain("hs-rp-leak");
+    expect(serialized).toContain("hs-rp-leak_camp-r");
+    expect(serialized).toContain("msgid-rp-leak");
+    expect(serialized).toContain("OBJECTION");
+    expect(serialized).toContain("classified");
+    expect(serialized).toContain("in_dialogue");
+    expect(serialized).toContain("pipelineDurationMs");
+  });
+
   it("classifier fallback=true → logger.warn('classifier_fallback') posé", async () => {
     const ctx = makeFakeCtx({ body: "Bonjour" });
     const deps = makeDeps({
@@ -688,6 +795,26 @@ describe("Step 7 — branch-by-intent", () => {
       nextStatus: "in_dialogue",
     });
     expect(deps.markOptedOut).not.toHaveBeenCalled();
+
+    // S9.2.3 — Step 8 audit-reply-processed posé en fin de branche.
+    // classifierFallback: false présent car branche passée par Claude.
+    expect(deps.appendAuditLog).toHaveBeenCalledWith({
+      actorId: "system",
+      actorType: "system",
+      action: "reply_processed",
+      targetType: "conversation",
+      targetId: "hs-i_camp-i",
+      payload: expect.objectContaining({
+        contactId: "hs-i",
+        conversationId: "hs-i_camp-i",
+        messageId: "msgid-i",
+        intent: "INTERESSE",
+        branchTaken: "classified",
+        finalConversationStatus: "in_dialogue",
+        classifierFallback: false,
+        pipelineDurationMs: expect.any(Number),
+      }),
+    });
   });
 
   it("OBJECTION → setConversationIntent('OBJECTION', in_dialogue) + classified", async () => {
@@ -716,6 +843,25 @@ describe("Step 7 — branch-by-intent", () => {
     expect(deps.setConversationIntent).toHaveBeenCalledWith("hs-o_camp-o", "OBJECTION", {
       nextStatus: "in_dialogue",
     });
+
+    // S9.2.3 — Step 8 audit-reply-processed
+    expect(deps.appendAuditLog).toHaveBeenCalledWith({
+      actorId: "system",
+      actorType: "system",
+      action: "reply_processed",
+      targetType: "conversation",
+      targetId: "hs-o_camp-o",
+      payload: expect.objectContaining({
+        contactId: "hs-o",
+        conversationId: "hs-o_camp-o",
+        messageId: "msgid-o",
+        intent: "OBJECTION",
+        branchTaken: "classified",
+        finalConversationStatus: "in_dialogue",
+        classifierFallback: false,
+        pipelineDurationMs: expect.any(Number),
+      }),
+    });
   });
 
   it("NEUTRE → setConversationIntent('NEUTRE', in_dialogue) + classified", async () => {
@@ -743,6 +889,25 @@ describe("Step 7 — branch-by-intent", () => {
     }
     expect(deps.setConversationIntent).toHaveBeenCalledWith("hs-n_camp-n", "NEUTRE", {
       nextStatus: "in_dialogue",
+    });
+
+    // S9.2.3 — Step 8 audit-reply-processed
+    expect(deps.appendAuditLog).toHaveBeenCalledWith({
+      actorId: "system",
+      actorType: "system",
+      action: "reply_processed",
+      targetType: "conversation",
+      targetId: "hs-n_camp-n",
+      payload: expect.objectContaining({
+        contactId: "hs-n",
+        conversationId: "hs-n_camp-n",
+        messageId: "msgid-n",
+        intent: "NEUTRE",
+        branchTaken: "classified",
+        finalConversationStatus: "in_dialogue",
+        classifierFallback: false,
+        pipelineDurationMs: expect.any(Number),
+      }),
     });
   });
 
@@ -780,6 +945,26 @@ describe("Step 7 — branch-by-intent", () => {
       intent: "STOP",
     });
     expect(deps.setConversationIntent).not.toHaveBeenCalled();
+
+    // S9.2.3 — Step 8 audit-reply-processed sur branche classifier_long_form.
+    // classifierFallback: false présent.
+    expect(deps.appendAuditLog).toHaveBeenCalledWith({
+      actorId: "system",
+      actorType: "system",
+      action: "reply_processed",
+      targetType: "conversation",
+      targetId: "hs-clf-stop-1_camp-x",
+      payload: expect.objectContaining({
+        contactId: "hs-clf-stop-1",
+        conversationId: "hs-clf-stop-1_camp-x",
+        messageId: "msgid-clf-stop-1",
+        intent: "STOP",
+        branchTaken: "opt_out_classifier_long_form",
+        finalConversationStatus: "opted_out",
+        classifierFallback: false,
+        pipelineDurationMs: expect.any(Number),
+      }),
+    });
   });
 
   it("STORE-INBOUND avant classifier long-form opt-out (forensic L.34-5 CPCE — J1 compliance-auditor)", async () => {
@@ -924,6 +1109,23 @@ describe("🔒 GUARD-001 — long-form opt-out rattrapé par classifier (anti-r�
       expect.objectContaining({
         action: "intent_classified",
         payload: expect.objectContaining({ intent: "STOP", fallback: false }),
+      }),
+    );
+
+    // Sentinelle 5 — S9.2.3 : audit reply_processed posé en fin de pipeline
+    // sur la branche classifier_long_form. Verrouille bout-en-bout le
+    // forensic L.34-5 CPCE pour les opt-out longs rattrapés par Claude.
+    expect(deps.appendAuditLog).toHaveBeenCalledWith(
+      expect.objectContaining({
+        action: "reply_processed",
+        targetType: "conversation",
+        targetId: "hs-guard001_camp-g",
+        payload: expect.objectContaining({
+          intent: "STOP",
+          branchTaken: "opt_out_classifier_long_form",
+          finalConversationStatus: "opted_out",
+          classifierFallback: false,
+        }),
       }),
     );
   });
