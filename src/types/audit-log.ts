@@ -50,9 +50,20 @@ import { type Timestamp } from "firebase-admin/firestore";
  *     `classifyReply` (S7a.2). Payload = `{ intent, confidence, fallback,
  *      promptVersion, model }`. Tous scrubber-safe (intent ∈ enum fermé,
  *     pas de reasoning ni de body).
- *   - `reply_processed` — pipeline `process-reply` terminé avec branche
- *     déterministe prise. Payload = `{ branch, conversationId,
- *      messageId }`.
+ *   - `reply_processed` — pipeline `process-reply` terminé avec succès
+ *     post-store-inbound sur une branche non-drop. Posé en step 8 final
+ *     (S9.2.3) UNIQUEMENT pour les branches `opt_out_short_form`,
+ *     `opt_out_classifier_long_form`, et `classified`. PAS posé sur les
+ *     drops — `reply_dropped` suffit. `targetType: "conversation"`,
+ *     `targetId: conversationId` (la conv est l'entité qui a transitionné
+ *     d'état). Payload =
+ *     `{ contactId, conversationId, messageId, intent (STOP|INTERESSE|
+ *        OBJECTION|NEUTRE), branchTaken (opt_out_short_form|
+ *        opt_out_classifier_long_form|classified), finalConversationStatus
+ *        (opted_out|in_dialogue), classifierFallback? (présent ssi
+ *        branche passée par classifier), pipelineDurationMs }`. Tous
+ *     scrubber-safe (IDs opaques + enums fermés + number). PAS de
+ *     body/phone/ovhMessageId/reasoning (defense-in-depth).
  *   - `reply_dropped` — pipeline `process-reply` court-circuité (PS
  *     inconnu, dédup webhook, body invalide). Payload = `{ reason,
  *      ovhMessageIdHash? }`.

@@ -1,5 +1,5 @@
 /**
- * Inngest function `process-reply` — pipeline déterministe steps 1-7 (S9.2.2).
+ * Inngest function `process-reply` — pipeline déterministe steps 1-8 (S9.2.3).
  *
  * ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
  * VUE D'ENSEMBLE
@@ -13,7 +13,7 @@
  * même event. Ce handler ne dépend ni d'OVH, ni d'un endpoint HTTP.
  *
  * ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
- * PIPELINE 7 STEPS (S9.2.2)
+ * PIPELINE 8 STEPS (S9.2.3)
  *
  *   1. `resolve-contact`            : `getContactByPhone(phone)` (S9.1).
  *                                     - found → `{contactId: hubspotId}`
@@ -74,20 +74,32 @@
  *                                       `{status:"classified", intent}`.
  *                                       S9.3 reprendra la gen IA.
  *
- * Step 8 (`audit-final reply_processed`) → S9.2.3.
+ *   8. `audit-reply-processed`      : `appendAuditLog({action:
+ *                                      "reply_processed", targetType:
+ *                                      "conversation", targetId:
+ *                                      conversationId, payload})`. Posé
+ *                                      UNIQUEMENT sur les branches non-drop
+ *                                      (4 short_form, 5 long_form, 6
+ *                                      classified). Forensic L.34-5 CPCE
+ *                                      bout-en-bout + observabilité P95
+ *                                      via `pipelineDurationMs`. PAS posé
+ *                                      sur les drops (reply_dropped suffit).
  *
  * ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
- * RETRIES — gardé à 0 en S9.2.2
+ * RETRIES — relâchés à 3 en S9.2.3 (= default Inngest v4.x explicite)
  *
- * `retries: 0` est conservé tant que la chaîne complète n'est pas
- * stabilisée (S9.2.3 relâchera à default Inngest = 4 avec un test
- * d'intégration qui valide la memoization step.run anti-doublon).
+ * `retries: 3` est choisi EXPLICITEMENT (= default Inngest v4.x, cf.
+ * `InngestFunction.d.ts:334`) pour garder la visibilité du choix dans
+ * le code. Permet à Inngest de retenter automatiquement en cas d'erreur
+ * transitoire (Firestore 5xx, Claude SDK timeout absorbé puis
+ * appendAuditLog fail post-classifier, etc.).
  *
  * Note Inngest : `step.run(name, fn)` memoize le résultat par
  * `(eventId, stepName)`. Sur retry, un step déjà commit retourne son
  * résultat caché sans ré-exécuter `fn` — assure idempotence sur tous
  * les writes Firestore, tous les `appendAuditLog`, ET tous les appels
- * Claude (pas de double facturation). Vérifié en S9.2.3.
+ * Claude (pas de double facturation). Test sentinelle anti-régression
+ * MED-1 dans `process-reply.memoization.test.ts` (S9.2.3.2).
  *
  * ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
  * ANTI-PII — logger strict
@@ -132,8 +144,9 @@
  *   | `opt_out` (auto)     | `contact`     | `contactId`               | `{channel: "sms", conversationId}` (markOptedOut étendu)     |
  *   | `intent_classified`  | `message`     | `messageId`               | `{contactId, conversationId, intent, confidence, fallback,   |
  *   |                      |               |                           |    promptVersion, model}` — PAS body/reasoning/tokens        |
- *
- * Action `reply_processed` (audit final) viendra en S9.2.3.
+ *   | `reply_processed`    | `conversation`| `conversationId`          | `{contactId, conversationId, messageId, intent, branchTaken, |
+ *   |                      |               |                           |    finalConversationStatus, classifierFallback?,             |
+ *   |                      |               |                           |    pipelineDurationMs}` — branches non-drop uniquement       |
  *
  * ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
  * INJECTION DE DÉPENDANCES (`deps`)
@@ -150,6 +163,7 @@ import {
   CLASSIFY_INTENT_MODEL,
   CLASSIFY_INTENT_PROMPT_VERSION,
 } from "@/lib/claude/prompts/classify-intent";
+import type { Intent } from "@/lib/claude/types";
 import { isOptOut } from "@/lib/compliance/opt-out";
 import { appendAuditLog } from "@/lib/firestore/audit-log";
 import { getContactByPhone, markOptedOut } from "@/lib/firestore/contacts";
@@ -312,11 +326,84 @@ export async function processReplyHandler(
   const { event, step, logger } = ctx;
   const { phone, body, ovhMessageId } = event.data;
 
+  // S9.2.3 — marqueur de début pour `pipelineDurationMs` du step 8
+  // `audit-reply-processed`. Capturé HORS de `step.run` pour mesurer
+  // bien la durée bout-en-bout du pipeline. Sur retry Inngest, ce
+  // marqueur est re-capturé à chaque attempt — la valeur committée par
+  // `step.run("audit-reply-processed", ...)` reflète donc la durée du
+  // run qui réussit l'audit, pas la durée cumulée des retries (volontaire :
+  // métrique d'observabilité de la latence pipeline en succès).
+  const handlerStartMs = Date.now();
+
   logger.info("[process-reply] received", {
     eventId: event.id,
     name: event.name,
     // PAS de phone, body, ovhMessageId — anti-PII strict.
   });
+
+  // S9.2.3 — Helper Step 8 `audit-reply-processed`.
+  //
+  // Posé UNIQUEMENT sur les branches non-drop (4 short_form, 5
+  // classifier_long_form, 6 classified). PAS sur les drops, qui sont
+  // déjà entièrement tracés par `reply_dropped` avec `reason`
+  // discriminant + phoneHash/contactId/duplicateOfMessageId.
+  //
+  // Sémantique : "fin de cycle de traitement post-store-inbound avec
+  // succès". Cible la conversation (entité qui a transitionné d'état),
+  // pas le message (qui est un événement ponctuel déjà ciblé par
+  // `intent_classified`). messageId reste tracé dans le payload pour
+  // corréler la conversation → preuve écrite L.34-5 CPCE.
+  //
+  // Idempotence : `step.run("audit-reply-processed", ...)` memoizé par
+  // (eventId, stepName). Branches mutuellement exclusives par flux de
+  // contrôle (early return après chaque branche) → un seul appel par run.
+  async function postReplyProcessedAudit(params: {
+    contactId: string;
+    conversationId: string;
+    messageId: string;
+    intent: Intent;
+    branchTaken: "opt_out_short_form" | "opt_out_classifier_long_form" | "classified";
+    finalConversationStatus: "opted_out" | "in_dialogue";
+    /**
+     * Présent UNIQUEMENT si la branche est passée par le classifier
+     * (long_form opt_out + classified). Omis sur short_form qui
+     * court-circuite avant l'appel Claude — éviter un faux signal de
+     * fallback côté analytics.
+     */
+    classifierFallback?: boolean;
+  }): Promise<void> {
+    await step.run("audit-reply-processed", async () => {
+      const pipelineDurationMs = Date.now() - handlerStartMs;
+      await _appendAuditLog({
+        actorId: "system",
+        actorType: "system",
+        action: "reply_processed",
+        targetType: "conversation",
+        targetId: params.conversationId,
+        // Payload scrubber-safe (cf. Q2 arbitrage Déthié S9.2.3) :
+        //   - IDs opaques internes (contactId, conversationId, messageId)
+        //   - intent : enum fermé Intent
+        //   - branchTaken/finalConversationStatus : enums fermés
+        //   - classifierFallback : boolean optional (présent ssi branche
+        //     passée par classifier — voir JSDoc helper)
+        //   - pipelineDurationMs : number (observabilité P95 monitoring S9.6)
+        // OMIS volontairement (jamais dans le payload) :
+        //   - phone/body/ovhMessageId/reasoning : defense-in-depth anti-PII
+        payload: {
+          contactId: params.contactId,
+          conversationId: params.conversationId,
+          messageId: params.messageId,
+          intent: params.intent,
+          branchTaken: params.branchTaken,
+          finalConversationStatus: params.finalConversationStatus,
+          ...(params.classifierFallback !== undefined
+            ? { classifierFallback: params.classifierFallback }
+            : {}),
+          pipelineDurationMs,
+        },
+      });
+    });
+  }
 
   // ── Step 1 — resolve-contact ──────────────────────────────────────────
   const contactStep = await step.run("resolve-contact", async () => {
@@ -471,7 +558,16 @@ export async function processReplyHandler(
       messageId,
       step: "short-form-opt-out-check",
     });
-    // S9.2.3 ajoutera l'audit `reply_processed` final ici.
+    // S9.2.3 — Step 8 audit-reply-processed. Pas de classifierFallback
+    // sur short_form (court-circuit avant Claude).
+    await postReplyProcessedAudit({
+      contactId,
+      conversationId,
+      messageId,
+      intent: "STOP",
+      branchTaken: "opt_out_short_form",
+      finalConversationStatus: "opted_out",
+    });
     return {
       status: "opt_out",
       contactId,
@@ -573,6 +669,18 @@ export async function processReplyHandler(
       classifierFallback: classification.fallback,
     });
 
+    // S9.2.3 — Step 8 audit-reply-processed. classifierFallback présent
+    // car branche passée par Claude.
+    await postReplyProcessedAudit({
+      contactId,
+      conversationId,
+      messageId,
+      intent: "STOP",
+      branchTaken: "opt_out_classifier_long_form",
+      finalConversationStatus: "opted_out",
+      classifierFallback: classification.fallback,
+    });
+
     return {
       status: "opt_out",
       contactId,
@@ -601,6 +709,18 @@ export async function processReplyHandler(
     step: `branch-${nonStopIntent.toLowerCase()}`,
   });
 
+  // S9.2.3 — Step 8 audit-reply-processed. classifierFallback présent
+  // car branche passée par Claude.
+  await postReplyProcessedAudit({
+    contactId,
+    conversationId,
+    messageId,
+    intent: nonStopIntent,
+    branchTaken: "classified",
+    finalConversationStatus: "in_dialogue",
+    classifierFallback: classification.fallback,
+  });
+
   return {
     status: "classified",
     contactId,
@@ -615,12 +735,14 @@ export async function processReplyHandler(
 // ─────────────────────────────────────────────────────────────────────────────
 
 /**
- * Inngest function `process-reply` — pipeline déterministe 5 steps (S9.2.1).
+ * Inngest function `process-reply` — pipeline déterministe 8 steps (S9.2.3).
  *
  * **Trigger** : event `medere/sms.reply.received` (`SmsReplyReceivedDataSchema`).
  *
- * **Retries** : 0 en S9.2.1. Relâchement à default Inngest (4) en S9.2.3
- * avec test d'intégration de memoization.
+ * **Retries** : 3 (= default Inngest v4.x mais choix EXPLICITE pour
+ * visibilité dans le code). Memoization step.run protège contre
+ * double-commit sur retry (cf. JSDoc en-tête + sentinelle MED-1 dans
+ * `process-reply.memoization.test.ts` S9.2.3.2).
  *
  * **Handler** : `processReplyHandler` (exporté pour tests).
  */
@@ -628,8 +750,12 @@ export const processReply = getInngestClient().createFunction(
   {
     id: FUNCTION_ID,
     triggers: [{ event: smsReplyReceived }],
-    // S9.2.1 — gardé à 0. Sentinelle test verrouille jusqu'à S9.2.3.
-    retries: 0,
+    // S9.2.3 — choix explicite (= default Inngest v4.x), pas implicite.
+    // Sentinelle test verrouille `retries === 3`. La memoization
+    // `step.run(name, fn)` (clé `(eventId, stepName)`) assure idempotence
+    // sur tous les writes Firestore + audits + appels Claude (pas de
+    // double facturation, pas de double-commit forensique).
+    retries: 3,
   },
   processReplyHandler,
 );
