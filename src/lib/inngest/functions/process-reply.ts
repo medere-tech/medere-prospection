@@ -1,5 +1,5 @@
 /**
- * Inngest function `process-reply` — pipeline déterministe steps 1-5 (S9.2.1).
+ * Inngest function `process-reply` — pipeline déterministe steps 1-7 (S9.2.2).
  *
  * ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
  * VUE D'ENSEMBLE
@@ -13,7 +13,7 @@
  * même event. Ce handler ne dépend ni d'OVH, ni d'un endpoint HTTP.
  *
  * ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
- * PIPELINE 5 STEPS (S9.2.1)
+ * PIPELINE 7 STEPS (S9.2.2)
  *
  *   1. `resolve-contact`            : `getContactByPhone(phone)` (S9.1).
  *                                     - found → `{contactId: hubspotId}`
@@ -35,28 +35,49 @@
  *                                        duplicateOfMessageId}` + return.
  *                                     - new → continue.
  *
- *   4. `store-inbound`              : `addInbound(convId, {body, channel:
- *                                      "sms", externalId: ovhMessageId,
- *                                      externalReceiver: phone})` (S6.5).
+ *   4. `store-inbound`              : `addInbound(convId, ...)` (S6.5).
  *                                     - Pose le doc message + audit
  *                                       `sms_received` AUTO dans la tx.
  *                                     - Retourne `messageId` Firestore.
  *
  *   5. `short-form-opt-out-check`   : `isOptOut(body)` (S4, GUARD-001
  *                                      short-form ≤ 50 chars).
- *                                     - true → `markOptedOut(contactId,
- *                                       "sms")` (S6.3, audit `opt_out`
- *                                       AUTO dans la tx) + return
- *                                       `{status: "opt_out", ...}`.
- *                                     - false → return
- *                                       `{status: "pending_intent_
- *                                       classification", ...}`.
+ *                                     - true → `markOptedOut` ÉTENDU
+ *                                       (S9.2.2.1 : `{conversationId,
+ *                                       intent:"STOP"}`) → conv synchro
+ *                                       intent=STOP, status=opted_out
+ *                                       dans la MÊME tx que contact +
+ *                                       return `{status:"opt_out", via:
+ *                                       "short_form"}`.
+ *                                     - false → continue step 6.
  *
- * Steps 6-7 (`classify-intent` + `branch-by-intent`) → S9.2.2.
+ *   6. `classify-intent`            : `classifyReply(body)` (S7a.2,
+ *                                      Claude Haiku 4.5 + tool use).
+ *                                     - Toujours retourne un résultat
+ *                                       (fail-safe STOP avec fallback=
+ *                                       true sur erreur SDK).
+ *                                     - Audit `intent_classified` posé
+ *                                       AVANT branch (Q1 brief Déthié).
+ *                                     - `logger.warn` si fallback=true
+ *                                       (observabilité S9.6 monitoring).
+ *
+ *   7. `branch-by-intent`           : 4 branches discriminées :
+ *                                     - STOP → `markOptedOut` étendu
+ *                                       (ferme GUARD-001 long-form
+ *                                       opt-out >50 chars rattrapé) +
+ *                                       return `{status:"opt_out", via:
+ *                                       "classifier_long_form"}`.
+ *                                     - INTERESSE/OBJECTION/NEUTRE →
+ *                                       `setConversationIntent(convId,
+ *                                       intent, {nextStatus:
+ *                                       "in_dialogue"})` + return
+ *                                       `{status:"classified", intent}`.
+ *                                       S9.3 reprendra la gen IA.
+ *
  * Step 8 (`audit-final reply_processed`) → S9.2.3.
  *
  * ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
- * RETRIES — gardé à 0 en S9.2.1
+ * RETRIES — gardé à 0 en S9.2.2
  *
  * `retries: 0` est conservé tant que la chaîne complète n'est pas
  * stabilisée (S9.2.3 relâchera à default Inngest = 4 avec un test
@@ -65,7 +86,8 @@
  * Note Inngest : `step.run(name, fn)` memoize le résultat par
  * `(eventId, stepName)`. Sur retry, un step déjà commit retourne son
  * résultat caché sans ré-exécuter `fn` — assure idempotence sur tous
- * les writes Firestore et tous les `appendAuditLog`. Vérifié en S9.2.3.
+ * les writes Firestore, tous les `appendAuditLog`, ET tous les appels
+ * Claude (pas de double facturation). Vérifié en S9.2.3.
  *
  * ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
  * ANTI-PII — logger strict
@@ -78,36 +100,40 @@
  *   - `conversationId` : = `${contactId}_${campaignId}` (opaque par construction)
  *   - `messageId`      : Firestore auto-ID `[A-Za-z0-9]{20}`
  *   - `step`           : nom du step en cours
+ *   - `intent`         : enum fermé (`INTENT_VALUES`), pas PII
+ *   - `classifierFallback` : boolean (S9.2.2)
  *
  * Champs INTERDITS dans les logs (PII / semi-sensibles) :
  *
- *   - `phone`          : E.164 du PS → hasher via `hashPii()` pour audit
+ *   - `phone`          : E.164 du PS → hasher via `safePhoneHash()` pour
+ *                        audit (PAS hashPii brut, cf. HIGH-1 S9.2.1)
  *   - `body`           : peut contenir n° perso, infos médicales
  *   - `ovhMessageId`   : identifiant externe semi-sensible (cf.
  *                        invariants `messages.ts:36-54`)
+ *   - `reasoning`      : reasoning Claude — defense-in-depth, le prompt
+ *                        l'interdit mais on ne fait pas confiance
  *
  * Sentinelle anti-PII pipeline complet : `process-reply.test.ts` couvre
- * chaque step et vérifie via `JSON.stringify(logger.mock.calls)` que
- * phone/body/ovhMessageId n'apparaissent JAMAIS.
+ * chaque step (1-7) et vérifie via `JSON.stringify(logger.mock.calls)`
+ * que phone/body/ovhMessageId/reasoning n'apparaissent JAMAIS.
  *
  * ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
- * AUDITS POSÉS (S9.2.1)
+ * AUDITS POSÉS (S9.2.2)
  *
- * Pattern uniforme `{actorId: "system", actorType: "system"}` (vérifié
- * cohérent avec 12 sites pipeline automatisés — `send-first-sms`,
- * `addOutbound`, `addInbound`, `markOptedOut`, etc.).
+ * Pattern uniforme `{actorId: "system", actorType: "system"}`.
  *
  *   | Action               | targetType    | targetId                  | payload                                                      |
  *   |----------------------|---------------|---------------------------|--------------------------------------------------------------|
- *   | `reply_dropped`      | `contact`     | `phoneHash` (hashPii)     | `{reason: "contact_unknown", phoneHash}`                     |
+ *   | `reply_dropped`      | `contact`     | `phoneHash` (safePhone)   | `{reason: "contact_unknown", phoneHash}`                     |
  *   | `reply_dropped`      | `contact`     | `contactId`               | `{reason: "no_active_conversation", phoneHash}`              |
  *   | `reply_dropped`      | `message`     | `duplicateOfMessageId`    | `{reason: "duplicate", contactId, conversationId,            |
  *   |                      |               |                           |    duplicateOfMessageId}`                                    |
  *   | `sms_received` (auto)| `message`     | `messageId` (nouveau)     | `{direction: "inbound", messageId}` (par `addInbound`)       |
- *   | `opt_out` (auto)     | `contact`     | `contactId`               | `{channel: "sms"}` (par `markOptedOut`)                      |
+ *   | `opt_out` (auto)     | `contact`     | `contactId`               | `{channel: "sms", conversationId}` (markOptedOut étendu)     |
+ *   | `intent_classified`  | `message`     | `messageId`               | `{contactId, conversationId, intent, confidence, fallback,   |
+ *   |                      |               |                           |    promptVersion, model}` — PAS body/reasoning/tokens        |
  *
- * Les actions `reply_processed` + `intent_classified` viendront en
- * S9.2.2 / S9.2.3 (déjà whitelistées S9.1).
+ * Action `reply_processed` (audit final) viendra en S9.2.3.
  *
  * ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
  * INJECTION DE DÉPENDANCES (`deps`)
@@ -119,10 +145,18 @@
  *
  * @see `processReplyHandler` ci-dessous pour le typage.
  */
+import { classifyReply } from "@/lib/claude/intent-classifier";
+import {
+  CLASSIFY_INTENT_MODEL,
+  CLASSIFY_INTENT_PROMPT_VERSION,
+} from "@/lib/claude/prompts/classify-intent";
 import { isOptOut } from "@/lib/compliance/opt-out";
 import { appendAuditLog } from "@/lib/firestore/audit-log";
 import { getContactByPhone, markOptedOut } from "@/lib/firestore/contacts";
-import { getActiveConversationByContactId } from "@/lib/firestore/conversations";
+import {
+  getActiveConversationByContactId,
+  setConversationIntent,
+} from "@/lib/firestore/conversations";
 import { addInbound, findInboundByExternalId } from "@/lib/firestore/messages";
 import { getInngestClient } from "@/lib/inngest/client";
 import { smsReplyReceived } from "@/lib/inngest/events";
@@ -152,17 +186,26 @@ type DropReason = (typeof DROP_REASONS)[number];
 // ─────────────────────────────────────────────────────────────────────────────
 
 /**
- * Résultat du pipeline `process-reply` (S9.2.1). Discriminé sur `status`.
+ * Résultat du pipeline `process-reply` (S9.2.2). Discriminé sur `status`.
  *
- *   - `dropped`                         : pipeline court-circuité par
- *                                          contact_unknown / no_active_
- *                                          conversation / duplicate.
- *   - `opt_out`                         : short-form opt-out détecté,
- *                                          `markOptedOut` appliqué.
- *   - `pending_intent_classification`   : transition vers S9.2.2 (le
- *                                          message est stocké, on attend
- *                                          que classify-intent prenne la
- *                                          suite).
+ *   - `dropped`     : pipeline court-circuité par contact_unknown /
+ *                     no_active_conversation / duplicate.
+ *
+ *   - `opt_out`     : STOP appliqué. Discriminant `via` :
+ *                     - `"short_form"` : détecté par `isOptOut(body)` au
+ *                       step 5 fast-path (STOP, ARRET, ≤ 50 chars).
+ *                     - `"classifier_long_form"` : détecté par le classifier
+ *                       Claude au step 6 (long-form opt-out > 50 chars,
+ *                       ferme GUARD-001).
+ *                     `intent` toujours `"STOP"` dans cette branche.
+ *
+ *   - `classified`  : classifier Claude a posé un intent non-STOP
+ *                     (INTERESSE / OBJECTION / NEUTRE). La conversation
+ *                     est mise à `status="in_dialogue"` + l'intent posé.
+ *                     S9.3 reprendra le relais pour la gen IA + envoi.
+ *
+ * Note : `pending_intent_classification` (S9.2.1) est SUPPRIMÉ — remplacé
+ * par `classified` qui acte la décision Claude au lieu d'attendre.
  */
 export type ProcessReplyResult =
   | { status: "dropped"; reason: DropReason }
@@ -171,12 +214,22 @@ export type ProcessReplyResult =
       contactId: string;
       conversationId: string;
       messageId: string;
+      intent: "STOP";
+      /**
+       * Discriminant analytics + forensic L.34-5 CPCE :
+       *   - `"short_form"` : fast-path déterministe (step 5).
+       *   - `"classifier_long_form"` : rattrapé par Claude (step 7).
+       * Permet de mesurer en prod le ratio des 2 voies (vérifier que le
+       * classifier ne capture pas trop de faux positifs côté GUARD-001).
+       */
+      via: "short_form" | "classifier_long_form";
     }
   | {
-      status: "pending_intent_classification";
+      status: "classified";
       contactId: string;
       conversationId: string;
       messageId: string;
+      intent: "INTERESSE" | "OBJECTION" | "NEUTRE";
     };
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -198,6 +251,9 @@ export interface ProcessReplyDeps {
   isOptOut?: typeof isOptOut;
   hashPii?: typeof hashPii;
   appendAuditLog?: typeof appendAuditLog;
+  // S9.2.2 — classifier + post-classification mutation
+  classifyReply?: typeof classifyReply;
+  setConversationIntent?: typeof setConversationIntent;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -250,6 +306,8 @@ export async function processReplyHandler(
   const _isOptOut = deps.isOptOut ?? isOptOut;
   const _hashPii = deps.hashPii ?? hashPii;
   const _appendAuditLog = deps.appendAuditLog ?? appendAuditLog;
+  const _classifyReply = deps.classifyReply ?? classifyReply;
+  const _setConversationIntent = deps.setConversationIntent ?? setConversationIntent;
 
   const { event, step, logger } = ctx;
   const { phone, body, ovhMessageId } = event.data;
@@ -389,12 +447,17 @@ export async function processReplyHandler(
   // ── Step 5 — short-form-opt-out-check (fast-path déterministe) ────────
   // Économise un appel Claude pour les opt-out courts évidents (STOP,
   // ARRET, DESINSCRIPTION, ≤ 50 chars). Le long-form opt-out (>50 chars)
-  // sera détecté par le classifier Claude en S9.2.2.
+  // est rattrapé par le classifier Claude en step 6/7 (ferme GUARD-001).
   const optOutStep = await step.run("short-form-opt-out-check", async () => {
     if (_isOptOut(body)) {
-      // `markOptedOut` est idempotent + atomique (update contact + audit
-      // `opt_out` dans la MÊME tx). Cf. contacts.ts:239-278.
-      await _markOptedOut(contactId, "sms");
+      // S9.2.2.2 — markOptedOut variante étendue : synchronise la
+      // conversation (intent="STOP", status="opted_out") dans la MÊME tx
+      // que le contact. Ferme le trou de désync S9.2.1 où le contact
+      // était marqué opted_out mais la conv restait awaiting_reply.
+      await _markOptedOut(contactId, "sms", {
+        conversationId,
+        intent: "STOP",
+      });
       return { isOptOut: true as const };
     }
     return { isOptOut: false as const };
@@ -409,22 +472,141 @@ export async function processReplyHandler(
       step: "short-form-opt-out-check",
     });
     // S9.2.3 ajoutera l'audit `reply_processed` final ici.
-    return { status: "opt_out", contactId, conversationId, messageId };
+    return {
+      status: "opt_out",
+      contactId,
+      conversationId,
+      messageId,
+      intent: "STOP",
+      via: "short_form",
+    };
   }
 
-  logger.info("[process-reply] pending intent classification", {
+  // ── Step 6 — classify-intent (Claude Haiku 4.5) ───────────────────────
+  // Appel classifier sur les messages non-opt-out short-form. Le classifier
+  // a un contrat fail-safe STOP : toute erreur SDK absorbée → fallback
+  // intent="STOP" + fallback=true (précaution juridique L.34-5 CPCE).
+  // L'audit `intent_classified` est posé AVANT le branch (Q1 brief) —
+  // on audit le VERDICT classifier indépendamment de ce que le pipeline
+  // en fait ensuite. Payload scrubber-safe (pas de body, pas de reasoning).
+  const classification = await step.run("classify-intent", async () => {
+    const result = await _classifyReply(body);
+
+    // Observabilité fail-safe (Q2 brief) : un fallback=true signale un
+    // échec SDK (timeout, 429, tool_use malformé). À monitorer en prod —
+    // si taux > 5%, alerter Sentry/Slack (câblage S9.6). Aucune PII dans
+    // le log : seulement les IDs opaques + le messageId Firestore.
+    if (result.fallback) {
+      logger.warn("[process-reply] classifier_fallback", {
+        eventId: event.id,
+        contactId,
+        conversationId,
+        messageId,
+        step: "classify-intent",
+      });
+    }
+
+    await _appendAuditLog({
+      actorId: "system",
+      actorType: "system",
+      action: "intent_classified",
+      targetType: "message",
+      targetId: messageId,
+      // Payload scrubber-safe (cf. Q1 arbitrage Déthié S9.2.2.0) :
+      //   - contactId/conversationId/messageId : IDs opaques internes.
+      //   - intent : enum fermé (`INTENT_VALUES`).
+      //   - confidence : number [0,1].
+      //   - fallback : boolean (distingue STOP authentique vs panne).
+      //   - promptVersion : `"1.0.1"`, marker forensic + corrélation
+      //     post-mortem si un changement prompt dégrade un intent.
+      //   - model : `"claude-haiku-4-5-20251001"` snapshot daté
+      //     (déterminisme compliance).
+      // OMIS volontairement :
+      //   - `reasoning` : defense-in-depth anti-fuite PII (le prompt
+      //     l'interdit côté Claude, mais on ne fait pas confiance).
+      //   - `tokensInput/tokensOutput` : disponibles via logs Pino côté
+      //     wrapper Claude. Agrégation Firestore reportée S10+ si besoin
+      //     (cf. Q1 arbitrage Déthié).
+      payload: {
+        contactId,
+        conversationId,
+        intent: result.intent,
+        confidence: result.confidence,
+        fallback: result.fallback,
+        promptVersion: CLASSIFY_INTENT_PROMPT_VERSION,
+        model: CLASSIFY_INTENT_MODEL,
+      },
+    });
+
+    return result;
+  });
+
+  // ── Step 7 — branch-by-intent ────────────────────────────────────────
+  // 4 branches discriminées par classifier.intent :
+  //   STOP        → markOptedOut étendu (idem step 5 mais via classifier
+  //                 long-form, discriminant `via: "classifier_long_form"`).
+  //   INTERESSE   → setConversationIntent + nextStatus="in_dialogue".
+  //   OBJECTION   → idem INTERESSE.
+  //   NEUTRE      → idem INTERESSE.
+  //
+  // L'invariant GUARD-001 (long-form opt-out rattrapé par Claude) est
+  // verrouillé par un test sentinelle dans process-reply.test.ts :
+  // `isOptOut(body) === false` ET `result.intent === "STOP"` →
+  // branche STOP empruntée + markOptedOut appelé avec conversationId.
+  if (classification.intent === "STOP") {
+    await step.run("branch-stop", async () => {
+      // markOptedOut étendu : idempotent si le contact + conv sont déjà
+      // à l'état final. Pose un audit `opt_out` avec payload enrichi
+      // {channel, conversationId}.
+      await _markOptedOut(contactId, "sms", {
+        conversationId,
+        intent: "STOP",
+      });
+    });
+
+    logger.info("[process-reply] classifier long-form opt-out applied", {
+      eventId: event.id,
+      contactId,
+      conversationId,
+      messageId,
+      step: "branch-stop",
+      classifierFallback: classification.fallback,
+    });
+
+    return {
+      status: "opt_out",
+      contactId,
+      conversationId,
+      messageId,
+      intent: "STOP",
+      via: "classifier_long_form",
+    };
+  }
+
+  // INTERESSE / OBJECTION / NEUTRE — la conv passe en in_dialogue.
+  // S9.3 reprendra le relais pour la génération IA + envoi reply.
+  const nonStopIntent = classification.intent;
+  await step.run(`branch-${nonStopIntent.toLowerCase()}`, async () => {
+    await _setConversationIntent(conversationId, nonStopIntent, {
+      nextStatus: "in_dialogue",
+    });
+  });
+
+  logger.info("[process-reply] classified", {
     eventId: event.id,
     contactId,
     conversationId,
     messageId,
+    intent: nonStopIntent,
+    step: `branch-${nonStopIntent.toLowerCase()}`,
   });
 
-  // S9.2.2 enchaînera classify-intent + branch-by-intent.
   return {
-    status: "pending_intent_classification",
+    status: "classified",
     contactId,
     conversationId,
     messageId,
+    intent: nonStopIntent,
   };
 }
 

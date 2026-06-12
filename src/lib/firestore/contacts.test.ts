@@ -325,10 +325,12 @@ describe("contacts.ts", () => {
       await expect(markOptedOut("contact_ghost", "sms")).rejects.toBeInstanceOf(NotFoundError);
     });
 
-    it("date custom injectée → optedOutAt = date custom", async () => {
+    it("date custom injectée via options.now → optedOutAt = date custom", async () => {
       await seedContact("contact_optout_4");
       const customDate = new Date("2026-03-15T10:30:00.000Z");
-      await markOptedOut("contact_optout_4", "manual", customDate);
+      // Signature évolutive S9.2.2.1 : `now` passe via `options.now`
+      // (ancien 3e arg `now: Date` migré vers `options: { now?: Date }`).
+      await markOptedOut("contact_optout_4", "manual", { now: customDate });
 
       const contact = await getContact("contact_optout_4");
       expect(contact?.consent.optedOutAt).toBeInstanceOf(Timestamp);
@@ -345,6 +347,218 @@ describe("contacts.ts", () => {
       expect(auditPayloads.some((p) => p.includes("dashboard"))).toBe(true);
       // Sentinelle : aucun téléphone dans les payloads audit.
       expect(auditPayloads.every((p) => !p.includes("612345678"))).toBe(true);
+    });
+  });
+
+  // ───────────────────────────────────────────────────────────────────────
+  // markOptedOut — variante étendue S9.2.2.1 (options.conversationId)
+  // ───────────────────────────────────────────────────────────────────────
+
+  describe("markOptedOut — variante étendue S9.2.2.1 (conversationId)", () => {
+    const CONV_COLL = "conversations";
+
+    /** Helper local — seed une conversation valide pour les tests opt-out. */
+    async function seedConv(
+      id: string,
+      overrides: {
+        status?:
+          | "active"
+          | "awaiting_reply"
+          | "in_dialogue"
+          | "qualified"
+          | "handed_off"
+          | "closed"
+          | "opted_out"
+          | "blocked";
+        intent?: "INTERESSE" | "OBJECTION" | "NEUTRE" | "STOP" | "unknown";
+        contactId?: string;
+        campaignId?: string;
+      } = {},
+    ): Promise<void> {
+      const now = Timestamp.now();
+      await getAdminDb()
+        .collection(CONV_COLL)
+        .doc(id)
+        .set({
+          contactId: overrides.contactId ?? "contact_ext_1",
+          campaignId: overrides.campaignId ?? "campaign_x",
+          channel: "sms",
+          status: overrides.status ?? "awaiting_reply",
+          intent: overrides.intent ?? "unknown",
+          messageCount: 1,
+          outboundCount: 1,
+          inboundCount: 0,
+          followupCount: 0,
+          createdAt: now,
+          updatedAt: now,
+        });
+    }
+
+    it("conversationId fourni → update contact + update conv atomique (intent=STOP, status=opted_out)", async () => {
+      await seedContact("contact_ext_1");
+      await seedConv("conv_ext_1", { contactId: "contact_ext_1" });
+
+      await markOptedOut("contact_ext_1", "sms", {
+        conversationId: "conv_ext_1",
+        intent: "STOP",
+      });
+
+      const contact = await getContact("contact_ext_1");
+      expect(contact?.consent.optedOut).toBe(true);
+      expect(contact?.status).toBe("opted_out");
+
+      const convDoc = await getAdminDb().collection(CONV_COLL).doc("conv_ext_1").get();
+      const conv = convDoc.data() as { intent: string; status: string };
+      expect(conv.intent).toBe("STOP");
+      expect(conv.status).toBe("opted_out");
+    });
+
+    it("conv en handed_off → throw ValidationError, contact NON mis à jour (atomicité)", async () => {
+      await seedContact("contact_ext_2");
+      await seedConv("conv_ext_2", {
+        contactId: "contact_ext_2",
+        status: "handed_off",
+      });
+
+      await expect(
+        markOptedOut("contact_ext_2", "sms", {
+          conversationId: "conv_ext_2",
+          intent: "STOP",
+        }),
+      ).rejects.toBeInstanceOf(ValidationError);
+
+      // Atomicité : la guard transition rollback la tx → contact intact.
+      const contact = await getContact("contact_ext_2");
+      expect(contact?.consent.optedOut).toBe(false);
+      expect(contact?.status).toBe("ready");
+    });
+
+    it("contact + conv déjà à l'état final → no-op total (0 nouvel audit)", async () => {
+      // Seed un contact déjà opted_out + une conv déjà intent=STOP/status=opted_out.
+      const now = Timestamp.now();
+      await seedContact("contact_ext_3", {
+        status: "opted_out",
+        consent: {
+          legitimateInterest:
+            "Contact HubSpot Médéré importé le 2026-05-29, dentiste IDF, opt-in B2B.",
+          optedOut: true,
+          optedOutAt: now,
+          optedOutChannel: "sms",
+        },
+      });
+      await seedConv("conv_ext_3", {
+        contactId: "contact_ext_3",
+        status: "opted_out",
+        intent: "STOP",
+      });
+
+      const auditsBefore = await countAuditDocs();
+      await markOptedOut("contact_ext_3", "sms", {
+        conversationId: "conv_ext_3",
+        intent: "STOP",
+      });
+      const auditsAfter = await countAuditDocs();
+
+      expect(auditsAfter).toBe(auditsBefore); // No-op total
+    });
+
+    it("contact déjà opt-out MAIS conv désync → update conv seul + audit avec reason=sync_conversation", async () => {
+      // Scénario : un ancien run a marqué le contact opt-out sans synchroniser
+      // la conv (cas legacy pré-S9.2.2.1). Le nouvel appel doit rattraper
+      // la cohérence + poser un audit forensic distinct.
+      const now = Timestamp.now();
+      await seedContact("contact_ext_4", {
+        status: "opted_out",
+        consent: {
+          legitimateInterest:
+            "Contact HubSpot Médéré importé le 2026-05-29, dentiste IDF, opt-in B2B.",
+          optedOut: true,
+          optedOutAt: now,
+          optedOutChannel: "sms",
+        },
+      });
+      await seedConv("conv_ext_4", {
+        contactId: "contact_ext_4",
+        status: "in_dialogue", // ← pas opted_out (désync)
+        intent: "INTERESSE",
+      });
+
+      const auditsBefore = await countAuditDocs();
+      await markOptedOut("contact_ext_4", "sms", {
+        conversationId: "conv_ext_4",
+        intent: "STOP",
+      });
+      const auditsAfter = await countAuditDocs();
+
+      // 1 audit posé pour le rattrapage forensic.
+      expect(auditsAfter).toBe(auditsBefore + 1);
+
+      const convDoc = await getAdminDb().collection(CONV_COLL).doc("conv_ext_4").get();
+      const conv = convDoc.data() as { intent: string; status: string };
+      expect(conv.intent).toBe("STOP");
+      expect(conv.status).toBe("opted_out");
+
+      // Sentinelle forensic : payload contient conversationId + reason.
+      const auditDocs = await getAdminDb().collection(__AUDIT_COLLECTION_FOR_TESTS).get();
+      const lastAudit = auditDocs.docs[auditDocs.docs.length - 1]?.data() as {
+        action: string;
+        payload: { channel: string; conversationId?: string; reason?: string };
+      };
+      expect(lastAudit.action).toBe("opt_out");
+      expect(lastAudit.payload.conversationId).toBe("conv_ext_4");
+      expect(lastAudit.payload.reason).toBe("sync_conversation");
+    });
+
+    it("payload audit contient conversationId si fourni (sentinelle forensic)", async () => {
+      await seedContact("contact_ext_5");
+      await seedConv("conv_ext_5", { contactId: "contact_ext_5" });
+
+      await markOptedOut("contact_ext_5", "sms", {
+        conversationId: "conv_ext_5",
+        intent: "STOP",
+      });
+
+      const auditDocs = await getAdminDb().collection(__AUDIT_COLLECTION_FOR_TESTS).get();
+      const lastAudit = auditDocs.docs[auditDocs.docs.length - 1]?.data() as {
+        payload: { channel: string; conversationId?: string };
+      };
+      expect(lastAudit.payload.channel).toBe("sms");
+      expect(lastAudit.payload.conversationId).toBe("conv_ext_5");
+    });
+
+    it("conversationId fourni mais conv inexistante → throw NotFoundError, contact NON mis à jour", async () => {
+      await seedContact("contact_ext_6");
+
+      await expect(
+        markOptedOut("contact_ext_6", "sms", {
+          conversationId: "conv_ghost",
+          intent: "STOP",
+        }),
+      ).rejects.toBeInstanceOf(NotFoundError);
+
+      // Atomicité : tx rollback → contact intact.
+      const contact = await getContact("contact_ext_6");
+      expect(contact?.consent.optedOut).toBe(false);
+    });
+
+    it("sans conversationId → comportement strictement identique à pré-S9.2.2.1 (rétrocompat)", async () => {
+      // Sentinelle anti-régression : appel sans options se comporte comme avant.
+      // Aucune lecture de conversation, aucune mention de conversationId dans audit.
+      await seedContact("contact_ext_7");
+      await markOptedOut("contact_ext_7", "sms");
+
+      const contact = await getContact("contact_ext_7");
+      expect(contact?.consent.optedOut).toBe(true);
+      expect(contact?.status).toBe("opted_out");
+
+      const auditDocs = await getAdminDb().collection(__AUDIT_COLLECTION_FOR_TESTS).get();
+      const lastAudit = auditDocs.docs[auditDocs.docs.length - 1]?.data() as {
+        payload: { channel: string; conversationId?: string; reason?: string };
+      };
+      expect(lastAudit.payload.channel).toBe("sms");
+      // Sentinelle : pas de conversationId dans le payload quand options omis.
+      expect(lastAudit.payload.conversationId).toBeUndefined();
+      expect(lastAudit.payload.reason).toBeUndefined();
     });
   });
 

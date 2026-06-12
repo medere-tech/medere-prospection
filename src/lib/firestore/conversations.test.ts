@@ -36,10 +36,14 @@ import {
   __ACTIVE_CONVERSATION_STATUSES_FOR_TESTS,
   __CONVERSATIONS_COLLECTION_FOR_TESTS,
   __HANDOFF_NOTES_MIN_LENGTH_FOR_TESTS,
+  __NON_STOP_INTENTS_FOR_TESTS,
+  __NON_TERMINAL_NEXT_STATUSES_FOR_TESTS,
+  __TERMINAL_CONV_STATUSES_FOR_INTENT_CHANGE_FOR_TESTS,
   conversationDocId,
   getActiveConversationByContactId,
   getConversation,
   incrementMessageCount,
+  setConversationIntent,
   setHandoff,
 } from "./conversations";
 
@@ -580,6 +584,242 @@ describe("conversations.ts", () => {
         expect(ctx.conversationId).toBe("conv_hand_ctx");
         expect(ctx.currentAssignedTo).toBe("U05UVHGBURX");
       }
+    });
+  });
+
+  // ───────────────────────────────────────────────────────────────────────
+  // setConversationIntent (S9.2.2.1) — branches INTERESSE/OBJECTION/NEUTRE
+  // ───────────────────────────────────────────────────────────────────────
+
+  describe("setConversationIntent (S9.2.2.1)", () => {
+    it("INTERESSE + nextStatus=in_dialogue → update les 2 champs + lastIntentChangeAt + updatedAt", async () => {
+      await seedConversation("conv_intent_1", {
+        status: "awaiting_reply",
+        intent: "unknown",
+      });
+
+      await setConversationIntent("conv_intent_1", "INTERESSE", {
+        nextStatus: "in_dialogue",
+      });
+
+      const conv = await getConversation("conv_intent_1");
+      expect(conv?.intent).toBe("INTERESSE");
+      expect(conv?.status).toBe("in_dialogue");
+      expect(conv?.lastIntentChangeAt).toBeInstanceOf(Timestamp);
+    });
+
+    it("OBJECTION + nextStatus=in_dialogue → update les 2 champs", async () => {
+      await seedConversation("conv_intent_2", {
+        status: "awaiting_reply",
+        intent: "unknown",
+      });
+
+      await setConversationIntent("conv_intent_2", "OBJECTION", {
+        nextStatus: "in_dialogue",
+      });
+
+      const conv = await getConversation("conv_intent_2");
+      expect(conv?.intent).toBe("OBJECTION");
+      expect(conv?.status).toBe("in_dialogue");
+    });
+
+    it("NEUTRE + nextStatus=in_dialogue → update les 2 champs", async () => {
+      await seedConversation("conv_intent_3", {
+        status: "awaiting_reply",
+        intent: "unknown",
+      });
+
+      await setConversationIntent("conv_intent_3", "NEUTRE", {
+        nextStatus: "in_dialogue",
+      });
+
+      const conv = await getConversation("conv_intent_3");
+      expect(conv?.intent).toBe("NEUTRE");
+      expect(conv?.status).toBe("in_dialogue");
+    });
+
+    it("sans nextStatus → update intent uniquement, status préservé", async () => {
+      await seedConversation("conv_intent_4", {
+        status: "in_dialogue",
+        intent: "NEUTRE",
+      });
+
+      await setConversationIntent("conv_intent_4", "INTERESSE");
+
+      const conv = await getConversation("conv_intent_4");
+      expect(conv?.intent).toBe("INTERESSE");
+      expect(conv?.status).toBe("in_dialogue"); // ← status inchangé
+    });
+
+    it("conv en status terminal (closed) → throw ValidationError, pas d'update", async () => {
+      await seedConversation("conv_intent_5", {
+        status: "closed",
+        intent: "NEUTRE",
+      });
+
+      await expect(
+        setConversationIntent("conv_intent_5", "INTERESSE", {
+          nextStatus: "in_dialogue",
+        }),
+      ).rejects.toBeInstanceOf(ValidationError);
+
+      const conv = await getConversation("conv_intent_5");
+      expect(conv?.intent).toBe("NEUTRE"); // ← inchangé
+      expect(conv?.status).toBe("closed");
+    });
+
+    it("conv en status opted_out → throw ValidationError (intent figé à STOP)", async () => {
+      await seedConversation("conv_intent_6", {
+        status: "opted_out",
+        intent: "STOP",
+      });
+
+      await expect(setConversationIntent("conv_intent_6", "INTERESSE")).rejects.toBeInstanceOf(
+        ValidationError,
+      );
+    });
+
+    it("conv inexistante → throw NotFoundError", async () => {
+      await expect(setConversationIntent("conv_ghost_intent", "INTERESSE")).rejects.toBeInstanceOf(
+        NotFoundError,
+      );
+    });
+
+    it("nextStatus terminal (handed_off) → throw ValidationError AVANT la tx", async () => {
+      await seedConversation("conv_intent_7", {
+        status: "awaiting_reply",
+        intent: "unknown",
+      });
+
+      // Sentinelle : un nextStatus terminal doit passer par la fonction
+      // dédiée (setHandoff / markOptedOut). setConversationIntent refuse
+      // au runtime (le typage TS accepte `ConversationStatus` entier, c'est
+      // le runtime guard qui filtre — defense-in-depth pragmatique).
+      await expect(
+        setConversationIntent("conv_intent_7", "INTERESSE", {
+          nextStatus: "handed_off",
+        }),
+      ).rejects.toBeInstanceOf(ValidationError);
+
+      // L'état n'a pas bougé.
+      const conv = await getConversation("conv_intent_7");
+      expect(conv?.intent).toBe("unknown");
+      expect(conv?.status).toBe("awaiting_reply");
+    });
+
+    it("aucun audit log posé (l'audit est orchestré par le pipeline)", async () => {
+      await seedConversation("conv_intent_8", {
+        status: "awaiting_reply",
+        intent: "unknown",
+      });
+
+      const auditsBefore = await countAuditDocs();
+      await setConversationIntent("conv_intent_8", "INTERESSE", {
+        nextStatus: "in_dialogue",
+      });
+      const auditsAfter = await countAuditDocs();
+
+      // Sentinelle critique : setConversationIntent NE pose PAS d'audit
+      // (cf. JSDoc — c'est le pipeline qui orchestre `intent_classified`).
+      expect(auditsAfter).toBe(auditsBefore);
+    });
+
+    it("date custom via options.now → lastIntentChangeAt = date custom", async () => {
+      await seedConversation("conv_intent_9");
+      const customDate = new Date("2026-06-15T14:30:00.000Z");
+
+      await setConversationIntent("conv_intent_9", "INTERESSE", {
+        nextStatus: "in_dialogue",
+        now: customDate,
+      });
+
+      const conv = await getConversation("conv_intent_9");
+      expect(conv?.lastIntentChangeAt).toBeInstanceOf(Timestamp);
+      expect((conv?.lastIntentChangeAt as Timestamp).toMillis()).toBe(customDate.getTime());
+    });
+
+    // ─── Defense-in-depth : runtime guard contre STOP / unknown via cast ───
+
+    it("runtime guard : intent='STOP' via cast as Intent → throw ValidationError", async () => {
+      await seedConversation("conv_intent_stop_bypass", {
+        status: "awaiting_reply",
+        intent: "unknown",
+      });
+
+      // Bypass typage TS pour simuler un caller JS / runtime non-typé.
+      // Le runtime guard DOIT refuser pour préserver l'invariant
+      // "STOP passe par markOptedOut, pas par setConversationIntent".
+      await expect(
+        setConversationIntent(
+          "conv_intent_stop_bypass",
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
+          "STOP" as any,
+        ),
+      ).rejects.toBeInstanceOf(ValidationError);
+
+      const conv = await getConversation("conv_intent_stop_bypass");
+      expect(conv?.intent).toBe("unknown"); // ← rien n'a bougé
+    });
+
+    it("runtime guard : intent='unknown' via cast as Intent → throw ValidationError", async () => {
+      await seedConversation("conv_intent_unknown_bypass", {
+        status: "awaiting_reply",
+        intent: "INTERESSE",
+      });
+
+      await expect(
+        setConversationIntent(
+          "conv_intent_unknown_bypass",
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
+          "unknown" as any,
+        ),
+      ).rejects.toBeInstanceOf(ValidationError);
+    });
+
+    // ─── Tests TYPE-LEVEL (compile-time defense via @ts-expect-error) ───
+
+    it("type-level : intent='STOP' refusé au compile-time", () => {
+      const exercise = async () => {
+        // @ts-expect-error — `"STOP"` n'est pas dans NonStopIntent
+        await setConversationIntent("conv_x", "STOP");
+      };
+      expect(exercise).toBeDefined();
+    });
+
+    it("type-level : intent='unknown' refusé au compile-time", () => {
+      const exercise = async () => {
+        // @ts-expect-error — `"unknown"` n'est pas dans NonStopIntent
+        await setConversationIntent("conv_x", "unknown");
+      };
+      expect(exercise).toBeDefined();
+    });
+
+    // ─── Sentinelles structurelles sur les constantes exposées ───
+
+    it("sentinelle : __NON_STOP_INTENTS verrouillé à ['INTERESSE','OBJECTION','NEUTRE']", () => {
+      expect([...__NON_STOP_INTENTS_FOR_TESTS].sort()).toEqual([
+        "INTERESSE",
+        "NEUTRE",
+        "OBJECTION",
+      ]);
+    });
+
+    it("sentinelle : __TERMINAL_CONV_STATUSES_FOR_INTENT_CHANGE inclut opted_out + handed_off + closed + blocked", () => {
+      expect([...__TERMINAL_CONV_STATUSES_FOR_INTENT_CHANGE_FOR_TESTS].sort()).toEqual([
+        "blocked",
+        "closed",
+        "handed_off",
+        "opted_out",
+      ]);
+    });
+
+    it("sentinelle : __NON_TERMINAL_NEXT_STATUSES exclut tous les terminaux", () => {
+      expect([...__NON_TERMINAL_NEXT_STATUSES_FOR_TESTS].sort()).toEqual([
+        "active",
+        "awaiting_reply",
+        "in_dialogue",
+        "qualified",
+      ]);
     });
   });
 });
