@@ -31,8 +31,8 @@
  *   - Test 3 : retry après failure step 5 (markOptedOut transient short-form)
  *   - Test 4 : happy path baseline (sentinelle de référence sans retry)
  *   - Test 5 : cache par `(eventId, stepName)`, pas par stepName seul
- *   - Test 6 : intra-step replay sur `classify-intent` (LIMITE DOCUMENTÉE
- *              → follow-up Notion S9.3-FOLLOWUP-1 splitter en 2 step.run)
+ *   - Test 6 : idempotence pleine `claude-classify` post-split S9.3.1
+ *              (anti-double-facturation Claude — ferme S9.3-FOLLOWUP-1)
  *
  * ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
  * POURQUOI MOCK ET PAS EMULATOR (rappel arbitrage S9.2.3.0)
@@ -248,9 +248,11 @@ describe("MED-1 — Memoization Inngest sur retry (S9.2.3.2)", () => {
 
     // Vérification intermédiaire : step 8 n'est PAS commit (cache absent)
     // mais steps 1-7 le sont (cache présent).
+    // S9.3.1 — step 6 splitté en `claude-classify` (6a) + `audit-intent-classified` (6b).
     expect(cache.has("evt-mem-1::audit-reply-processed")).toBe(false);
     expect(cache.has("evt-mem-1::branch-interesse")).toBe(true);
-    expect(cache.has("evt-mem-1::classify-intent")).toBe(true);
+    expect(cache.has("evt-mem-1::claude-classify")).toBe(true);
+    expect(cache.has("evt-mem-1::audit-intent-classified")).toBe(true);
     expect(cache.has("evt-mem-1::store-inbound")).toBe(true);
 
     // Run 2 — retry, MÊME step memoizé partagé. Doit succeed.
@@ -474,14 +476,15 @@ describe("MED-1 — Memoization Inngest sur retry (S9.2.3.2)", () => {
       .sort();
     expect(auditActions).toEqual(["intent_classified", "reply_processed"]);
 
-    // Cache : 8 steps présents
+    // Cache : 9 steps présents (S9.3.1 — split classify-intent en 6a + 6b)
     const expectedSteps = [
       "resolve-contact",
       "resolve-conversation",
       "dedup-by-external-id",
       "store-inbound",
       "short-form-opt-out-check",
-      "classify-intent",
+      "claude-classify",
+      "audit-intent-classified",
       "branch-interesse",
       "audit-reply-processed",
     ];
@@ -574,27 +577,37 @@ describe("MED-1 — Memoization Inngest sur retry (S9.2.3.2)", () => {
   });
 
   // ───────────────────────────────────────────────────────────────────────────
-  // Test 6 — Intra-step replay sur classify-intent (LIMITE DOCUMENTÉE)
+  // Test 6 — Idempotence pleine claude-classify post-split S9.3.1
   // ───────────────────────────────────────────────────────────────────────────
 
   /**
-   * Test 6 — Intra-step replay : LIMITE DOCUMENTÉE
+   * Test 6 — Idempotence pleine `claude-classify` post-split S9.3.1
    *
-   * La granularité d'idempotence Inngest = `step.run()`, pas opération
-   * individuelle. `classifyReply` + `appendAuditLog(intent_classified)`
-   * sont dans la MÊME `step.run("classify-intent")`, donc si l'audit
-   * throw, `classifyReply` est ré-exécuté sur retry (2 appels Claude
-   * facturés).
+   * Verrouille le contrat : `classifyReply` n'est PAS ré-facturée Claude
+   * si l'audit `intent_classified` (step 6b) throw, grâce au split en
+   * 2 `step.run` distincts (`claude-classify` + `audit-intent-classified`).
+   * La memoization Inngest sert step 6a depuis le cache même si step 6b
+   * throw → retry.
    *
-   * Ce test verrouille cette limite et signale qu'un futur split en
-   * 2 `step.run` (`claude-classify` + `audit-intent-classified`) la
-   * supprimerait. Voir Notion **S9.3-FOLLOWUP-1**.
+   * Ferme **S9.3-FOLLOWUP-1** documenté en S9.2.3.2 (limite originelle :
+   * 2 appels Claude facturés sur retry intra-step). Si quelqu'un re-fusionne
+   * les 2 `step.run` en 1 seul, ce test casse → forcera la mise à jour
+   * explicite (signal anti-régression intentionnel).
    *
-   * Pas un bug, une caractéristique. À monitor en S9.6 si quota
-   * Anthropic devient critique.
+   * Scénario :
+   *   - Run 1 : steps 1-5 commit, step 6a `claude-classify` commit
+   *     (`classifyReply` appelé 1×), step 6b `audit-intent-classified`
+   *     throw transient → toute la pile remonte.
+   *   - Run 2 (retry, MÊME cache) : steps 1-5 servis depuis cache (no-op),
+   *     step 6a servi depuis cache (`classifyReply` NON ré-appelé), step
+   *     6b ré-exécuté → succeed.
+   *   - Assert `classifyReply` TOTAL : **1×** (PAS 2× comme avant le split).
+   *   - Assert `appendAuditLog("intent_classified")` TOTAL : 2× (1 fail
+   *     + 1 success ; côté Firestore, 1 seul doc commit puisque la 1ère
+   *     tentative throw avant commit).
    */
-  it("Test 6 — intra-step replay sur classify-intent (LIMITE — S9.3-FOLLOWUP-1)", async () => {
-    const { step } = makeMemoizedStepRun("evt-mem-6");
+  it("Test 6 — idempotence pleine claude-classify post-split S9.3.1 (anti-double-facturation)", async () => {
+    const { step, cache } = makeMemoizedStepRun("evt-mem-6");
 
     let intentClassifiedAttempt = 0;
     const deps = makeDeps({
@@ -615,31 +628,40 @@ describe("MED-1 — Memoization Inngest sur retry (S9.2.3.2)", () => {
       }),
     });
 
-    // Run 1 — throws au step 6 (DANS la closure classify-intent)
+    // Run 1 — throws au step 6b (audit-intent-classified)
     await expect(processReplyHandler(makeFakeCtx("evt-mem-6", step), deps)).rejects.toThrow(
       "Firestore 5xx on intent_classified audit",
     );
 
-    // Run 2 — retry
+    // 🔒 Vérification clé S9.3.1 : step 6a commit (cache présent), step
+    // 6b PAS commit (cache absent). C'est ce qui permet à classifyReply
+    // d'être servi depuis le cache au Run 2 sans ré-appel SDK.
+    expect(cache.has("evt-mem-6::claude-classify")).toBe(true);
+    expect(cache.has("evt-mem-6::audit-intent-classified")).toBe(false);
+
+    // Run 2 — retry, MÊME cache memoization partagé
     const result = await processReplyHandler(makeFakeCtx("evt-mem-6", step), deps);
 
     expect(result.status).toBe("classified");
 
-    // ⚠️ LIMITE DOCUMENTÉE : classifyReply appelé 2× (PAS 1×).
-    // Le step.run("classify-intent") ré-exécute SA closure complète sur
-    // retry → 2 appels Claude facturés. Coût marginal acceptable pour
-    // MVP. Splitter en 2 steps fermerait la dette — voir S9.3-FOLLOWUP-1.
-    expect(deps.classifyReply).toHaveBeenCalledTimes(2);
+    // ✅ IDEMPOTENCE PLEINE CLAUDE (ferme S9.3-FOLLOWUP-1) :
+    // classifyReply appelé EXACTEMENT 1× au TOTAL malgré le retry, parce
+    // que step 6a `claude-classify` est servi depuis le cache au Run 2.
+    // C'est l'INVERSE de la limite documentée pré-S9.3.1 (qui voyait 2×).
+    //
+    // Si ce nombre dérive à 2× : régression critique (potentiel fusion
+    // des 2 step.run en 1, ou nommage cassé du step 6a). Investigate.
+    expect(deps.classifyReply).toHaveBeenCalledTimes(1);
 
-    // Audit intent_classified : 2× appels (1 fail + 1 success). État
-    // Firestore final = 1 doc (le 1er a throw avant commit).
+    // Audit intent_classified : 2× appels SDK (1 fail + 1 success). État
+    // Firestore final = 1 doc commit (le 1er throw avant commit).
     const intentClassifiedCount = (
       deps.appendAuditLog as ReturnType<typeof vi.fn>
     ).mock.calls.filter((c) => (c[0] as { action: string }).action === "intent_classified").length;
     expect(intentClassifiedCount).toBe(2);
 
-    // 🔒 Mais : steps amont (1-5) memoizés (1× chacun) — la limite
-    // est CONTENUE au step 6 uniquement, pas de propagation amont.
+    // 🔒 Steps amont (1-5) memoizés (1× chacun) — pas de propagation
+    // amont du retry intra-step 6b.
     expect(deps.getContactByPhone).toHaveBeenCalledTimes(1);
     expect(deps.getActiveConversationByContactId).toHaveBeenCalledTimes(1);
     expect(deps.findInboundByExternalId).toHaveBeenCalledTimes(1);
@@ -647,7 +669,6 @@ describe("MED-1 — Memoization Inngest sur retry (S9.2.3.2)", () => {
     expect(deps.isOptOut).toHaveBeenCalledTimes(1);
 
     // Step 7 (branch-interesse) : 1× total — memoizé après succès Run 2.
-    // La limite intra-step de classify-intent ne contamine PAS step 7.
     expect(deps.setConversationIntent).toHaveBeenCalledTimes(1);
 
     // Step 8 audit-reply-processed : 1× total — memoizé après Run 2.
@@ -655,5 +676,8 @@ describe("MED-1 — Memoization Inngest sur retry (S9.2.3.2)", () => {
       (c) => (c[0] as { action: string }).action === "reply_processed",
     ).length;
     expect(replyProcessedCount).toBe(1);
+
+    // Step 6b cached après succès Run 2.
+    expect(cache.has("evt-mem-6::audit-intent-classified")).toBe(true);
   });
 });

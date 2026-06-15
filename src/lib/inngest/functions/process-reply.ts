@@ -1,5 +1,5 @@
 /**
- * Inngest function `process-reply` — pipeline déterministe steps 1-8 (S9.2.3).
+ * Inngest function `process-reply` — pipeline déterministe steps 1-9 (S9.3.1).
  *
  * ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
  * VUE D'ENSEMBLE
@@ -13,7 +13,7 @@
  * même event. Ce handler ne dépend ni d'OVH, ni d'un endpoint HTTP.
  *
  * ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
- * PIPELINE 8 STEPS (S9.2.3)
+ * PIPELINE 9 STEPS (S9.3.1 split — anti-double-facturation Claude)
  *
  *   1. `resolve-contact`            : `getContactByPhone(phone)` (S9.1).
  *                                     - found → `{contactId: hubspotId}`
@@ -51,15 +51,25 @@
  *                                       "short_form"}`.
  *                                     - false → continue step 6.
  *
- *   6. `classify-intent`            : `classifyReply(body)` (S7a.2,
+ *   6a. `claude-classify`           : `classifyReply(body)` (S7a.2,
  *                                      Claude Haiku 4.5 + tool use).
  *                                     - Toujours retourne un résultat
  *                                       (fail-safe STOP avec fallback=
  *                                       true sur erreur SDK).
- *                                     - Audit `intent_classified` posé
- *                                       AVANT branch (Q1 brief Déthié).
  *                                     - `logger.warn` si fallback=true
  *                                       (observabilité S9.6 monitoring).
+ *                                     - 🔒 ISOLÉ de l'audit (step 6b) →
+ *                                       idempotence pleine Claude sur
+ *                                       retry après failure step 6b.
+ *                                       Ferme S9.3-FOLLOWUP-1 (limite
+ *                                       documentée pré-S9.3).
+ *
+ *   6b. `audit-intent-classified`   : `appendAuditLog(intent_classified,
+ *                                      payload scrubber-safe)`. Posé
+ *                                      AVANT branch (Q1 brief Déthié).
+ *                                     - Sur retry après failure ici,
+ *                                       step 6a est servi depuis cache
+ *                                       memoization → 0 ré-appel Claude.
  *
  *   7. `branch-by-intent`           : 4 branches discriminées :
  *                                     - STOP → `markOptedOut` étendu
@@ -72,7 +82,7 @@
  *                                       intent, {nextStatus:
  *                                       "in_dialogue"})` + return
  *                                       `{status:"classified", intent}`.
- *                                       S9.3 reprendra la gen IA.
+ *                                       S9.3.3 reprendra la gen IA.
  *
  *   8. `audit-reply-processed`      : `appendAuditLog({action:
  *                                      "reply_processed", targetType:
@@ -100,6 +110,15 @@
  * les writes Firestore, tous les `appendAuditLog`, ET tous les appels
  * Claude (pas de double facturation). Test sentinelle anti-régression
  * MED-1 dans `process-reply.memoization.test.ts` (S9.2.3.2).
+ *
+ * S9.3.1 split classify-intent en `step.run("claude-classify")` +
+ * `step.run("audit-intent-classified")` pour atteindre l'idempotence
+ * pleine sur Claude (anti-double-facturation, ferme S9.3-FOLLOWUP-1
+ * documenté en S9.2.3.2). Si l'audit `intent_classified` throw → retry
+ * → step 6a `claude-classify` est servi depuis le cache memoization →
+ * `classifyReply` n'est PAS ré-appelé. Verrouillé par Test 6
+ * (`process-reply.memoization.test.ts`) qui prouve `classifyReply ===
+ * 1×` même en présence d'un fail transient sur l'audit step 6b.
  *
  * ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
  * ANTI-PII — logger strict
@@ -578,18 +597,27 @@ export async function processReplyHandler(
     };
   }
 
-  // ── Step 6 — classify-intent (Claude Haiku 4.5) ───────────────────────
+  // ── Step 6a — claude-classify (S9.3.1 split) ──────────────────────────
   // Appel classifier sur les messages non-opt-out short-form. Le classifier
   // a un contrat fail-safe STOP : toute erreur SDK absorbée → fallback
   // intent="STOP" + fallback=true (précaution juridique L.34-5 CPCE).
-  // L'audit `intent_classified` est posé AVANT le branch (Q1 brief) —
-  // on audit le VERDICT classifier indépendamment de ce que le pipeline
-  // en fait ensuite. Payload scrubber-safe (pas de body, pas de reasoning).
-  const classification = await step.run("classify-intent", async () => {
+  //
+  // 🔒 **Idempotence pleine Claude (S9.3.1 ferme S9.3-FOLLOWUP-1)** : le
+  // step est ISOLÉ de l'audit `intent_classified` (step 6b). Si l'audit
+  // Firestore throw (5xx transient, AuditPiiError d'un payload futur mal
+  // posé), Inngest retry → step 6a est servi depuis le cache memoization
+  // par `(eventId, "claude-classify")` → 0 ré-appel Claude → 0 double
+  // facturation. Verrouillé par Test 6 de `process-reply.memoization.test.ts`.
+  //
+  // Le `logger.warn` fallback reste DANS step 6a car c'est un side-effect
+  // d'observabilité lié à l'APPEL Claude (pas à son audit). Sur retry du
+  // step 6b, l'observabilité du fallback est déjà loggée par le premier
+  // run du step 6a — pas de double-log non plus.
+  const classification = await step.run("claude-classify", async () => {
     const result = await _classifyReply(body);
 
-    // Observabilité fail-safe (Q2 brief) : un fallback=true signale un
-    // échec SDK (timeout, 429, tool_use malformé). À monitorer en prod —
+    // Observabilité fail-safe (Q2 brief S9.2.2) : un fallback=true signale
+    // un échec SDK (timeout, 429, tool_use malformé). À monitorer en prod —
     // si taux > 5%, alerter Sentry/Slack (câblage S9.6). Aucune PII dans
     // le log : seulement les IDs opaques + le messageId Firestore.
     if (result.fallback) {
@@ -598,10 +626,25 @@ export async function processReplyHandler(
         contactId,
         conversationId,
         messageId,
-        step: "classify-intent",
+        step: "claude-classify",
       });
     }
 
+    return result;
+  });
+
+  // ── Step 6b — audit-intent-classified (S9.3.1 split) ──────────────────
+  // Audit du verdict classifier, séparé de l'appel Claude pour garantir
+  // l'idempotence Claude sur retry (cf. JSDoc step 6a + sentinelle MED-1).
+  //
+  // `classification` ci-dessus est le résultat commit du step 6a — sur
+  // retry du step 6b après failure transient, la valeur servie au handler
+  // sera servie depuis le cache memoization Inngest (pas de ré-appel SDK).
+  //
+  // Audit posé AVANT le branch step 7 (Q1 brief Déthié S9.2.2) — on audit
+  // le VERDICT classifier indépendamment de ce que le pipeline en fait
+  // ensuite. Payload scrubber-safe (pas de body, pas de reasoning).
+  await step.run("audit-intent-classified", async () => {
     await _appendAuditLog({
       actorId: "system",
       actorType: "system",
@@ -626,15 +669,13 @@ export async function processReplyHandler(
       payload: {
         contactId,
         conversationId,
-        intent: result.intent,
-        confidence: result.confidence,
-        fallback: result.fallback,
+        intent: classification.intent,
+        confidence: classification.confidence,
+        fallback: classification.fallback,
         promptVersion: CLASSIFY_INTENT_PROMPT_VERSION,
         model: CLASSIFY_INTENT_MODEL,
       },
     });
-
-    return result;
   });
 
   // ── Step 7 — branch-by-intent ────────────────────────────────────────
@@ -735,7 +776,7 @@ export async function processReplyHandler(
 // ─────────────────────────────────────────────────────────────────────────────
 
 /**
- * Inngest function `process-reply` — pipeline déterministe 8 steps (S9.2.3).
+ * Inngest function `process-reply` — pipeline déterministe 9 steps (S9.3.1).
  *
  * **Trigger** : event `medere/sms.reply.received` (`SmsReplyReceivedDataSchema`).
  *
