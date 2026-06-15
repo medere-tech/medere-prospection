@@ -13,6 +13,7 @@
 import type { Timestamp } from "firebase-admin/firestore";
 import { describe, expect, it, vi } from "vitest";
 
+import { ExternalServiceError } from "@/lib/utils/errors";
 import type { Contact } from "@/types/contact";
 import type { Conversation } from "@/types/conversation";
 import type { Message } from "@/types/message";
@@ -159,6 +160,26 @@ function makeDeps(overrides: Partial<ProcessReplyDeps> = {}): ProcessReplyDeps {
       fallback: false,
     }),
     setConversationIntent: vi.fn().mockResolvedValue(undefined),
+    // S9.3.3b — gen IA reply + stockage draft (defaults qui SUCCÈDENT,
+    // chaque test branche INTERESSE/OBJECTION/NEUTRE atterrit ici).
+    listRecentMessages: vi
+      .fn()
+      .mockResolvedValue([
+        {
+          direction: "outbound",
+          body: "Bonjour Dr Test, je suis Léa, assistante virtuelle de Médéré.",
+        },
+      ]),
+    generateReply: vi.fn().mockResolvedValue({
+      body: "Bonjour Docteur, quelle formation Médéré vous intéresse ?",
+      promptVersion: "1.0.0",
+      model: "claude-sonnet-4-6",
+      temperature: 0.5,
+      tokensInput: 540,
+      tokensOutput: 38,
+      generationDurationMs: 1234,
+    }),
+    addOutboundDraft: vi.fn().mockResolvedValue("draft-firestore-id20ch"),
     ...overrides,
   };
 }
@@ -784,13 +805,18 @@ describe("Step 7 — branch-by-intent", () => {
 
     const result = await processReplyHandler(ctx, deps);
 
-    expect(result).toEqual({
+    // S9.3.3b — ProcessReplyResult.classified étendu avec draftMessageId.
+    // toMatchObject (vs toEqual strict) car nouveau champ peut bouger.
+    expect(result).toMatchObject({
       status: "classified",
       contactId: "hs-i",
       conversationId: "hs-i_camp-i",
       messageId: "msgid-i",
       intent: "INTERESSE",
     });
+    if (result.status === "classified") {
+      expect(result.draftMessageId).toBeDefined();
+    }
     expect(deps.setConversationIntent).toHaveBeenCalledWith("hs-i_camp-i", "INTERESSE", {
       nextStatus: "in_dialogue",
     });
@@ -1047,6 +1073,290 @@ describe("Step 7 — branch-by-intent", () => {
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Step 8 — generate-reply (S9.3.3b — sub-steps 8a/8b/8c)
+// ─────────────────────────────────────────────────────────────────────────────
+
+describe("Step 8 — generate-reply (S9.3.3b)", () => {
+  it("happy path INTERESSE : listRecentMessages + generateReply + addOutboundDraft + audit reply_generated appelés", async () => {
+    const ctx = makeFakeCtx({ body: "ça m'intéresse, c'est combien ?" });
+    const deps = makeDeps({
+      getContactByPhone: vi.fn().mockResolvedValue(makeFakeContact("hs-8a-1")),
+      getActiveConversationByContactId: vi.fn().mockResolvedValue({
+        conversationId: "hs-8a-1_camp",
+        conversation: makeFakeConversation("hs-8a-1", "camp"),
+      }),
+      addInbound: vi.fn().mockResolvedValue("msg-inbound-8a-1"),
+      classifyReply: vi.fn().mockResolvedValue({
+        intent: "INTERESSE",
+        confidence: 0.9,
+        reasoning: "ok",
+        fallback: false,
+      }),
+    });
+
+    const result = await processReplyHandler(ctx, deps);
+
+    expect(result.status).toBe("classified");
+    if (result.status === "classified") {
+      expect(result.intent).toBe("INTERESSE");
+      expect(result.draftMessageId).toBe("draft-firestore-id20ch");
+    }
+
+    // Sentinelle dispatch S9.3.3b
+    expect(deps.listRecentMessages).toHaveBeenCalledWith("hs-8a-1_camp");
+    expect(deps.generateReply).toHaveBeenCalledWith(
+      expect.objectContaining({
+        intent: "INTERESSE",
+        rawMessage: "ça m'intéresse, c'est combien ?",
+      }),
+    );
+    expect(deps.addOutboundDraft).toHaveBeenCalledWith(
+      expect.objectContaining({
+        contactId: "hs-8a-1",
+        conversationId: "hs-8a-1_camp",
+        body: "Bonjour Docteur, quelle formation Médéré vous intéresse ?",
+        aiModel: "claude-sonnet-4-6",
+        aiPromptVersion: "1.0.0",
+        aiTemperature: 0.5,
+        aiTokensInput: 540,
+        aiTokensOutput: 38,
+        aiGenerationDurationMs: 1234,
+      }),
+    );
+
+    // Audit reply_generated posé avec payload scrubber-safe (PAS de body).
+    const replyGeneratedCall = (deps.appendAuditLog as ReturnType<typeof vi.fn>).mock.calls.find(
+      (c) => (c[0] as { action: string }).action === "reply_generated",
+    );
+    expect(replyGeneratedCall).toBeDefined();
+    const auditEntry = replyGeneratedCall![0] as {
+      action: string;
+      targetType: string;
+      targetId: string;
+      payload: Record<string, unknown>;
+    };
+    expect(auditEntry.targetType).toBe("message");
+    expect(auditEntry.targetId).toBe("draft-firestore-id20ch");
+    expect(auditEntry.payload).toMatchObject({
+      contactId: "hs-8a-1",
+      conversationId: "hs-8a-1_camp",
+      draftMessageId: "draft-firestore-id20ch",
+      intent: "INTERESSE",
+      promptVersion: "1.0.0",
+      model: "claude-sonnet-4-6",
+      temperature: 0.5,
+      tokensInput: 540,
+      tokensOutput: 38,
+      bodyLength: expect.any(Number),
+      generationDurationMs: 1234,
+    });
+    // 🚨 INVARIANT ANTI-PII (LOW-4 + NIT-1 compliance-auditor) : pas de body.
+    expect(auditEntry.payload).not.toHaveProperty("body");
+  });
+
+  it("contactCivility passé undefined en MVP (S9.5-CONTACT-CIVILITY-IN-REPLY-001)", async () => {
+    const ctx = makeFakeCtx({ body: "OK je vais voir" });
+    const deps = makeDeps({
+      getContactByPhone: vi.fn().mockResolvedValue(makeFakeContact("hs-civ")),
+      getActiveConversationByContactId: vi.fn().mockResolvedValue({
+        conversationId: "hs-civ_camp",
+        conversation: makeFakeConversation("hs-civ", "camp"),
+      }),
+      addInbound: vi.fn().mockResolvedValue("msg-civ"),
+      classifyReply: vi.fn().mockResolvedValue({
+        intent: "NEUTRE",
+        confidence: 0.7,
+        reasoning: "ok",
+        fallback: false,
+      }),
+    });
+
+    await processReplyHandler(ctx, deps);
+
+    const generateReplyCall = (deps.generateReply as ReturnType<typeof vi.fn>).mock
+      .calls[0]![0] as {
+      contactCivility?: string;
+    };
+    // MVP : contactCivility absent du payload (Z arbitrage S9.3.3b — étape
+    // 0 sous-question civilité, follow-up S9.5).
+    expect(generateReplyCall.contactCivility).toBeUndefined();
+  });
+
+  it("payload reply_processed étendu avec draftMessageId sur branche classified", async () => {
+    const ctx = makeFakeCtx({ body: "Trop cher !" });
+    const deps = makeDeps({
+      getContactByPhone: vi.fn().mockResolvedValue(makeFakeContact("hs-rp")),
+      getActiveConversationByContactId: vi.fn().mockResolvedValue({
+        conversationId: "hs-rp_camp",
+        conversation: makeFakeConversation("hs-rp", "camp"),
+      }),
+      addInbound: vi.fn().mockResolvedValue("msg-rp"),
+      classifyReply: vi.fn().mockResolvedValue({
+        intent: "OBJECTION",
+        confidence: 0.85,
+        reasoning: "ok",
+        fallback: false,
+      }),
+      addOutboundDraft: vi.fn().mockResolvedValue("draft-rp-id20ch"),
+    });
+
+    await processReplyHandler(ctx, deps);
+
+    const replyProcessedCall = (deps.appendAuditLog as ReturnType<typeof vi.fn>).mock.calls.find(
+      (c) => (c[0] as { action: string }).action === "reply_processed",
+    );
+    expect(replyProcessedCall).toBeDefined();
+    const payload = (replyProcessedCall![0] as { payload: Record<string, unknown> }).payload;
+    expect(payload).toMatchObject({
+      branchTaken: "classified",
+      draftMessageId: "draft-rp-id20ch",
+    });
+  });
+
+  it("Branche STOP short-form : step 8 ENTIER skippé (no generateReply, no addOutboundDraft, no audit reply_generated)", async () => {
+    const ctx = makeFakeCtx({ body: "STOP" });
+    const deps = makeDeps({
+      getContactByPhone: vi.fn().mockResolvedValue(makeFakeContact("hs-stop-sf")),
+      getActiveConversationByContactId: vi.fn().mockResolvedValue({
+        conversationId: "hs-stop-sf_camp",
+        conversation: makeFakeConversation("hs-stop-sf", "camp"),
+      }),
+      addInbound: vi.fn().mockResolvedValue("msg-stop-sf"),
+      isOptOut: vi.fn().mockReturnValue(true),
+    });
+
+    const result = await processReplyHandler(ctx, deps);
+
+    expect(result.status).toBe("opt_out");
+    expect(deps.generateReply).not.toHaveBeenCalled();
+    expect(deps.addOutboundDraft).not.toHaveBeenCalled();
+    expect(deps.listRecentMessages).not.toHaveBeenCalled();
+    // Pas de reply_generated dans les audits posés.
+    const replyGeneratedCalls = (deps.appendAuditLog as ReturnType<typeof vi.fn>).mock.calls.filter(
+      (c) => (c[0] as { action: string }).action === "reply_generated",
+    );
+    expect(replyGeneratedCalls.length).toBe(0);
+  });
+
+  it("Branche STOP classifier_long_form : step 8 ENTIER skippé", async () => {
+    const ctx = makeFakeCtx({
+      body: "Je vous remercie mais je préfère ne plus recevoir de messages de votre part",
+    });
+    const deps = makeDeps({
+      getContactByPhone: vi.fn().mockResolvedValue(makeFakeContact("hs-stop-lf")),
+      getActiveConversationByContactId: vi.fn().mockResolvedValue({
+        conversationId: "hs-stop-lf_camp",
+        conversation: makeFakeConversation("hs-stop-lf", "camp"),
+      }),
+      addInbound: vi.fn().mockResolvedValue("msg-stop-lf"),
+      isOptOut: vi.fn().mockReturnValue(false),
+      classifyReply: vi.fn().mockResolvedValue({
+        intent: "STOP",
+        confidence: 0.92,
+        reasoning: "ok",
+        fallback: false,
+      }),
+    });
+
+    const result = await processReplyHandler(ctx, deps);
+
+    expect(result.status).toBe("opt_out");
+    if (result.status === "opt_out") {
+      expect(result.via).toBe("classifier_long_form");
+    }
+    expect(deps.generateReply).not.toHaveBeenCalled();
+    expect(deps.addOutboundDraft).not.toHaveBeenCalled();
+  });
+
+  it("Step 8a generateReply throw ExternalServiceError → propagé, step 8b/8c PAS exécutés", async () => {
+    // 🔒 Sentinelle pas de fallback artificiel — décision Déthié S9.3.0.
+    // Inngest retry naturel (ExternalServiceError noRetry=false).
+    const sdkErr = new ExternalServiceError({
+      message: "Anthropic API connection failure",
+      context: { kind: "APIConnectionError" },
+    });
+    const ctx = makeFakeCtx({ body: "ça m'intéresse" });
+    const deps = makeDeps({
+      getContactByPhone: vi.fn().mockResolvedValue(makeFakeContact("hs-8a-err")),
+      getActiveConversationByContactId: vi.fn().mockResolvedValue({
+        conversationId: "hs-8a-err_camp",
+        conversation: makeFakeConversation("hs-8a-err", "camp"),
+      }),
+      addInbound: vi.fn().mockResolvedValue("msg-8a-err"),
+      generateReply: vi.fn().mockRejectedValue(sdkErr),
+    });
+
+    await expect(processReplyHandler(ctx, deps)).rejects.toBe(sdkErr);
+
+    expect(deps.generateReply).toHaveBeenCalledTimes(1);
+    expect(deps.addOutboundDraft).not.toHaveBeenCalled();
+    // Pas d'audit reply_generated ni reply_processed posé.
+    const auditActions = (deps.appendAuditLog as ReturnType<typeof vi.fn>).mock.calls.map(
+      (c) => (c[0] as { action: string }).action,
+    );
+    expect(auditActions).not.toContain("reply_generated");
+    expect(auditActions).not.toContain("reply_processed");
+  });
+
+  it("Step 8b addOutboundDraft throw → propagé, step 8c PAS exécuté", async () => {
+    const ctx = makeFakeCtx({ body: "Trop cher !" });
+    const deps = makeDeps({
+      getContactByPhone: vi.fn().mockResolvedValue(makeFakeContact("hs-8b-err")),
+      getActiveConversationByContactId: vi.fn().mockResolvedValue({
+        conversationId: "hs-8b-err_camp",
+        conversation: makeFakeConversation("hs-8b-err", "camp"),
+      }),
+      addInbound: vi.fn().mockResolvedValue("msg-8b-err"),
+      classifyReply: vi.fn().mockResolvedValue({
+        intent: "OBJECTION",
+        confidence: 0.85,
+        reasoning: "ok",
+        fallback: false,
+      }),
+      addOutboundDraft: vi.fn().mockRejectedValue(new Error("Firestore 5xx")),
+    });
+
+    await expect(processReplyHandler(ctx, deps)).rejects.toThrow("Firestore 5xx");
+
+    expect(deps.generateReply).toHaveBeenCalledTimes(1);
+    expect(deps.addOutboundDraft).toHaveBeenCalledTimes(1);
+    // Pas d'audit reply_generated ni reply_processed posé.
+    const auditActions = (deps.appendAuditLog as ReturnType<typeof vi.fn>).mock.calls.map(
+      (c) => (c[0] as { action: string }).action,
+    );
+    expect(auditActions).not.toContain("reply_generated");
+    expect(auditActions).not.toContain("reply_processed");
+  });
+
+  it("ProcessReplyResult.classified expose draftMessageId (typage strict)", async () => {
+    const ctx = makeFakeCtx({ body: "OK je vais voir" });
+    const deps = makeDeps({
+      getContactByPhone: vi.fn().mockResolvedValue(makeFakeContact("hs-typed")),
+      getActiveConversationByContactId: vi.fn().mockResolvedValue({
+        conversationId: "hs-typed_camp",
+        conversation: makeFakeConversation("hs-typed", "camp"),
+      }),
+      addInbound: vi.fn().mockResolvedValue("msg-typed"),
+      classifyReply: vi.fn().mockResolvedValue({
+        intent: "NEUTRE",
+        confidence: 0.7,
+        reasoning: "ok",
+        fallback: false,
+      }),
+      addOutboundDraft: vi.fn().mockResolvedValue("draft-typed-id"),
+    });
+
+    const result = await processReplyHandler(ctx, deps);
+
+    expect(result.status).toBe("classified");
+    if (result.status === "classified") {
+      // TS narrow : draftMessageId est un champ requis du variant.
+      expect(result.draftMessageId).toBe("draft-typed-id");
+    }
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
 // 🔒 GUARD-001 — sentinelle anti-régression CRITIQUE
 // Long-form opt-out rattrapé par classifier
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1263,6 +1573,14 @@ describe("Anti-PII pipeline complet (sentinelle critique L.34-5 CPCE)", () => {
   // X le pipeline forwardait le reasoning vers logs/audit, ce test
   // casse.
   const SECRET_REASONING = "Dr Dupont à Lyon — refus poli explicite";
+  // S9.3.3b — fix MED-2 security-reviewer + LOW-3 compliance-auditor :
+  // body DRAFT généré par Claude qui aurait MIROIRÉ une PII du PS (cas
+  // pathologique mais possible). Le code production NE log PAS ce body
+  // au step 8c "reply draft stored" (vérifié par security-reviewer),
+  // mais defense-in-depth : si quelqu'un ajoute par mégarde
+  // `body: generationResult.body` dans `logger.info`, ce stress-test
+  // casse → forcera la régression à devenir explicite.
+  const SECRET_DRAFT_BODY = "Bonjour Médéré, j'ai vu votre numéro +33799887766 pour le rappel.";
 
   function assertNoLeak(logger: ProcessReplyHandlerContext["logger"]) {
     const allCalls = [
@@ -1282,6 +1600,9 @@ describe("Anti-PII pipeline complet (sentinelle critique L.34-5 CPCE)", () => {
     expect(serialized).not.toContain(SECRET_REASONING);
     expect(serialized).not.toContain("Dr Dupont");
     expect(serialized).not.toContain("Lyon");
+    // S9.3.3b — draft body avec PII miroirée ne doit jamais apparaître.
+    expect(serialized).not.toContain(SECRET_DRAFT_BODY);
+    expect(serialized).not.toContain("+33799887766");
   }
 
   it("branche contact_unknown — aucune fuite phone/body/ovhMessageId", async () => {
@@ -1348,11 +1669,18 @@ describe("Anti-PII pipeline complet (sentinelle critique L.34-5 CPCE)", () => {
     assertNoLeak(ctx.logger);
   });
 
-  it("branche classified — aucune fuite (phone/body/ovh/reasoning)", async () => {
+  it("branche classified — aucune fuite (phone/body/ovh/reasoning/draft body)", async () => {
     // S9.2.2 — pipeline va jusqu'au classifier + branch-by-intent.
     // Mock reasoning enrichi pour stress-test : Dr Dupont à Lyon ne
     // doit jamais arriver dans les logs même si Claude le posait
     // (defense-in-depth contre une régression prompt classifier).
+    //
+    // S9.3.3b fix MED-2 security-reviewer + LOW-3 compliance-auditor :
+    // pipeline va aussi jusqu'aux sub-steps 8a/8b/8c. Mock generateReply
+    // override avec SECRET_DRAFT_BODY (body LLM qui miroir un E.164
+    // pathologique) → vérifie que le `logger.info "reply draft stored"`
+    // step 8c (process-reply.ts:920-928) ne forward jamais
+    // `generationResult.body` dans les logs.
     const ctx = makeFakeCtx({
       phone: SECRET_PHONE,
       body: SECRET_BODY,
@@ -1370,6 +1698,19 @@ describe("Anti-PII pipeline complet (sentinelle critique L.34-5 CPCE)", () => {
         confidence: 0.85,
         reasoning: SECRET_REASONING, // ← stress reasoning leak
         fallback: false,
+      }),
+      // S9.3.3b — body LLM contenant un E.164 miroirée. Le code prod
+      // log uniquement IDs opaques au step 8c — assertNoLeak verrouille
+      // que ce body ne fuit JAMAIS dans les logs, même si Claude
+      // mirroir une PII du PS.
+      generateReply: vi.fn().mockResolvedValue({
+        body: SECRET_DRAFT_BODY,
+        promptVersion: "1.0.0",
+        model: "claude-sonnet-4-6",
+        temperature: 0.5,
+        tokensInput: 540,
+        tokensOutput: 38,
+        generationDurationMs: 1234,
       }),
     });
     await processReplyHandler(ctx, deps);

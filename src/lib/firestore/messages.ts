@@ -1106,6 +1106,125 @@ export function addOutboundDraftInTx(tx: Transaction, input: AddOutboundDraftInp
   return messageRef.id;
 }
 
+/**
+ * Wrapper standalone de `addOutboundDraftInTx` (S9.3.3b). Ouvre sa
+ * propre `runTransaction` et délègue à la version tx-aware. Pour callers
+ * SANS tx ouverte (pipeline `process-reply` step 8b).
+ *
+ * Pattern miroir `addOutbound` (S6.5) qui wrap `addOutboundInTx`. Tous
+ * les invariants de `addOutboundDraftInTx` s'appliquent (no counter
+ * bump, no audit sms_sent, body validation).
+ *
+ * @throws ValidationError si `body` vide ou > `BODY_MAX_LENGTH`.
+ */
+export async function addOutboundDraft(input: AddOutboundDraftInput): Promise<string> {
+  // Pre-flight validation HORS tx → fail-fast sans ouvrir de tx si body
+  // invalide. `addOutboundDraftInTx` re-valide en défense en profondeur.
+  validateBodyOrThrow(input.body, input.conversationId);
+
+  return await getAdminDb().runTransaction(async (tx) => addOutboundDraftInTx(tx, input));
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// listRecentMessages (S9.3.3b) — historique chronologique pour gen IA
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * Sous-ensemble d'un `Message` exposé par `listRecentMessages` pour le
+ * pipeline `process-reply` step 8a — passé tel quel à `generateReply()`
+ * (`ReplyHistoryEntry`-compatible par structural typing).
+ *
+ * Pas de couplage avec le type `ReplyHistoryEntry` des prompts
+ * `generate-reply-*.ts` — la forme inline `{direction, body}` est
+ * stable et indépendante (le caller peut assigner ce résultat à
+ * `ReplyHistoryEntry[]` sans cast).
+ */
+export interface RecentMessageEntry {
+  direction: "inbound" | "outbound";
+  body: string;
+}
+
+/**
+ * Largeur par défaut de l'historique passé à `generateReply` (décision
+ * Déthié S9.3.0). Au-delà : signal d'un caller qui charge trop.
+ */
+const DEFAULT_HISTORY_LIMIT = 3;
+
+/**
+ * Retourne les N derniers messages d'une conversation, mélangeant
+ * inbound et outbound, en ORDRE CHRONOLOGIQUE CROISSANT (les plus
+ * anciens en premier — sémantique attendue par les prompts Claude qui
+ * lisent l'historique de gauche à droite).
+ *
+ * ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ * USAGE — pipeline `process-reply` step 8a (S9.3.3b)
+ *
+ * Appelé par le pipeline pour construire le contexte historique passé à
+ * `generateReply()`. Limite stricte = 3 messages (décision Déthié
+ * S9.3.0) : un historique plus long dilue l'intent + coût Claude inutile
+ * + risque conformité RGPD art. 5.1.c (minimisation données traitées).
+ *
+ * ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ * EXCLUSION DES DRAFTS (S9.3.3a)
+ *
+ * Les messages `status="draft"` (générés IA mais pas encore envoyés OVH)
+ * sont **EXCLUS** de l'historique passé à Claude. Justification :
+ *
+ *   - Un draft n'a JAMAIS été reçu par le PS — l'inclure simulerait un
+ *     échange qui n'a pas eu lieu et confondrait Claude.
+ *
+ *   - Cohérent avec l'exclusion `RATE_LIMIT_COUNTED_STATUSES` qui ne
+ *     compte pas les drafts contre le plafond rate-limit.
+ *
+ * Filtre côté CODE post-parse (pas dans la query Firestore) pour éviter
+ * un index composite supplémentaire. Cf. JSDoc `RATE_LIMIT_COUNTED_STATUSES`
+ * pour le même rationale.
+ *
+ * ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ * GESTION INPUT
+ *
+ * Conversation absente → `[]` (cohérent `listRecentOutbound` — c'est une
+ * recherche, pas une mutation). Doc message corrompu → `ValidationError`
+ * (filet Zod identique aux autres `listX`).
+ *
+ * ⚠️ PII potentielle — le `body` retourné PEUT contenir des fragments
+ * PII (inbound : PS qui écrit son numéro perso). Le caller `process-reply`
+ * step 8a passe l'historique au prompt Claude (anti-injection XML déjà
+ * appliqué côté prompts S9.3.2). NE JAMAIS logger les `body` retournés
+ * en clair (sentinelle anti-PII pipeline `process-reply.test.ts`).
+ *
+ * @param conversationId  docId composite `${contactId}_${campaignId}`.
+ * @param limit           Nombre maximum de messages à retourner. Défaut 3.
+ *
+ * @returns Tableau ordonné CROISSANT par `createdAt`. Drafts exclus.
+ *          Conversation absente → `[]`.
+ *
+ * @throws ValidationError si un doc message dans le résultat est corrompu.
+ */
+export async function listRecentMessages(
+  conversationId: string,
+  limit: number = DEFAULT_HISTORY_LIMIT,
+): Promise<RecentMessageEntry[]> {
+  // Query DESC + limit → on prend les N PLUS RÉCENTS, puis on inverse
+  // pour rendre en chronologique CROISSANT (cohérent prompt LLM).
+  // Filtre status drafts appliqué post-parse côté code.
+  const snap = await messagesSubcollectionRef(conversationId)
+    .orderBy("createdAt", "desc")
+    .limit(limit)
+    .get();
+
+  const parsed = snap.docs.map((doc) => parseMessageOrThrow(doc.data(), conversationId, doc.id));
+
+  // Exclusion des drafts (S9.3.3a) — un draft n'a pas été envoyé au PS.
+  const nonDrafts = parsed.filter((msg) => msg.status !== "draft");
+
+  // Inverse pour ordre chronologique CROISSANT (plus ancien en premier).
+  return nonDrafts.reverse().map((msg) => ({
+    direction: msg.direction,
+    body: msg.body,
+  }));
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Exposés pour tests
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1121,3 +1240,6 @@ export const __BODY_MAX_LENGTH_FOR_TESTS = BODY_MAX_LENGTH;
 
 /** @internal */
 export const __DEFAULT_LIST_DAYS_FOR_TESTS = DEFAULT_LIST_DAYS;
+
+/** @internal */
+export const __DEFAULT_HISTORY_LIMIT_FOR_TESTS = DEFAULT_HISTORY_LIMIT;

@@ -196,6 +196,11 @@ export interface ReplyGeneratedPayload {
   bodyLength: number;
   /** Durée wall-clock de l'appel `generate` (ms). */
   generationDurationMs: number;
+  // Index signature explicite : permet l'assignation à
+  // `AuditLogInput.payload: Record<string, unknown>` sans cast (cf.
+  // pattern `ComplianceConcurrencyContext` errors.ts:199-211 — TS
+  // limitation structurelle, no-op runtime, TS-level only).
+  readonly [k: string]: unknown;
 }
 
 /**

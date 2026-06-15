@@ -62,6 +62,7 @@ import {
 } from "./conversations";
 import {
   __BODY_MAX_LENGTH_FOR_TESTS,
+  __DEFAULT_HISTORY_LIMIT_FOR_TESTS,
   __DEFAULT_LIST_DAYS_FOR_TESTS,
   __MESSAGES_PARENT_COLLECTION_FOR_TESTS,
   __MESSAGES_SUBCOLLECTION_FOR_TESTS,
@@ -70,6 +71,7 @@ import {
   addOutboundDraftInTx,
   addOutboundInTx,
   findInboundByExternalId,
+  listRecentMessages,
   listRecentOutbound,
   listRecentOutboundInTx,
   RATE_LIMIT_COUNTED_STATUSES,
@@ -1683,6 +1685,164 @@ describe("messages.ts", () => {
       // Mais 0 message compté par listRecentOutbound (rate-limit safe).
       const recent = await listRecentOutbound(convId);
       expect(recent.length).toBe(0);
+    });
+  });
+
+  // ───────────────────────────────────────────────────────────────────────
+  // S9.3.3b — listRecentMessages (historique passé à generateReply)
+  // Fix MED-1 security-reviewer S9.3.3b : sentinelles runtime exclusion drafts
+  // ───────────────────────────────────────────────────────────────────────
+
+  describe("listRecentMessages (S9.3.3b)", () => {
+    it("DEFAULT_HISTORY_LIMIT === 3 (décision Déthié S9.3.0)", () => {
+      expect(__DEFAULT_HISTORY_LIMIT_FOR_TESTS).toBe(3);
+    });
+
+    it("🔒 EXCLUT les drafts de l'historique (anti-régression S9.3.3b MED-1)", async () => {
+      // Sentinelle CRITIQUE — un draft n'a JAMAIS été envoyé au PS, l'inclure
+      // dans le contexte Claude pour une nouvelle génération simulerait un
+      // échange fictif. Si quelqu'un supprime le filtre `status !== "draft"`
+      // dans listRecentMessages (messages.ts), ce test casse → forcera la
+      // mise à jour explicite + revue compliance-auditor.
+      const convId = "conv_history_no_draft";
+      await seedConversation(convId);
+
+      const now = Timestamp.now();
+      // 1 doc draft (à EXCLURE)
+      await seedMessage(convId, {
+        direction: "outbound",
+        status: "draft",
+        body: "Draft body (NEVER seen by PS)",
+        createdAt: now,
+      });
+      // 1 doc received inbound (à INCLURE)
+      await seedMessage(convId, {
+        direction: "inbound",
+        status: "received",
+        body: "Bonjour, ça m'intéresse",
+        createdAt: now,
+      });
+
+      const history = await listRecentMessages(convId);
+
+      // Seul le received remonte (draft exclu).
+      expect(history.length).toBe(1);
+      expect(history[0]).toEqual({
+        direction: "inbound",
+        body: "Bonjour, ça m'intéresse",
+      });
+    });
+
+    it("INCLUT inbound (received) ET outbound NON-draft (queued/sending/sent/delivered/failed)", async () => {
+      // Vérifie que le filtre exclu UNIQUEMENT "draft" — tous les autres
+      // statuts (y compris failed, contrairement au rate-limit) sont
+      // pertinents pour le contexte historique passé à Claude.
+      const convId = "conv_history_all_statuses";
+      await seedConversation(convId);
+
+      const t0 = Timestamp.fromMillis(Date.now() - 1000 * 60 * 60 * 5);
+      const t1 = Timestamp.fromMillis(Date.now() - 1000 * 60 * 60 * 4);
+      const t2 = Timestamp.fromMillis(Date.now() - 1000 * 60 * 60 * 3);
+      const t3 = Timestamp.fromMillis(Date.now() - 1000 * 60 * 60 * 2);
+
+      // Volontairement varié et chronologique
+      await seedMessage(convId, {
+        direction: "outbound",
+        status: "sent",
+        body: "m1",
+        createdAt: t0,
+      });
+      await seedMessage(convId, {
+        direction: "inbound",
+        status: "received",
+        body: "m2",
+        createdAt: t1,
+      });
+      await seedMessage(convId, {
+        direction: "outbound",
+        status: "queued",
+        body: "m3",
+        createdAt: t2,
+      });
+      // Limit défaut = 3 → on prend les 3 derniers (t1/t2/t3) → m2/m3/m4
+      await seedMessage(convId, {
+        direction: "outbound",
+        status: "failed",
+        body: "m4",
+        createdAt: t3,
+      });
+
+      const history = await listRecentMessages(convId);
+
+      // 3 dernières entries en ORDRE CHRONOLOGIQUE CROISSANT.
+      expect(history.length).toBe(3);
+      expect(history.map((h) => h.body)).toEqual(["m2", "m3", "m4"]);
+    });
+
+    it("retourne en ordre CHRONOLOGIQUE CROISSANT (anciens en premier)", async () => {
+      // Sentinelle — le prompt LLM attend l'historique du plus ancien au
+      // plus récent. Si l'ordre était DESC, Claude lirait à l'envers.
+      const convId = "conv_history_order";
+      await seedConversation(convId);
+
+      const t1 = Timestamp.fromMillis(Date.now() - 1000 * 60 * 60 * 3);
+      const t2 = Timestamp.fromMillis(Date.now() - 1000 * 60 * 60 * 2);
+      const t3 = Timestamp.fromMillis(Date.now() - 1000 * 60 * 60 * 1);
+
+      await seedMessage(convId, {
+        direction: "outbound",
+        status: "sent",
+        body: "first",
+        createdAt: t1,
+      });
+      await seedMessage(convId, {
+        direction: "inbound",
+        status: "received",
+        body: "second",
+        createdAt: t2,
+      });
+      await seedMessage(convId, {
+        direction: "outbound",
+        status: "sent",
+        body: "third",
+        createdAt: t3,
+      });
+
+      const history = await listRecentMessages(convId);
+
+      expect(history.map((h) => h.body)).toEqual(["first", "second", "third"]);
+    });
+
+    it("conversation absente → [] (cohérent listRecentOutbound, pas NotFoundError)", async () => {
+      const result = await listRecentMessages("conv_history_ghost");
+      expect(result).toEqual([]);
+    });
+
+    it("limit custom (1) respecté + ordre chronologique", async () => {
+      const convId = "conv_history_limit_1";
+      await seedConversation(convId);
+
+      const t1 = Timestamp.fromMillis(Date.now() - 1000 * 60 * 60 * 2);
+      const t2 = Timestamp.fromMillis(Date.now() - 1000 * 60 * 60 * 1);
+
+      await seedMessage(convId, {
+        direction: "outbound",
+        status: "sent",
+        body: "old",
+        createdAt: t1,
+      });
+      await seedMessage(convId, {
+        direction: "inbound",
+        status: "received",
+        body: "new",
+        createdAt: t2,
+      });
+
+      const history = await listRecentMessages(convId, 1);
+
+      expect(history.length).toBe(1);
+      // Limit=1 → on prend le PLUS RÉCENT (DESC) puis on inverse → "new" seul.
+      expect(history[0]!.body).toBe("new");
     });
   });
 });

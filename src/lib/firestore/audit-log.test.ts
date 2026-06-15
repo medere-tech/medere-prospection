@@ -357,3 +357,168 @@ describe("appendAuditLog", () => {
     });
   });
 });
+
+// ─────────────────────────────────────────────────────────────────────────────
+// S9.3.3b — Sentinelle NIT-1 anti-PII payload reply_generated
+//
+// 🚨 LOW-4 compliance-auditor S9.3.2 + NIT-1 compliance-auditor S9.3.3a :
+// "ne JAMAIS persister result.text dans audit_log.payload.reply_generated".
+// Le body draft est stocké DANS messages/{draftMessageId} (forensic L.34-5
+// CPCE par doc Message), JAMAIS dans audit_log.payload (historisation
+// événement SANS contenu).
+//
+// LIMITATION HONNÊTE — Sentinelle TS @ts-expect-error NON LIVRÉE :
+// `ReplyGeneratedPayload` (src/types/audit-log.ts) expose une index
+// signature `readonly [k: string]: unknown` nécessaire à l'assignation à
+// `AuditLogInput.payload: Record<string, unknown>` (TS limitation). Cette
+// index signature accepte n'importe quelle clé (y compris "body") — donc
+// `@ts-expect-error` sur `body: "leak"` ne fonctionnerait PAS. Trace :
+// follow-up Notion `S9.4-AUDIT-STRICT-PAYLOAD-SCHEMAS-001` (validation
+// Zod stricte par action retire l'index signature et restaure le typage
+// strict compile-time).
+//
+// La sentinelle RUNTIME ci-dessous reste le filet de sécurité actif :
+// si un caller bypass `as any` un body contenant un téléphone E.164 /
+// FR national / email, le scrubber `detectPiiInPayload` (S6.2) attrape
+// et `appendAuditLog` throw `AuditPiiError` → rollback Firestore.
+// ─────────────────────────────────────────────────────────────────────────────
+
+describe("S9.3.3b — sentinelle NIT-1 reply_generated anti-PII (defense-in-depth)", () => {
+  beforeEach(async () => {
+    vi.unstubAllEnvs();
+    vi.stubEnv("AUDIT_PII_PEPPER", PEPPER);
+    await fullReset();
+  });
+
+  afterEach(async () => {
+    vi.unstubAllEnvs();
+    await fullReset();
+  });
+
+  it("body contenant un E.164 dans payload reply_generated → AuditPiiError + 0 doc créé", async () => {
+    // 🔒 Sentinelle defense-in-depth : si un caller bypass via `as any`
+    // un payload contenant un body qui leak un téléphone E.164, le
+    // scrubber attrape et REFUSE l'écriture.
+    const payloadWithLeakedPhone = {
+      contactId: "ct_test",
+      conversationId: "cv_test",
+      draftMessageId: "msg_test",
+      intent: "INTERESSE",
+      promptVersion: "1.0.0",
+      model: "claude-sonnet-4-6",
+      temperature: 0.5,
+      tokensInput: 100,
+      tokensOutput: 50,
+      bodyLength: 60,
+      generationDurationMs: 500,
+      // 🚨 INTERDIT — un body LLM qui aurait miroiré un téléphone du PS.
+      body: "Bonjour, mon numéro de mobile est +33612345678 si besoin",
+    };
+
+    await expect(
+      appendAuditLog({
+        actorId: "system",
+        actorType: "system",
+        action: "reply_generated",
+        targetType: "message",
+        targetId: "msg_test",
+        payload: payloadWithLeakedPhone,
+      }),
+    ).rejects.toBeInstanceOf(AuditPiiError);
+
+    // 0 doc créé (refus = pas d'écriture partielle).
+    expect(await countAuditDocs()).toBe(0);
+  });
+
+  it("body contenant un FR national dans payload reply_generated → AuditPiiError + 0 doc créé", async () => {
+    // Variant FR national — 10 chiffres `0[1-9]\d{8}` (anti-bypass strip).
+    const payloadWithLeakedFRNational = {
+      contactId: "ct_test_fr",
+      conversationId: "cv_test_fr",
+      draftMessageId: "msg_test_fr",
+      intent: "OBJECTION",
+      promptVersion: "1.0.0",
+      model: "claude-sonnet-4-6",
+      temperature: 0.5,
+      tokensInput: 100,
+      tokensOutput: 50,
+      bodyLength: 50,
+      generationDurationMs: 500,
+      body: "Mon numéro 0612345678 si rappel possible",
+    };
+
+    await expect(
+      appendAuditLog({
+        actorId: "system",
+        actorType: "system",
+        action: "reply_generated",
+        targetType: "message",
+        targetId: "msg_test_fr",
+        payload: payloadWithLeakedFRNational,
+      }),
+    ).rejects.toBeInstanceOf(AuditPiiError);
+
+    expect(await countAuditDocs()).toBe(0);
+  });
+
+  it("body contenant un email dans payload reply_generated → AuditPiiError + 0 doc créé", async () => {
+    const payloadWithLeakedEmail = {
+      contactId: "ct_test_em",
+      conversationId: "cv_test_em",
+      draftMessageId: "msg_test_em",
+      intent: "NEUTRE",
+      promptVersion: "1.0.0",
+      model: "claude-sonnet-4-6",
+      temperature: 0.5,
+      tokensInput: 100,
+      tokensOutput: 50,
+      bodyLength: 45,
+      generationDurationMs: 500,
+      body: "Contactez-moi sur contact@cabinet-medecin.fr",
+    };
+
+    await expect(
+      appendAuditLog({
+        actorId: "system",
+        actorType: "system",
+        action: "reply_generated",
+        targetType: "message",
+        targetId: "msg_test_em",
+        payload: payloadWithLeakedEmail,
+      }),
+    ).rejects.toBeInstanceOf(AuditPiiError);
+
+    expect(await countAuditDocs()).toBe(0);
+  });
+
+  it("payload reply_generated CONFORME (sans body, scrubber-safe) → succès + doc créé", async () => {
+    // Sentinelle baseline : le payload légitime du pipeline S9.3.3b
+    // (cf. process-reply.ts:881) est accepté. Si ce test casse, c'est
+    // qu'un faux positif scrubber a été introduit.
+    const validPayload = {
+      contactId: "hs_dent_paris_01",
+      conversationId: "hs_dent_paris_01_dentistes-idf-mai-2026",
+      draftMessageId: "draft_FirestoreAutoId20",
+      intent: "INTERESSE",
+      promptVersion: "1.0.0",
+      model: "claude-sonnet-4-6",
+      temperature: 0.5,
+      tokensInput: 540,
+      tokensOutput: 38,
+      bodyLength: 95,
+      generationDurationMs: 1234,
+    };
+
+    const docId = await appendAuditLog({
+      actorId: "system",
+      actorType: "system",
+      action: "reply_generated",
+      targetType: "message",
+      targetId: "draft_FirestoreAutoId20",
+      payload: validPayload,
+    });
+
+    expect(docId).toMatch(/^[A-Za-z0-9]{20}$/);
+    expect(await countAuditDocs()).toBe(1);
+  });
+});
