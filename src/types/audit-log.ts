@@ -50,6 +50,14 @@ import { type Timestamp } from "firebase-admin/firestore";
  *     `classifyReply` (S7a.2). Payload = `{ intent, confidence, fallback,
  *      promptVersion, model }`. Tous scrubber-safe (intent ∈ enum fermé,
  *     pas de reasoning ni de body).
+ *   - `reply_generated` — réponse Claude Sonnet générée et stockée comme
+ *     draft Firestore (S9.3.3a). Payload = `ReplyGeneratedPayload` (cf.
+ *     interface ci-dessous). `targetType: "message"`, `targetId:
+ *     draftMessageId`. 🚨 INVARIANT ANTI-PII : le `body` draft est
+ *     INTERDIT dans le payload audit — il est stocké UNIQUEMENT dans
+ *     `messages/{draftMessageId}` (forensic L.34-5 CPCE par doc Message,
+ *     historisation événement par audit_log SANS contenu). Cf. compliance-
+ *     auditor LOW-4 S9.3.2.
  *   - `reply_processed` — pipeline `process-reply` terminé avec succès
  *     post-store-inbound sur une branche non-drop. Posé en step 8 final
  *     (S9.2.3) UNIQUEMENT pour les branches `opt_out_short_form`,
@@ -95,6 +103,7 @@ export type AuditAction =
   // ── SMS INBOUND (S9.1 — process-reply) ─────────────────────────────────
   | "sms_received"
   | "intent_classified"
+  | "reply_generated"
   | "reply_processed"
   | "reply_dropped"
   | "long_form_opt_out_candidate"
@@ -127,6 +136,67 @@ export type AuditTargetType =
   | "campaign"
   | "user"
   | "prompt";
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Payload types — formes typées des `payload` par action (anti-PII compile-time)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * Payload type pour action `reply_generated` (S9.3.3a).
+ *
+ * **Cible** : `targetType: "message"`, `targetId: draftMessageId`
+ * (Firestore auto-ID `[A-Za-z0-9]{20}`, scrubber-safe par construction).
+ *
+ * ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ * 🚨 INVARIANT ANTI-PII — LE CHAMP `body` EST INTERDIT.
+ *
+ * Le body draft généré par Claude est stocké dans
+ * `messages/{draftMessageId}` (collection Firestore Messages), PAS dans
+ * `audit_log.payload`. Forensic L.34-5 CPCE :
+ *
+ *   - traçabilité DU CONTENU envoyé        → doc `messages/{id}`
+ *   - historisation DE L'ÉVÉNEMENT         → doc `audit_log/{id}` (sans body)
+ *
+ * Cette séparation respecte le compliance-auditor LOW-4 S9.3.2 :
+ * "ne JAMAIS persister `result.text` brut dans l'audit". Le body LLM
+ * peut miroirer des fragments PII du message PS (rare mais possible si
+ * Claude reformule). Sentinelle test verrouille l'absence du champ
+ * `body` dans le payload.
+ *
+ * ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ * Champs scrubber-safe par construction
+ *
+ *   - `contactId`/`conversationId`/`draftMessageId` : IDs opaques internes.
+ *   - `intent`                                     : enum fermé.
+ *   - `promptVersion`/`model`                      : marqueurs forensic.
+ *   - `temperature`/`tokensInput`/`tokensOutput`   : observabilité Claude.
+ *   - `bodyLength`                                 : LENGTH SEULEMENT, jamais le body.
+ *   - `generationDurationMs`                       : observabilité P95.
+ */
+export interface ReplyGeneratedPayload {
+  /** hubspotId opaque. */
+  contactId: string;
+  /** docId composite `${contactId}_${campaignId}`. */
+  conversationId: string;
+  /** Firestore auto-ID `[A-Za-z0-9]{20}` du draft créé par `addOutboundDraftInTx`. */
+  draftMessageId: string;
+  /** Branche du classifier (S7a.2) qui a déclenché la génération. */
+  intent: "INTERESSE" | "OBJECTION" | "NEUTRE";
+  /** Version semver du prompt utilisé (ex `"1.0.0"`). */
+  promptVersion: string;
+  /** Modèle Claude (`"claude-sonnet-4-6"` en S9.3). */
+  model: string;
+  /** Temperature SDK (`0.5` en S9.3). */
+  temperature: number;
+  /** Tokens input facturés par Claude. */
+  tokensInput: number;
+  /** Tokens output facturés par Claude. */
+  tokensOutput: number;
+  /** Longueur du body draft (chars). JAMAIS le body lui-même. */
+  bodyLength: number;
+  /** Durée wall-clock de l'appel `generate` (ms). */
+  generationDurationMs: number;
+}
 
 /**
  * Forme persistée d'une entrée d'audit (avec `timestamp` posé par le

@@ -76,6 +76,7 @@ const ACTIONS = [
   // ── SMS INBOUND (S9.1 — process-reply) ─────────────────────────────────
   "sms_received",
   "intent_classified",
+  "reply_generated",
   "reply_processed",
   "reply_dropped",
   "long_form_opt_out_candidate",

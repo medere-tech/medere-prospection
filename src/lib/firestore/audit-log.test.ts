@@ -82,9 +82,10 @@ const EXPECTED_AUDIT_ACTIONS: ReadonlySet<AuditAction> = new Set<AuditAction>([
   "sms_failed",
   "sms_provider_dispatched",
   "send_blocked",
-  // SMS INBOUND (S9.1)
+  // SMS INBOUND (S9.1 + S9.3.3a)
   "sms_received",
   "intent_classified",
+  "reply_generated",
   "reply_processed",
   "reply_dropped",
   "long_form_opt_out_candidate",
@@ -129,6 +130,13 @@ describe("ACTIONS whitelist — sentinelle anti-drift TS ↔ runtime (S9.1)", ()
     expect(EXPECTED_AUDIT_ACTIONS.has("intent_classified")).toBe(true);
     expect(EXPECTED_AUDIT_ACTIONS.has("reply_processed")).toBe(true);
     expect(EXPECTED_AUDIT_ACTIONS.has("reply_dropped")).toBe(true);
+  });
+
+  it("contient l'action S9.3.3a `reply_generated` (sentinelle dédiée)", () => {
+    // Verrouillage spécifique pour repérer un revert/squash accidentel
+    // de l'ajout S9.3.3a (stockage draft IA). Si retiré, le pipeline
+    // process-reply step 8 (S9.3.3b) ne pourra plus poser cet audit.
+    expect(EXPECTED_AUDIT_ACTIONS.has("reply_generated")).toBe(true);
   });
 });
 

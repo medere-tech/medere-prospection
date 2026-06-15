@@ -18,6 +18,21 @@ import type { Intent } from "./conversation";
 export type MessageDirection = "outbound" | "inbound";
 
 export type MessageStatus =
+  /**
+   * "draft" — Message outbound généré par l'IA (S9.3) mais pas encore
+   * envoyé OVH. Stocké via `addOutboundDraftInTx` (S9.3.3a).
+   *
+   * **N'EST PAS COMPTÉ par le rate-limit 3 SMS/30j** : `listRecentOutbound`
+   * exclut les drafts via la whitelist `RATE_LIMIT_COUNTED_STATUSES`
+   * (S9.3.3a-INVARIANT-RATE-LIMIT). Un draft non envoyé n'est pas un
+   * envoi tenté au sens L.34-5 CPCE.
+   *
+   * **NE BUMP PAS les compteurs conversation** (`outboundCount`,
+   * `lastOutboundAt`) — la fonction `addOutboundDraftInTx` les laisse
+   * intacts. Le bump aura lieu lors de la transition `draft → queued`
+   * via `commitDraftToQueued()` en S9.4 (cf. S9.4-DRAFT-TO-QUEUED-001).
+   */
+  | "draft"
   | "queued" // créé en Firestore, en attente d'envoi via OVH
   | "sending" // remis à OVH, en attente d'accusé
   | "sent" // accusé OVH (job accepté)

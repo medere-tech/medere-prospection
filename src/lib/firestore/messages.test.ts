@@ -67,10 +67,12 @@ import {
   __MESSAGES_SUBCOLLECTION_FOR_TESTS,
   addInbound,
   addOutbound,
+  addOutboundDraftInTx,
   addOutboundInTx,
   findInboundByExternalId,
   listRecentOutbound,
   listRecentOutboundInTx,
+  RATE_LIMIT_COUNTED_STATUSES,
 } from "./messages";
 
 const PEPPER = "a".repeat(64);
@@ -1368,5 +1370,319 @@ describe("messages.ts", () => {
         externalReceiver: "+33611111111",
       });
     }
+  });
+
+  // ───────────────────────────────────────────────────────────────────────
+  // S9.3.3a — Sentinelle RATE_LIMIT_COUNTED_STATUSES (whitelist explicite)
+  // ───────────────────────────────────────────────────────────────────────
+
+  describe("RATE_LIMIT_COUNTED_STATUSES (S9.3.3a-INVARIANT-RATE-LIMIT)", () => {
+    it("contient EXACTEMENT ['queued', 'sending', 'sent', 'delivered']", () => {
+      // 🔒 Sentinelle compliance — modification = re-validation
+      // compliance-auditor + bump JSDoc + amender ces tests.
+      // Cf. JSDoc RATE_LIMIT_COUNTED_STATUSES pour sémantique.
+      expect([...RATE_LIMIT_COUNTED_STATUSES].sort()).toEqual([
+        "delivered",
+        "queued",
+        "sending",
+        "sent",
+      ]);
+    });
+
+    it("EXCLUT 'draft' (S9.3 drafts non envoyés)", () => {
+      expect((RATE_LIMIT_COUNTED_STATUSES as readonly string[]).includes("draft")).toBe(false);
+    });
+
+    it("EXCLUT 'failed' (sémantique S9.3.3a — un envoi qui n'a jamais atteint le PS)", () => {
+      expect((RATE_LIMIT_COUNTED_STATUSES as readonly string[]).includes("failed")).toBe(false);
+    });
+
+    it("EXCLUT 'received' (déjà exclu par filtre direction='outbound', sentinelle redondante)", () => {
+      expect((RATE_LIMIT_COUNTED_STATUSES as readonly string[]).includes("received")).toBe(false);
+    });
+  });
+
+  // ───────────────────────────────────────────────────────────────────────
+  // S9.3.3a — listRecentOutbound : filtre status whitelist
+  // ───────────────────────────────────────────────────────────────────────
+
+  describe("listRecentOutbound — filtre status whitelist (S9.3.3a)", () => {
+    it("EXCLUT les drafts du résultat (anti-pollution rate-limit)", async () => {
+      // 🔒 Sentinelle critique — un draft S9.3 ne doit JAMAIS être compté
+      // contre le plafond 3 SMS/30j. Si retiré, double-comptage en S9.4
+      // quand `commitDraftToQueued` transitionnera le draft en queued.
+      const convId = "conv_invariant_no_draft";
+      await seedConversation(convId);
+
+      const now = Timestamp.now();
+      await seedMessage(convId, { status: "draft", createdAt: now, body: "draft body" });
+      await seedMessage(convId, { status: "queued", createdAt: now, body: "queued body" });
+      await seedMessage(convId, { status: "sent", createdAt: now, body: "sent body" });
+
+      const result = await listRecentOutbound(convId);
+
+      // Seuls queued + sent remontent (2 messages comptés).
+      expect(result.length).toBe(2);
+    });
+
+    it("EXCLUT 'failed' du résultat (sémantique S9.3.3a)", async () => {
+      // 🔒 Sentinelle — un envoi failed côté OVH n'a jamais atteint le PS,
+      // donc ne compte pas comme une tentative de dérangement L.34-5 CPCE.
+      // Changement de sémantique vs pré-S9.3.3a (où failed était compté
+      // par effet de bord — absence de filtre status).
+      const convId = "conv_invariant_no_failed";
+      await seedConversation(convId);
+
+      const now = Timestamp.now();
+      await seedMessage(convId, { status: "failed", createdAt: now });
+      await seedMessage(convId, { status: "queued", createdAt: now });
+
+      const result = await listRecentOutbound(convId);
+
+      // Seul queued remonte (failed exclu).
+      expect(result.length).toBe(1);
+    });
+
+    it("INCLUT tous les statuts de la whitelist ['queued', 'sending', 'sent', 'delivered']", async () => {
+      const convId = "conv_invariant_whitelist";
+      await seedConversation(convId);
+
+      const now = Timestamp.now();
+      await seedMessage(convId, { status: "queued", createdAt: now });
+      await seedMessage(convId, { status: "sending", createdAt: now });
+      await seedMessage(convId, { status: "sent", createdAt: now });
+      await seedMessage(convId, { status: "delivered", createdAt: now });
+
+      const result = await listRecentOutbound(convId);
+
+      expect(result.length).toBe(4);
+    });
+  });
+
+  // ───────────────────────────────────────────────────────────────────────
+  // S9.3.3a — listRecentOutboundInTx : filtre status whitelist aligné
+  // ───────────────────────────────────────────────────────────────────────
+
+  describe("listRecentOutboundInTx — filtre status whitelist (S9.3.3a)", () => {
+    it("EXCLUT les drafts (même sémantique que listRecentOutbound HORS tx)", async () => {
+      // 🔒 Sentinelle anti-drift — la version tx-aware DOIT appliquer le
+      // même filtre que la version HORS tx. Si drift, race rate-limit
+      // possible en S9.4 (sendOutboundWithLock lit DANS tx, miss le draft
+      // exclu HORS tx, et autorise un envoi qui aurait dû être bloqué).
+      const convId = "conv_invarianttx_no_draft";
+      await seedConversation(convId);
+
+      const now = Timestamp.now();
+      await seedMessage(convId, { status: "draft", createdAt: now });
+      await seedMessage(convId, { status: "queued", createdAt: now });
+      await seedMessage(convId, { status: "sent", createdAt: now });
+
+      const result = await getAdminDb().runTransaction((tx) => listRecentOutboundInTx(tx, convId));
+
+      expect(result.length).toBe(2);
+    });
+
+    it("EXCLUT 'failed' (sémantique alignée)", async () => {
+      const convId = "conv_invarianttx_no_failed";
+      await seedConversation(convId);
+
+      const now = Timestamp.now();
+      await seedMessage(convId, { status: "failed", createdAt: now });
+      await seedMessage(convId, { status: "queued", createdAt: now });
+
+      const result = await getAdminDb().runTransaction((tx) => listRecentOutboundInTx(tx, convId));
+
+      expect(result.length).toBe(1);
+    });
+  });
+
+  // ───────────────────────────────────────────────────────────────────────
+  // S9.3.3a — addOutboundDraftInTx
+  // ───────────────────────────────────────────────────────────────────────
+
+  describe("addOutboundDraftInTx (S9.3.3a)", () => {
+    it("happy path : crée un doc Message status='draft' avec tous les champs IA", async () => {
+      const convId = "conv_draft_happy";
+      await seedConversation(convId);
+
+      const draftId = await getAdminDb().runTransaction(async (tx) =>
+        addOutboundDraftInTx(tx, {
+          contactId: "contact_abc",
+          conversationId: convId,
+          body: "Bonjour Docteur, quelle formation vous intéresse chez Médéré ?",
+          aiModel: "claude-sonnet-4-6",
+          aiPromptVersion: "1.0.0",
+          aiTemperature: 0.5,
+          aiTokensInput: 540,
+          aiTokensOutput: 38,
+          aiGenerationDurationMs: 1234,
+        }),
+      );
+
+      expect(draftId).toMatch(FIRESTORE_AUTO_ID_PATTERN);
+
+      const docSnap = await getAdminDb()
+        .collection(__MESSAGES_PARENT_COLLECTION_FOR_TESTS)
+        .doc(convId)
+        .collection(__MESSAGES_SUBCOLLECTION_FOR_TESTS)
+        .doc(draftId)
+        .get();
+      expect(docSnap.exists).toBe(true);
+      const msg = docSnap.data() as Message;
+      expect(msg.direction).toBe("outbound");
+      expect(msg.status).toBe("draft");
+      expect(msg.channel).toBe("sms");
+      expect(msg.generatedBy).toBe("ai");
+      expect(msg.aiModel).toBe("claude-sonnet-4-6");
+      expect(msg.aiPromptVersion).toBe("1.0.0");
+      expect(msg.aiTemperature).toBe(0.5);
+      expect(msg.aiTokens).toEqual({ input: 540, output: 38 });
+      expect(msg.createdAt).toBeInstanceOf(Timestamp);
+      // Statuts post-envoi NON posés (laissés à S9.4 commitDraftToQueued).
+      expect(msg.sentAt).toBeUndefined();
+      expect(msg.deliveredAt).toBeUndefined();
+    });
+
+    it("🔒 NE BUMP PAS conversation.outboundCount / messageCount / lastOutboundAt", async () => {
+      // Invariant critique S9.3.3a — un draft n'est pas un envoi tenté.
+      // Si retiré, race en S9.4 quand commitDraftToQueued bumpera à son
+      // tour → double-comptage côté analytics et rate-limit.
+      const convId = "conv_draft_no_bump";
+      await seedConversation(convId);
+
+      const before = await getAdminDb()
+        .collection(__CONVERSATIONS_COLLECTION_FOR_TESTS)
+        .doc(convId)
+        .get();
+      const beforeConv = before.data() as Conversation;
+      expect(beforeConv.messageCount).toBe(0);
+      expect(beforeConv.outboundCount).toBe(0);
+
+      await getAdminDb().runTransaction(async (tx) =>
+        addOutboundDraftInTx(tx, {
+          contactId: "contact_abc",
+          conversationId: convId,
+          body: "Bonjour Docteur, Médéré propose des formations DPC. Une question ?",
+          aiModel: "claude-sonnet-4-6",
+          aiPromptVersion: "1.0.0",
+          aiTemperature: 0.5,
+          aiTokensInput: 500,
+          aiTokensOutput: 30,
+          aiGenerationDurationMs: 1000,
+        }),
+      );
+
+      const after = await getAdminDb()
+        .collection(__CONVERSATIONS_COLLECTION_FOR_TESTS)
+        .doc(convId)
+        .get();
+      const afterConv = after.data() as Conversation;
+      expect(afterConv.messageCount).toBe(0);
+      expect(afterConv.outboundCount).toBe(0);
+      expect(afterConv.lastOutboundAt).toBeUndefined();
+      expect(afterConv.firstMessageAt).toBeUndefined();
+    });
+
+    it("🔒 NE POSE PAS d'audit sms_sent (laissé à S9.4 commitDraftToQueued)", async () => {
+      // Invariant — l'audit sms_sent doit être posé UNIQUEMENT quand
+      // l'envoi OVH est acté (S9.4). Le caller (process-reply step 8
+      // S9.3.3b) posera reply_generated à la place, distinct.
+      const convId = "conv_draft_no_audit";
+      await seedConversation(convId);
+
+      const beforeAudit = await countAuditDocs();
+
+      await getAdminDb().runTransaction(async (tx) =>
+        addOutboundDraftInTx(tx, {
+          contactId: "contact_abc",
+          conversationId: convId,
+          body: "Bonjour Médéré, formations DPC.",
+          aiModel: "claude-sonnet-4-6",
+          aiPromptVersion: "1.0.0",
+          aiTemperature: 0.5,
+          aiTokensInput: 400,
+          aiTokensOutput: 20,
+          aiGenerationDurationMs: 800,
+        }),
+      );
+
+      const afterAudit = await countAuditDocs();
+      // Aucun audit posé par la fonction (caller pose reply_generated).
+      expect(afterAudit).toBe(beforeAudit);
+    });
+
+    it("body vide → ValidationError (pas de doc créé)", async () => {
+      const convId = "conv_draft_empty_body";
+      await seedConversation(convId);
+
+      await expect(
+        getAdminDb().runTransaction(async (tx) =>
+          addOutboundDraftInTx(tx, {
+            contactId: "contact_abc",
+            conversationId: convId,
+            body: "",
+            aiModel: "claude-sonnet-4-6",
+            aiPromptVersion: "1.0.0",
+            aiTemperature: 0.5,
+            aiTokensInput: 100,
+            aiTokensOutput: 10,
+            aiGenerationDurationMs: 500,
+          }),
+        ),
+      ).rejects.toBeInstanceOf(ValidationError);
+
+      expect(await countMessages(convId)).toBe(0);
+    });
+
+    it("body > BODY_MAX_LENGTH (1600) → ValidationError", async () => {
+      const convId = "conv_draft_too_long";
+      await seedConversation(convId);
+
+      const tooLong = "a".repeat(__BODY_MAX_LENGTH_FOR_TESTS + 1);
+      await expect(
+        getAdminDb().runTransaction(async (tx) =>
+          addOutboundDraftInTx(tx, {
+            contactId: "contact_abc",
+            conversationId: convId,
+            body: tooLong,
+            aiModel: "claude-sonnet-4-6",
+            aiPromptVersion: "1.0.0",
+            aiTemperature: 0.5,
+            aiTokensInput: 100,
+            aiTokensOutput: 10,
+            aiGenerationDurationMs: 500,
+          }),
+        ),
+      ).rejects.toBeInstanceOf(ValidationError);
+    });
+
+    it("le draft créé n'est PAS compté par listRecentOutbound (bout-en-bout)", async () => {
+      // Sentinelle bout-en-bout — confirme que l'invariant rate-limit
+      // tient ENSEMBLE pour les deux modules : addOutboundDraftInTx crée
+      // un doc status='draft', listRecentOutbound le filtre.
+      const convId = "conv_draft_e2e_rate_limit";
+      await seedConversation(convId);
+
+      await getAdminDb().runTransaction(async (tx) =>
+        addOutboundDraftInTx(tx, {
+          contactId: "contact_abc",
+          conversationId: convId,
+          body: "Bonjour Médéré, draft test.",
+          aiModel: "claude-sonnet-4-6",
+          aiPromptVersion: "1.0.0",
+          aiTemperature: 0.5,
+          aiTokensInput: 300,
+          aiTokensOutput: 15,
+          aiGenerationDurationMs: 600,
+        }),
+      );
+
+      // 1 doc total créé (vérifiable directement).
+      expect(await countMessages(convId)).toBe(1);
+
+      // Mais 0 message compté par listRecentOutbound (rate-limit safe).
+      const recent = await listRecentOutbound(convId);
+      expect(recent.length).toBe(0);
+    });
   });
 });
