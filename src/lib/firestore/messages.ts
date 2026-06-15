@@ -97,6 +97,7 @@
 import { type DocumentReference, Timestamp, type Transaction } from "firebase-admin/firestore";
 import { z } from "zod";
 
+import type { ClaudeModel } from "@/lib/claude/types";
 import { type OutboundMessageRecord } from "@/lib/compliance/rate-limits";
 import { getAdminDb } from "@/lib/firestore/admin";
 import { appendAuditLogTx } from "@/lib/firestore/audit-log";
@@ -137,6 +138,68 @@ const DEFAULT_LIST_DAYS = 30;
 
 const MS_PER_DAY = 24 * 60 * 60 * 1000;
 
+/**
+ * 🔒 SENTINEL S9.3.3a-INVARIANT-RATE-LIMIT — Whitelist explicite des
+ * statuts comptés contre le plafond rate-limit 3 SMS/30j L.34-5 CPCE.
+ *
+ * ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ * Statuts INCLUS (envois tentés à compter L.34-5 CPCE) :
+ *
+ *   - `queued`    : message créé en Firestore, en attente OVH. Conservateur
+ *                   (anti-race S6.5) — un queued non encore parti compte
+ *                   contre le plafond pour éviter la fenêtre de race
+ *                   pre-check → tx.commit.
+ *   - `sending`   : remis à OVH, en attente d'accusé. Envoi en cours.
+ *   - `sent`      : accusé OVH (job accepté). Envoi acté.
+ *   - `delivered` : OVH a confirmé la délivrance au PS. Envoi reçu.
+ *
+ * ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ * Statuts EXCLUS :
+ *
+ *   - `draft`    : S9.3.3a — message IA généré mais pas encore envoyé.
+ *                  Un brouillon n'est pas un envoi tenté.
+ *   - `failed`   : un SMS qui a ÉCHOUÉ côté OVH (numéro invalide,
+ *                  ConfigError) n'a jamais atteint le PS — donc ne compte
+ *                  pas comme un dérangement L.34-5 CPCE. Changement de
+ *                  sémantique vs pré-S9.3.3a (où l'absence de filtre
+ *                  status comptait `failed` par effet de bord, pas par
+ *                  décision consciente).
+ *   - `received` : statut inbound, déjà exclu par filtre `direction == "outbound"`.
+ *
+ * ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ * RAISON D'ÊTRE — sécurité par défaut
+ *
+ * Whitelist > Blacklist : un nouveau status futur (ex: `cancelled`,
+ * `expired`) ne sera PAS comptabilisé par défaut, ce qui force une
+ * décision consciente du dev qui l'ajoute (modification de cette liste
+ * = validation compliance-auditor obligatoire).
+ *
+ * Filtre appliqué CÔTÉ CODE (post-parse Firestore) plutôt que dans la
+ * query Firestore (`where status in [...]`) pour :
+ *   - éviter un nouvel index composite Firestore
+ *     (`direction ASC, status ASC, createdAt DESC`) à déployer.
+ *   - rester explicite et testable sans round-trip emulator.
+ *   - volume borné par contact (~3-5 docs dans la fenêtre).
+ *
+ * Sentinelles tests : `messages.test.ts` verrouille (a) la composition
+ * exacte de la liste, (b) l'exclusion runtime des drafts dans
+ * `listRecentOutbound` et `listRecentOutboundInTx`.
+ */
+export const RATE_LIMIT_COUNTED_STATUSES = ["queued", "sending", "sent", "delivered"] as const;
+
+/** Type narrow des statuts comptés rate-limit (sous-ensemble de MessageStatus). */
+type RateLimitCountedStatus = (typeof RATE_LIMIT_COUNTED_STATUSES)[number];
+
+/**
+ * Vrai si le status du message compte contre le plafond rate-limit
+ * 3 SMS/30j. Used by `listRecentOutbound` + `listRecentOutboundInTx`.
+ *
+ * Cf. JSDoc `RATE_LIMIT_COUNTED_STATUSES` pour la sémantique compliance.
+ */
+function isRateLimitCounted(status: Message["status"]): status is RateLimitCountedStatus {
+  return (RATE_LIMIT_COUNTED_STATUSES as readonly string[]).includes(status);
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Schéma Zod (validation runtime à la lecture)
 // ─────────────────────────────────────────────────────────────────────────────
@@ -162,7 +225,7 @@ export const MessageErrorSchema = z.object({
 export const MessageSchema = z.object({
   direction: z.enum(["outbound", "inbound"]),
   body: z.string().min(1).max(BODY_MAX_LENGTH),
-  status: z.enum(["queued", "sending", "sent", "delivered", "failed", "received"]),
+  status: z.enum(["draft", "queued", "sending", "sent", "delivered", "failed", "received"]),
   channel: z.enum(["sms", "whatsapp"]),
   externalId: z.string().optional(),
   externalReceiver: z.string().optional(),
@@ -604,6 +667,17 @@ export async function addInbound(conversationId: string, input: AddInboundInput)
  * Inngest n'est pas correctement sérialisé par contact. Conservateur >
  * exploitable.
  *
+ * **S9.3.3a — filtre status whitelist (`RATE_LIMIT_COUNTED_STATUSES`)** :
+ *
+ * Post-parse Firestore, on FILTRE les messages dont le status n'est pas
+ * dans la whitelist `["queued", "sending", "sent", "delivered"]`.
+ * Exclut `draft` (S9.3 IA générée pas envoyée) ET `failed` (envoi qui
+ * n'a jamais atteint le PS). Cf. JSDoc `RATE_LIMIT_COUNTED_STATUSES`
+ * pour la sémantique compliance + raison d'être whitelist > blacklist.
+ *
+ * Filtre côté code (pas dans la query Firestore) pour éviter un index
+ * composite supplémentaire (`direction ASC, status ASC, createdAt DESC`).
+ *
  * Mapping de sortie : `sentAt = msg.sentAt ?? msg.createdAt`. Préserve
  * la sémantique du type `OutboundMessageRecord` (S4, `rate-limits.ts`)
  * sans toucher au champ Firestore — un message `queued` voit son
@@ -640,15 +714,24 @@ export async function listRecentOutbound(
     .orderBy("createdAt", "desc")
     .get();
 
-  return snap.docs.map((doc) => {
+  // 🔒 S9.3.3a-INVARIANT-RATE-LIMIT — filtre status post-parse.
+  // Exclut `draft` (S9.3 IA générée pas encore envoyée) ET `failed`
+  // (envoi qui n'a jamais atteint le PS). Cf. JSDoc
+  // `RATE_LIMIT_COUNTED_STATUSES`.
+  return snap.docs.flatMap((doc) => {
     const msg = parseMessageOrThrow(doc.data(), conversationId, doc.id);
+    if (!isRateLimitCounted(msg.status)) {
+      return [];
+    }
     // Mapping cf. JSDoc : `sentAt` exposé = `msg.sentAt ?? msg.createdAt`.
     // Le cast `Timestamp` est sûr car les 2 viennent du SDK Firestore.
     const sentAt = (msg.sentAt ?? msg.createdAt) as OutboundMessageRecord["sentAt"];
-    return {
-      direction: "outbound",
-      sentAt,
-    };
+    return [
+      {
+        direction: "outbound" as const,
+        sentAt,
+      },
+    ];
   });
 }
 
@@ -828,9 +911,15 @@ export async function findInboundByExternalId(
  *   - Conversation absente → `[]` (PAS `NotFoundError`)
  *   - Doc corrompu → throw `ValidationError` au parse Zod
  *
- * SEULE différence : `tx.get(query)` au lieu de `.get()`. Pour les tests
- * sentinelles : si quelqu'un remplace `tx.get(query)` par `.get()`
- * direct (régression), la race rate-limit redevient possible.
+ * SEULE différence vs `listRecentOutbound` : `tx.get(query)` au lieu de
+ * `.get()`. Pour les tests sentinelles : si quelqu'un remplace
+ * `tx.get(query)` par `.get()` direct (régression), la race rate-limit
+ * redevient possible.
+ *
+ * **S9.3.3a — filtre status aligné** : même whitelist
+ * `RATE_LIMIT_COUNTED_STATUSES` que `listRecentOutbound` HORS tx.
+ * Drift entre les deux fonctions = bug compliance. Sentinelle test
+ * `messages.test.ts` verrouille l'égalité de sémantique.
  *
  * @param tx              Transaction Firestore ouverte par le caller
  *                        (typiquement via `withContactLock`).
@@ -863,14 +952,277 @@ export async function listRecentOutboundInTx(
   // `query.get` n'est PAS appelé.
   const snap = await tx.get(query);
 
-  return snap.docs.map((doc) => {
+  // 🔒 S9.3.3a-INVARIANT-RATE-LIMIT — filtre status post-parse aligné
+  // sur `listRecentOutbound` HORS tx (même sémantique compliance).
+  // Cf. JSDoc `RATE_LIMIT_COUNTED_STATUSES`.
+  return snap.docs.flatMap((doc) => {
     const msg = parseMessageOrThrow(doc.data(), conversationId, doc.id);
+    if (!isRateLimitCounted(msg.status)) {
+      return [];
+    }
     const sentAt = (msg.sentAt ?? msg.createdAt) as OutboundMessageRecord["sentAt"];
-    return {
-      direction: "outbound",
-      sentAt,
-    };
+    return [
+      {
+        direction: "outbound" as const,
+        sentAt,
+      },
+    ];
   });
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// addOutboundDraftInTx (S9.3.3a) — stockage draft IA pré-envoi
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * Input pour `addOutboundDraftInTx`. Tous les champs IA sont obligatoires
+ * (vs `AddOutboundInput` où ils sont optionnels) — un draft est toujours
+ * généré par Claude, jamais manuel.
+ *
+ * `contactId` est inclus pour cohérence forensic côté caller (utilisé
+ * pour le payload audit `reply_generated` posé par le caller — process-reply
+ * step 8 S9.3.3b). NON stocké dans le doc Message (le `conversationId`
+ * composite `${contactId}_${campaignId}` suffit pour retrouver le contact).
+ *
+ * `now` injectable pour tests déterministes — défaut `Timestamp.now()`.
+ */
+export interface AddOutboundDraftInput {
+  /** hubspotId opaque. Forensic caller, non stocké dans le doc Message. */
+  contactId: string;
+  /** docId composite `${contactId}_${campaignId}`. */
+  conversationId: string;
+  /** Body SMS draft généré par Claude (S9.3.2 `generateReply`). */
+  body: string;
+  /** Modèle Claude utilisé (`claude-sonnet-4-6` en S9.3). */
+  aiModel: ClaudeModel;
+  /** Version semver du prompt (`"1.0.0"` en S9.3). */
+  aiPromptVersion: string;
+  /** Temperature SDK Claude (`0.5` en S9.3). */
+  aiTemperature: number;
+  /** Tokens input facturés par Claude. */
+  aiTokensInput: number;
+  /** Tokens output facturés par Claude. */
+  aiTokensOutput: number;
+  /**
+   * Durée wall-clock de l'appel `generate` (ms). Forensic caller : NON
+   * STOCKÉ dans le doc Message (le type `Message` ne porte pas ce champ).
+   * Relayé par le caller (process-reply step 8 S9.3.3b) dans le payload
+   * audit `reply_generated.generationDurationMs` pour observabilité P95.
+   * Cf. miroir `contactId` ci-dessus pour le même pattern.
+   */
+  aiGenerationDurationMs: number;
+  /** Référence temporelle (défaut `Timestamp.now()`). Injectable tests. */
+  now?: Date;
+}
+
+/**
+ * Stocke un message draft (généré IA, pas encore envoyé OVH).
+ *
+ * ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ * INVARIANTS — différences vs `addOutboundInTx`
+ *
+ *   - Pose un doc Message avec `status="draft"`, `direction="outbound"`,
+ *     `generatedBy="ai"`. Champs IA obligatoires (tous renseignés).
+ *
+ *   - **NE BUMP PAS** `conversation.messageCount` / `outboundCount` /
+ *     `lastOutboundAt` / `firstMessageAt`. Le draft n'est pas un SMS
+ *     envoyé — il n'altère pas l'état conversationnel observable.
+ *
+ *   - **NE POSE PAS** d'audit `sms_sent`. Le caller (process-reply step
+ *     8 S9.3.3b) posera un audit `reply_generated` distinct avec un
+ *     payload dédié (cf. `ReplyGeneratedPayload` dans `audit-log.ts`).
+ *
+ *   - **N'EST PAS COMPTÉ** par le rate-limit 3 SMS/30j (`listRecentOutbound`
+ *     filtre via whitelist `RATE_LIMIT_COUNTED_STATUSES`).
+ *
+ * ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ * S9.4-DRAFT-TO-QUEUED-001 — Transition `draft → queued` (S9.4)
+ *
+ * Une fonction `commitDraftToQueued(draftMessageId)` à venir en S9.4 :
+ *   - Transitionne le status `draft → queued`.
+ *   - Bumpe `conversation.outboundCount` + `lastOutboundAt` (et
+ *     `firstMessageAt` si absent).
+ *   - Pose l'audit `sms_sent` rétroactif (corrélation `messageId` ↔
+ *     `ovhMessageId` une fois OVH appelé).
+ *   - Le tout dans une transaction atomique avec re-check rate-limit
+ *     (cohérent avec le pattern `sendOutboundWithLock` DEBT-001.3).
+ *
+ * **Risque si discipline rompue** : si un futur chemin d'envoi bypasse
+ * `commitDraftToQueued` et transitionne le draft directement en `sent`
+ * (ex: via un `updateMessageStatus` direct sans bump), on aurait :
+ *   - `outboundCount` non bumpé → analytics conversation fausse.
+ *   - `lastOutboundAt` absent → tri dashboard cassé.
+ *   - Pas d'audit `sms_sent` → trou forensique L.34-5 CPCE.
+ * À l'inverse, si `commitDraftToQueued` est appelé ET qu'un autre chemin
+ * bumpe AUSSI les compteurs, on a un double-bump silencieux. Discipline
+ * : `commitDraftToQueued` est LE SEUL point de transition autorisé.
+ *
+ * ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ * CONTRAT TX-AWARE
+ *
+ * Fonction `tx-aware` — le caller ouvre la transaction (typiquement le
+ * pipeline `process-reply` step 8) et appelle cette fonction DANS la tx.
+ * Pas de wrapper standalone `addOutboundDraft` HORS tx : l'atomicité
+ * draft + audit reply_generated est portée par la step.run Inngest +
+ * la tx Firestore parente.
+ *
+ * @param tx     Transaction Firestore ouverte par le caller.
+ * @param input  Voir `AddOutboundDraftInput` pour le périmètre.
+ *
+ * @returns L'ID Firestore (auto-généré, 20 chars `[A-Za-z0-9]`) du
+ *          draft créé. À propager au caller pour audit + retour S9.3.3b.
+ *
+ * @throws ValidationError si `body` vide ou > `BODY_MAX_LENGTH`.
+ */
+export function addOutboundDraftInTx(tx: Transaction, input: AddOutboundDraftInput): string {
+  validateBodyOrThrow(input.body, input.conversationId);
+
+  const messageRef = messagesSubcollectionRef(input.conversationId).doc(); // auto-ID
+  const now = input.now !== undefined ? Timestamp.fromDate(input.now) : Timestamp.now();
+
+  // Construction explicite : NE PAS spreader `input` brut — risque
+  // qu'un champ inattendu (introduit côté caller via `as any`) passe.
+  const messageDoc: Message = {
+    direction: "outbound",
+    body: input.body,
+    status: "draft",
+    channel: "sms",
+    generatedBy: "ai",
+    aiModel: input.aiModel,
+    aiPromptVersion: input.aiPromptVersion,
+    aiTemperature: input.aiTemperature,
+    aiTokens: {
+      input: input.aiTokensInput,
+      output: input.aiTokensOutput,
+    },
+    createdAt: now,
+  };
+  tx.create(messageRef, messageDoc);
+
+  // PAS de `_bumpConversationCountersTx` — un draft n'est pas un envoi.
+  // PAS de `appendAuditLogTx("sms_sent")` — sera posé par S9.4
+  // (`commitDraftToQueued`). Le caller pose `reply_generated` séparément.
+
+  return messageRef.id;
+}
+
+/**
+ * Wrapper standalone de `addOutboundDraftInTx` (S9.3.3b). Ouvre sa
+ * propre `runTransaction` et délègue à la version tx-aware. Pour callers
+ * SANS tx ouverte (pipeline `process-reply` step 8b).
+ *
+ * Pattern miroir `addOutbound` (S6.5) qui wrap `addOutboundInTx`. Tous
+ * les invariants de `addOutboundDraftInTx` s'appliquent (no counter
+ * bump, no audit sms_sent, body validation).
+ *
+ * @throws ValidationError si `body` vide ou > `BODY_MAX_LENGTH`.
+ */
+export async function addOutboundDraft(input: AddOutboundDraftInput): Promise<string> {
+  // Pre-flight validation HORS tx → fail-fast sans ouvrir de tx si body
+  // invalide. `addOutboundDraftInTx` re-valide en défense en profondeur.
+  validateBodyOrThrow(input.body, input.conversationId);
+
+  return await getAdminDb().runTransaction(async (tx) => addOutboundDraftInTx(tx, input));
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// listRecentMessages (S9.3.3b) — historique chronologique pour gen IA
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * Sous-ensemble d'un `Message` exposé par `listRecentMessages` pour le
+ * pipeline `process-reply` step 8a — passé tel quel à `generateReply()`
+ * (`ReplyHistoryEntry`-compatible par structural typing).
+ *
+ * Pas de couplage avec le type `ReplyHistoryEntry` des prompts
+ * `generate-reply-*.ts` — la forme inline `{direction, body}` est
+ * stable et indépendante (le caller peut assigner ce résultat à
+ * `ReplyHistoryEntry[]` sans cast).
+ */
+export interface RecentMessageEntry {
+  direction: "inbound" | "outbound";
+  body: string;
+}
+
+/**
+ * Largeur par défaut de l'historique passé à `generateReply` (décision
+ * Déthié S9.3.0). Au-delà : signal d'un caller qui charge trop.
+ */
+const DEFAULT_HISTORY_LIMIT = 3;
+
+/**
+ * Retourne les N derniers messages d'une conversation, mélangeant
+ * inbound et outbound, en ORDRE CHRONOLOGIQUE CROISSANT (les plus
+ * anciens en premier — sémantique attendue par les prompts Claude qui
+ * lisent l'historique de gauche à droite).
+ *
+ * ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ * USAGE — pipeline `process-reply` step 8a (S9.3.3b)
+ *
+ * Appelé par le pipeline pour construire le contexte historique passé à
+ * `generateReply()`. Limite stricte = 3 messages (décision Déthié
+ * S9.3.0) : un historique plus long dilue l'intent + coût Claude inutile
+ * + risque conformité RGPD art. 5.1.c (minimisation données traitées).
+ *
+ * ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ * EXCLUSION DES DRAFTS (S9.3.3a)
+ *
+ * Les messages `status="draft"` (générés IA mais pas encore envoyés OVH)
+ * sont **EXCLUS** de l'historique passé à Claude. Justification :
+ *
+ *   - Un draft n'a JAMAIS été reçu par le PS — l'inclure simulerait un
+ *     échange qui n'a pas eu lieu et confondrait Claude.
+ *
+ *   - Cohérent avec l'exclusion `RATE_LIMIT_COUNTED_STATUSES` qui ne
+ *     compte pas les drafts contre le plafond rate-limit.
+ *
+ * Filtre côté CODE post-parse (pas dans la query Firestore) pour éviter
+ * un index composite supplémentaire. Cf. JSDoc `RATE_LIMIT_COUNTED_STATUSES`
+ * pour le même rationale.
+ *
+ * ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ * GESTION INPUT
+ *
+ * Conversation absente → `[]` (cohérent `listRecentOutbound` — c'est une
+ * recherche, pas une mutation). Doc message corrompu → `ValidationError`
+ * (filet Zod identique aux autres `listX`).
+ *
+ * ⚠️ PII potentielle — le `body` retourné PEUT contenir des fragments
+ * PII (inbound : PS qui écrit son numéro perso). Le caller `process-reply`
+ * step 8a passe l'historique au prompt Claude (anti-injection XML déjà
+ * appliqué côté prompts S9.3.2). NE JAMAIS logger les `body` retournés
+ * en clair (sentinelle anti-PII pipeline `process-reply.test.ts`).
+ *
+ * @param conversationId  docId composite `${contactId}_${campaignId}`.
+ * @param limit           Nombre maximum de messages à retourner. Défaut 3.
+ *
+ * @returns Tableau ordonné CROISSANT par `createdAt`. Drafts exclus.
+ *          Conversation absente → `[]`.
+ *
+ * @throws ValidationError si un doc message dans le résultat est corrompu.
+ */
+export async function listRecentMessages(
+  conversationId: string,
+  limit: number = DEFAULT_HISTORY_LIMIT,
+): Promise<RecentMessageEntry[]> {
+  // Query DESC + limit → on prend les N PLUS RÉCENTS, puis on inverse
+  // pour rendre en chronologique CROISSANT (cohérent prompt LLM).
+  // Filtre status drafts appliqué post-parse côté code.
+  const snap = await messagesSubcollectionRef(conversationId)
+    .orderBy("createdAt", "desc")
+    .limit(limit)
+    .get();
+
+  const parsed = snap.docs.map((doc) => parseMessageOrThrow(doc.data(), conversationId, doc.id));
+
+  // Exclusion des drafts (S9.3.3a) — un draft n'a pas été envoyé au PS.
+  const nonDrafts = parsed.filter((msg) => msg.status !== "draft");
+
+  // Inverse pour ordre chronologique CROISSANT (plus ancien en premier).
+  return nonDrafts.reverse().map((msg) => ({
+    direction: msg.direction,
+    body: msg.body,
+  }));
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -888,3 +1240,6 @@ export const __BODY_MAX_LENGTH_FOR_TESTS = BODY_MAX_LENGTH;
 
 /** @internal */
 export const __DEFAULT_LIST_DAYS_FOR_TESTS = DEFAULT_LIST_DAYS;
+
+/** @internal */
+export const __DEFAULT_HISTORY_LIMIT_FOR_TESTS = DEFAULT_HISTORY_LIMIT;

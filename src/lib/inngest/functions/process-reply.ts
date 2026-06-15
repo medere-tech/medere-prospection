@@ -1,5 +1,5 @@
 /**
- * Inngest function `process-reply` — pipeline déterministe steps 1-8 (S9.2.3).
+ * Inngest function `process-reply` — pipeline déterministe steps 1-9 avec sub-divisions 6a/6b + 8a/8b/8c (S9.3.3b).
  *
  * ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
  * VUE D'ENSEMBLE
@@ -13,7 +13,7 @@
  * même event. Ce handler ne dépend ni d'OVH, ni d'un endpoint HTTP.
  *
  * ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
- * PIPELINE 8 STEPS (S9.2.3)
+ * PIPELINE 12 STEPS (S9.3.3b câblage gen IA + draft Firestore + audit)
  *
  *   1. `resolve-contact`            : `getContactByPhone(phone)` (S9.1).
  *                                     - found → `{contactId: hubspotId}`
@@ -51,30 +51,83 @@
  *                                       "short_form"}`.
  *                                     - false → continue step 6.
  *
- *   6. `classify-intent`            : `classifyReply(body)` (S7a.2,
+ *   6a. `claude-classify`           : `classifyReply(body)` (S7a.2,
  *                                      Claude Haiku 4.5 + tool use).
  *                                     - Toujours retourne un résultat
  *                                       (fail-safe STOP avec fallback=
  *                                       true sur erreur SDK).
- *                                     - Audit `intent_classified` posé
- *                                       AVANT branch (Q1 brief Déthié).
  *                                     - `logger.warn` si fallback=true
  *                                       (observabilité S9.6 monitoring).
+ *                                     - 🔒 ISOLÉ de l'audit (step 6b) →
+ *                                       idempotence pleine Claude sur
+ *                                       retry après failure step 6b.
+ *                                       Ferme S9.3-FOLLOWUP-1 (limite
+ *                                       documentée pré-S9.3).
+ *
+ *   6b. `audit-intent-classified`   : `appendAuditLog(intent_classified,
+ *                                      payload scrubber-safe)`. Posé
+ *                                      AVANT branch (Q1 brief Déthié).
+ *                                     - Sur retry après failure ici,
+ *                                       step 6a est servi depuis cache
+ *                                       memoization → 0 ré-appel Claude.
  *
  *   7. `branch-by-intent`           : 4 branches discriminées :
  *                                     - STOP → `markOptedOut` étendu
  *                                       (ferme GUARD-001 long-form
  *                                       opt-out >50 chars rattrapé) +
- *                                       return `{status:"opt_out", via:
+ *                                       SKIP step 8 entier + return
+ *                                       `{status:"opt_out", via:
  *                                       "classifier_long_form"}`.
  *                                     - INTERESSE/OBJECTION/NEUTRE →
  *                                       `setConversationIntent(convId,
  *                                       intent, {nextStatus:
- *                                       "in_dialogue"})` + return
- *                                       `{status:"classified", intent}`.
- *                                       S9.3 reprendra la gen IA.
+ *                                       "in_dialogue"})` puis enchaîne
+ *                                       les sub-steps 8a/8b/8c.
  *
- *   8. `audit-reply-processed`      : `appendAuditLog({action:
+ *   8a. `claude-generate-{intent}`  : `generateReply({intent, rawMessage,
+ *                                      history})` (S9.3.2 Sonnet 4.6).
+ *                                     - Charge l'historique 3 derniers
+ *                                       messages (drafts exclus, S9.3.3a)
+ *                                       via `listRecentMessages`.
+ *                                     - Triple garde Médéré (S9.3.2) :
+ *                                       prompt instruit + assertion code
+ *                                       `hasAdvertiserIdentification` +
+ *                                       preSendCheck rule 4 (S9.4).
+ *                                     - 🔒 ISOLÉ des steps 8b/8c →
+ *                                       idempotence pleine Claude sur
+ *                                       retry. Pas de fallback artificiel
+ *                                       — AppError propagée, Inngest
+ *                                       retry naturel.
+ *
+ *   8b. `store-draft`               : `addOutboundDraft({contactId,
+ *                                      conversationId, body, aiModel,
+ *                                      aiPromptVersion, aiTemperature,
+ *                                      aiTokens*, aiGenerationDurationMs})`
+ *                                      (S9.3.3a addOutboundDraftInTx).
+ *                                     - Pose doc `messages/{id}` avec
+ *                                       `status="draft"`.
+ *                                     - NE BUMP PAS counters conversation,
+ *                                       NE POSE PAS audit `sms_sent`
+ *                                       (S9.3.3a invariants).
+ *                                     - Retourne `draftMessageId`.
+ *                                     - 🔒 ISOLÉ du step 8a → si Firestore
+ *                                       throw, Claude pas ré-appelé sur retry.
+ *
+ *   8c. `audit-reply-generated`     : `appendAuditLog({action:
+ *                                      "reply_generated", targetType:
+ *                                      "message", targetId: draftMessageId,
+ *                                      payload: ReplyGeneratedPayload})`.
+ *                                     - 🚨 INVARIANT ANTI-PII (LOW-4
+ *                                       compliance-auditor S9.3.2 +
+ *                                       NIT-1 S9.3.3a) : le `body` brut
+ *                                       JAMAIS dans payload. Seul
+ *                                       `bodyLength` exposé. Le body
+ *                                       vit dans `messages/{id}`.
+ *                                     - 🔒 ISOLÉ des steps 8a/8b →
+ *                                       retry sur audit fail = 0 ré-appel
+ *                                       Claude + 0 double-doc Firestore.
+ *
+ *   9. `audit-reply-processed`      : `appendAuditLog({action:
  *                                      "reply_processed", targetType:
  *                                      "conversation", targetId:
  *                                      conversationId, payload})`. Posé
@@ -100,6 +153,52 @@
  * les writes Firestore, tous les `appendAuditLog`, ET tous les appels
  * Claude (pas de double facturation). Test sentinelle anti-régression
  * MED-1 dans `process-reply.memoization.test.ts` (S9.2.3.2).
+ *
+ * S9.3.1 split classify-intent en `step.run("claude-classify")` +
+ * `step.run("audit-intent-classified")` pour atteindre l'idempotence
+ * pleine sur Claude (anti-double-facturation, ferme S9.3-FOLLOWUP-1
+ * documenté en S9.2.3.2). Si l'audit `intent_classified` throw → retry
+ * → step 6a `claude-classify` est servi depuis le cache memoization →
+ * `classifyReply` n'est PAS ré-appelé. Verrouillé par Test 6
+ * (`process-reply.memoization.test.ts`) qui prouve `classifyReply ===
+ * 1×` même en présence d'un fail transient sur l'audit step 6b.
+ *
+ * S9.3.3b applique le MÊME pattern au step 8 generate-reply : split en
+ * 3 sub-steps distincts `claude-generate-{intent}` + `store-draft` +
+ * `audit-reply-generated`. Si step 8b (Firestore) ou step 8c (audit)
+ * throw → retry → step 8a (Claude) servi depuis cache → 0 ré-appel
+ * SDK Anthropic. Si step 8c throw → retry → step 8b servi depuis cache
+ * → pas de double-doc Firestore créé. Verrouillé par Test 7
+ * (`process-reply.memoization.test.ts`).
+ *
+ * ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ * 🚨 CAVEAT S9.5+ (AI Act Article 50.1) — Fix LOW-2 compliance-auditor S9.3.3b
+ *
+ * Le verdict 3.F S9.3.0 = "PAS de mention IA dans les replies S9.3"
+ * repose sur l'INVARIANT que le 1er SMS prod identifie EXPLICITEMENT
+ * "Léa, assistante virtuelle de Médéré" (garde code structurelle :
+ * `pre-send-check.ts:479` rule 2 `ai_disclosure` REFUSE tout 1er SMS
+ * sans cette mention). La continuation de la conversation par la même
+ * IA est alors "évidente" au sens AI Act 50.1 ("sauf si évident à un
+ * observateur raisonnablement informé").
+ *
+ * **Si en S9.5+ le 1er SMS devient génératif** (via Claude prompt
+ * `first-sms-*.ts` à créer) et glisse vers une mention moins explicite
+ * (ex: "Bonjour de Médéré" sans "assistante virtuelle"), la décision
+ * 3.F DOIT être RÉÉVALUÉE :
+ *
+ *   1. Soit ré-introduire une mention IA dans les replies S9.3
+ *      (modifier les 3 SYSTEM prompts `generate-reply-{intent}.ts` +
+ *      bump VERSION).
+ *   2. Soit verrouiller le 1er SMS génératif avec une garde code
+ *      équivalente (rule 2 `ai_disclosure` reste effective).
+ *
+ * Action concrète si réévaluation déclenchée : re-passer par
+ * compliance-auditor avec verdict 3.F mis à jour + sentinelles tests
+ * SYSTEM prompts amendées.
+ *
+ * Cf. JSDoc en-tête `src/lib/claude/prompts/generate-reply-interesse.ts`
+ * (lignes 20-26) pour le caveat miroir côté prompts.
  *
  * ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
  * ANTI-PII — logger strict
@@ -144,9 +243,11 @@
  *   | `opt_out` (auto)     | `contact`     | `contactId`               | `{channel: "sms", conversationId}` (markOptedOut étendu)     |
  *   | `intent_classified`  | `message`     | `messageId`               | `{contactId, conversationId, intent, confidence, fallback,   |
  *   |                      |               |                           |    promptVersion, model}` — PAS body/reasoning/tokens        |
+ *   | `reply_generated`    | `message`     | `draftMessageId`          | `ReplyGeneratedPayload` (S9.3.3a) — PAS body brut, seul      |
+ *   |                      |               |                           |    `bodyLength` exposé. Branche `classified` uniquement.     |
  *   | `reply_processed`    | `conversation`| `conversationId`          | `{contactId, conversationId, messageId, intent, branchTaken, |
  *   |                      |               |                           |    finalConversationStatus, classifierFallback?,             |
- *   |                      |               |                           |    pipelineDurationMs}` — branches non-drop uniquement       |
+ *   |                      |               |                           |    draftMessageId? (classified), pipelineDurationMs}`        |
  *
  * ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
  * INJECTION DE DÉPENDANCES (`deps`)
@@ -163,6 +264,7 @@ import {
   CLASSIFY_INTENT_MODEL,
   CLASSIFY_INTENT_PROMPT_VERSION,
 } from "@/lib/claude/prompts/classify-intent";
+import { generateReply } from "@/lib/claude/reply-generator";
 import type { Intent } from "@/lib/claude/types";
 import { isOptOut } from "@/lib/compliance/opt-out";
 import { appendAuditLog } from "@/lib/firestore/audit-log";
@@ -171,10 +273,16 @@ import {
   getActiveConversationByContactId,
   setConversationIntent,
 } from "@/lib/firestore/conversations";
-import { addInbound, findInboundByExternalId } from "@/lib/firestore/messages";
+import {
+  addInbound,
+  addOutboundDraft,
+  findInboundByExternalId,
+  listRecentMessages,
+} from "@/lib/firestore/messages";
 import { getInngestClient } from "@/lib/inngest/client";
 import { smsReplyReceived } from "@/lib/inngest/events";
 import { hashPii, PHONE_HASH_PREFIX, safePhoneHash } from "@/lib/utils/pii-detector";
+import type { ReplyGeneratedPayload } from "@/types/audit-log";
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Constantes
@@ -244,6 +352,14 @@ export type ProcessReplyResult =
       conversationId: string;
       messageId: string;
       intent: "INTERESSE" | "OBJECTION" | "NEUTRE";
+      /**
+       * S9.3.3b — ID Firestore (auto-ID 20 chars `[A-Za-z0-9]{20}`) du
+       * draft outbound créé par `addOutboundDraft` au step 8b. Le draft
+       * a `status="draft"` (pas envoyé OVH — sera transitionné en S9.4
+       * via `commitDraftToQueued`). Présent UNIQUEMENT sur branche
+       * `classified` (les branches `opt_out` skip step 8 entier).
+       */
+      draftMessageId: string;
     };
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -268,6 +384,10 @@ export interface ProcessReplyDeps {
   // S9.2.2 — classifier + post-classification mutation
   classifyReply?: typeof classifyReply;
   setConversationIntent?: typeof setConversationIntent;
+  // S9.3.3b — gen IA reply + stockage draft
+  listRecentMessages?: typeof listRecentMessages;
+  generateReply?: typeof generateReply;
+  addOutboundDraft?: typeof addOutboundDraft;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -322,6 +442,10 @@ export async function processReplyHandler(
   const _appendAuditLog = deps.appendAuditLog ?? appendAuditLog;
   const _classifyReply = deps.classifyReply ?? classifyReply;
   const _setConversationIntent = deps.setConversationIntent ?? setConversationIntent;
+  // S9.3.3b — gen IA reply + stockage draft
+  const _listRecentMessages = deps.listRecentMessages ?? listRecentMessages;
+  const _generateReply = deps.generateReply ?? generateReply;
+  const _addOutboundDraft = deps.addOutboundDraft ?? addOutboundDraft;
 
   const { event, step, logger } = ctx;
   const { phone, body, ovhMessageId } = event.data;
@@ -371,6 +495,13 @@ export async function processReplyHandler(
      * fallback côté analytics.
      */
     classifierFallback?: boolean;
+    /**
+     * S9.3.3b — ID Firestore du draft créé au step 8b. Présent UNIQUEMENT
+     * sur branche `branchTaken === "classified"` (les branches `opt_out_*`
+     * skip step 8 entier). Permet la corrélation forensique
+     * `reply_processed.payload.draftMessageId → messages/{id}` côté audit.
+     */
+    draftMessageId?: string;
   }): Promise<void> {
     await step.run("audit-reply-processed", async () => {
       const pipelineDurationMs = Date.now() - handlerStartMs;
@@ -381,7 +512,8 @@ export async function processReplyHandler(
         targetType: "conversation",
         targetId: params.conversationId,
         // Payload scrubber-safe (cf. Q2 arbitrage Déthié S9.2.3) :
-        //   - IDs opaques internes (contactId, conversationId, messageId)
+        //   - IDs opaques internes (contactId, conversationId, messageId,
+        //     draftMessageId — S9.3.3b sur branche classified)
         //   - intent : enum fermé Intent
         //   - branchTaken/finalConversationStatus : enums fermés
         //   - classifierFallback : boolean optional (présent ssi branche
@@ -399,6 +531,7 @@ export async function processReplyHandler(
           ...(params.classifierFallback !== undefined
             ? { classifierFallback: params.classifierFallback }
             : {}),
+          ...(params.draftMessageId !== undefined ? { draftMessageId: params.draftMessageId } : {}),
           pipelineDurationMs,
         },
       });
@@ -578,18 +711,27 @@ export async function processReplyHandler(
     };
   }
 
-  // ── Step 6 — classify-intent (Claude Haiku 4.5) ───────────────────────
+  // ── Step 6a — claude-classify (S9.3.1 split) ──────────────────────────
   // Appel classifier sur les messages non-opt-out short-form. Le classifier
   // a un contrat fail-safe STOP : toute erreur SDK absorbée → fallback
   // intent="STOP" + fallback=true (précaution juridique L.34-5 CPCE).
-  // L'audit `intent_classified` est posé AVANT le branch (Q1 brief) —
-  // on audit le VERDICT classifier indépendamment de ce que le pipeline
-  // en fait ensuite. Payload scrubber-safe (pas de body, pas de reasoning).
-  const classification = await step.run("classify-intent", async () => {
+  //
+  // 🔒 **Idempotence pleine Claude (S9.3.1 ferme S9.3-FOLLOWUP-1)** : le
+  // step est ISOLÉ de l'audit `intent_classified` (step 6b). Si l'audit
+  // Firestore throw (5xx transient, AuditPiiError d'un payload futur mal
+  // posé), Inngest retry → step 6a est servi depuis le cache memoization
+  // par `(eventId, "claude-classify")` → 0 ré-appel Claude → 0 double
+  // facturation. Verrouillé par Test 6 de `process-reply.memoization.test.ts`.
+  //
+  // Le `logger.warn` fallback reste DANS step 6a car c'est un side-effect
+  // d'observabilité lié à l'APPEL Claude (pas à son audit). Sur retry du
+  // step 6b, l'observabilité du fallback est déjà loggée par le premier
+  // run du step 6a — pas de double-log non plus.
+  const classification = await step.run("claude-classify", async () => {
     const result = await _classifyReply(body);
 
-    // Observabilité fail-safe (Q2 brief) : un fallback=true signale un
-    // échec SDK (timeout, 429, tool_use malformé). À monitorer en prod —
+    // Observabilité fail-safe (Q2 brief S9.2.2) : un fallback=true signale
+    // un échec SDK (timeout, 429, tool_use malformé). À monitorer en prod —
     // si taux > 5%, alerter Sentry/Slack (câblage S9.6). Aucune PII dans
     // le log : seulement les IDs opaques + le messageId Firestore.
     if (result.fallback) {
@@ -598,10 +740,25 @@ export async function processReplyHandler(
         contactId,
         conversationId,
         messageId,
-        step: "classify-intent",
+        step: "claude-classify",
       });
     }
 
+    return result;
+  });
+
+  // ── Step 6b — audit-intent-classified (S9.3.1 split) ──────────────────
+  // Audit du verdict classifier, séparé de l'appel Claude pour garantir
+  // l'idempotence Claude sur retry (cf. JSDoc step 6a + sentinelle MED-1).
+  //
+  // `classification` ci-dessus est le résultat commit du step 6a — sur
+  // retry du step 6b après failure transient, la valeur servie au handler
+  // sera servie depuis le cache memoization Inngest (pas de ré-appel SDK).
+  //
+  // Audit posé AVANT le branch step 7 (Q1 brief Déthié S9.2.2) — on audit
+  // le VERDICT classifier indépendamment de ce que le pipeline en fait
+  // ensuite. Payload scrubber-safe (pas de body, pas de reasoning).
+  await step.run("audit-intent-classified", async () => {
     await _appendAuditLog({
       actorId: "system",
       actorType: "system",
@@ -626,15 +783,13 @@ export async function processReplyHandler(
       payload: {
         contactId,
         conversationId,
-        intent: result.intent,
-        confidence: result.confidence,
-        fallback: result.fallback,
+        intent: classification.intent,
+        confidence: classification.confidence,
+        fallback: classification.fallback,
         promptVersion: CLASSIFY_INTENT_PROMPT_VERSION,
         model: CLASSIFY_INTENT_MODEL,
       },
     });
-
-    return result;
   });
 
   // ── Step 7 — branch-by-intent ────────────────────────────────────────
@@ -692,7 +847,7 @@ export async function processReplyHandler(
   }
 
   // INTERESSE / OBJECTION / NEUTRE — la conv passe en in_dialogue.
-  // S9.3 reprendra le relais pour la génération IA + envoi reply.
+  // S9.3.3b génère + stocke le draft + audit reply_generated.
   const nonStopIntent = classification.intent;
   await step.run(`branch-${nonStopIntent.toLowerCase()}`, async () => {
     await _setConversationIntent(conversationId, nonStopIntent, {
@@ -709,8 +864,97 @@ export async function processReplyHandler(
     step: `branch-${nonStopIntent.toLowerCase()}`,
   });
 
-  // S9.2.3 — Step 8 audit-reply-processed. classifierFallback présent
-  // car branche passée par Claude.
+  // ── Step 8a — claude-generate-${intent} (S9.3.3b) ─────────────────────
+  // Appel Claude Sonnet 4.6 isolé en step.run distinct pour idempotence
+  // pleine sur retry (cohérent S9.3.1 split classify-intent). Si step 8b
+  // ou 8c throw → retry → step 8a est servi depuis cache memoization
+  // Inngest → 0 ré-appel Claude (anti-double-facturation).
+  //
+  // Charge l'historique 3 derniers messages (drafts exclus, S9.3.3a) +
+  // appelle generateReply qui propage toute AppError SDK (pas de fallback
+  // artificiel — décision Déthié S9.3.0). Si Claude omet "Médéré", le
+  // wrapper throw ExternalServiceError retry-friendly (triple garde Q3).
+  //
+  // contactCivility=undefined en MVP — voir S9.5-CONTACT-CIVILITY-IN-REPLY-001
+  // pour étendre resolve-contact step 1.
+  const generationResult = await step.run(
+    `claude-generate-${nonStopIntent.toLowerCase()}`,
+    async () => {
+      const history = await _listRecentMessages(conversationId);
+      return _generateReply({
+        intent: nonStopIntent,
+        rawMessage: body,
+        history,
+      });
+    },
+  );
+
+  // ── Step 8b — store-draft (S9.3.3b) ───────────────────────────────────
+  // Stockage Firestore atomique via tx (addOutboundDraft wrap
+  // addOutboundDraftInTx). Status="draft" — NE BUMP PAS counters
+  // conversation, NE POSE PAS audit sms_sent (S9.3.3a invariants).
+  // Sera transitionné en S9.4 via commitDraftToQueued.
+  //
+  // Si throw (Firestore 5xx transient) → retry, step 8a servi depuis
+  // cache → 0 ré-appel Claude. Si succeed → draftMessageId cached pour
+  // step 8c.
+  const draftMessageId = await step.run("store-draft", async () => {
+    return _addOutboundDraft({
+      contactId,
+      conversationId,
+      body: generationResult.body,
+      aiModel: generationResult.model,
+      aiPromptVersion: generationResult.promptVersion,
+      aiTemperature: generationResult.temperature,
+      aiTokensInput: generationResult.tokensInput,
+      aiTokensOutput: generationResult.tokensOutput,
+      aiGenerationDurationMs: generationResult.generationDurationMs,
+    });
+  });
+
+  // ── Step 8c — audit-reply-generated (S9.3.3b) ─────────────────────────
+  // Audit forensic L.34-5 CPCE du verdict génération. Payload strict
+  // `ReplyGeneratedPayload` (defense-in-depth anti-PII : pas de `body`
+  // brut, seulement `bodyLength`). Cf. LOW-4 compliance-auditor S9.3.2 +
+  // NIT-1 compliance-auditor S9.3.3a.
+  //
+  // Si throw → retry, steps 8a + 8b servis depuis cache → 0 ré-appel
+  // Claude + 0 double-doc Firestore.
+  await step.run("audit-reply-generated", async () => {
+    const payload: ReplyGeneratedPayload = {
+      contactId,
+      conversationId,
+      draftMessageId,
+      intent: nonStopIntent,
+      promptVersion: generationResult.promptVersion,
+      model: generationResult.model,
+      temperature: generationResult.temperature,
+      tokensInput: generationResult.tokensInput,
+      tokensOutput: generationResult.tokensOutput,
+      bodyLength: generationResult.body.length,
+      generationDurationMs: generationResult.generationDurationMs,
+    };
+    await _appendAuditLog({
+      actorId: "system",
+      actorType: "system",
+      action: "reply_generated",
+      targetType: "message",
+      targetId: draftMessageId,
+      payload,
+    });
+  });
+
+  logger.info("[process-reply] reply draft stored", {
+    eventId: event.id,
+    contactId,
+    conversationId,
+    messageId,
+    draftMessageId,
+    intent: nonStopIntent,
+    step: "audit-reply-generated",
+  });
+
+  // ── Step 9 — audit-reply-processed (étendu draftMessageId) ────────────
   await postReplyProcessedAudit({
     contactId,
     conversationId,
@@ -719,6 +963,7 @@ export async function processReplyHandler(
     branchTaken: "classified",
     finalConversationStatus: "in_dialogue",
     classifierFallback: classification.fallback,
+    draftMessageId,
   });
 
   return {
@@ -727,6 +972,7 @@ export async function processReplyHandler(
     conversationId,
     messageId,
     intent: nonStopIntent,
+    draftMessageId,
   };
 }
 
@@ -735,7 +981,7 @@ export async function processReplyHandler(
 // ─────────────────────────────────────────────────────────────────────────────
 
 /**
- * Inngest function `process-reply` — pipeline déterministe 8 steps (S9.2.3).
+ * Inngest function `process-reply` — pipeline déterministe 12 steps (S9.3.3b).
  *
  * **Trigger** : event `medere/sms.reply.received` (`SmsReplyReceivedDataSchema`).
  *
