@@ -37,9 +37,14 @@ import {
  * — comportement OK pour tests unit. La memoization Inngest est testée en
  * S9.2.3 en intégration cloud.
  */
-function makeStepRun() {
+function makeStepRun(): ProcessReplyHandlerContext["step"] {
   return {
     run: async <T>(_name: string, fn: () => Promise<T>): Promise<T> => fn(),
+    // S9.4.3 — step.sendEvent fake : pas d'émission réelle, juste un
+    // spy pour assertions (event name + data + id). mockResolvedValue
+    // évite les warnings ESLint args unused (vi.fn ne propage pas le
+    // prefix _ aux params).
+    sendEvent: vi.fn().mockResolvedValue({}),
   };
 }
 
@@ -162,14 +167,12 @@ function makeDeps(overrides: Partial<ProcessReplyDeps> = {}): ProcessReplyDeps {
     setConversationIntent: vi.fn().mockResolvedValue(undefined),
     // S9.3.3b — gen IA reply + stockage draft (defaults qui SUCCÈDENT,
     // chaque test branche INTERESSE/OBJECTION/NEUTRE atterrit ici).
-    listRecentMessages: vi
-      .fn()
-      .mockResolvedValue([
-        {
-          direction: "outbound",
-          body: "Bonjour Dr Test, je suis Léa, assistante virtuelle de Médéré.",
-        },
-      ]),
+    listRecentMessages: vi.fn().mockResolvedValue([
+      {
+        direction: "outbound",
+        body: "Bonjour Dr Test, je suis Léa, assistante virtuelle de Médéré.",
+      },
+    ]),
     generateReply: vi.fn().mockResolvedValue({
       body: "Bonjour Docteur, quelle formation Médéré vous intéresse ?",
       promptVersion: "1.0.0",
@@ -179,7 +182,7 @@ function makeDeps(overrides: Partial<ProcessReplyDeps> = {}): ProcessReplyDeps {
       tokensOutput: 38,
       generationDurationMs: 1234,
     }),
-    addOutboundDraft: vi.fn().mockResolvedValue("draft-firestore-id20ch"),
+    addOutboundDraft: vi.fn().mockResolvedValue("draftfirestoreid20ch"),
     ...overrides,
   };
 }
@@ -502,6 +505,9 @@ describe("Step 5 — short-form-opt-out-check (fast-path)", () => {
     expect(deps.classifyReply).not.toHaveBeenCalled();
     // setConversationIntent NON appelé (STOP passe par markOptedOut).
     expect(deps.setConversationIntent).not.toHaveBeenCalled();
+    // S9.4.3 — sendEvent NON appelé sur branche STOP short_form (le PS a
+    // dit stop, on respecte — pas de dispatch reply).
+    expect(ctx.step.sendEvent).not.toHaveBeenCalled();
 
     // S9.2.3 — Step 8 audit-reply-processed posé en fin de branche.
     // PAS de classifierFallback (court-circuit avant Claude).
@@ -841,6 +847,22 @@ describe("Step 7 — branch-by-intent", () => {
         pipelineDurationMs: expect.any(Number),
       }),
     });
+
+    // S9.4.3 — Step 8d dispatch-reply-event émet l'event jumeau
+    // medere/sms.reply.send-requested vers le handler send-reply.ts.
+    // eventId déterministe `reply.send.${draftMessageId}` pour
+    // déduplication 60s Inngest (defense-in-depth).
+    const sendEventSpy = ctx.step.sendEvent as ReturnType<typeof vi.fn>;
+    expect(sendEventSpy).toHaveBeenCalledTimes(1);
+    expect(sendEventSpy).toHaveBeenCalledWith("dispatch-reply-event", {
+      name: "medere/sms.reply.send-requested",
+      data: {
+        contactId: "hs-i",
+        conversationId: "hs-i_camp-i",
+        draftMessageId: expect.any(String),
+      },
+      id: expect.stringMatching(/^reply\.send\.[A-Za-z0-9]+$/),
+    });
   });
 
   it("OBJECTION → setConversationIntent('OBJECTION', in_dialogue) + classified", async () => {
@@ -887,6 +909,19 @@ describe("Step 7 — branch-by-intent", () => {
         classifierFallback: false,
         pipelineDurationMs: expect.any(Number),
       }),
+    });
+
+    // S9.4.3 — Step 8d dispatch-reply-event sur branche OBJECTION
+    const sendEventSpyO = ctx.step.sendEvent as ReturnType<typeof vi.fn>;
+    expect(sendEventSpyO).toHaveBeenCalledTimes(1);
+    expect(sendEventSpyO).toHaveBeenCalledWith("dispatch-reply-event", {
+      name: "medere/sms.reply.send-requested",
+      data: {
+        contactId: "hs-o",
+        conversationId: "hs-o_camp-o",
+        draftMessageId: expect.any(String),
+      },
+      id: expect.stringMatching(/^reply\.send\.[A-Za-z0-9]+$/),
     });
   });
 
@@ -935,6 +970,19 @@ describe("Step 7 — branch-by-intent", () => {
         pipelineDurationMs: expect.any(Number),
       }),
     });
+
+    // S9.4.3 — Step 8d dispatch-reply-event sur branche NEUTRE
+    const sendEventSpyN = ctx.step.sendEvent as ReturnType<typeof vi.fn>;
+    expect(sendEventSpyN).toHaveBeenCalledTimes(1);
+    expect(sendEventSpyN).toHaveBeenCalledWith("dispatch-reply-event", {
+      name: "medere/sms.reply.send-requested",
+      data: {
+        contactId: "hs-n",
+        conversationId: "hs-n_camp-n",
+        draftMessageId: expect.any(String),
+      },
+      id: expect.stringMatching(/^reply\.send\.[A-Za-z0-9]+$/),
+    });
   });
 
   it("STOP via classifier → markOptedOut ÉTENDU + status opt_out via=classifier_long_form", async () => {
@@ -971,6 +1019,9 @@ describe("Step 7 — branch-by-intent", () => {
       intent: "STOP",
     });
     expect(deps.setConversationIntent).not.toHaveBeenCalled();
+    // S9.4.3 — sendEvent NON appelé sur branche STOP classifier_long_form
+    // (le PS a dit stop via Claude, on respecte — pas de dispatch reply).
+    expect(ctx.step.sendEvent).not.toHaveBeenCalled();
 
     // S9.2.3 — Step 8 audit-reply-processed sur branche classifier_long_form.
     // classifierFallback: false présent.
@@ -1099,7 +1150,7 @@ describe("Step 8 — generate-reply (S9.3.3b)", () => {
     expect(result.status).toBe("classified");
     if (result.status === "classified") {
       expect(result.intent).toBe("INTERESSE");
-      expect(result.draftMessageId).toBe("draft-firestore-id20ch");
+      expect(result.draftMessageId).toBe("draftfirestoreid20ch");
     }
 
     // Sentinelle dispatch S9.3.3b
@@ -1136,11 +1187,11 @@ describe("Step 8 — generate-reply (S9.3.3b)", () => {
       payload: Record<string, unknown>;
     };
     expect(auditEntry.targetType).toBe("message");
-    expect(auditEntry.targetId).toBe("draft-firestore-id20ch");
+    expect(auditEntry.targetId).toBe("draftfirestoreid20ch");
     expect(auditEntry.payload).toMatchObject({
       contactId: "hs-8a-1",
       conversationId: "hs-8a-1_camp",
-      draftMessageId: "draft-firestore-id20ch",
+      draftMessageId: "draftfirestoreid20ch",
       intent: "INTERESSE",
       promptVersion: "1.0.0",
       model: "claude-sonnet-4-6",
@@ -1793,5 +1844,160 @@ describe("Anti-PII pipeline complet (sentinelle critique L.34-5 CPCE)", () => {
     expect(serialized).toContain("hs-positive");
     expect(serialized).toContain("hs-positive_camp-pos");
     expect(serialized).toContain("msgid-positive-001");
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// S9.4.3 — Sentinelles anti-PII dispatch-reply-event (step 8d)
+//
+// 🔒 Verrouille les invariants de l'émission d'event jumeau vers
+// send-reply.ts (S9.4.2) :
+//   - event.id format strict `reply.send.${draftMessageId}` —
+//     scrubber-safe par construction (draftMessageId = Firestore auto-ID
+//     `[A-Za-z0-9]{20}`)
+//   - event.data minimaliste {contactId, conversationId, draftMessageId} —
+//     pas de body/phone/intent/ovhMessageId
+//   - event name figé `medere/sms.reply.send-requested`
+// ─────────────────────────────────────────────────────────────────────────────
+
+describe("S9.4.3 — sentinelles anti-PII dispatch-reply-event", () => {
+  it("event.id format strict /^reply\\.send\\.[A-Za-z0-9]+$/ + absence PII (phone/email)", async () => {
+    const ctx = makeFakeCtx({ body: "Je suis intéressé" });
+    const deps = makeDeps({
+      getContactByPhone: vi.fn().mockResolvedValue(makeFakeContact("hs-sentinel-id")),
+      getActiveConversationByContactId: vi.fn().mockResolvedValue({
+        conversationId: "hs-sentinel-id_camp-si",
+        conversation: makeFakeConversation("hs-sentinel-id", "camp-si"),
+      }),
+      addInbound: vi.fn().mockResolvedValue("msgid-sentinel-id"),
+      classifyReply: vi.fn().mockResolvedValue({
+        intent: "INTERESSE",
+        confidence: 0.9,
+        reasoning: "tarif demandé",
+        fallback: false,
+      }),
+    });
+
+    await processReplyHandler(ctx, deps);
+
+    const sendEventSpy = ctx.step.sendEvent as ReturnType<typeof vi.fn>;
+    expect(sendEventSpy).toHaveBeenCalledTimes(1);
+
+    const callArgs = sendEventSpy.mock.calls[0];
+    expect(callArgs).toBeDefined();
+    // callArgs[1] = payload { name, data, id }
+    const payload = callArgs![1] as { name: string; data: unknown; id: string };
+
+    // Format strict scrubber-safe.
+    expect(payload.id).toMatch(/^reply\.send\.[A-Za-z0-9]+$/);
+
+    // Aucune PII dans event.id (defense-in-depth contre fuite Inngest cloud).
+    expect(payload.id).not.toMatch(/\+33\d{9}/); // E.164 FR
+    expect(payload.id).not.toMatch(/0[1-9]\d{8}/); // FR national
+    expect(payload.id).not.toMatch(/\S+@\S+\.\S+/); // email
+    // ovhMessageId NE DOIT PAS apparaître (semi-sensible cf. messages.ts:36-54).
+    expect(payload.id).not.toContain("ovh-msg-789");
+  });
+
+  it("event.data minimaliste : uniquement {contactId, conversationId, draftMessageId}", async () => {
+    const ctx = makeFakeCtx({ body: "Pas dispo" });
+    const deps = makeDeps({
+      getContactByPhone: vi.fn().mockResolvedValue(makeFakeContact("hs-sentinel-data")),
+      getActiveConversationByContactId: vi.fn().mockResolvedValue({
+        conversationId: "hs-sentinel-data_camp-sd",
+        conversation: makeFakeConversation("hs-sentinel-data", "camp-sd"),
+      }),
+      addInbound: vi.fn().mockResolvedValue("msgid-sentinel-data"),
+      classifyReply: vi.fn().mockResolvedValue({
+        intent: "OBJECTION",
+        confidence: 0.8,
+        reasoning: "report poli",
+        fallback: false,
+      }),
+    });
+
+    await processReplyHandler(ctx, deps);
+
+    const sendEventSpy = ctx.step.sendEvent as ReturnType<typeof vi.fn>;
+    const payload = sendEventSpy.mock.calls[0]![1] as {
+      name: string;
+      data: Record<string, unknown>;
+      id: string;
+    };
+
+    // Exactement 3 clés dans data (anti-bypass : pas de champ en plus).
+    expect(Object.keys(payload.data).sort()).toEqual([
+      "contactId",
+      "conversationId",
+      "draftMessageId",
+    ]);
+
+    // Aucun champ PII attendu.
+    expect(payload.data).not.toHaveProperty("phone");
+    expect(payload.data).not.toHaveProperty("body");
+    expect(payload.data).not.toHaveProperty("email");
+    expect(payload.data).not.toHaveProperty("ovhMessageId");
+    expect(payload.data).not.toHaveProperty("intent");
+    expect(payload.data).not.toHaveProperty("reasoning");
+
+    // Pas de PII brute dans les valeurs sérialisées.
+    const serializedData = JSON.stringify(payload.data);
+    expect(serializedData).not.toMatch(/\+33\d{9}/);
+    expect(serializedData).not.toMatch(/0[1-9]\d{8}/);
+    expect(serializedData).not.toMatch(/\S+@\S+\.\S+/);
+  });
+
+  it("event name figé 'medere/sms.reply.send-requested' (sentinelle anti-drift)", async () => {
+    // Si quelqu'un renomme l'event côté events.ts SANS amender ce test,
+    // le test casse. Force la cohérence émetteur (process-reply.ts) ↔
+    // schema (events.ts) ↔ handler (send-reply.ts S9.4.2).
+    const ctx = makeFakeCtx({ body: "OK noté" });
+    const deps = makeDeps({
+      getContactByPhone: vi.fn().mockResolvedValue(makeFakeContact("hs-sentinel-name")),
+      getActiveConversationByContactId: vi.fn().mockResolvedValue({
+        conversationId: "hs-sentinel-name_camp-sn",
+        conversation: makeFakeConversation("hs-sentinel-name", "camp-sn"),
+      }),
+      addInbound: vi.fn().mockResolvedValue("msgid-sentinel-name"),
+      classifyReply: vi.fn().mockResolvedValue({
+        intent: "NEUTRE",
+        confidence: 0.6,
+        reasoning: "accusé réception",
+        fallback: false,
+      }),
+    });
+
+    await processReplyHandler(ctx, deps);
+
+    const sendEventSpy = ctx.step.sendEvent as ReturnType<typeof vi.fn>;
+    const payload = sendEventSpy.mock.calls[0]![1] as { name: string };
+    expect(payload.name).toBe("medere/sms.reply.send-requested");
+  });
+
+  it("step nommé 'dispatch-reply-event' (sentinelle anti-drift step name)", async () => {
+    // Force la stabilité du nom du step (utilisé pour la memoization
+    // Inngest par eventId,stepName et pour expectedSteps des tests
+    // memoization).
+    const ctx = makeFakeCtx({ body: "intéressant à creuser" });
+    const deps = makeDeps({
+      getContactByPhone: vi.fn().mockResolvedValue(makeFakeContact("hs-sentinel-step")),
+      getActiveConversationByContactId: vi.fn().mockResolvedValue({
+        conversationId: "hs-sentinel-step_camp-st",
+        conversation: makeFakeConversation("hs-sentinel-step", "camp-st"),
+      }),
+      addInbound: vi.fn().mockResolvedValue("msgid-sentinel-step"),
+      classifyReply: vi.fn().mockResolvedValue({
+        intent: "INTERESSE",
+        confidence: 0.85,
+        reasoning: "curiosité",
+        fallback: false,
+      }),
+    });
+
+    await processReplyHandler(ctx, deps);
+
+    const sendEventSpy = ctx.step.sendEvent as ReturnType<typeof vi.fn>;
+    const stepName = sendEventSpy.mock.calls[0]![0] as string;
+    expect(stepName).toBe("dispatch-reply-event");
   });
 });
