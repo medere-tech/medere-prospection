@@ -1242,6 +1242,328 @@ export async function listRecentMessages(
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// updateMessageStatus (S9.4.2) — transition de status post-création
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * Codes structurés de failure pour `UpdateMessageStatusInput.failureReason.code`.
+ *
+ * Conçus pour distinguer les classes d'erreurs en post-mortem :
+ *   - `config_error`     : OVH 4xx (auth, payload, service inexistant). Bug
+ *                          config morte — `ConfigError.noRetry=true`.
+ *   - `validation_error` : payload Zod fail OU OVH `invalidReceivers` /
+ *                          `no_valid_receivers`. `ValidationError.noRetry`
+ *                          (selon caller) = true en règle.
+ *   - `external_service` : OVH 5xx, errno réseau (ENOTFOUND, ETIMEDOUT,
+ *                          ECONNREFUSED), OAuth-like. Retry-friendly. Le
+ *                          caller décide d'appeler `updateMessageStatus`
+ *                          AVEC ce code seulement après épuisement des
+ *                          retries (cron monitoring S9.4.4 ou similaire).
+ *   - `timeout`          : timeout local (AbortController côté caller).
+ *                          Retry-friendly aussi.
+ *   - `internal`         : bug interne wrapper (rejection SDK de shape
+ *                          inattendu, etc.). Noter pour Sentry.
+ *
+ * Whitelist FERMÉE — typo côté caller refusé au compile-time.
+ */
+export type MessageFailureCode =
+  | "config_error"
+  | "validation_error"
+  | "external_service"
+  | "timeout"
+  | "internal";
+
+/**
+ * Forme du `failureReason` pour transition vers `status="failed"`.
+ *
+ * ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ * 🚨 INVARIANT ANTI-PII — `detail` DOIT être sanitized par le caller.
+ *
+ * Le `detail` peut contenir un message technique court (ex: "OVH 401 auth
+ * denied", "Zod fail on receivers[0]"). Il est stocké dans le doc
+ * `messages.error.message` ET dans le payload audit `sms_failed`. NE
+ * JAMAIS y inclure :
+ *   - phone E.164 / FR national / email du PS
+ *   - body du SMS
+ *   - clé API / token / secret
+ *   - ovhMessageId externe (semi-sensible cf. messages.ts:36-54)
+ *
+ * Le scrubber `detectPiiInPayload` (S6.2) sert de filet runtime SI le
+ * caller bypass. Mais discipline : pré-sanitize côté caller.
+ */
+export interface MessageFailureReason {
+  code: MessageFailureCode;
+  /** Detail technique sanitized (sans PII). Optionnel. */
+  detail?: string;
+  /** Nombre de retries Inngest avant la failure définitive. */
+  retryCount: number;
+}
+
+/**
+ * Arguments de `updateMessageStatus`.
+ *
+ *   - `conversationId` / `messageId` : pointent le doc à muter.
+ *   - `status`                       : status cible (transition assertée
+ *                                       côté impl — cf. table de transitions
+ *                                       dans la JSDoc fonction).
+ *   - `ovhMessageId`                 : posé en `externalId` si transition
+ *                                       vers `sent` (S7 webhook DLR) ou
+ *                                       `sending`. Cohérent invariant
+ *                                       Message (`externalId` = ID OVH).
+ *   - `failureReason`                : OBLIGATOIRE si `status="failed"`,
+ *                                       INTERDIT sinon (`ValidationError`
+ *                                       au compile-time via narrowing TS
+ *                                       impossible — assertion runtime).
+ *   - `now`                          : Injectable tests. Défaut `Timestamp.now()`.
+ */
+export interface UpdateMessageStatusInput {
+  conversationId: string;
+  messageId: string;
+  status: "sending" | "sent" | "delivered" | "failed";
+  ovhMessageId?: string;
+  failureReason?: MessageFailureReason;
+  now?: Date;
+}
+
+/**
+ * 🔒 Table des transitions de status AUTORISÉES. Whitelist > blacklist :
+ * une transition non listée → `ValidationError`. Anti-régression : ajouter
+ * une transition force une revue compliance-auditor (la sémantique
+ * forensique L.34-5 CPCE dépend de la traçabilité ordonnée des transitions).
+ *
+ * Lecture : `from → [...allowed_targets]`.
+ *
+ *   - `queued`    : peut transitionner vers tout (sending, sent, delivered, failed).
+ *                   Cas S9.4.2 happy path : reste "queued" (pas d'appel).
+ *                   Cas S9.4.2 ConfigError : transition → "failed".
+ *                   Cas S7 webhook DLR : transition → "sent"/"delivered".
+ *   - `sending`   : peut transitionner vers sent, delivered, failed.
+ *   - `sent`      : peut transitionner vers delivered, failed (DLR négatif).
+ *   - `delivered` : TERMINAL — aucune transition sortante autorisée.
+ *   - `failed`    : TERMINAL avec idempotence — `failed → failed` est un
+ *                   no-op silencieux (retry Inngest qui réappelle).
+ *
+ * Note : `draft → queued` est géré par `commitDraftToQueued` (S9.4.1), pas
+ * ici (logique compliance + bump compteurs spécifique). `draft` n'apparaît
+ * pas dans cette table.
+ */
+const STATUS_TRANSITIONS: Record<
+  "queued" | "sending" | "sent" | "delivered" | "failed",
+  ReadonlySet<"sending" | "sent" | "delivered" | "failed">
+> = {
+  queued: new Set(["sending", "sent", "delivered", "failed"]),
+  sending: new Set(["sent", "delivered", "failed"]),
+  sent: new Set(["delivered", "failed"]),
+  delivered: new Set([]),
+  failed: new Set([]), // idempotence "failed → failed" gérée AVANT cette check
+};
+
+/**
+ * Transitionne le `status` d'un message Firestore + pose les timestamps /
+ * `error` associés / audit `sms_failed` selon le target.
+ *
+ * ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ * CAS D'USAGE
+ *
+ *   - **S9.4.2 ConfigError/ValidationError** : `commitDraftToQueued` a
+ *     posé `status="queued"` mais le step OVH a fail noRetry. Le caller
+ *     `send-reply.ts` appelle ici avec `status="failed"` + `failureReason`
+ *     pour transitionner le message orphelin → terminal + audit forensique.
+ *
+ *   - **S7 webhook DLR (futur)** : OVH envoie un DLR (delivery report)
+ *     async sur un webhook dédié. Le handler appellera ici avec
+ *     `status="delivered"` ou `status="failed"` selon le DLR.
+ *
+ *   - **S7 transition `queued → sent` (futur, suivi
+ *     `S7-POST-OVH-ACK-STATUS-001`)** : si on active la transition
+ *     `queued → sent` immédiatement post-OVH-ack symétriquement en
+ *     send-first-sms + send-reply, ce sera via cette fonction avec
+ *     `status="sent"` + `ovhMessageId`.
+ *
+ * ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ * COMPOSITION DE LA TX ATOMIQUE
+ *
+ *   1. `tx.get(messageRef)` → lecture + parse Zod.
+ *   2. **Idempotence no-op** : si `current.status === input.status` →
+ *      return silent (retry Inngest qui réappelle pour le même target).
+ *      Vérifié AVANT la table de transitions pour éviter un faux positif
+ *      "failed → failed" rejeté par la table (Set vide pour les terminaux).
+ *   3. Vérification transition autorisée via `STATUS_TRANSITIONS[from]`.
+ *      Si target hors Set → `ValidationError`.
+ *   4. Assertion `status="failed"` nécessite `failureReason` (et inversement).
+ *   5. Build payload Firestore update partiel :
+ *        - `status` (toujours)
+ *        - `sentAt: now`         si target ∈ {"sent"}
+ *        - `deliveredAt: now`    si target ∈ {"delivered"}
+ *        - `error: failureReason → {code, message?, retryCount}` si target ∈ {"failed"}
+ *        - `externalId: ovhMessageId` si fourni (sentAt / sending typiquement)
+ *   6. `tx.update(messageRef, update)`.
+ *   7. **Audit `sms_failed` DANS la même tx** si transition VERS `failed`
+ *      ET source ≠ `failed` (pas de double-audit sur retry idempotent).
+ *      Payload `{direction, messageId, failureCode, retryCount}` — pas de
+ *      PII (sentinelle anti-PII identique aux audits pré-existants).
+ *
+ * Idempotence assurée :
+ *   - same target → no-op silencieux
+ *   - audit posé UNE FOIS (au passage from ≠ failed → failed)
+ *
+ * ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ * PAS DE BUMP COMPTEURS
+ *
+ * Cette fonction NE BUMPE PAS `conversation.messageCount` / `outboundCount`.
+ * La transition de status d'un message déjà compté (queued comptait déjà,
+ * cf. `RATE_LIMIT_COUNTED_STATUSES`) ne change pas le nombre de SMS
+ * comptabilisés contre le plafond rate-limit. Bump = responsabilité de
+ * `addOutbound`/`addInbound`/`commitDraftToQueued`.
+ *
+ * Exception : transition `queued → failed` retire conceptuellement le
+ * message du compteur rate-limit (`failed` est EXCLU de
+ * `RATE_LIMIT_COUNTED_STATUSES` — cf. messages.ts:188). Donc le quota
+ * 3/30j se relâche après une transition vers failed. Comportement
+ * SOUHAITÉ : un envoi qui n'a jamais atteint le PS ne doit pas compter
+ * (sémantique L.34-5 CPCE). PAS de re-bump explicite — le filtre
+ * post-parse de `listRecentOutbound` exclut naturellement.
+ *
+ * @param input Cf. `UpdateMessageStatusInput`.
+ *
+ * @throws {NotFoundError}    si le message n'existe pas.
+ * @throws {ValidationError}  si transition invalide, OU `status="failed"`
+ *                            sans `failureReason`, OU `status≠"failed"` avec
+ *                            `failureReason`, OU doc message corrompu (Zod).
+ */
+export async function updateMessageStatus(input: UpdateMessageStatusInput): Promise<void> {
+  // Assertion structure : failureReason ↔ status="failed".
+  // Vérification HORS tx (fail-fast — pas la peine d'ouvrir tx si caller bug).
+  if (input.status === "failed" && input.failureReason === undefined) {
+    throw new ValidationError({
+      message: "updateMessageStatus: failureReason is required when status='failed'",
+      context: {
+        conversationId: input.conversationId,
+        messageId: input.messageId,
+        status: input.status,
+      },
+    });
+  }
+  if (input.status !== "failed" && input.failureReason !== undefined) {
+    throw new ValidationError({
+      message: `updateMessageStatus: failureReason is only allowed when status='failed' (got status='${input.status}')`,
+      context: {
+        conversationId: input.conversationId,
+        messageId: input.messageId,
+        status: input.status,
+      },
+    });
+  }
+
+  return await getAdminDb().runTransaction(async (tx) => {
+    const messageRef = messagesSubcollectionRef(input.conversationId).doc(input.messageId);
+    const doc = await tx.get(messageRef);
+    if (!doc.exists) {
+      throw new NotFoundError({
+        message: `Message not found: ${input.messageId} in conversation ${input.conversationId}`,
+        context: {
+          conversationId: input.conversationId,
+          messageId: input.messageId,
+        },
+      });
+    }
+
+    const current = _parseMessageOrThrow(doc.data(), input.conversationId, input.messageId);
+
+    // ── Idempotence no-op : target === actuel ──────────────────────────────
+    // Vérifié AVANT la table de transitions car les status terminaux
+    // (delivered, failed) ont un Set vide dans la table — sans cette
+    // garde, `failed → failed` serait rejeté par ValidationError au lieu
+    // d'être un no-op (retry Inngest qui réappelle).
+    if (current.status === input.status) {
+      return;
+    }
+
+    // ── Status `draft` / `received` ne transitionnent PAS via cette fct ────
+    // `draft → queued` est géré par `commitDraftToQueued` S9.4.1 (logique
+    // compliance + bump compteurs). `received` est terminal inbound.
+    // Refus explicite — la table ne contient pas ces sources.
+    if (current.status === "draft" || current.status === "received") {
+      throw new ValidationError({
+        message: `updateMessageStatus refuses transition from "${current.status}" (use commitDraftToQueued for drafts; inbound 'received' is terminal)`,
+        context: {
+          conversationId: input.conversationId,
+          messageId: input.messageId,
+          currentStatus: current.status,
+          targetStatus: input.status,
+        },
+      });
+    }
+
+    // ── Vérification transition via STATUS_TRANSITIONS ─────────────────────
+    const allowed = STATUS_TRANSITIONS[current.status];
+    if (!allowed.has(input.status)) {
+      throw new ValidationError({
+        message: `updateMessageStatus: invalid transition "${current.status}" → "${input.status}"`,
+        context: {
+          conversationId: input.conversationId,
+          messageId: input.messageId,
+          currentStatus: current.status,
+          targetStatus: input.status,
+        },
+      });
+    }
+
+    // ── Build update partiel Firestore ─────────────────────────────────────
+    const now = input.now !== undefined ? Timestamp.fromDate(input.now) : Timestamp.now();
+    const update: Record<string, unknown> = { status: input.status };
+
+    if (input.status === "sent") {
+      update.sentAt = now;
+    } else if (input.status === "delivered") {
+      update.deliveredAt = now;
+    } else if (input.status === "failed") {
+      // failureReason non-undefined garanti par assertion HORS tx ci-dessus.
+      const failure = input.failureReason!;
+      update.error = {
+        code: failure.code,
+        // Le schéma Zod Message exige `error.message: string.min(1)`.
+        // On compose un message par défaut depuis le code si detail absent.
+        message: failure.detail ?? failure.code,
+        retryCount: failure.retryCount,
+      };
+    }
+
+    // `externalId` (= ovhMessageId) posé sur transition vers `sent`/`sending`
+    // si fourni. Cohérent invariant Message (`externalId` = ID OVH).
+    if (input.ovhMessageId !== undefined) {
+      update.externalId = input.ovhMessageId;
+    }
+
+    tx.update(messageRef, update);
+
+    // ── Audit `sms_failed` DANS la tx pour transition VERS `failed` ────────
+    // Posé UNE FOIS au passage `from ≠ failed → failed`. Le no-op idempotent
+    // (failed → failed) est court-circuité plus haut, donc pas de double-audit.
+    if (input.status === "failed") {
+      const failure = input.failureReason!;
+      appendAuditLogTx(tx, {
+        actorId: "system",
+        actorType: "system",
+        action: "sms_failed",
+        targetType: "message",
+        targetId: input.messageId,
+        // Payload anti-PII : juste les IDs opaques + code structuré +
+        // retryCount. PAS de body, PAS de detail brut (le detail est
+        // dans le doc message.error.message — accessible via lecture
+        // explicite, pas via audit_log pour limiter la surface).
+        payload: {
+          direction: "outbound",
+          messageId: input.messageId,
+          failureCode: failure.code,
+          retryCount: failure.retryCount,
+        },
+      });
+    }
+  });
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Exposés pour tests
 // ─────────────────────────────────────────────────────────────────────────────
 

@@ -120,6 +120,15 @@ const SMS_SEND_FIRST_REQUESTED = "medere/sms.send-first.requested";
 /** Nom de l'event "réponse SMS reçue d'un PS via webhook OVH". Stable. */
 const SMS_REPLY_RECEIVED = "medere/sms.reply.received";
 
+/**
+ * Nom de l'event "dispatch OVH du draft réponse demandé". Stable.
+ *
+ * Émis par `process-reply.ts` après step 9 audit-reply-processed sur la
+ * branche `classified` (S9.4.3 — process-reply émet l'event jumeau).
+ * Consommé par `send-reply.ts` handler (S9.4.2) pour le dispatch OVH.
+ */
+const SMS_REPLY_SEND_REQUESTED = "medere/sms.reply.send-requested";
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Schemas Zod (data des events) — exportés pour réutilisation
 // ─────────────────────────────────────────────────────────────────────────────
@@ -185,6 +194,51 @@ export const SmsReplyReceivedDataSchema = z.strictObject({
 /** Type inféré (Output = Input — aucun transform). */
 export type SmsReplyReceivedData = z.infer<typeof SmsReplyReceivedDataSchema>;
 
+/**
+ * Schéma data de `medere/sms.reply.send-requested` (S9.4.2).
+ *
+ * **Émis par** : `process-reply.ts` step 8d (S9.4.3) après step 9
+ * `audit-reply-processed` sur la branche `classified`. Le draft existe
+ * déjà en Firestore avec `status="draft"` (posé par step 8b `store-draft`
+ * S9.3.3b). L'event signale que le draft est prêt à être commité +
+ * dispatché OVH.
+ *
+ * **Consommé par** : `send-reply.ts` Inngest handler (S9.4.2). Le handler :
+ *   1. `commitDraftToQueued({conversationId, draftMessageId})` → tx
+ *      atomique compliance + transition draft→queued + audit `sms_sent`.
+ *   2. Si compliance fail → audit `reply_draft_dropped` posé par
+ *      commitDraftToQueued, handler retourne `blocked_by_compliance`.
+ *   3. Sinon dispatch OVH via `sendSms` + audit `sms_provider_dispatched`.
+ *
+ * **Sémantique** (payload minimaliste — décision Q-B3 Déthié S9.4.0) :
+ *   - `contactId` : hubspotId opaque. Redondant par dérivation depuis
+ *      `conversationId = ${contactId}_${campaignId}` mais utile pour
+ *      observabilité Inngest dashboard + logs sans round-trip Firestore.
+ *   - `conversationId` : docId composite `${contactId}_${campaignId}`.
+ *   - `draftMessageId` : Firestore auto-ID `[A-Za-z0-9]{20}` du draft à
+ *      transitionner. Source de vérité — le body, aiModel, aiPromptVersion
+ *      etc. vivent dans `messages/{draftMessageId}`, PAS dans le payload
+ *      event (minimiser surface PII Inngest cloud).
+ *
+ * 🚨 **PAS de `intent` dans le payload** : récupérable via lecture du draft
+ * (champ `aiPromptVersion` permet de tracer la branche) ou via audit
+ * `reply_generated` corrélé. Minimaliser drift.
+ *
+ * 🚨 **`event.id` INTERDIT avec PII** (cf. l.49-73) — phone, email,
+ * ovhMessageId interdits dans le forge d'event.id par l'émetteur S9.4.3.
+ *
+ * `strictObject` (vs `object`) — anti-bypass identique
+ * `SmsSendFirstRequestedDataSchema`.
+ */
+export const SmsReplySendRequestedDataSchema = z.strictObject({
+  contactId: z.string().min(1),
+  conversationId: z.string().min(1),
+  draftMessageId: z.string().min(1),
+});
+
+/** Type inféré (Output = Input — aucun transform). */
+export type SmsReplySendRequestedData = z.infer<typeof SmsReplySendRequestedDataSchema>;
+
 // ─────────────────────────────────────────────────────────────────────────────
 // EventType Inngest — réutilisables comme triggers + .send() payloads
 // ─────────────────────────────────────────────────────────────────────────────
@@ -211,6 +265,16 @@ export const smsReplyReceived = eventType(SMS_REPLY_RECEIVED, {
   schema: SmsReplyReceivedDataSchema,
 });
 
+/**
+ * Event typé "dispatch OVH du draft réponse demandé" (S9.4.2). À utiliser
+ * comme trigger (`triggers: [{ event: smsReplySendRequested }]`) et comme
+ * payload (`inngest.send(smsReplySendRequested.create({ contactId,
+ * conversationId, draftMessageId }))`).
+ */
+export const smsReplySendRequested = eventType(SMS_REPLY_SEND_REQUESTED, {
+  schema: SmsReplySendRequestedDataSchema,
+});
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Exposés pour tests sentinelles
 // ─────────────────────────────────────────────────────────────────────────────
@@ -219,6 +283,7 @@ export const smsReplyReceived = eventType(SMS_REPLY_RECEIVED, {
 export const __EVENT_NAMES_FOR_TESTS = {
   SMS_SEND_FIRST_REQUESTED,
   SMS_REPLY_RECEIVED,
+  SMS_REPLY_SEND_REQUESTED,
 } as const;
 
 /** @internal */

@@ -42,9 +42,9 @@
 import { serve } from "inngest/next";
 
 import { getInngestClient } from "@/lib/inngest/client";
-import { processReply, sendFirstSms } from "@/lib/inngest/functions";
+import { processReply, sendFirstSms, sendReply } from "@/lib/inngest/functions";
 
 export const { GET, POST, PUT } = serve({
   client: getInngestClient(),
-  functions: [sendFirstSms, processReply],
+  functions: [sendFirstSms, processReply, sendReply],
 });

@@ -5,6 +5,8 @@ import {
   __EVENT_NAMES_FOR_TESTS,
   smsReplyReceived,
   SmsReplyReceivedDataSchema,
+  smsReplySendRequested,
+  SmsReplySendRequestedDataSchema,
   smsSendFirstRequested,
   SmsSendFirstRequestedDataSchema,
 } from "./events";
@@ -26,12 +28,25 @@ describe("EVENT_NAMES — sentinelles anti-régression", () => {
     expect(__EVENT_NAMES_FOR_TESTS.SMS_REPLY_RECEIVED).toBe("medere/sms.reply.received");
   });
 
+  it("SMS_REPLY_SEND_REQUESTED est figé à 'medere/sms.reply.send-requested' (S9.4.2)", () => {
+    // Sentinelle anti-régression : ce nom est le contrat entre process-reply
+    // (émetteur S9.4.3) et send-reply (consommateur S9.4.2). Le modifier
+    // casserait la boucle dispatch.
+    expect(__EVENT_NAMES_FOR_TESTS.SMS_REPLY_SEND_REQUESTED).toBe(
+      "medere/sms.reply.send-requested",
+    );
+  });
+
   it("EventType `smsSendFirstRequested.name` correspond à la constante", () => {
     expect(smsSendFirstRequested.name).toBe(__EVENT_NAMES_FOR_TESTS.SMS_SEND_FIRST_REQUESTED);
   });
 
   it("EventType `smsReplyReceived.name` correspond à la constante", () => {
     expect(smsReplyReceived.name).toBe(__EVENT_NAMES_FOR_TESTS.SMS_REPLY_RECEIVED);
+  });
+
+  it("EventType `smsReplySendRequested.name` correspond à la constante (S9.4.2)", () => {
+    expect(smsReplySendRequested.name).toBe(__EVENT_NAMES_FOR_TESTS.SMS_REPLY_SEND_REQUESTED);
   });
 });
 
@@ -167,6 +182,74 @@ describe("SmsReplyReceivedDataSchema", () => {
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
+// SmsReplySendRequestedDataSchema — validation runtime (S9.4.2)
+// ─────────────────────────────────────────────────────────────────────────────
+
+describe("SmsReplySendRequestedDataSchema", () => {
+  const validData = {
+    contactId: "hs_dent_paris_01",
+    conversationId: "hs_dent_paris_01_dentistes-idf-mai-2026",
+    draftMessageId: "draft_FirestoreAutoId20a",
+  };
+
+  it("accepte un payload bien formé", () => {
+    const result = SmsReplySendRequestedDataSchema.safeParse(validData);
+    expect(result.success).toBe(true);
+  });
+
+  it("refuse contactId vide", () => {
+    const result = SmsReplySendRequestedDataSchema.safeParse({ ...validData, contactId: "" });
+    expect(result.success).toBe(false);
+  });
+
+  it("refuse conversationId vide", () => {
+    const result = SmsReplySendRequestedDataSchema.safeParse({ ...validData, conversationId: "" });
+    expect(result.success).toBe(false);
+  });
+
+  it("refuse draftMessageId vide", () => {
+    const result = SmsReplySendRequestedDataSchema.safeParse({
+      ...validData,
+      draftMessageId: "",
+    });
+    expect(result.success).toBe(false);
+  });
+
+  it("strictObject : refuse un champ inattendu (anti-bypass)", () => {
+    // Sentinelle : si un caller injecte `intent: "INTERESSE"` ou `body: "..."`
+    // via cast TS forcé, le schéma doit throw plutôt que stripper
+    // silencieusement (limiter surface PII Inngest cloud + drift contrat).
+    const sneaky = { ...validData, intent: "INTERESSE" };
+    const result = SmsReplySendRequestedDataSchema.safeParse(sneaky);
+    expect(result.success).toBe(false);
+  });
+
+  it("refuse contactId manquant", () => {
+    const result = SmsReplySendRequestedDataSchema.safeParse({
+      conversationId: "cv1",
+      draftMessageId: "msg1",
+    });
+    expect(result.success).toBe(false);
+  });
+
+  it("refuse conversationId manquant", () => {
+    const result = SmsReplySendRequestedDataSchema.safeParse({
+      contactId: "ct1",
+      draftMessageId: "msg1",
+    });
+    expect(result.success).toBe(false);
+  });
+
+  it("refuse draftMessageId manquant", () => {
+    const result = SmsReplySendRequestedDataSchema.safeParse({
+      contactId: "ct1",
+      conversationId: "cv1",
+    });
+    expect(result.success).toBe(false);
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
 // EventType — contrat structurel
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -181,6 +264,26 @@ describe("EventType — structure Inngest", () => {
     expect(typeof smsReplyReceived.name).toBe("string");
     expect(smsReplyReceived.schema).toBe(SmsReplyReceivedDataSchema);
     expect(typeof smsReplyReceived.create).toBe("function");
+  });
+
+  it("smsReplySendRequested expose `.name`, `.schema` et `.create()` (S9.4.2)", () => {
+    expect(typeof smsReplySendRequested.name).toBe("string");
+    expect(smsReplySendRequested.schema).toBe(SmsReplySendRequestedDataSchema);
+    expect(typeof smsReplySendRequested.create).toBe("function");
+  });
+
+  it("smsReplySendRequested.create() produit un payload `{ name, data }`", () => {
+    const payload = smsReplySendRequested.create({
+      contactId: "ct_test",
+      conversationId: "ct_test_camp",
+      draftMessageId: "draft_FirestoreAutoId20",
+    });
+    expect(payload.name).toBe("medere/sms.reply.send-requested");
+    expect(payload.data).toEqual({
+      contactId: "ct_test",
+      conversationId: "ct_test_camp",
+      draftMessageId: "draft_FirestoreAutoId20",
+    });
   });
 
   it("smsSendFirstRequested.create() produit un payload `{ name, data }`", () => {

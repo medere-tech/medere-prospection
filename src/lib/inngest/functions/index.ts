@@ -8,3 +8,4 @@
  */
 export { processReply } from "./process-reply";
 export { sendFirstSms } from "./send-first-sms";
+export { sendReply } from "./send-reply";

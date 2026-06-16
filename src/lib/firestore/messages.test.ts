@@ -75,6 +75,7 @@ import {
   listRecentOutbound,
   listRecentOutboundInTx,
   RATE_LIMIT_COUNTED_STATUSES,
+  updateMessageStatus,
 } from "./messages";
 
 const PEPPER = "a".repeat(64);
@@ -1843,6 +1844,371 @@ describe("messages.ts", () => {
       expect(history.length).toBe(1);
       // Limit=1 → on prend le PLUS RÉCENT (DESC) puis on inverse → "new" seul.
       expect(history[0]!.body).toBe("new");
+    });
+  });
+
+  // ───────────────────────────────────────────────────────────────────────
+  // updateMessageStatus (S9.4.2) — transitions + audit sms_failed
+  // ───────────────────────────────────────────────────────────────────────
+
+  describe("updateMessageStatus", () => {
+    const CONV_ID = "conv_update_status";
+
+    async function seedQueuedMessage(): Promise<string> {
+      await seedConversation(CONV_ID);
+      return seedMessage(CONV_ID, {
+        direction: "outbound",
+        status: "queued",
+        body: "Bonjour, c'est Léa de Médéré. Test. STOP pour refuser.",
+        generatedBy: "ai",
+        createdAt: Timestamp.now(),
+        queuedAt: Timestamp.now(),
+      });
+    }
+
+    async function readMsg(messageId: string): Promise<Message | null> {
+      const doc = await getAdminDb()
+        .collection(__MESSAGES_PARENT_COLLECTION_FOR_TESTS)
+        .doc(CONV_ID)
+        .collection(__MESSAGES_SUBCOLLECTION_FOR_TESTS)
+        .doc(messageId)
+        .get();
+      return doc.exists ? (doc.data() as Message) : null;
+    }
+
+    async function countAuditByAction(action: string): Promise<number> {
+      const snap = await getAdminDb()
+        .collection(__AUDIT_COLLECTION_FOR_TESTS)
+        .where("action", "==", action)
+        .get();
+      return snap.size;
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // Happy paths — transitions valides
+    // ─────────────────────────────────────────────────────────────────────
+
+    it("queued → sent : pose sentAt + externalId (si fourni), aucun audit sms_failed", async () => {
+      const msgId = await seedQueuedMessage();
+
+      await updateMessageStatus({
+        conversationId: CONV_ID,
+        messageId: msgId,
+        status: "sent",
+        ovhMessageId: "ovh-msg-abc-123",
+      });
+
+      const msg = await readMsg(msgId);
+      expect(msg?.status).toBe("sent");
+      expect(msg?.sentAt).toBeInstanceOf(Timestamp);
+      expect(msg?.externalId).toBe("ovh-msg-abc-123");
+      expect(msg?.error).toBeUndefined();
+
+      expect(await countAuditByAction("sms_failed")).toBe(0);
+    });
+
+    it("queued → failed : pose error + audit sms_failed DANS la tx", async () => {
+      const msgId = await seedQueuedMessage();
+
+      await updateMessageStatus({
+        conversationId: CONV_ID,
+        messageId: msgId,
+        status: "failed",
+        failureReason: {
+          code: "config_error",
+          detail: "OVH 401 auth denied",
+          retryCount: 0,
+        },
+      });
+
+      const msg = await readMsg(msgId);
+      expect(msg?.status).toBe("failed");
+      expect(msg?.error).toEqual({
+        code: "config_error",
+        message: "OVH 401 auth denied",
+        retryCount: 0,
+      });
+      expect(msg?.sentAt).toBeUndefined();
+
+      // Audit sms_failed posé DANS la tx (atomicité avec UPDATE).
+      expect(await countAuditByAction("sms_failed")).toBe(1);
+
+      const snap = await getAdminDb()
+        .collection(__AUDIT_COLLECTION_FOR_TESTS)
+        .where("action", "==", "sms_failed")
+        .get();
+      const audit = snap.docs[0]!.data();
+      expect(audit.targetType).toBe("message");
+      expect(audit.targetId).toBe(msgId);
+      // Payload anti-PII : code structuré + retryCount, PAS le detail brut.
+      expect(audit.payload).toEqual({
+        direction: "outbound",
+        messageId: msgId,
+        failureCode: "config_error",
+        retryCount: 0,
+      });
+    });
+
+    it("queued → failed avec detail absent : message default-fallback sur code", async () => {
+      // Le schéma Zod Message exige `error.message: string.min(1)`. Si le
+      // caller ne fournit pas `failureReason.detail`, on compose le message
+      // depuis le `code` pour rester schema-valide.
+      const msgId = await seedQueuedMessage();
+
+      await updateMessageStatus({
+        conversationId: CONV_ID,
+        messageId: msgId,
+        status: "failed",
+        failureReason: { code: "validation_error", retryCount: 2 },
+      });
+
+      const msg = await readMsg(msgId);
+      expect(msg?.error?.message).toBe("validation_error");
+    });
+
+    it("sent → delivered : pose deliveredAt, pas de audit sms_failed", async () => {
+      await seedConversation(CONV_ID);
+      const msgId = await seedMessage(CONV_ID, {
+        direction: "outbound",
+        status: "sent",
+        body: "sent prior",
+        generatedBy: "ai",
+        createdAt: Timestamp.now(),
+        sentAt: Timestamp.now(),
+      });
+
+      await updateMessageStatus({
+        conversationId: CONV_ID,
+        messageId: msgId,
+        status: "delivered",
+      });
+
+      const msg = await readMsg(msgId);
+      expect(msg?.status).toBe("delivered");
+      expect(msg?.deliveredAt).toBeInstanceOf(Timestamp);
+      expect(await countAuditByAction("sms_failed")).toBe(0);
+    });
+
+    it("sent → failed : pose error + audit sms_failed (DLR négatif)", async () => {
+      await seedConversation(CONV_ID);
+      const msgId = await seedMessage(CONV_ID, {
+        direction: "outbound",
+        status: "sent",
+        body: "sent prior",
+        generatedBy: "ai",
+        createdAt: Timestamp.now(),
+        sentAt: Timestamp.now(),
+      });
+
+      await updateMessageStatus({
+        conversationId: CONV_ID,
+        messageId: msgId,
+        status: "failed",
+        failureReason: {
+          code: "external_service",
+          detail: "DLR reported undeliverable",
+          retryCount: 3,
+        },
+      });
+
+      const msg = await readMsg(msgId);
+      expect(msg?.status).toBe("failed");
+      expect(await countAuditByAction("sms_failed")).toBe(1);
+    });
+
+    // ─────────────────────────────────────────────────────────────────────
+    // Idempotence (no-op silencieux)
+    // ─────────────────────────────────────────────────────────────────────
+
+    it("status target === actuel : no-op silencieux, aucun audit double-posé", async () => {
+      await seedConversation(CONV_ID);
+      const msgId = await seedMessage(CONV_ID, {
+        direction: "outbound",
+        status: "failed",
+        body: "already failed",
+        generatedBy: "ai",
+        createdAt: Timestamp.now(),
+        error: { code: "config_error", message: "prior", retryCount: 1 },
+      });
+
+      // Tentative idempotente `failed → failed` (retry Inngest qui réappelle).
+      await updateMessageStatus({
+        conversationId: CONV_ID,
+        messageId: msgId,
+        status: "failed",
+        failureReason: { code: "config_error", detail: "ignored", retryCount: 99 },
+      });
+
+      const msg = await readMsg(msgId);
+      // Pas d'override de error.* (le doc reste tel quel, no-op silencieux).
+      expect(msg?.error).toEqual({ code: "config_error", message: "prior", retryCount: 1 });
+
+      // Aucun audit double-posé.
+      expect(await countAuditByAction("sms_failed")).toBe(0);
+    });
+
+    it("sent → sent (no-op) : aucun update, aucun audit", async () => {
+      await seedConversation(CONV_ID);
+      const originalSentAt = Timestamp.fromMillis(Date.now() - 60_000);
+      const msgId = await seedMessage(CONV_ID, {
+        direction: "outbound",
+        status: "sent",
+        body: "sent prior",
+        generatedBy: "ai",
+        createdAt: Timestamp.fromMillis(Date.now() - 120_000),
+        sentAt: originalSentAt,
+      });
+
+      await updateMessageStatus({
+        conversationId: CONV_ID,
+        messageId: msgId,
+        status: "sent",
+        ovhMessageId: "would-overwrite-but-noop",
+      });
+
+      const msg = await readMsg(msgId);
+      // sentAt PAS overridden (no-op silencieux).
+      expect(msg?.sentAt?.toMillis()).toBe(originalSentAt.toMillis());
+      expect(msg?.externalId).toBeUndefined();
+    });
+
+    // ─────────────────────────────────────────────────────────────────────
+    // Transitions invalides
+    // ─────────────────────────────────────────────────────────────────────
+
+    it("delivered → failed : refuse (terminal, Set vide dans table)", async () => {
+      await seedConversation(CONV_ID);
+      const msgId = await seedMessage(CONV_ID, {
+        direction: "outbound",
+        status: "delivered",
+        body: "already delivered",
+        generatedBy: "ai",
+        createdAt: Timestamp.now(),
+        deliveredAt: Timestamp.now(),
+      });
+
+      await expect(
+        updateMessageStatus({
+          conversationId: CONV_ID,
+          messageId: msgId,
+          status: "failed",
+          failureReason: { code: "external_service", retryCount: 0 },
+        }),
+      ).rejects.toBeInstanceOf(ValidationError);
+    });
+
+    it("failed → sent : refuse (terminal, transition invalide)", async () => {
+      await seedConversation(CONV_ID);
+      const msgId = await seedMessage(CONV_ID, {
+        direction: "outbound",
+        status: "failed",
+        body: "failed prior",
+        generatedBy: "ai",
+        createdAt: Timestamp.now(),
+        error: { code: "config_error", message: "prior", retryCount: 0 },
+      });
+
+      await expect(
+        updateMessageStatus({
+          conversationId: CONV_ID,
+          messageId: msgId,
+          status: "sent",
+        }),
+      ).rejects.toBeInstanceOf(ValidationError);
+    });
+
+    it("draft → sent : refuse explicitement (utiliser commitDraftToQueued)", async () => {
+      await seedConversation(CONV_ID);
+      const msgId = await seedMessage(CONV_ID, {
+        direction: "outbound",
+        status: "draft",
+        body: "Bonjour, c'est Léa de Médéré. STOP.",
+        generatedBy: "ai",
+        createdAt: Timestamp.now(),
+      });
+
+      await expect(
+        updateMessageStatus({
+          conversationId: CONV_ID,
+          messageId: msgId,
+          status: "sent",
+        }),
+      ).rejects.toBeInstanceOf(ValidationError);
+    });
+
+    it("received (inbound) → sent : refuse (status terminal inbound)", async () => {
+      await seedConversation(CONV_ID);
+      const msgId = await seedMessage(CONV_ID, {
+        direction: "inbound",
+        status: "received",
+        body: "Inbound test",
+        generatedBy: "human",
+        externalId: "ovh-inbound-1",
+        externalReceiver: "+33612345678",
+        createdAt: Timestamp.now(),
+        receivedAt: Timestamp.now(),
+      });
+
+      await expect(
+        updateMessageStatus({
+          conversationId: CONV_ID,
+          messageId: msgId,
+          status: "sent",
+        }),
+      ).rejects.toBeInstanceOf(ValidationError);
+    });
+
+    // ─────────────────────────────────────────────────────────────────────
+    // Assertions structurelles failureReason ↔ status="failed"
+    // ─────────────────────────────────────────────────────────────────────
+
+    it("status='failed' SANS failureReason → ValidationError (fail-fast HORS tx)", async () => {
+      const msgId = await seedQueuedMessage();
+
+      await expect(
+        updateMessageStatus({
+          conversationId: CONV_ID,
+          messageId: msgId,
+          status: "failed",
+          // failureReason MANQUANT
+        }),
+      ).rejects.toBeInstanceOf(ValidationError);
+
+      // Vérifie le fail-fast HORS tx : le message reste "queued" (pas de tx ouverte).
+      const msg = await readMsg(msgId);
+      expect(msg?.status).toBe("queued");
+    });
+
+    it("status='sent' AVEC failureReason → ValidationError", async () => {
+      const msgId = await seedQueuedMessage();
+
+      await expect(
+        updateMessageStatus({
+          conversationId: CONV_ID,
+          messageId: msgId,
+          status: "sent",
+          failureReason: { code: "config_error", retryCount: 0 },
+        }),
+      ).rejects.toBeInstanceOf(ValidationError);
+
+      const msg = await readMsg(msgId);
+      expect(msg?.status).toBe("queued");
+    });
+
+    // ─────────────────────────────────────────────────────────────────────
+    // Cas d'erreur — doc absent / corrompu
+    // ─────────────────────────────────────────────────────────────────────
+
+    it("message inexistant → NotFoundError (tx ouverte mais rollback propre)", async () => {
+      await seedConversation(CONV_ID);
+
+      await expect(
+        updateMessageStatus({
+          conversationId: CONV_ID,
+          messageId: "nonexistent_msg_id",
+          status: "sent",
+        }),
+      ).rejects.toBeInstanceOf(NotFoundError);
     });
   });
 });
