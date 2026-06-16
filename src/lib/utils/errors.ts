@@ -298,6 +298,106 @@ export class ComplianceConcurrencyError extends ComplianceError {
   }
 }
 
+/**
+ * Contexte structuré obligatoire d'une `ComplianceFailureError`. Anti-PII
+ * par construction : aucune clé n'est PII.
+ *
+ *   - `rule`           : nom de la `ComplianceRule` qui a refusé (voir
+ *                        `src/lib/compliance/pre-send-check.ts`). Typé
+ *                        `string` ici (pas import du type côté errors.ts
+ *                        pour éviter un cycle d'import compliance→errors).
+ *   - `code`           : `ComplianceFailCode` correspondant (idem `string`
+ *                        pour la raison ci-dessus).
+ *   - `failureContext` : contexte structuré du failure tel que renvoyé
+ *                        par `preSendCheck` (discriminated union FERMÉE
+ *                        de pre-send-check.ts — aucune clé PII possible).
+ */
+export interface ComplianceFailureContext {
+  rule: string;
+  code: string;
+  failureContext: Record<string, unknown>;
+  // Index signature explicite : permet l'assignation à
+  // `AppError.context: Record<string, unknown>` sans cast (cf. pattern
+  // miroir `ComplianceConcurrencyContext` ci-dessus, TS limitation
+  // structurelle no-op runtime).
+  readonly [k: string]: unknown;
+}
+
+/**
+ * Options d'instanciation d'une `ComplianceFailureError`. Diffère de
+ * `AppErrorOptions` en rendant `context` OBLIGATOIRE et typé strict
+ * (`ComplianceFailureContext`) — empêche au compile-time tout caller
+ * d'omettre les champs forensiques.
+ */
+export interface ComplianceFailureErrorOptions extends Omit<AppErrorOptions, "context"> {
+  context: ComplianceFailureContext;
+}
+
+/**
+ * 422 — refus compliance détecté DANS une transaction Firestore (S9.4.1
+ * `preSendCheckWithAuditTx`). Sous-classe de `ComplianceError` →
+ * `instanceof ComplianceError` reste true pour les callers compliance-aware.
+ *
+ * ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ * DISTINCTION VS `ComplianceConcurrencyError`
+ *
+ *   - `ComplianceConcurrencyError` (`noRetry=false`) : RACE détectée DANS
+ *     la tx (la pré-vérif HORS tx a dit OK mais une autre tx a saturé le
+ *     plafond entre temps). Retry naturel Inngest pertinent — la prochaine
+ *     itération relira l'état mis à jour et soit passera, soit se
+ *     transformera en blocage stable. Réservé à `rate_limit` (seule règle
+ *     sujette à la race en S6 pattern).
+ *
+ *   - `ComplianceFailureError` (`noRetry=TRUE`) : BLOCAGE STABLE détecté
+ *     dans la tx (S9.4.1 pattern — entre génération draft et envoi, la
+ *     fenêtre temporelle minutes/heures permet un consent drift sur n'importe
+ *     laquelle des 9 rules). Retry ne va pas inverser la décision (le PS
+ *     a opt-out, l'heure est passée, le contact a été marqué invalide).
+ *     L'orchestrateur (`commitDraftToQueued`) catch l'erreur HORS tx pour
+ *     poser les audits `compliance_check (blocked)` + `reply_draft_dropped`
+ *     en best-effort, puis retourne `{ok: false, failure}` au caller.
+ *
+ * ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ * QUI THROW / QUI CATCH
+ *
+ *   - **Throw** : `preSendCheckWithAuditTx()` (S9.4.1) quand
+ *     `preSendCheck` retourne `{ok: false, failure}` DANS une transaction
+ *     Firestore. La tx rollback automatiquement (aucun audit
+ *     `compliance_check (allowed)` ne sera commit, aucune transition
+ *     `draft→queued` ne sera commit).
+ *
+ *   - **Catch** : `commitDraftToQueued()` (S9.4.1) HORS withContactLock —
+ *     pose les 2 audits best-effort puis return `{ok: false, failure}`
+ *     au caller (handler send-reply S9.4.2 ou tests).
+ *
+ * ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ * CLIENT MESSAGE
+ *
+ * Hérite de `ComplianceError` : `"Envoi non autorisé."` — strictement
+ * identique au cas pre-vérif HORS tx. AUCUN champ technique (rule, code,
+ * failureContext) ne doit fuir côté client.
+ */
+export class ComplianceFailureError extends ComplianceError {
+  override readonly code = "COMPLIANCE_BLOCKED" as const;
+  /**
+   * Distinct de `ComplianceConcurrencyError.noRetry=false` : un refus
+   * compliance stable (opt_out, hours, rate_limit non-race, etc.) ne
+   * s'inversera pas avec un retry — c'est une décision métier finale.
+   * L'orchestrateur traite le retour `{ok: false, failure}` du caller
+   * (`commitDraftToQueued`), pas un retry.
+   */
+  override readonly noRetry = true;
+  override readonly context!: ComplianceFailureContext;
+  constructor(options: ComplianceFailureErrorOptions) {
+    super({
+      clientMessage: "Envoi non autorisé.",
+      message: options.message,
+      cause: options.cause,
+      context: options.context,
+    });
+  }
+}
+
 /** 502 — échec d'un service tiers (OVH, HubSpot, Anthropic…). Opérationnel. */
 export class ExternalServiceError extends AppError {
   readonly code = "EXTERNAL_SERVICE" as const;

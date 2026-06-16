@@ -55,7 +55,7 @@
  * ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
  * INVARIANTS (CNIL / RGPD) :
  *
- *   1. **Validation Zod STRICTE à la lecture** (`parseMessageOrThrow`).
+ *   1. **Validation Zod STRICTE à la lecture** (`_parseMessageOrThrow`).
  *      Doc corrompu → throw `ValidationError` SANS `cause` (la ZodError
  *      contient `issue.received` qui peut leak le `body` PII en inbound).
  *      Pas de fallback partiel.
@@ -306,11 +306,27 @@ export interface AddInboundInput {
 // ─────────────────────────────────────────────────────────────────────────────
 
 /**
- * Parse + cast strict. ⚠️ PAS de `cause: result.error` — la ZodError
- * contient `issue.received` qui peut leak `body` PII en inbound (un PS
- * peut écrire "Mon numéro perso est 06..."). Pattern identique S6.3/S6.4.
+ * Parse + cast strict d'un doc message lu depuis Firestore.
+ *
+ * ⚠️ PAS de `cause: result.error` — la ZodError contient `issue.received`
+ * qui peut leak `body` PII en inbound (un PS peut écrire "Mon numéro
+ * perso est 06..."). Pattern identique S6.3/S6.4 / `_parseConversationOrThrow`.
+ *
+ * Exporté en S9.4.1 (pattern miroir `_parseConversationOrThrow`) pour
+ * permettre aux callers tx-aware (`commitDraftToQueued` dans
+ * `lib/firestore/send-reply.ts`) de lire + valider un doc message DANS
+ * une transaction Firestore. Le préfixe underscore signale l'usage
+ * inter-modules `firestore/` — ne PAS appeler depuis du code applicatif
+ * (Inngest handlers, API routes) qui doit passer par les wrappers
+ * `addOutbound`/`addInbound`/`listRecentX`.
+ *
+ * @internal Inter-modules `firestore/`. Pas d'usage applicatif direct.
  */
-function parseMessageOrThrow(raw: unknown, conversationId: string, messageId: string): Message {
+export function _parseMessageOrThrow(
+  raw: unknown,
+  conversationId: string,
+  messageId: string,
+): Message {
   const result = MessageSchema.safeParse(raw);
   if (!result.success) {
     throw new ValidationError({
@@ -719,7 +735,7 @@ export async function listRecentOutbound(
   // (envoi qui n'a jamais atteint le PS). Cf. JSDoc
   // `RATE_LIMIT_COUNTED_STATUSES`.
   return snap.docs.flatMap((doc) => {
-    const msg = parseMessageOrThrow(doc.data(), conversationId, doc.id);
+    const msg = _parseMessageOrThrow(doc.data(), conversationId, doc.id);
     if (!isRateLimitCounted(msg.status)) {
       return [];
     }
@@ -866,7 +882,7 @@ export async function findInboundByExternalId(
 
   // limit(1) garantit snap.docs[0] défini ici.
   const doc = snap.docs[0]!;
-  const message = parseMessageOrThrow(doc.data(), conversationId, doc.id);
+  const message = _parseMessageOrThrow(doc.data(), conversationId, doc.id);
   return { messageId: doc.id, message };
 }
 
@@ -956,7 +972,7 @@ export async function listRecentOutboundInTx(
   // sur `listRecentOutbound` HORS tx (même sémantique compliance).
   // Cf. JSDoc `RATE_LIMIT_COUNTED_STATUSES`.
   return snap.docs.flatMap((doc) => {
-    const msg = parseMessageOrThrow(doc.data(), conversationId, doc.id);
+    const msg = _parseMessageOrThrow(doc.data(), conversationId, doc.id);
     if (!isRateLimitCounted(msg.status)) {
       return [];
     }
@@ -1213,7 +1229,7 @@ export async function listRecentMessages(
     .limit(limit)
     .get();
 
-  const parsed = snap.docs.map((doc) => parseMessageOrThrow(doc.data(), conversationId, doc.id));
+  const parsed = snap.docs.map((doc) => _parseMessageOrThrow(doc.data(), conversationId, doc.id));
 
   // Exclusion des drafts (S9.3.3a) — un draft n'a pas été envoyé au PS.
   const nonDrafts = parsed.filter((msg) => msg.status !== "draft");
