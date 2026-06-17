@@ -6,6 +6,7 @@
  * de `serve()`. Sans ça, Inngest cloud ne la verra pas même si le code
  * est déployé.
  */
+export { monitorOrphanMessages } from "./monitor-orphan-messages";
 export { processReply } from "./process-reply";
 export { sendFirstSms } from "./send-first-sms";
 export { sendReply } from "./send-reply";

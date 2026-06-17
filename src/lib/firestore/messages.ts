@@ -1564,6 +1564,184 @@ export async function updateMessageStatus(input: UpdateMessageStatusInput): Prom
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// listStaleMessages (S9.4.4) — monitoring orphan drafts/queued
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * Status whitelist autorisés pour le monitoring orphan S9.4.4.
+ *
+ *   - `"draft"`  : message IA généré (S9.3.3b `addOutboundDraftInTx`) mais
+ *                  jamais transitionné en queued. Symptôme : handler
+ *                  `send-reply.ts` (S9.4.2) n'a jamais consommé l'event
+ *                  jumeau émis en step 8d (S9.4.3), OU `commitDraftToQueued`
+ *                  a rejeté sans propager d'alerte.
+ *   - `"queued"` : message committé Firestore (S9.4.1 `commitDraftToQueued`)
+ *                  mais dispatch OVH jamais réussi. Symptôme : OVH 5xx
+ *                  persistants au-delà des 4 retries Inngest naturels.
+ *
+ * Whitelist FERMÉE — autres status non monitorés en S9.4.4. `sent`/`delivered`
+ * sont des terminaux normaux ; `failed` est tracé séparément côté audit
+ * `sms_failed`.
+ */
+export type StaleMessageStatus = "draft" | "queued";
+
+/**
+ * Arguments de `listStaleMessages`. `maxAgeMs` représente le seuil
+ * "orphan" — un message dont `createdAt < now - maxAgeMs` est considéré
+ * stuck. Valeur typique S9.4.4 monitoring = 1h = 3 600 000 ms.
+ */
+export interface ListStaleMessagesInput {
+  status: StaleMessageStatus;
+  /** Seuil orphan en ms (ex: 3_600_000 pour 1h). */
+  maxAgeMs: number;
+  /** Limit query Firestore (anti-DoS + protection mémoire). Défaut 100. */
+  limit?: number;
+  /** Référence temporelle. Défaut `new Date()`. Injectable tests. */
+  now?: Date;
+}
+
+/**
+ * Forme retournée pour chaque message stale détecté. Anti-PII strict :
+ *   - `conversationId` = `${contactId}_${campaignId}` (opaque par
+ *     construction)
+ *   - `messageId` = Firestore auto-ID `[A-Za-z0-9]{20}` (scrubber-safe)
+ *   - `createdAt` = `Timestamp` Firestore (pas de PII)
+ *   - `status` = enum fermé `StaleMessageStatus`
+ *
+ * PAS de `body` / `phone` / `externalId` (semi-sensibles cf.
+ * messages.ts:36-54). Le caller monitoring (`monitor-orphan-messages.ts`
+ * S9.4.4) ne consomme que les IDs + timestamps pour comptage.
+ */
+export interface StaleMessageEntry {
+  conversationId: string;
+  messageId: string;
+  createdAt: Timestamp;
+  status: StaleMessageStatus;
+}
+
+/** Limit query par défaut. Borne défensive anti-DoS Firestore. */
+const STALE_MESSAGES_DEFAULT_LIMIT = 100;
+
+/**
+ * Liste les messages outbound `status` ancien (createdAt < now - maxAgeMs)
+ * cross-conversation via **collection group query**. Cas d'usage primaire
+ * S9.4.4 : monitoring orphan drafts/queued par le cron Inngest
+ * `monitor-orphan-messages`.
+ *
+ * ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ * QUERY FIRESTORE
+ *
+ * Premier usage `collectionGroup("messages")` du projet (cross-conversation
+ * cluster) — différent de `messagesSubcollectionRef(convId)` qui est
+ * single-conversation scope.
+ *
+ *   collectionGroup("messages")
+ *     .where("direction", "==", "outbound")
+ *     .where("status", "==", input.status)
+ *     .where("createdAt", "<=", thresholdTs)
+ *     .orderBy("createdAt", "asc")        // oldest first (priorité monitoring)
+ *     .limit(input.limit ?? 100)
+ *
+ * Le `conversationId` parent est récupéré via `doc.ref.parent.parent?.id`
+ * (Firestore Admin SDK pattern pour collection group queries).
+ *
+ * ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ * INDEX FIRESTORE COMPOSITE REQUIS (S9.4.4)
+ *
+ *   {
+ *     "collectionGroup": "messages",
+ *     "queryScope": "COLLECTION_GROUP",
+ *     "fields": [
+ *       { "fieldPath": "direction", "order": "ASCENDING" },
+ *       { "fieldPath": "status", "order": "ASCENDING" },
+ *       { "fieldPath": "createdAt", "order": "ASCENDING" }
+ *     ]
+ *   }
+ *
+ * Sans déploiement de cet index, la query throw `FAILED_PRECONDITION` —
+ * cf. `firestore.indexes.json` + procédure `npm run firebase:deploy:indexes`.
+ *
+ * Note `queryScope: "COLLECTION_GROUP"` vs `"COLLECTION"` des autres
+ * index — la query est cross-conversation, pas single-conversation.
+ *
+ * ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ * 🔒 ANTI-PII STRICT
+ *
+ * Le mapping de sortie ne contient QUE des IDs opaques + timestamps. PAS
+ * de `body`, PAS de `phone` (externalReceiver), PAS d'`externalId`
+ * (ovhMessageId semi-sensible). Le caller monitoring ne consomme que
+ * `length` + `oldestAgeMs` pour les compteurs Sentry.
+ *
+ * Si le caller a besoin du body/phone pour debug (S10+), il devra
+ * appeler une fonction dédiée AVEC élévation de privilège — pas via
+ * cette interface monitoring.
+ *
+ * ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ * RETOUR
+ *
+ *   - Aucun stale dans la fenêtre → `[]`
+ *   - Limit atteint (typique en cas d'incident grave) → retourne les
+ *     `limit` plus anciens (oldest first via `orderBy asc`). Le caller
+ *     monitoring loggera un warning si `length === limit` pour signaler
+ *     une truncation (incident grand échelle).
+ *   - Conversation parent supprimée (cas anormal) → le `doc.ref.parent.parent`
+ *     est `null` côté Firestore Admin SDK → on skip ce doc avec
+ *     `flatMap`. Cas pathologique non-bloquant pour le monitoring.
+ *
+ * @throws ValidationError si `maxAgeMs < 0` (defense-in-depth caller bug).
+ */
+export async function listStaleMessages(
+  input: ListStaleMessagesInput,
+): Promise<StaleMessageEntry[]> {
+  if (input.maxAgeMs < 0) {
+    throw new ValidationError({
+      message: `listStaleMessages: maxAgeMs must be >= 0, got ${input.maxAgeMs}`,
+      context: { maxAgeMs: input.maxAgeMs, status: input.status },
+    });
+  }
+
+  const now = input.now ?? new Date();
+  const thresholdMs = now.getTime() - input.maxAgeMs;
+  const thresholdTs = Timestamp.fromMillis(thresholdMs);
+  const limit = input.limit ?? STALE_MESSAGES_DEFAULT_LIMIT;
+
+  const snap = await getAdminDb()
+    .collectionGroup(MESSAGES_SUBCOLLECTION)
+    .where("direction", "==", "outbound")
+    .where("status", "==", input.status)
+    .where("createdAt", "<=", thresholdTs)
+    .orderBy("createdAt", "asc") // oldest first — priorité monitoring
+    .limit(limit)
+    .get();
+
+  return snap.docs.flatMap((doc) => {
+    // Le `parent.parent` est la conversation parente. En théorie présent
+    // par construction (les messages sont créés dans
+    // `conversations/{convId}/messages/{msgId}`), mais défensive guard
+    // pour les cas où la conversation aurait été supprimée tout en
+    // gardant la sous-collection orpheline (cas pathologique).
+    const conversationId = doc.ref.parent.parent?.id;
+    if (conversationId === undefined) {
+      return [];
+    }
+    const msg = _parseMessageOrThrow(doc.data(), conversationId, doc.id);
+    // Le filtre Firestore where status === input.status garantit déjà
+    // ce statut, mais defense-in-depth : double-check post-parse.
+    if (msg.status !== input.status) {
+      return [];
+    }
+    return [
+      {
+        conversationId,
+        messageId: doc.id,
+        createdAt: msg.createdAt as Timestamp,
+        status: input.status,
+      },
+    ];
+  });
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Exposés pour tests
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -1572,6 +1750,9 @@ export const __MESSAGES_PARENT_COLLECTION_FOR_TESTS = CONVERSATIONS_COLLECTION;
 
 /** @internal */
 export const __MESSAGES_SUBCOLLECTION_FOR_TESTS = MESSAGES_SUBCOLLECTION;
+
+/** @internal */
+export const __STALE_MESSAGES_DEFAULT_LIMIT_FOR_TESTS = STALE_MESSAGES_DEFAULT_LIMIT;
 
 /** @internal */
 export const __BODY_MAX_LENGTH_FOR_TESTS = BODY_MAX_LENGTH;

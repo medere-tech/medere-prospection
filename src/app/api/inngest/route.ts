@@ -42,9 +42,14 @@
 import { serve } from "inngest/next";
 
 import { getInngestClient } from "@/lib/inngest/client";
-import { processReply, sendFirstSms, sendReply } from "@/lib/inngest/functions";
+import {
+  monitorOrphanMessages,
+  processReply,
+  sendFirstSms,
+  sendReply,
+} from "@/lib/inngest/functions";
 
 export const { GET, POST, PUT } = serve({
   client: getInngestClient(),
-  functions: [sendFirstSms, processReply, sendReply],
+  functions: [sendFirstSms, processReply, sendReply, monitorOrphanMessages],
 });
