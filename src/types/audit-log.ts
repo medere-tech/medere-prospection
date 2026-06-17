@@ -76,6 +76,17 @@ import { type Timestamp } from "firebase-admin/firestore";
  *     inconnu, dédup webhook, body invalide). Payload = `{ reason,
  *      ovhMessageIdHash? }`.
  *
+ * Extensions S9.4.1 (commitDraftToQueued — transition draft→queued) :
+ *   - `reply_draft_dropped` — draft rejeté par `preSendCheckWithAuditTx`
+ *     DANS la tx `commitDraftToQueued` (re-validation TOUTES les 9 rules
+ *     post-génération S9.3, fenêtre temporelle minutes/heures permettant
+ *     un consent drift). `targetType: "message"`, `targetId:
+ *     draftMessageId`. Payload = `ReplyDraftDroppedPayload` (cf. interface
+ *     ci-dessous). 🚨 INVARIANT ANTI-PII : pas de body, pas de phone, pas
+ *     d'email — uniquement IDs opaques + rule/code (enums fermés) +
+ *     blockedContext (discriminated union FERMÉE de `pre-send-check.ts`
+ *     qui exclut les PII par typage compile-time).
+ *
  * ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
  * ORGANISATION VISUELLE (S9.1) — sections par cycle de vie
  *
@@ -106,6 +117,7 @@ export type AuditAction =
   | "reply_generated"
   | "reply_processed"
   | "reply_dropped"
+  | "reply_draft_dropped"
   | "long_form_opt_out_candidate"
   // ── CONVERSATION lifecycle ─────────────────────────────────────────────
   | "opt_out"
@@ -200,6 +212,79 @@ export interface ReplyGeneratedPayload {
   // `AuditLogInput.payload: Record<string, unknown>` sans cast (cf.
   // pattern `ComplianceConcurrencyContext` errors.ts:199-211 — TS
   // limitation structurelle, no-op runtime, TS-level only).
+  readonly [k: string]: unknown;
+}
+
+/**
+ * Payload type pour action `reply_draft_dropped` (S9.4.1).
+ *
+ * **Cible** : `targetType: "message"`, `targetId: draftMessageId`
+ * (Firestore auto-ID `[A-Za-z0-9]{20}`, scrubber-safe par construction).
+ *
+ * ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ * 🚨 INVARIANT ANTI-PII — body / phone / email / ovhMessageId INTERDITS.
+ *
+ * Posé HORS tx en best-effort par `commitDraftToQueued` après rollback de
+ * la tx (le draft reste `status="draft"`, aucun envoi OVH n'a eu lieu).
+ * Le body du draft existe toujours dans `messages/{draftMessageId}` — pas
+ * besoin de le dupliquer ici (forensic L.34-5 CPCE intact par cohabitation
+ * `reply_generated` (création draft) + `reply_draft_dropped` (rejet draft)).
+ *
+ * ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ * Champs scrubber-safe par construction
+ *
+ *   - `contactId`/`conversationId`/`draftMessageId` : IDs opaques internes.
+ *   - `blockedRule`                                 : enum FERMÉ aligné
+ *                                                     `ComplianceRule` S5.
+ *   - `blockedCode`                                 : enum FERMÉ aligné
+ *                                                     `ComplianceFailCode` S5.
+ *   - `blockedContext`                              : discriminated union
+ *                                                     FERMÉE de `pre-send-
+ *                                                     check.ts` qui exclut
+ *                                                     les PII par typage
+ *                                                     compile-time (clés
+ *                                                     autorisées : count,
+ *                                                     hour, minute, weekday,
+ *                                                     isoDate, year,
+ *                                                     maxAllowed, etc.).
+ */
+export interface ReplyDraftDroppedPayload {
+  /** hubspotId opaque. */
+  contactId: string;
+  /** docId composite `${contactId}_${campaignId}`. */
+  conversationId: string;
+  /** Firestore auto-ID `[A-Za-z0-9]{20}` du draft rejeté. */
+  draftMessageId: string;
+  /** Nom de la rule compliance qui a refusé (aligné `ComplianceRule` S5). */
+  blockedRule:
+    | "opt_out"
+    | "ai_disclosure"
+    | "stop_present"
+    | "advertiser_identification"
+    | "rate_limit"
+    | "hours"
+    | "bloctel"
+    | "legitimate_interest"
+    | "phone_validity";
+  /**
+   * Code spécifique du failure (aligné `ComplianceFailCode` S5). Typé
+   * `string` ici plutôt que l'union fermée — autonomie du type audit vs
+   * l'enum compliance (évite couplage `types/audit-log.ts` →
+   * `lib/compliance/pre-send-check.ts`). La cohérence est assurée au
+   * site d'écriture par le caller `commitDraftToQueued` qui passe la
+   * valeur typée `ComplianceFailCode`.
+   */
+  blockedCode: string;
+  /**
+   * Contexte structuré du failure tel que renvoyé par `preSendCheck`.
+   * Anti-PII par typage S5 (discriminated union FERMÉE, clés autorisées :
+   * count, maxAllowed, windowDays, hour, minute, weekday, isoDate, year,
+   * maxVerified, daysSinceCheck, documentedLength, minLength). Aucune
+   * de ces clés n'est PII par construction.
+   */
+  blockedContext: Record<string, unknown>;
+  // Index signature pour assignation `AuditLogInput.payload` (cf. pattern
+  // miroir `ReplyGeneratedPayload` + JSDoc ci-dessus).
   readonly [k: string]: unknown;
 }
 

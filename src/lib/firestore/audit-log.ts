@@ -79,6 +79,7 @@ const ACTIONS = [
   "reply_generated",
   "reply_processed",
   "reply_dropped",
+  "reply_draft_dropped",
   "long_form_opt_out_candidate",
   // ── CONVERSATION lifecycle ─────────────────────────────────────────────
   "opt_out",

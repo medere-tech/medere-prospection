@@ -87,8 +87,19 @@ import {
 function makeMemoizedStepRun(eventId: string): {
   step: ProcessReplyHandlerContext["step"];
   cache: Map<string, unknown>;
+  sendEventCalls: Array<{
+    stepName: string;
+    payload: { name: string; data: Record<string, unknown>; id?: string };
+  }>;
 } {
   const cache = new Map<string, unknown>();
+  // S9.4.3 — Trace des appels effectifs à step.sendEvent (i.e. pas les
+  // hits cache memoization). Permet aux Tests 1/4/8 de prouver le contrat
+  // anti-doublon "1 dispatch event par run lifetime même avec retry".
+  const sendEventCalls: Array<{
+    stepName: string;
+    payload: { name: string; data: Record<string, unknown>; id?: string };
+  }> = [];
   const step: ProcessReplyHandlerContext["step"] = {
     run: async <T>(name: string, fn: () => Promise<T>): Promise<T> => {
       const key = `${eventId}::${name}`;
@@ -102,8 +113,25 @@ function makeMemoizedStepRun(eventId: string): {
       cache.set(key, result);
       return result;
     },
+    // S9.4.3 — `step.sendEvent` memoizé par (eventId, stepName) cohérent
+    // avec `step.run`. Sur retry, le step.sendEvent déjà commit retourne
+    // son résultat caché SANS ré-émettre l'event. Reproduit fidèlement le
+    // contrat Inngest v4 sur les 2 tools (cf. JSDoc step 8d process-reply.ts).
+    sendEvent: async (
+      stepName: string,
+      payload: { name: string; data: Record<string, unknown>; id?: string },
+    ) => {
+      const key = `${eventId}::${stepName}`;
+      if (cache.has(key)) {
+        return cache.get(key);
+      }
+      sendEventCalls.push({ stepName, payload });
+      const result = {}; // EventResult symbolique
+      cache.set(key, result);
+      return result;
+    },
   };
-  return { step, cache };
+  return { step, cache, sendEventCalls };
 }
 
 /**
@@ -207,14 +235,12 @@ function makeDeps(overrides: Partial<ProcessReplyDeps> = {}): ProcessReplyDeps {
     }),
     setConversationIntent: vi.fn().mockResolvedValue(undefined),
     // S9.3.3b — gen IA reply + stockage draft.
-    listRecentMessages: vi
-      .fn()
-      .mockResolvedValue([
-        {
-          direction: "outbound",
-          body: "Bonjour Dr Test, je suis Léa, assistante virtuelle de Médéré.",
-        },
-      ]),
+    listRecentMessages: vi.fn().mockResolvedValue([
+      {
+        direction: "outbound",
+        body: "Bonjour Dr Test, je suis Léa, assistante virtuelle de Médéré.",
+      },
+    ]),
     generateReply: vi.fn().mockResolvedValue({
       body: "Bonjour Docteur, quelle formation Médéré vous intéresse ?",
       promptVersion: "1.0.0",
@@ -224,7 +250,7 @@ function makeDeps(overrides: Partial<ProcessReplyDeps> = {}): ProcessReplyDeps {
       tokensOutput: 38,
       generationDurationMs: 1234,
     }),
-    addOutboundDraft: vi.fn().mockResolvedValue("draftid-mem-default"),
+    addOutboundDraft: vi.fn().mockResolvedValue("draftidmemdefault000"),
     ...overrides,
   };
 }
@@ -238,13 +264,15 @@ describe("MED-1 — Memoization Inngest sur retry (S9.2.3.2)", () => {
   // Test 1 — Retry après failure step 8 (audit-reply-processed)
   // ───────────────────────────────────────────────────────────────────────────
 
-  it("Test 1 — retry après failure step 8 (audit-reply-processed) : steps 1-7 memoizés", async () => {
-    // Scénario : pipeline classified atteint le step 8, l'audit
+  it("Test 1 — retry après failure step 9 (audit-reply-processed) : steps 1-8d memoizés", async () => {
+    // Scénario : pipeline classified atteint le step 9, l'audit
     // `reply_processed` throw une fois (5xx transitoire Firestore), puis
     // succeed sur le retry. Démonstration la plus pédagogique de la
-    // memoization : chaque step 1-7 a son propre cache, le pipeline ne
-    // ré-exécute QUE le step 8 sur Run 2.
-    const { step, cache } = makeMemoizedStepRun("evt-mem-1");
+    // memoization : chaque step 1-8d a son propre cache, le pipeline ne
+    // ré-exécute QUE le step 9 sur Run 2. S9.4.3 — `dispatch-reply-event`
+    // step 8d est mémoizé comme step.run (Inngest contrat identique sur
+    // step.sendEvent et step.run).
+    const { step, cache, sendEventCalls } = makeMemoizedStepRun("evt-mem-1");
 
     let replyProcessedFailedOnce = false;
     const deps = makeDeps({
@@ -269,10 +297,11 @@ describe("MED-1 — Memoization Inngest sur retry (S9.2.3.2)", () => {
     );
 
     // Vérification intermédiaire : step 9 audit-reply-processed n'est
-    // PAS commit (cache absent) mais steps 1-8c le sont (cache présent).
+    // PAS commit (cache absent) mais steps 1-8d le sont (cache présent).
     // S9.3.1 — step 6 splitté en `claude-classify` (6a) + `audit-intent-classified` (6b).
     // S9.3.3b — step 8 splitté en `claude-generate-{intent}` (8a) +
     // `store-draft` (8b) + `audit-reply-generated` (8c).
+    // S9.4.3 — step 8d `dispatch-reply-event` ajouté entre 8c et 9.
     expect(cache.has("evt-mem-1::audit-reply-processed")).toBe(false);
     expect(cache.has("evt-mem-1::branch-interesse")).toBe(true);
     expect(cache.has("evt-mem-1::claude-classify")).toBe(true);
@@ -280,6 +309,7 @@ describe("MED-1 — Memoization Inngest sur retry (S9.2.3.2)", () => {
     expect(cache.has("evt-mem-1::claude-generate-interesse")).toBe(true);
     expect(cache.has("evt-mem-1::store-draft")).toBe(true);
     expect(cache.has("evt-mem-1::audit-reply-generated")).toBe(true);
+    expect(cache.has("evt-mem-1::dispatch-reply-event")).toBe(true);
     expect(cache.has("evt-mem-1::store-inbound")).toBe(true);
 
     // Run 2 — retry, MÊME step memoizé partagé. Doit succeed.
@@ -324,7 +354,16 @@ describe("MED-1 — Memoization Inngest sur retry (S9.2.3.2)", () => {
     expect(replyGeneratedCount).toBe(1);
     expect(replyProcessedCount).toBe(2);
 
-    // Step 8 maintenant cached après succès Run 2
+    // 🔒 S9.4.3 — dispatch-reply-event émis EXACTEMENT 1× sur les 2 runs.
+    // Memoization Inngest court-circuite la ré-émission au Run 2. C'est le
+    // contrat anti-double-dispatch OVH critique : si memoization était
+    // perdue, on aurait 2 events → 2 dispatch SMS → faute compliance.
+    expect(sendEventCalls.length).toBe(1);
+    expect(sendEventCalls[0]?.stepName).toBe("dispatch-reply-event");
+    expect(sendEventCalls[0]?.payload.name).toBe("medere/sms.reply.send-requested");
+    expect(sendEventCalls[0]?.payload.id).toMatch(/^reply\.send\.[A-Za-z0-9]+$/);
+
+    // Step 9 maintenant cached après succès Run 2
     expect(cache.has("evt-mem-1::audit-reply-processed")).toBe(true);
   });
 
@@ -516,7 +555,8 @@ describe("MED-1 — Memoization Inngest sur retry (S9.2.3.2)", () => {
       .sort();
     expect(auditActions).toEqual(["intent_classified", "reply_generated", "reply_processed"]);
 
-    // Cache : 12 steps présents (S9.3.3b — câblage gen IA + draft + audit)
+    // Cache : 13 steps présents (S9.4.3 — câblage gen IA + draft + audit +
+    // dispatch-reply-event)
     const expectedSteps = [
       "resolve-contact",
       "resolve-conversation",
@@ -530,6 +570,8 @@ describe("MED-1 — Memoization Inngest sur retry (S9.2.3.2)", () => {
       "claude-generate-interesse",
       "store-draft",
       "audit-reply-generated",
+      // S9.4.3 sub-step 8d
+      "dispatch-reply-event",
       "audit-reply-processed",
     ];
     for (const stepName of expectedSteps) {
@@ -834,5 +876,99 @@ describe("MED-1 — Memoization Inngest sur retry (S9.2.3.2)", () => {
 
     // Step 8c cached après succès Run 2.
     expect(cache.has("evt-mem-7::audit-reply-generated")).toBe(true);
+  });
+
+  // ───────────────────────────────────────────────────────────────────────────
+  // Test 8 — Idempotence dispatch-reply-event post-câblage S9.4.3
+  // ───────────────────────────────────────────────────────────────────────────
+
+  it("Test 8 — retry après failure step 9 (audit-reply-processed) : dispatch-reply-event 1× total", async () => {
+    // 🔒 SENTINELLE CRITIQUE S9.4.3 — verrouille le contrat
+    // anti-double-dispatch OVH.
+    //
+    // Scénario : pipeline classified atteint le step 8d
+    // `dispatch-reply-event` (event jumeau émis vers handler send-reply.ts).
+    // Au step 9, audit-reply-processed throw 1× (5xx transitoire), puis
+    // succeed sur le retry. Sur Run 2, steps 1-8d sont servis depuis le
+    // cache memoization → step.sendEvent N'EST PAS RAPPELÉ.
+    //
+    // Contrat verrouillé : sur N retries (N ≥ 0) du step 9, le
+    // step.sendEvent("dispatch-reply-event") n'est EXÉCUTÉ qu'1 SEULE
+    // FOIS au TOTAL. C'est la garantie anti-double-dispatch OVH
+    // (sans cette propriété, le handler send-reply.ts serait invoqué 2×
+    // → commitDraftToQueued rejetterait le 2ème, MAIS on aurait un trou
+    // forensic ET un appel Firestore inutile).
+    //
+    // Defense-in-depth supplémentaire : event.id déterministe
+    // `reply.send.${draftMessageId}` (déduplication 60s native Inngest).
+    // Le présent test verrouille la couche memoization, pas la
+    // déduplication 60s (testable seulement en Inngest cloud réel).
+    const { step, cache, sendEventCalls } = makeMemoizedStepRun("evt-mem-8");
+
+    let replyProcessedFailedOnce = false;
+    const deps = makeDeps({
+      getContactByPhone: vi.fn().mockResolvedValue(makeFakeContact("hs-mem-8")),
+      getActiveConversationByContactId: vi.fn().mockResolvedValue({
+        conversationId: "hs-mem-8_camp-8",
+        conversation: makeFakeConversation("hs-mem-8", "camp-8"),
+      }),
+      addInbound: vi.fn().mockResolvedValue("msgid-mem-8"),
+      appendAuditLog: vi.fn().mockImplementation(async (entry: { action: string }) => {
+        if (entry.action === "reply_processed" && !replyProcessedFailedOnce) {
+          replyProcessedFailedOnce = true;
+          throw new Error("transient 5xx on reply_processed audit");
+        }
+        return "audit-id";
+      }),
+      addOutboundDraft: vi.fn().mockResolvedValue("draftidmem8aaaaaaaaa"),
+    });
+
+    // Run 1 — doit throw au step 9 audit-reply-processed
+    await expect(processReplyHandler(makeFakeCtx("evt-mem-8", step), deps)).rejects.toThrow(
+      "transient 5xx on reply_processed audit",
+    );
+
+    // Vérification intermédiaire : step 8d dispatch-reply-event commit
+    // AVANT le throw step 9. Cache présent + 1 appel sendEventCalls.
+    expect(cache.has("evt-mem-8::dispatch-reply-event")).toBe(true);
+    expect(sendEventCalls.length).toBe(1);
+    expect(sendEventCalls[0]?.stepName).toBe("dispatch-reply-event");
+    expect(sendEventCalls[0]?.payload.name).toBe("medere/sms.reply.send-requested");
+    // event.id déterministe construit depuis draftMessageId.
+    expect(sendEventCalls[0]?.payload.id).toBe("reply.send.draftidmem8aaaaaaaaa");
+    // event.data minimaliste (anti-PII + anti-drift).
+    expect(sendEventCalls[0]?.payload.data).toEqual({
+      contactId: "hs-mem-8",
+      conversationId: "hs-mem-8_camp-8",
+      draftMessageId: "draftidmem8aaaaaaaaa",
+    });
+
+    // Run 2 — retry, MÊME step memoizé partagé. Doit succeed.
+    const result = await processReplyHandler(makeFakeCtx("evt-mem-8", step), deps);
+
+    expect(result.status).toBe("classified");
+
+    // 🔒 GARANTIE CRITIQUE — dispatch-reply-event TOUJOURS 1× au total
+    // après le retry. Memoization native Inngest court-circuite la
+    // ré-émission au Run 2.
+    expect(sendEventCalls.length).toBe(1);
+
+    // Steps 1-8d tous appelés 1× chacun (memoization)
+    expect(deps.getContactByPhone).toHaveBeenCalledTimes(1);
+    expect(deps.classifyReply).toHaveBeenCalledTimes(1);
+    expect(deps.generateReply).toHaveBeenCalledTimes(1);
+    expect(deps.addOutboundDraft).toHaveBeenCalledTimes(1);
+
+    // appendAuditLog : reply_generated 1× (memoizé), reply_processed 2×
+    // (1 fail Run 1 + 1 success Run 2)
+    const auditCalls = (deps.appendAuditLog as ReturnType<typeof vi.fn>).mock.calls;
+    const replyGeneratedCount = auditCalls.filter(
+      (c) => (c[0] as { action: string }).action === "reply_generated",
+    ).length;
+    const replyProcessedCount = auditCalls.filter(
+      (c) => (c[0] as { action: string }).action === "reply_processed",
+    ).length;
+    expect(replyGeneratedCount).toBe(1);
+    expect(replyProcessedCount).toBe(2);
   });
 });

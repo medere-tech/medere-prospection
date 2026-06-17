@@ -55,7 +55,7 @@
  * ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
  * INVARIANTS (CNIL / RGPD) :
  *
- *   1. **Validation Zod STRICTE à la lecture** (`parseMessageOrThrow`).
+ *   1. **Validation Zod STRICTE à la lecture** (`_parseMessageOrThrow`).
  *      Doc corrompu → throw `ValidationError` SANS `cause` (la ZodError
  *      contient `issue.received` qui peut leak le `body` PII en inbound).
  *      Pas de fallback partiel.
@@ -306,11 +306,27 @@ export interface AddInboundInput {
 // ─────────────────────────────────────────────────────────────────────────────
 
 /**
- * Parse + cast strict. ⚠️ PAS de `cause: result.error` — la ZodError
- * contient `issue.received` qui peut leak `body` PII en inbound (un PS
- * peut écrire "Mon numéro perso est 06..."). Pattern identique S6.3/S6.4.
+ * Parse + cast strict d'un doc message lu depuis Firestore.
+ *
+ * ⚠️ PAS de `cause: result.error` — la ZodError contient `issue.received`
+ * qui peut leak `body` PII en inbound (un PS peut écrire "Mon numéro
+ * perso est 06..."). Pattern identique S6.3/S6.4 / `_parseConversationOrThrow`.
+ *
+ * Exporté en S9.4.1 (pattern miroir `_parseConversationOrThrow`) pour
+ * permettre aux callers tx-aware (`commitDraftToQueued` dans
+ * `lib/firestore/send-reply.ts`) de lire + valider un doc message DANS
+ * une transaction Firestore. Le préfixe underscore signale l'usage
+ * inter-modules `firestore/` — ne PAS appeler depuis du code applicatif
+ * (Inngest handlers, API routes) qui doit passer par les wrappers
+ * `addOutbound`/`addInbound`/`listRecentX`.
+ *
+ * @internal Inter-modules `firestore/`. Pas d'usage applicatif direct.
  */
-function parseMessageOrThrow(raw: unknown, conversationId: string, messageId: string): Message {
+export function _parseMessageOrThrow(
+  raw: unknown,
+  conversationId: string,
+  messageId: string,
+): Message {
   const result = MessageSchema.safeParse(raw);
   if (!result.success) {
     throw new ValidationError({
@@ -719,7 +735,7 @@ export async function listRecentOutbound(
   // (envoi qui n'a jamais atteint le PS). Cf. JSDoc
   // `RATE_LIMIT_COUNTED_STATUSES`.
   return snap.docs.flatMap((doc) => {
-    const msg = parseMessageOrThrow(doc.data(), conversationId, doc.id);
+    const msg = _parseMessageOrThrow(doc.data(), conversationId, doc.id);
     if (!isRateLimitCounted(msg.status)) {
       return [];
     }
@@ -866,7 +882,7 @@ export async function findInboundByExternalId(
 
   // limit(1) garantit snap.docs[0] défini ici.
   const doc = snap.docs[0]!;
-  const message = parseMessageOrThrow(doc.data(), conversationId, doc.id);
+  const message = _parseMessageOrThrow(doc.data(), conversationId, doc.id);
   return { messageId: doc.id, message };
 }
 
@@ -956,7 +972,7 @@ export async function listRecentOutboundInTx(
   // sur `listRecentOutbound` HORS tx (même sémantique compliance).
   // Cf. JSDoc `RATE_LIMIT_COUNTED_STATUSES`.
   return snap.docs.flatMap((doc) => {
-    const msg = parseMessageOrThrow(doc.data(), conversationId, doc.id);
+    const msg = _parseMessageOrThrow(doc.data(), conversationId, doc.id);
     if (!isRateLimitCounted(msg.status)) {
       return [];
     }
@@ -1213,7 +1229,7 @@ export async function listRecentMessages(
     .limit(limit)
     .get();
 
-  const parsed = snap.docs.map((doc) => parseMessageOrThrow(doc.data(), conversationId, doc.id));
+  const parsed = snap.docs.map((doc) => _parseMessageOrThrow(doc.data(), conversationId, doc.id));
 
   // Exclusion des drafts (S9.3.3a) — un draft n'a pas été envoyé au PS.
   const nonDrafts = parsed.filter((msg) => msg.status !== "draft");
@@ -1226,6 +1242,506 @@ export async function listRecentMessages(
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// updateMessageStatus (S9.4.2) — transition de status post-création
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * Codes structurés de failure pour `UpdateMessageStatusInput.failureReason.code`.
+ *
+ * Conçus pour distinguer les classes d'erreurs en post-mortem :
+ *   - `config_error`     : OVH 4xx (auth, payload, service inexistant). Bug
+ *                          config morte — `ConfigError.noRetry=true`.
+ *   - `validation_error` : payload Zod fail OU OVH `invalidReceivers` /
+ *                          `no_valid_receivers`. `ValidationError.noRetry`
+ *                          (selon caller) = true en règle.
+ *   - `external_service` : OVH 5xx, errno réseau (ENOTFOUND, ETIMEDOUT,
+ *                          ECONNREFUSED), OAuth-like. Retry-friendly. Le
+ *                          caller décide d'appeler `updateMessageStatus`
+ *                          AVEC ce code seulement après épuisement des
+ *                          retries (cron monitoring S9.4.4 ou similaire).
+ *   - `timeout`          : timeout local (AbortController côté caller).
+ *                          Retry-friendly aussi.
+ *   - `internal`         : bug interne wrapper (rejection SDK de shape
+ *                          inattendu, etc.). Noter pour Sentry.
+ *
+ * Whitelist FERMÉE — typo côté caller refusé au compile-time.
+ */
+export type MessageFailureCode =
+  | "config_error"
+  | "validation_error"
+  | "external_service"
+  | "timeout"
+  | "internal";
+
+/**
+ * Forme du `failureReason` pour transition vers `status="failed"`.
+ *
+ * ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ * 🚨 INVARIANT ANTI-PII — `detail` DOIT être sanitized par le caller.
+ *
+ * Le `detail` peut contenir un message technique court (ex: "OVH 401 auth
+ * denied", "Zod fail on receivers[0]"). Il est stocké dans le doc
+ * `messages.error.message` ET dans le payload audit `sms_failed`. NE
+ * JAMAIS y inclure :
+ *   - phone E.164 / FR national / email du PS
+ *   - body du SMS
+ *   - clé API / token / secret
+ *   - ovhMessageId externe (semi-sensible cf. messages.ts:36-54)
+ *
+ * Le scrubber `detectPiiInPayload` (S6.2) sert de filet runtime SI le
+ * caller bypass. Mais discipline : pré-sanitize côté caller.
+ */
+export interface MessageFailureReason {
+  code: MessageFailureCode;
+  /** Detail technique sanitized (sans PII). Optionnel. */
+  detail?: string;
+  /** Nombre de retries Inngest avant la failure définitive. */
+  retryCount: number;
+}
+
+/**
+ * Arguments de `updateMessageStatus`.
+ *
+ *   - `conversationId` / `messageId` : pointent le doc à muter.
+ *   - `status`                       : status cible (transition assertée
+ *                                       côté impl — cf. table de transitions
+ *                                       dans la JSDoc fonction).
+ *   - `ovhMessageId`                 : posé en `externalId` si transition
+ *                                       vers `sent` (S7 webhook DLR) ou
+ *                                       `sending`. Cohérent invariant
+ *                                       Message (`externalId` = ID OVH).
+ *   - `failureReason`                : OBLIGATOIRE si `status="failed"`,
+ *                                       INTERDIT sinon (`ValidationError`
+ *                                       au compile-time via narrowing TS
+ *                                       impossible — assertion runtime).
+ *   - `now`                          : Injectable tests. Défaut `Timestamp.now()`.
+ */
+export interface UpdateMessageStatusInput {
+  conversationId: string;
+  messageId: string;
+  status: "sending" | "sent" | "delivered" | "failed";
+  ovhMessageId?: string;
+  failureReason?: MessageFailureReason;
+  now?: Date;
+}
+
+/**
+ * 🔒 Table des transitions de status AUTORISÉES. Whitelist > blacklist :
+ * une transition non listée → `ValidationError`. Anti-régression : ajouter
+ * une transition force une revue compliance-auditor (la sémantique
+ * forensique L.34-5 CPCE dépend de la traçabilité ordonnée des transitions).
+ *
+ * Lecture : `from → [...allowed_targets]`.
+ *
+ *   - `queued`    : peut transitionner vers tout (sending, sent, delivered, failed).
+ *                   Cas S9.4.2 happy path : reste "queued" (pas d'appel).
+ *                   Cas S9.4.2 ConfigError : transition → "failed".
+ *                   Cas S7 webhook DLR : transition → "sent"/"delivered".
+ *   - `sending`   : peut transitionner vers sent, delivered, failed.
+ *   - `sent`      : peut transitionner vers delivered, failed (DLR négatif).
+ *   - `delivered` : TERMINAL — aucune transition sortante autorisée.
+ *   - `failed`    : TERMINAL avec idempotence — `failed → failed` est un
+ *                   no-op silencieux (retry Inngest qui réappelle).
+ *
+ * Note : `draft → queued` est géré par `commitDraftToQueued` (S9.4.1), pas
+ * ici (logique compliance + bump compteurs spécifique). `draft` n'apparaît
+ * pas dans cette table.
+ */
+const STATUS_TRANSITIONS: Record<
+  "queued" | "sending" | "sent" | "delivered" | "failed",
+  ReadonlySet<"sending" | "sent" | "delivered" | "failed">
+> = {
+  queued: new Set(["sending", "sent", "delivered", "failed"]),
+  sending: new Set(["sent", "delivered", "failed"]),
+  sent: new Set(["delivered", "failed"]),
+  delivered: new Set([]),
+  failed: new Set([]), // idempotence "failed → failed" gérée AVANT cette check
+};
+
+/**
+ * Transitionne le `status` d'un message Firestore + pose les timestamps /
+ * `error` associés / audit `sms_failed` selon le target.
+ *
+ * ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ * CAS D'USAGE
+ *
+ *   - **S9.4.2 ConfigError/ValidationError** : `commitDraftToQueued` a
+ *     posé `status="queued"` mais le step OVH a fail noRetry. Le caller
+ *     `send-reply.ts` appelle ici avec `status="failed"` + `failureReason`
+ *     pour transitionner le message orphelin → terminal + audit forensique.
+ *
+ *   - **S7 webhook DLR (futur)** : OVH envoie un DLR (delivery report)
+ *     async sur un webhook dédié. Le handler appellera ici avec
+ *     `status="delivered"` ou `status="failed"` selon le DLR.
+ *
+ *   - **S7 transition `queued → sent` (futur, suivi
+ *     `S7-POST-OVH-ACK-STATUS-001`)** : si on active la transition
+ *     `queued → sent` immédiatement post-OVH-ack symétriquement en
+ *     send-first-sms + send-reply, ce sera via cette fonction avec
+ *     `status="sent"` + `ovhMessageId`.
+ *
+ * ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ * COMPOSITION DE LA TX ATOMIQUE
+ *
+ *   1. `tx.get(messageRef)` → lecture + parse Zod.
+ *   2. **Idempotence no-op** : si `current.status === input.status` →
+ *      return silent (retry Inngest qui réappelle pour le même target).
+ *      Vérifié AVANT la table de transitions pour éviter un faux positif
+ *      "failed → failed" rejeté par la table (Set vide pour les terminaux).
+ *   3. Vérification transition autorisée via `STATUS_TRANSITIONS[from]`.
+ *      Si target hors Set → `ValidationError`.
+ *   4. Assertion `status="failed"` nécessite `failureReason` (et inversement).
+ *   5. Build payload Firestore update partiel :
+ *        - `status` (toujours)
+ *        - `sentAt: now`         si target ∈ {"sent"}
+ *        - `deliveredAt: now`    si target ∈ {"delivered"}
+ *        - `error: failureReason → {code, message?, retryCount}` si target ∈ {"failed"}
+ *        - `externalId: ovhMessageId` si fourni (sentAt / sending typiquement)
+ *   6. `tx.update(messageRef, update)`.
+ *   7. **Audit `sms_failed` DANS la même tx** si transition VERS `failed`
+ *      ET source ≠ `failed` (pas de double-audit sur retry idempotent).
+ *      Payload `{direction, messageId, failureCode, retryCount}` — pas de
+ *      PII (sentinelle anti-PII identique aux audits pré-existants).
+ *
+ * Idempotence assurée :
+ *   - same target → no-op silencieux
+ *   - audit posé UNE FOIS (au passage from ≠ failed → failed)
+ *
+ * ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ * PAS DE BUMP COMPTEURS
+ *
+ * Cette fonction NE BUMPE PAS `conversation.messageCount` / `outboundCount`.
+ * La transition de status d'un message déjà compté (queued comptait déjà,
+ * cf. `RATE_LIMIT_COUNTED_STATUSES`) ne change pas le nombre de SMS
+ * comptabilisés contre le plafond rate-limit. Bump = responsabilité de
+ * `addOutbound`/`addInbound`/`commitDraftToQueued`.
+ *
+ * Exception : transition `queued → failed` retire conceptuellement le
+ * message du compteur rate-limit (`failed` est EXCLU de
+ * `RATE_LIMIT_COUNTED_STATUSES` — cf. messages.ts:188). Donc le quota
+ * 3/30j se relâche après une transition vers failed. Comportement
+ * SOUHAITÉ : un envoi qui n'a jamais atteint le PS ne doit pas compter
+ * (sémantique L.34-5 CPCE). PAS de re-bump explicite — le filtre
+ * post-parse de `listRecentOutbound` exclut naturellement.
+ *
+ * @param input Cf. `UpdateMessageStatusInput`.
+ *
+ * @throws {NotFoundError}    si le message n'existe pas.
+ * @throws {ValidationError}  si transition invalide, OU `status="failed"`
+ *                            sans `failureReason`, OU `status≠"failed"` avec
+ *                            `failureReason`, OU doc message corrompu (Zod).
+ */
+export async function updateMessageStatus(input: UpdateMessageStatusInput): Promise<void> {
+  // Assertion structure : failureReason ↔ status="failed".
+  // Vérification HORS tx (fail-fast — pas la peine d'ouvrir tx si caller bug).
+  if (input.status === "failed" && input.failureReason === undefined) {
+    throw new ValidationError({
+      message: "updateMessageStatus: failureReason is required when status='failed'",
+      context: {
+        conversationId: input.conversationId,
+        messageId: input.messageId,
+        status: input.status,
+      },
+    });
+  }
+  if (input.status !== "failed" && input.failureReason !== undefined) {
+    throw new ValidationError({
+      message: `updateMessageStatus: failureReason is only allowed when status='failed' (got status='${input.status}')`,
+      context: {
+        conversationId: input.conversationId,
+        messageId: input.messageId,
+        status: input.status,
+      },
+    });
+  }
+
+  return await getAdminDb().runTransaction(async (tx) => {
+    const messageRef = messagesSubcollectionRef(input.conversationId).doc(input.messageId);
+    const doc = await tx.get(messageRef);
+    if (!doc.exists) {
+      throw new NotFoundError({
+        message: `Message not found: ${input.messageId} in conversation ${input.conversationId}`,
+        context: {
+          conversationId: input.conversationId,
+          messageId: input.messageId,
+        },
+      });
+    }
+
+    const current = _parseMessageOrThrow(doc.data(), input.conversationId, input.messageId);
+
+    // ── Idempotence no-op : target === actuel ──────────────────────────────
+    // Vérifié AVANT la table de transitions car les status terminaux
+    // (delivered, failed) ont un Set vide dans la table — sans cette
+    // garde, `failed → failed` serait rejeté par ValidationError au lieu
+    // d'être un no-op (retry Inngest qui réappelle).
+    if (current.status === input.status) {
+      return;
+    }
+
+    // ── Status `draft` / `received` ne transitionnent PAS via cette fct ────
+    // `draft → queued` est géré par `commitDraftToQueued` S9.4.1 (logique
+    // compliance + bump compteurs). `received` est terminal inbound.
+    // Refus explicite — la table ne contient pas ces sources.
+    if (current.status === "draft" || current.status === "received") {
+      throw new ValidationError({
+        message: `updateMessageStatus refuses transition from "${current.status}" (use commitDraftToQueued for drafts; inbound 'received' is terminal)`,
+        context: {
+          conversationId: input.conversationId,
+          messageId: input.messageId,
+          currentStatus: current.status,
+          targetStatus: input.status,
+        },
+      });
+    }
+
+    // ── Vérification transition via STATUS_TRANSITIONS ─────────────────────
+    const allowed = STATUS_TRANSITIONS[current.status];
+    if (!allowed.has(input.status)) {
+      throw new ValidationError({
+        message: `updateMessageStatus: invalid transition "${current.status}" → "${input.status}"`,
+        context: {
+          conversationId: input.conversationId,
+          messageId: input.messageId,
+          currentStatus: current.status,
+          targetStatus: input.status,
+        },
+      });
+    }
+
+    // ── Build update partiel Firestore ─────────────────────────────────────
+    const now = input.now !== undefined ? Timestamp.fromDate(input.now) : Timestamp.now();
+    const update: Record<string, unknown> = { status: input.status };
+
+    if (input.status === "sent") {
+      update.sentAt = now;
+    } else if (input.status === "delivered") {
+      update.deliveredAt = now;
+    } else if (input.status === "failed") {
+      // failureReason non-undefined garanti par assertion HORS tx ci-dessus.
+      const failure = input.failureReason!;
+      update.error = {
+        code: failure.code,
+        // Le schéma Zod Message exige `error.message: string.min(1)`.
+        // On compose un message par défaut depuis le code si detail absent.
+        message: failure.detail ?? failure.code,
+        retryCount: failure.retryCount,
+      };
+    }
+
+    // `externalId` (= ovhMessageId) posé sur transition vers `sent`/`sending`
+    // si fourni. Cohérent invariant Message (`externalId` = ID OVH).
+    if (input.ovhMessageId !== undefined) {
+      update.externalId = input.ovhMessageId;
+    }
+
+    tx.update(messageRef, update);
+
+    // ── Audit `sms_failed` DANS la tx pour transition VERS `failed` ────────
+    // Posé UNE FOIS au passage `from ≠ failed → failed`. Le no-op idempotent
+    // (failed → failed) est court-circuité plus haut, donc pas de double-audit.
+    if (input.status === "failed") {
+      const failure = input.failureReason!;
+      appendAuditLogTx(tx, {
+        actorId: "system",
+        actorType: "system",
+        action: "sms_failed",
+        targetType: "message",
+        targetId: input.messageId,
+        // Payload anti-PII : juste les IDs opaques + code structuré +
+        // retryCount. PAS de body, PAS de detail brut (le detail est
+        // dans le doc message.error.message — accessible via lecture
+        // explicite, pas via audit_log pour limiter la surface).
+        payload: {
+          direction: "outbound",
+          messageId: input.messageId,
+          failureCode: failure.code,
+          retryCount: failure.retryCount,
+        },
+      });
+    }
+  });
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// listStaleMessages (S9.4.4) — monitoring orphan drafts/queued
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * Status whitelist autorisés pour le monitoring orphan S9.4.4.
+ *
+ *   - `"draft"`  : message IA généré (S9.3.3b `addOutboundDraftInTx`) mais
+ *                  jamais transitionné en queued. Symptôme : handler
+ *                  `send-reply.ts` (S9.4.2) n'a jamais consommé l'event
+ *                  jumeau émis en step 8d (S9.4.3), OU `commitDraftToQueued`
+ *                  a rejeté sans propager d'alerte.
+ *   - `"queued"` : message committé Firestore (S9.4.1 `commitDraftToQueued`)
+ *                  mais dispatch OVH jamais réussi. Symptôme : OVH 5xx
+ *                  persistants au-delà des 4 retries Inngest naturels.
+ *
+ * Whitelist FERMÉE — autres status non monitorés en S9.4.4. `sent`/`delivered`
+ * sont des terminaux normaux ; `failed` est tracé séparément côté audit
+ * `sms_failed`.
+ */
+export type StaleMessageStatus = "draft" | "queued";
+
+/**
+ * Arguments de `listStaleMessages`. `maxAgeMs` représente le seuil
+ * "orphan" — un message dont `createdAt < now - maxAgeMs` est considéré
+ * stuck. Valeur typique S9.4.4 monitoring = 1h = 3 600 000 ms.
+ */
+export interface ListStaleMessagesInput {
+  status: StaleMessageStatus;
+  /** Seuil orphan en ms (ex: 3_600_000 pour 1h). */
+  maxAgeMs: number;
+  /** Limit query Firestore (anti-DoS + protection mémoire). Défaut 100. */
+  limit?: number;
+  /** Référence temporelle. Défaut `new Date()`. Injectable tests. */
+  now?: Date;
+}
+
+/**
+ * Forme retournée pour chaque message stale détecté. Anti-PII strict :
+ *   - `conversationId` = `${contactId}_${campaignId}` (opaque par
+ *     construction)
+ *   - `messageId` = Firestore auto-ID `[A-Za-z0-9]{20}` (scrubber-safe)
+ *   - `createdAt` = `Timestamp` Firestore (pas de PII)
+ *   - `status` = enum fermé `StaleMessageStatus`
+ *
+ * PAS de `body` / `phone` / `externalId` (semi-sensibles cf.
+ * messages.ts:36-54). Le caller monitoring (`monitor-orphan-messages.ts`
+ * S9.4.4) ne consomme que les IDs + timestamps pour comptage.
+ */
+export interface StaleMessageEntry {
+  conversationId: string;
+  messageId: string;
+  createdAt: Timestamp;
+  status: StaleMessageStatus;
+}
+
+/** Limit query par défaut. Borne défensive anti-DoS Firestore. */
+const STALE_MESSAGES_DEFAULT_LIMIT = 100;
+
+/**
+ * Liste les messages outbound `status` ancien (createdAt < now - maxAgeMs)
+ * cross-conversation via **collection group query**. Cas d'usage primaire
+ * S9.4.4 : monitoring orphan drafts/queued par le cron Inngest
+ * `monitor-orphan-messages`.
+ *
+ * ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ * QUERY FIRESTORE
+ *
+ * Premier usage `collectionGroup("messages")` du projet (cross-conversation
+ * cluster) — différent de `messagesSubcollectionRef(convId)` qui est
+ * single-conversation scope.
+ *
+ *   collectionGroup("messages")
+ *     .where("direction", "==", "outbound")
+ *     .where("status", "==", input.status)
+ *     .where("createdAt", "<=", thresholdTs)
+ *     .orderBy("createdAt", "asc")        // oldest first (priorité monitoring)
+ *     .limit(input.limit ?? 100)
+ *
+ * Le `conversationId` parent est récupéré via `doc.ref.parent.parent?.id`
+ * (Firestore Admin SDK pattern pour collection group queries).
+ *
+ * ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ * INDEX FIRESTORE COMPOSITE REQUIS (S9.4.4)
+ *
+ *   {
+ *     "collectionGroup": "messages",
+ *     "queryScope": "COLLECTION_GROUP",
+ *     "fields": [
+ *       { "fieldPath": "direction", "order": "ASCENDING" },
+ *       { "fieldPath": "status", "order": "ASCENDING" },
+ *       { "fieldPath": "createdAt", "order": "ASCENDING" }
+ *     ]
+ *   }
+ *
+ * Sans déploiement de cet index, la query throw `FAILED_PRECONDITION` —
+ * cf. `firestore.indexes.json` + procédure `npm run firebase:deploy:indexes`.
+ *
+ * Note `queryScope: "COLLECTION_GROUP"` vs `"COLLECTION"` des autres
+ * index — la query est cross-conversation, pas single-conversation.
+ *
+ * ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ * 🔒 ANTI-PII STRICT
+ *
+ * Le mapping de sortie ne contient QUE des IDs opaques + timestamps. PAS
+ * de `body`, PAS de `phone` (externalReceiver), PAS d'`externalId`
+ * (ovhMessageId semi-sensible). Le caller monitoring ne consomme que
+ * `length` + `oldestAgeMs` pour les compteurs Sentry.
+ *
+ * Si le caller a besoin du body/phone pour debug (S10+), il devra
+ * appeler une fonction dédiée AVEC élévation de privilège — pas via
+ * cette interface monitoring.
+ *
+ * ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ * RETOUR
+ *
+ *   - Aucun stale dans la fenêtre → `[]`
+ *   - Limit atteint (typique en cas d'incident grave) → retourne les
+ *     `limit` plus anciens (oldest first via `orderBy asc`). Le caller
+ *     monitoring loggera un warning si `length === limit` pour signaler
+ *     une truncation (incident grand échelle).
+ *   - Conversation parent supprimée (cas anormal) → le `doc.ref.parent.parent`
+ *     est `null` côté Firestore Admin SDK → on skip ce doc avec
+ *     `flatMap`. Cas pathologique non-bloquant pour le monitoring.
+ *
+ * @throws ValidationError si `maxAgeMs < 0` (defense-in-depth caller bug).
+ */
+export async function listStaleMessages(
+  input: ListStaleMessagesInput,
+): Promise<StaleMessageEntry[]> {
+  if (input.maxAgeMs < 0) {
+    throw new ValidationError({
+      message: `listStaleMessages: maxAgeMs must be >= 0, got ${input.maxAgeMs}`,
+      context: { maxAgeMs: input.maxAgeMs, status: input.status },
+    });
+  }
+
+  const now = input.now ?? new Date();
+  const thresholdMs = now.getTime() - input.maxAgeMs;
+  const thresholdTs = Timestamp.fromMillis(thresholdMs);
+  const limit = input.limit ?? STALE_MESSAGES_DEFAULT_LIMIT;
+
+  const snap = await getAdminDb()
+    .collectionGroup(MESSAGES_SUBCOLLECTION)
+    .where("direction", "==", "outbound")
+    .where("status", "==", input.status)
+    .where("createdAt", "<=", thresholdTs)
+    .orderBy("createdAt", "asc") // oldest first — priorité monitoring
+    .limit(limit)
+    .get();
+
+  return snap.docs.flatMap((doc) => {
+    // Le `parent.parent` est la conversation parente. En théorie présent
+    // par construction (les messages sont créés dans
+    // `conversations/{convId}/messages/{msgId}`), mais défensive guard
+    // pour les cas où la conversation aurait été supprimée tout en
+    // gardant la sous-collection orpheline (cas pathologique).
+    const conversationId = doc.ref.parent.parent?.id;
+    if (conversationId === undefined) {
+      return [];
+    }
+    const msg = _parseMessageOrThrow(doc.data(), conversationId, doc.id);
+    // Le filtre Firestore where status === input.status garantit déjà
+    // ce statut, mais defense-in-depth : double-check post-parse.
+    if (msg.status !== input.status) {
+      return [];
+    }
+    return [
+      {
+        conversationId,
+        messageId: doc.id,
+        createdAt: msg.createdAt as Timestamp,
+        status: input.status,
+      },
+    ];
+  });
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Exposés pour tests
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -1234,6 +1750,9 @@ export const __MESSAGES_PARENT_COLLECTION_FOR_TESTS = CONVERSATIONS_COLLECTION;
 
 /** @internal */
 export const __MESSAGES_SUBCOLLECTION_FOR_TESTS = MESSAGES_SUBCOLLECTION;
+
+/** @internal */
+export const __STALE_MESSAGES_DEFAULT_LIMIT_FOR_TESTS = STALE_MESSAGES_DEFAULT_LIMIT;
 
 /** @internal */
 export const __BODY_MAX_LENGTH_FOR_TESTS = BODY_MAX_LENGTH;

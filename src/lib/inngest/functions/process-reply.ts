@@ -1,5 +1,5 @@
 /**
- * Inngest function `process-reply` — pipeline déterministe steps 1-9 avec sub-divisions 6a/6b + 8a/8b/8c (S9.3.3b).
+ * Inngest function `process-reply` — pipeline déterministe steps 1-9 avec sub-divisions 6a/6b + 8a/8b/8c/8d (S9.4.3).
  *
  * ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
  * VUE D'ENSEMBLE
@@ -126,6 +126,33 @@
  *                                     - 🔒 ISOLÉ des steps 8a/8b →
  *                                       retry sur audit fail = 0 ré-appel
  *                                       Claude + 0 double-doc Firestore.
+ *
+ *   8d. `dispatch-reply-event`      : `step.sendEvent({name:
+ *                                      smsReplySendRequested.name, data:
+ *                                      {contactId, conversationId,
+ *                                      draftMessageId}, id:
+ *                                      `reply.send.${draftMessageId}`})`
+ *                                      (S9.4.3 — branches non-STOP only).
+ *                                     - Émet l'event consommé par le
+ *                                       handler `send-reply.ts` (S9.4.2)
+ *                                       pour dispatch OVH. Le draft est
+ *                                       déjà queued (S9.4.1).
+ *                                     - 🚨 IDEMPOTENCE eventId déterministe
+ *                                       `reply.send.${draftMessageId}` :
+ *                                       déduplication 60s native Inngest
+ *                                       en defense-in-depth (memoization
+ *                                       step.sendEvent couvre déjà 95%).
+ *                                       Filet ultime côté handler S9.4.2 :
+ *                                       commitDraftToQueued assert
+ *                                       `status === "draft"` DANS tx →
+ *                                       ValidationError si déjà queued.
+ *                                     - 🚨 ANTI-PII payload minimaliste
+ *                                       (cf. Q-B3 S9.4.0) + event.id
+ *                                       scrubber-safe par construction
+ *                                       (Firestore auto-ID `[A-Za-z0-9]{20}`).
+ *                                     - 🔒 ISOLÉ des steps 8a/8b/8c →
+ *                                       retry sur sendEvent fail = 0
+ *                                       ré-appel Claude + 0 double-doc.
  *
  *   9. `audit-reply-processed`      : `appendAuditLog({action:
  *                                      "reply_processed", targetType:
@@ -280,7 +307,7 @@ import {
   listRecentMessages,
 } from "@/lib/firestore/messages";
 import { getInngestClient } from "@/lib/inngest/client";
-import { smsReplyReceived } from "@/lib/inngest/events";
+import { smsReplyReceived, smsReplySendRequested } from "@/lib/inngest/events";
 import { hashPii, PHONE_HASH_PREFIX, safePhoneHash } from "@/lib/utils/pii-detector";
 import type { ReplyGeneratedPayload } from "@/types/audit-log";
 
@@ -411,6 +438,17 @@ export interface ProcessReplyHandlerContext {
   };
   step: {
     run: <T>(name: string, fn: () => Promise<T>) => Promise<T>;
+    /**
+     * Émet un event Inngest depuis un step nommé (memoizable comme
+     * `step.run`). Pattern S9.4.3 `dispatch-reply-event` qui chaîne le
+     * pipeline `process-reply` → handler `send-reply` (S9.4.2). Le
+     * `payload.id` (optionnel) permet d'imposer un eventId déterministe
+     * pour la déduplication 60s native Inngest (defense-in-depth).
+     */
+    sendEvent: (
+      stepName: string,
+      payload: { name: string; data: Record<string, unknown>; id?: string },
+    ) => Promise<unknown>;
   };
   logger: {
     info: (...args: unknown[]) => void;
@@ -954,6 +992,48 @@ export async function processReplyHandler(
     step: "audit-reply-generated",
   });
 
+  // ── Step 8d — dispatch-reply-event (S9.4.3) ──────────────────────────
+  // Émet l'event `medere/sms.reply.send-requested` consommé par le
+  // handler `send-reply.ts` (S9.4.2) pour le dispatch OVH. Le draft est
+  // déjà queued (S9.4.1) ; le handler aval va commit + dispatch OVH +
+  // poser audit `sms_provider_dispatched`. Branche STOP NE PASSE PAS par
+  // ce step (early return en step 7 STOP fait un return avant — physique
+  // dans le bloc non-STOP).
+  //
+  // 🚨 IDEMPOTENCE — eventId déterministe `reply.send.${draftMessageId}`
+  //
+  // Memoization native Inngest `step.sendEvent` par (parent eventId,
+  // stepName) couvre 95% des cas d'idempotence (retry intra-pipeline). On
+  // ajoute un eventId déterministe pour belt-and-braces :
+  //   1. Déduplication 60s native Inngest sur `event.id` — couvre les
+  //      retry rapides où le cache memoization pourrait être perdu.
+  //   2. Filet ultime — `commitDraftToQueued` (S9.4.1) assert
+  //      `status === "draft"` DANS sa tx. Si le draft est DÉJÀ queued
+  //      (1ère invocation a commit), `ValidationError` propage → Inngest
+  //      marque la 2ème invocation "failed" sans dispatch OVH.
+  //   3. Bénéfice forensique — Inngest cloud dashboard filtre par
+  //      eventId, on retrouve facilement les events par draft (corrélation
+  //      avec audits `reply_generated`/`sms_sent`/`sms_provider_dispatched`
+  //      sur même `draftMessageId`).
+  //
+  // 🚨 ANTI-PII event.id — `reply.send.${draftMessageId}` est scrubber-safe
+  // par construction (`draftMessageId` est un Firestore auto-ID
+  // `[A-Za-z0-9]{20}`). Sentinelle test verrouille le format strict
+  // `/^reply\.send\.[A-Za-z0-9]+$/` + absence de phone/email/ovhMessageId.
+  //
+  // 🚨 ANTI-PII event.data — payload minimaliste `{contactId,
+  // conversationId, draftMessageId}` (cf. arbitrage Q-B3 S9.4.0). Pas
+  // d'intent/body/phone — récupérables via lecture Firestore aval.
+  await step.sendEvent("dispatch-reply-event", {
+    name: smsReplySendRequested.name,
+    data: {
+      contactId,
+      conversationId,
+      draftMessageId,
+    },
+    id: `reply.send.${draftMessageId}`,
+  });
+
   // ── Step 9 — audit-reply-processed (étendu draftMessageId) ────────────
   await postReplyProcessedAudit({
     contactId,
@@ -981,7 +1061,25 @@ export async function processReplyHandler(
 // ─────────────────────────────────────────────────────────────────────────────
 
 /**
- * Inngest function `process-reply` — pipeline déterministe 12 steps (S9.3.3b).
+ * Inngest function `process-reply` — pipeline déterministe 13 steps
+ * distincts (12 `step.run` + 1 `step.sendEvent` = step 8d) sur branche
+ * `classified` (post-S9.4.3) :
+ *   1. resolve-contact
+ *   2. resolve-conversation
+ *   3. dedup-by-external-id
+ *   4. store-inbound
+ *   5. short-form-opt-out-check
+ *   6a. claude-classify           (S9.3.1 split)
+ *   6b. audit-intent-classified   (S9.3.1 split)
+ *   7. branch-{intent}            (`branch-stop` early return STOP)
+ *   8a. claude-generate-{intent}  (S9.3.3b, non-STOP only)
+ *   8b. store-draft               (S9.3.3b, non-STOP only)
+ *   8c. audit-reply-generated     (S9.3.3b, non-STOP only)
+ *   8d. dispatch-reply-event      (S9.4.3, non-STOP only) 🆕
+ *   9. audit-reply-processed
+ *
+ * Branche STOP (short-form ou classifier_long_form) : skip steps 8a-8d,
+ * step 9 est appelé pour forensic.
  *
  * **Trigger** : event `medere/sms.reply.received` (`SmsReplyReceivedDataSchema`).
  *

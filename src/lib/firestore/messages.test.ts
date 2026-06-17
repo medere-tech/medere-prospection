@@ -66,6 +66,7 @@ import {
   __DEFAULT_LIST_DAYS_FOR_TESTS,
   __MESSAGES_PARENT_COLLECTION_FOR_TESTS,
   __MESSAGES_SUBCOLLECTION_FOR_TESTS,
+  __STALE_MESSAGES_DEFAULT_LIMIT_FOR_TESTS,
   addInbound,
   addOutbound,
   addOutboundDraftInTx,
@@ -74,7 +75,9 @@ import {
   listRecentMessages,
   listRecentOutbound,
   listRecentOutboundInTx,
+  listStaleMessages,
   RATE_LIMIT_COUNTED_STATUSES,
+  updateMessageStatus,
 } from "./messages";
 
 const PEPPER = "a".repeat(64);
@@ -1843,6 +1846,630 @@ describe("messages.ts", () => {
       expect(history.length).toBe(1);
       // Limit=1 → on prend le PLUS RÉCENT (DESC) puis on inverse → "new" seul.
       expect(history[0]!.body).toBe("new");
+    });
+  });
+
+  // ───────────────────────────────────────────────────────────────────────
+  // updateMessageStatus (S9.4.2) — transitions + audit sms_failed
+  // ───────────────────────────────────────────────────────────────────────
+
+  describe("updateMessageStatus", () => {
+    const CONV_ID = "conv_update_status";
+
+    async function seedQueuedMessage(): Promise<string> {
+      await seedConversation(CONV_ID);
+      return seedMessage(CONV_ID, {
+        direction: "outbound",
+        status: "queued",
+        body: "Bonjour, c'est Léa de Médéré. Test. STOP pour refuser.",
+        generatedBy: "ai",
+        createdAt: Timestamp.now(),
+        queuedAt: Timestamp.now(),
+      });
+    }
+
+    async function readMsg(messageId: string): Promise<Message | null> {
+      const doc = await getAdminDb()
+        .collection(__MESSAGES_PARENT_COLLECTION_FOR_TESTS)
+        .doc(CONV_ID)
+        .collection(__MESSAGES_SUBCOLLECTION_FOR_TESTS)
+        .doc(messageId)
+        .get();
+      return doc.exists ? (doc.data() as Message) : null;
+    }
+
+    async function countAuditByAction(action: string): Promise<number> {
+      const snap = await getAdminDb()
+        .collection(__AUDIT_COLLECTION_FOR_TESTS)
+        .where("action", "==", action)
+        .get();
+      return snap.size;
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // Happy paths — transitions valides
+    // ─────────────────────────────────────────────────────────────────────
+
+    it("queued → sent : pose sentAt + externalId (si fourni), aucun audit sms_failed", async () => {
+      const msgId = await seedQueuedMessage();
+
+      await updateMessageStatus({
+        conversationId: CONV_ID,
+        messageId: msgId,
+        status: "sent",
+        ovhMessageId: "ovh-msg-abc-123",
+      });
+
+      const msg = await readMsg(msgId);
+      expect(msg?.status).toBe("sent");
+      expect(msg?.sentAt).toBeInstanceOf(Timestamp);
+      expect(msg?.externalId).toBe("ovh-msg-abc-123");
+      expect(msg?.error).toBeUndefined();
+
+      expect(await countAuditByAction("sms_failed")).toBe(0);
+    });
+
+    it("queued → failed : pose error + audit sms_failed DANS la tx", async () => {
+      const msgId = await seedQueuedMessage();
+
+      await updateMessageStatus({
+        conversationId: CONV_ID,
+        messageId: msgId,
+        status: "failed",
+        failureReason: {
+          code: "config_error",
+          detail: "OVH 401 auth denied",
+          retryCount: 0,
+        },
+      });
+
+      const msg = await readMsg(msgId);
+      expect(msg?.status).toBe("failed");
+      expect(msg?.error).toEqual({
+        code: "config_error",
+        message: "OVH 401 auth denied",
+        retryCount: 0,
+      });
+      expect(msg?.sentAt).toBeUndefined();
+
+      // Audit sms_failed posé DANS la tx (atomicité avec UPDATE).
+      expect(await countAuditByAction("sms_failed")).toBe(1);
+
+      const snap = await getAdminDb()
+        .collection(__AUDIT_COLLECTION_FOR_TESTS)
+        .where("action", "==", "sms_failed")
+        .get();
+      const audit = snap.docs[0]!.data();
+      expect(audit.targetType).toBe("message");
+      expect(audit.targetId).toBe(msgId);
+      // Payload anti-PII : code structuré + retryCount, PAS le detail brut.
+      expect(audit.payload).toEqual({
+        direction: "outbound",
+        messageId: msgId,
+        failureCode: "config_error",
+        retryCount: 0,
+      });
+    });
+
+    it("queued → failed avec detail absent : message default-fallback sur code", async () => {
+      // Le schéma Zod Message exige `error.message: string.min(1)`. Si le
+      // caller ne fournit pas `failureReason.detail`, on compose le message
+      // depuis le `code` pour rester schema-valide.
+      const msgId = await seedQueuedMessage();
+
+      await updateMessageStatus({
+        conversationId: CONV_ID,
+        messageId: msgId,
+        status: "failed",
+        failureReason: { code: "validation_error", retryCount: 2 },
+      });
+
+      const msg = await readMsg(msgId);
+      expect(msg?.error?.message).toBe("validation_error");
+    });
+
+    it("sent → delivered : pose deliveredAt, pas de audit sms_failed", async () => {
+      await seedConversation(CONV_ID);
+      const msgId = await seedMessage(CONV_ID, {
+        direction: "outbound",
+        status: "sent",
+        body: "sent prior",
+        generatedBy: "ai",
+        createdAt: Timestamp.now(),
+        sentAt: Timestamp.now(),
+      });
+
+      await updateMessageStatus({
+        conversationId: CONV_ID,
+        messageId: msgId,
+        status: "delivered",
+      });
+
+      const msg = await readMsg(msgId);
+      expect(msg?.status).toBe("delivered");
+      expect(msg?.deliveredAt).toBeInstanceOf(Timestamp);
+      expect(await countAuditByAction("sms_failed")).toBe(0);
+    });
+
+    it("sent → failed : pose error + audit sms_failed (DLR négatif)", async () => {
+      await seedConversation(CONV_ID);
+      const msgId = await seedMessage(CONV_ID, {
+        direction: "outbound",
+        status: "sent",
+        body: "sent prior",
+        generatedBy: "ai",
+        createdAt: Timestamp.now(),
+        sentAt: Timestamp.now(),
+      });
+
+      await updateMessageStatus({
+        conversationId: CONV_ID,
+        messageId: msgId,
+        status: "failed",
+        failureReason: {
+          code: "external_service",
+          detail: "DLR reported undeliverable",
+          retryCount: 3,
+        },
+      });
+
+      const msg = await readMsg(msgId);
+      expect(msg?.status).toBe("failed");
+      expect(await countAuditByAction("sms_failed")).toBe(1);
+    });
+
+    // ─────────────────────────────────────────────────────────────────────
+    // Idempotence (no-op silencieux)
+    // ─────────────────────────────────────────────────────────────────────
+
+    it("status target === actuel : no-op silencieux, aucun audit double-posé", async () => {
+      await seedConversation(CONV_ID);
+      const msgId = await seedMessage(CONV_ID, {
+        direction: "outbound",
+        status: "failed",
+        body: "already failed",
+        generatedBy: "ai",
+        createdAt: Timestamp.now(),
+        error: { code: "config_error", message: "prior", retryCount: 1 },
+      });
+
+      // Tentative idempotente `failed → failed` (retry Inngest qui réappelle).
+      await updateMessageStatus({
+        conversationId: CONV_ID,
+        messageId: msgId,
+        status: "failed",
+        failureReason: { code: "config_error", detail: "ignored", retryCount: 99 },
+      });
+
+      const msg = await readMsg(msgId);
+      // Pas d'override de error.* (le doc reste tel quel, no-op silencieux).
+      expect(msg?.error).toEqual({ code: "config_error", message: "prior", retryCount: 1 });
+
+      // Aucun audit double-posé.
+      expect(await countAuditByAction("sms_failed")).toBe(0);
+    });
+
+    it("sent → sent (no-op) : aucun update, aucun audit", async () => {
+      await seedConversation(CONV_ID);
+      const originalSentAt = Timestamp.fromMillis(Date.now() - 60_000);
+      const msgId = await seedMessage(CONV_ID, {
+        direction: "outbound",
+        status: "sent",
+        body: "sent prior",
+        generatedBy: "ai",
+        createdAt: Timestamp.fromMillis(Date.now() - 120_000),
+        sentAt: originalSentAt,
+      });
+
+      await updateMessageStatus({
+        conversationId: CONV_ID,
+        messageId: msgId,
+        status: "sent",
+        ovhMessageId: "would-overwrite-but-noop",
+      });
+
+      const msg = await readMsg(msgId);
+      // sentAt PAS overridden (no-op silencieux).
+      expect(msg?.sentAt?.toMillis()).toBe(originalSentAt.toMillis());
+      expect(msg?.externalId).toBeUndefined();
+    });
+
+    // ─────────────────────────────────────────────────────────────────────
+    // Transitions invalides
+    // ─────────────────────────────────────────────────────────────────────
+
+    it("delivered → failed : refuse (terminal, Set vide dans table)", async () => {
+      await seedConversation(CONV_ID);
+      const msgId = await seedMessage(CONV_ID, {
+        direction: "outbound",
+        status: "delivered",
+        body: "already delivered",
+        generatedBy: "ai",
+        createdAt: Timestamp.now(),
+        deliveredAt: Timestamp.now(),
+      });
+
+      await expect(
+        updateMessageStatus({
+          conversationId: CONV_ID,
+          messageId: msgId,
+          status: "failed",
+          failureReason: { code: "external_service", retryCount: 0 },
+        }),
+      ).rejects.toBeInstanceOf(ValidationError);
+    });
+
+    it("failed → sent : refuse (terminal, transition invalide)", async () => {
+      await seedConversation(CONV_ID);
+      const msgId = await seedMessage(CONV_ID, {
+        direction: "outbound",
+        status: "failed",
+        body: "failed prior",
+        generatedBy: "ai",
+        createdAt: Timestamp.now(),
+        error: { code: "config_error", message: "prior", retryCount: 0 },
+      });
+
+      await expect(
+        updateMessageStatus({
+          conversationId: CONV_ID,
+          messageId: msgId,
+          status: "sent",
+        }),
+      ).rejects.toBeInstanceOf(ValidationError);
+    });
+
+    it("draft → sent : refuse explicitement (utiliser commitDraftToQueued)", async () => {
+      await seedConversation(CONV_ID);
+      const msgId = await seedMessage(CONV_ID, {
+        direction: "outbound",
+        status: "draft",
+        body: "Bonjour, c'est Léa de Médéré. STOP.",
+        generatedBy: "ai",
+        createdAt: Timestamp.now(),
+      });
+
+      await expect(
+        updateMessageStatus({
+          conversationId: CONV_ID,
+          messageId: msgId,
+          status: "sent",
+        }),
+      ).rejects.toBeInstanceOf(ValidationError);
+    });
+
+    it("received (inbound) → sent : refuse (status terminal inbound)", async () => {
+      await seedConversation(CONV_ID);
+      const msgId = await seedMessage(CONV_ID, {
+        direction: "inbound",
+        status: "received",
+        body: "Inbound test",
+        generatedBy: "human",
+        externalId: "ovh-inbound-1",
+        externalReceiver: "+33612345678",
+        createdAt: Timestamp.now(),
+        receivedAt: Timestamp.now(),
+      });
+
+      await expect(
+        updateMessageStatus({
+          conversationId: CONV_ID,
+          messageId: msgId,
+          status: "sent",
+        }),
+      ).rejects.toBeInstanceOf(ValidationError);
+    });
+
+    // ─────────────────────────────────────────────────────────────────────
+    // Assertions structurelles failureReason ↔ status="failed"
+    // ─────────────────────────────────────────────────────────────────────
+
+    it("status='failed' SANS failureReason → ValidationError (fail-fast HORS tx)", async () => {
+      const msgId = await seedQueuedMessage();
+
+      await expect(
+        updateMessageStatus({
+          conversationId: CONV_ID,
+          messageId: msgId,
+          status: "failed",
+          // failureReason MANQUANT
+        }),
+      ).rejects.toBeInstanceOf(ValidationError);
+
+      // Vérifie le fail-fast HORS tx : le message reste "queued" (pas de tx ouverte).
+      const msg = await readMsg(msgId);
+      expect(msg?.status).toBe("queued");
+    });
+
+    it("status='sent' AVEC failureReason → ValidationError", async () => {
+      const msgId = await seedQueuedMessage();
+
+      await expect(
+        updateMessageStatus({
+          conversationId: CONV_ID,
+          messageId: msgId,
+          status: "sent",
+          failureReason: { code: "config_error", retryCount: 0 },
+        }),
+      ).rejects.toBeInstanceOf(ValidationError);
+
+      const msg = await readMsg(msgId);
+      expect(msg?.status).toBe("queued");
+    });
+
+    // ─────────────────────────────────────────────────────────────────────
+    // Cas d'erreur — doc absent / corrompu
+    // ─────────────────────────────────────────────────────────────────────
+
+    it("message inexistant → NotFoundError (tx ouverte mais rollback propre)", async () => {
+      await seedConversation(CONV_ID);
+
+      await expect(
+        updateMessageStatus({
+          conversationId: CONV_ID,
+          messageId: "nonexistent_msg_id",
+          status: "sent",
+        }),
+      ).rejects.toBeInstanceOf(NotFoundError);
+    });
+  });
+
+  // ───────────────────────────────────────────────────────────────────────
+  // listStaleMessages (S9.4.4) — collection group query orphan monitoring
+  // ───────────────────────────────────────────────────────────────────────
+
+  describe("listStaleMessages", () => {
+    const CONV_A = "hsa_camp_A";
+    const CONV_B = "hsb_camp_B";
+    const NOW = new Date("2026-06-17T12:00:00Z");
+    const ONE_HOUR_MS = 60 * 60 * 1000;
+
+    async function seedConv(convId: string): Promise<void> {
+      await seedConversation(convId);
+    }
+
+    async function seedStaleMessage(convId: string, overrides: Partial<Message>): Promise<string> {
+      const createdAt = (overrides.createdAt as Timestamp) ?? Timestamp.fromDate(NOW);
+      const base: Message = {
+        direction: "outbound",
+        body: "Bonjour Léa de Médéré. STOP pour refuser.",
+        status: "draft",
+        channel: "sms",
+        generatedBy: "ai",
+        createdAt,
+      };
+      const ref = await getAdminDb()
+        .collection(__MESSAGES_PARENT_COLLECTION_FOR_TESTS)
+        .doc(convId)
+        .collection(__MESSAGES_SUBCOLLECTION_FOR_TESTS)
+        .add({ ...base, ...overrides });
+      return ref.id;
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // Happy paths
+    // ─────────────────────────────────────────────────────────────────────
+
+    it("retourne [] si aucun message stale", async () => {
+      await seedConv(CONV_A);
+      // Seed un draft RÉCENT (créé maintenant, pas stale)
+      await seedStaleMessage(CONV_A, {
+        status: "draft",
+        createdAt: Timestamp.fromDate(NOW),
+      });
+
+      const result = await listStaleMessages({
+        status: "draft",
+        maxAgeMs: ONE_HOUR_MS,
+        now: NOW,
+      });
+
+      expect(result).toEqual([]);
+    });
+
+    it("retourne les drafts stale cross-conversation (collection group)", async () => {
+      // Seed 2 conversations différentes, 1 draft stale chacune
+      await seedConv(CONV_A);
+      await seedConv(CONV_B);
+
+      const twoHoursAgo = Timestamp.fromDate(new Date(NOW.getTime() - 2 * ONE_HOUR_MS));
+      const draftIdA = await seedStaleMessage(CONV_A, {
+        status: "draft",
+        createdAt: twoHoursAgo,
+      });
+      const draftIdB = await seedStaleMessage(CONV_B, {
+        status: "draft",
+        createdAt: twoHoursAgo,
+      });
+
+      const result = await listStaleMessages({
+        status: "draft",
+        maxAgeMs: ONE_HOUR_MS,
+        now: NOW,
+      });
+
+      expect(result.length).toBe(2);
+      const convIds = result.map((r) => r.conversationId).sort();
+      expect(convIds).toEqual([CONV_A, CONV_B].sort());
+      const msgIds = result.map((r) => r.messageId).sort();
+      expect(msgIds).toEqual([draftIdA, draftIdB].sort());
+
+      // Status correctement remonté
+      expect(result.every((r) => r.status === "draft")).toBe(true);
+    });
+
+    it("ordre createdAt ASC (oldest first)", async () => {
+      await seedConv(CONV_A);
+
+      const oldest = Timestamp.fromDate(new Date(NOW.getTime() - 5 * ONE_HOUR_MS));
+      const middle = Timestamp.fromDate(new Date(NOW.getTime() - 3 * ONE_HOUR_MS));
+      const newer = Timestamp.fromDate(new Date(NOW.getTime() - 2 * ONE_HOUR_MS));
+
+      const idMiddle = await seedStaleMessage(CONV_A, {
+        status: "queued",
+        createdAt: middle,
+      });
+      const idOldest = await seedStaleMessage(CONV_A, {
+        status: "queued",
+        createdAt: oldest,
+      });
+      const idNewer = await seedStaleMessage(CONV_A, {
+        status: "queued",
+        createdAt: newer,
+      });
+
+      const result = await listStaleMessages({
+        status: "queued",
+        maxAgeMs: ONE_HOUR_MS,
+        now: NOW,
+      });
+
+      expect(result.length).toBe(3);
+      // Oldest first (priorité monitoring)
+      expect(result.map((r) => r.messageId)).toEqual([idOldest, idMiddle, idNewer]);
+    });
+
+    it("limit respecté (anti-DoS Firestore)", async () => {
+      await seedConv(CONV_A);
+      const twoHoursAgo = Timestamp.fromDate(new Date(NOW.getTime() - 2 * ONE_HOUR_MS));
+
+      // Seed 5 drafts stale
+      for (let i = 0; i < 5; i++) {
+        await seedStaleMessage(CONV_A, {
+          status: "draft",
+          createdAt: Timestamp.fromMillis(twoHoursAgo.toMillis() + i * 1000),
+        });
+      }
+
+      const result = await listStaleMessages({
+        status: "draft",
+        maxAgeMs: ONE_HOUR_MS,
+        limit: 3,
+        now: NOW,
+      });
+
+      expect(result.length).toBe(3);
+    });
+
+    it("filtre par status whitelist (drafts ≠ queued)", async () => {
+      await seedConv(CONV_A);
+      const twoHoursAgo = Timestamp.fromDate(new Date(NOW.getTime() - 2 * ONE_HOUR_MS));
+
+      await seedStaleMessage(CONV_A, { status: "draft", createdAt: twoHoursAgo });
+      await seedStaleMessage(CONV_A, { status: "queued", createdAt: twoHoursAgo });
+      await seedStaleMessage(CONV_A, {
+        status: "sent",
+        createdAt: twoHoursAgo,
+        sentAt: twoHoursAgo,
+      });
+
+      const drafts = await listStaleMessages({
+        status: "draft",
+        maxAgeMs: ONE_HOUR_MS,
+        now: NOW,
+      });
+      const queued = await listStaleMessages({
+        status: "queued",
+        maxAgeMs: ONE_HOUR_MS,
+        now: NOW,
+      });
+
+      expect(drafts.length).toBe(1);
+      expect(drafts[0]?.status).toBe("draft");
+      expect(queued.length).toBe(1);
+      expect(queued[0]?.status).toBe("queued");
+    });
+
+    it("filtre direction outbound (ignore inbound)", async () => {
+      await seedConv(CONV_A);
+      const twoHoursAgo = Timestamp.fromDate(new Date(NOW.getTime() - 2 * ONE_HOUR_MS));
+
+      // Un draft outbound (légitime) — devrait apparaître
+      await seedStaleMessage(CONV_A, {
+        status: "draft",
+        direction: "outbound",
+        createdAt: twoHoursAgo,
+      });
+      // Cas pathologique : inbound créé en "draft" status (ne devrait jamais
+      // arriver en pratique mais defense-in-depth). Doit être filtré par
+      // direction=outbound dans la query.
+      await seedStaleMessage(CONV_A, {
+        status: "draft",
+        direction: "inbound",
+        externalId: "ovh-test-inbound",
+        externalReceiver: "+33612345678",
+        createdAt: twoHoursAgo,
+      } as Partial<Message>);
+
+      const result = await listStaleMessages({
+        status: "draft",
+        maxAgeMs: ONE_HOUR_MS,
+        now: NOW,
+      });
+
+      expect(result.length).toBe(1);
+    });
+
+    // ─────────────────────────────────────────────────────────────────────
+    // Sentinelles anti-PII payload retour
+    // ─────────────────────────────────────────────────────────────────────
+
+    it("payload retour ne contient PAS body / phone / externalId (anti-PII)", async () => {
+      await seedConv(CONV_A);
+      const twoHoursAgo = Timestamp.fromDate(new Date(NOW.getTime() - 2 * ONE_HOUR_MS));
+
+      await seedStaleMessage(CONV_A, {
+        status: "queued",
+        body: "Body SECRET avec phone +33612345678 dedans",
+        externalReceiver: "+33612345678",
+        externalId: "ovh-secret-id-XYZ",
+        createdAt: twoHoursAgo,
+      });
+
+      const result = await listStaleMessages({
+        status: "queued",
+        maxAgeMs: ONE_HOUR_MS,
+        now: NOW,
+      });
+
+      expect(result.length).toBe(1);
+      const entry = result[0]!;
+
+      // Champs exposés : 4 exactement (conversationId/messageId/createdAt/status)
+      expect(Object.keys(entry).sort()).toEqual([
+        "conversationId",
+        "createdAt",
+        "messageId",
+        "status",
+      ]);
+
+      // Sentinelle defense-in-depth — pas de PII dans le serialized
+      const serialized = JSON.stringify(entry);
+      expect(serialized).not.toContain("Body SECRET");
+      expect(serialized).not.toContain("+33612345678");
+      expect(serialized).not.toContain("ovh-secret-id-XYZ");
+    });
+
+    // ─────────────────────────────────────────────────────────────────────
+    // Cas d'erreur
+    // ─────────────────────────────────────────────────────────────────────
+
+    it("maxAgeMs négatif → ValidationError", async () => {
+      await expect(
+        listStaleMessages({
+          status: "draft",
+          maxAgeMs: -1,
+          now: NOW,
+        }),
+      ).rejects.toBeInstanceOf(ValidationError);
+    });
+
+    // ─────────────────────────────────────────────────────────────────────
+    // Sentinelle constante
+    // ─────────────────────────────────────────────────────────────────────
+
+    it("DEFAULT_LIMIT === 100 (anti-DoS borne défensive)", () => {
+      expect(__STALE_MESSAGES_DEFAULT_LIMIT_FOR_TESTS).toBe(100);
     });
   });
 });

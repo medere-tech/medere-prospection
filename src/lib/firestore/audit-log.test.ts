@@ -82,12 +82,13 @@ const EXPECTED_AUDIT_ACTIONS: ReadonlySet<AuditAction> = new Set<AuditAction>([
   "sms_failed",
   "sms_provider_dispatched",
   "send_blocked",
-  // SMS INBOUND (S9.1 + S9.3.3a)
+  // SMS INBOUND (S9.1 + S9.3.3a + S9.4.1)
   "sms_received",
   "intent_classified",
   "reply_generated",
   "reply_processed",
   "reply_dropped",
+  "reply_draft_dropped",
   "long_form_opt_out_candidate",
   // CONVERSATION lifecycle
   "opt_out",
@@ -137,6 +138,14 @@ describe("ACTIONS whitelist — sentinelle anti-drift TS ↔ runtime (S9.1)", ()
     // de l'ajout S9.3.3a (stockage draft IA). Si retiré, le pipeline
     // process-reply step 8 (S9.3.3b) ne pourra plus poser cet audit.
     expect(EXPECTED_AUDIT_ACTIONS.has("reply_generated")).toBe(true);
+  });
+
+  it("contient l'action S9.4.1 `reply_draft_dropped` (sentinelle dédiée)", () => {
+    // Verrouillage spécifique pour repérer un revert/squash accidentel
+    // de l'ajout S9.4.1 (rejet draft par preSendCheckWithAuditTx). Si
+    // retiré, `commitDraftToQueued` ne pourra plus poser cet audit en
+    // branche blocked → trou forensique consent drift.
+    expect(EXPECTED_AUDIT_ACTIONS.has("reply_draft_dropped")).toBe(true);
   });
 });
 
@@ -515,6 +524,166 @@ describe("S9.3.3b — sentinelle NIT-1 reply_generated anti-PII (defense-in-dept
       action: "reply_generated",
       targetType: "message",
       targetId: "draft_FirestoreAutoId20",
+      payload: validPayload,
+    });
+
+    expect(docId).toMatch(/^[A-Za-z0-9]{20}$/);
+    expect(await countAuditDocs()).toBe(1);
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// S9.4.1 — Sentinelle anti-PII payload reply_draft_dropped
+//
+// 🚨 Pattern miroir S9.3.3b reply_generated. Le payload reply_draft_dropped
+// est posé HORS tx en best-effort par `commitDraftToQueued` après rollback.
+// Defense-in-depth scrubber : si un caller bypass `as any` une valeur
+// `blockedContext` contenant un téléphone E.164 / FR national / email,
+// `detectPiiInPayload` (S6.2) attrape et `appendAuditLog` throw
+// `AuditPiiError` → 0 doc créé.
+//
+// LIMITATION IDENTIQUE S9.3.3b : `ReplyDraftDroppedPayload` expose une
+// index signature `readonly [k: string]: unknown` nécessaire à
+// l'assignation à `AuditLogInput.payload: Record<string, unknown>` (TS
+// limitation). Cette index signature accepte n'importe quelle clé. Trace
+// follow-up partagée : `S9.4-AUDIT-STRICT-PAYLOAD-SCHEMAS-001` (validation
+// Zod stricte par action retire l'index signature au compile-time).
+// ─────────────────────────────────────────────────────────────────────────────
+
+describe("S9.4.1 — sentinelle reply_draft_dropped anti-PII (defense-in-depth)", () => {
+  beforeEach(async () => {
+    vi.unstubAllEnvs();
+    vi.stubEnv("AUDIT_PII_PEPPER", PEPPER);
+    await fullReset();
+  });
+
+  afterEach(async () => {
+    vi.unstubAllEnvs();
+    await fullReset();
+  });
+
+  it("blockedContext avec E.164 → AuditPiiError + 0 doc créé", async () => {
+    // Cas anormal : un dev bypass via `as any` un blockedContext qui
+    // contient un téléphone E.164. Le scrubber attrape.
+    const payloadWithLeakedPhone = {
+      contactId: "ct_test",
+      conversationId: "cv_test",
+      draftMessageId: "msg_test",
+      blockedRule: "rate_limit",
+      blockedCode: "rate_limit_exceeded",
+      // 🚨 INTERDIT — blockedContext ne devrait JAMAIS contenir de PII (la
+      // discriminated union FERMÉE de pre-send-check.ts l'exclut au
+      // compile-time, mais defense-in-depth runtime).
+      blockedContext: { contactPhone: "+33612345678", count: 3 },
+    };
+
+    await expect(
+      appendAuditLog({
+        actorId: "system",
+        actorType: "system",
+        action: "reply_draft_dropped",
+        targetType: "message",
+        targetId: "msg_test",
+        payload: payloadWithLeakedPhone,
+      }),
+    ).rejects.toBeInstanceOf(AuditPiiError);
+
+    expect(await countAuditDocs()).toBe(0);
+  });
+
+  it("blockedContext avec FR national → AuditPiiError + 0 doc créé", async () => {
+    const payloadWithLeakedFRNational = {
+      contactId: "ct_test_fr",
+      conversationId: "cv_test_fr",
+      draftMessageId: "msg_test_fr",
+      blockedRule: "phone_validity",
+      blockedCode: "phone_invalid",
+      blockedContext: { phone: "0612345678" },
+    };
+
+    await expect(
+      appendAuditLog({
+        actorId: "system",
+        actorType: "system",
+        action: "reply_draft_dropped",
+        targetType: "message",
+        targetId: "msg_test_fr",
+        payload: payloadWithLeakedFRNational,
+      }),
+    ).rejects.toBeInstanceOf(AuditPiiError);
+
+    expect(await countAuditDocs()).toBe(0);
+  });
+
+  it("blockedContext avec email → AuditPiiError + 0 doc créé", async () => {
+    const payloadWithLeakedEmail = {
+      contactId: "ct_test_em",
+      conversationId: "cv_test_em",
+      draftMessageId: "msg_test_em",
+      blockedRule: "opt_out",
+      blockedCode: "opted_out",
+      blockedContext: { reportedEmail: "ps@cabinet.fr" },
+    };
+
+    await expect(
+      appendAuditLog({
+        actorId: "system",
+        actorType: "system",
+        action: "reply_draft_dropped",
+        targetType: "message",
+        targetId: "msg_test_em",
+        payload: payloadWithLeakedEmail,
+      }),
+    ).rejects.toBeInstanceOf(AuditPiiError);
+
+    expect(await countAuditDocs()).toBe(0);
+  });
+
+  it("payload reply_draft_dropped CONFORME (rule rate_limit + context typé) → succès + doc créé", async () => {
+    // Sentinelle baseline : payload légitime posé par commitDraftToQueued
+    // en branche blocked. La discriminated union FERMÉE de S5 garantit
+    // que blockedContext ne contient que des nombres/strings non-PII.
+    const validPayload = {
+      contactId: "hs_dent_paris_01",
+      conversationId: "hs_dent_paris_01_dentistes-idf-mai-2026",
+      draftMessageId: "draft_FirestoreAutoId20",
+      blockedRule: "rate_limit",
+      blockedCode: "rate_limit_exceeded",
+      blockedContext: { count: 3, maxAllowed: 3, windowDays: 30 },
+    };
+
+    const docId = await appendAuditLog({
+      actorId: "system",
+      actorType: "system",
+      action: "reply_draft_dropped",
+      targetType: "message",
+      targetId: "draft_FirestoreAutoId20",
+      payload: validPayload,
+    });
+
+    expect(docId).toMatch(/^[A-Za-z0-9]{20}$/);
+    expect(await countAuditDocs()).toBe(1);
+  });
+
+  it("payload reply_draft_dropped avec blockedRule hours + context isoDate → succès", async () => {
+    // Variante avec blockedContext `{isoDate}` (rule "hours" → "holiday").
+    // Vérifie qu'une string ISO YYYY-MM-DD passe le scrubber (pas de
+    // false positive sur les dates).
+    const validPayload = {
+      contactId: "hs_med_idf_42",
+      conversationId: "hs_med_idf_42_medecins-mai-2026",
+      draftMessageId: "draft_AutoId4Holiday",
+      blockedRule: "hours",
+      blockedCode: "holiday",
+      blockedContext: { isoDate: "2026-05-21" },
+    };
+
+    const docId = await appendAuditLog({
+      actorId: "system",
+      actorType: "system",
+      action: "reply_draft_dropped",
+      targetType: "message",
+      targetId: "draft_AutoId4Holiday",
       payload: validPayload,
     });
 
