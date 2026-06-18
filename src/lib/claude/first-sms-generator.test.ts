@@ -509,7 +509,7 @@ describe("generateFirstSms — sentinelles return values", () => {
   it("promptVersion retourné === FIRST_SMS_PROMPT_VERSION (audit forensic)", async () => {
     mockedGenerate.mockResolvedValue(makeToolUseResult());
     const result = await generateFirstSms({ contact: VALID_CONTACT });
-    expect(result.promptVersion).toBe("1.0.0");
+    expect(result.promptVersion).toBe("1.0.1");
   });
 
   it("model retourné === FIRST_SMS_MODEL", async () => {

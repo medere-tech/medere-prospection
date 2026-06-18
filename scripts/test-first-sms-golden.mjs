@@ -115,6 +115,16 @@ const TEST_CONTACTS = [
       city: "Toulouse",
     },
   },
+  {
+    label: "M.+MKDE+Marseille (cas masculin M. + MKDE worst-case civilité — F11 compliance v1.0.1)",
+    contact: {
+      firstName: "Julien",
+      lastName: "Lefebvre",
+      civilite: "M.",
+      speciality: "MKDE",
+      city: "Marseille",
+    },
+  },
 ];
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -238,9 +248,26 @@ for (const { label, contact } of TEST_CONTACTS) {
       const code = err.code ?? "(no code)";
       const message = err.message ?? "(no message)";
       console.log(`    ${code}: ${message}`);
+
+      // 🆕 S10.1.2.a.2.0 — expose Zod issues sanitisées pour diagnostic.
+      // `err.context.issues` est posé par `client.ts::generateWithTool` (S7a.1)
+      // au format [{path: string, code: string}] — déjà sanitized (pas de
+      // valeur brute, anti-fuite PII garantie côté wrapper).
+      const issues = err.context?.issues ?? null;
+      if (issues) {
+        console.log(`    Zod issues : ${JSON.stringify(issues)}`);
+      }
+
       contactReport.runs.push({
         runIdx: i + 1,
-        error: { name: err.constructor?.name, code, message },
+        error: {
+          name: err.constructor?.name,
+          code,
+          message,
+          // Diag-only : path + code sanitized depuis client.ts wrapper.
+          // Pas de body/reasoning brut (anti-fuite PII).
+          issues,
+        },
         allPass: false,
       });
     }

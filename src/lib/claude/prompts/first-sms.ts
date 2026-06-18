@@ -101,8 +101,26 @@ import { escapeXml } from "./shared";
  *             (Dr+Chirurgien-dentiste+Paris+660€, Dr+Médecin+Lyon+7h,
  *             undefined+Sage-Femme+""+100%). Triple-garde wired
  *             côté `first-sms-generator.ts`.
+ *
+ *   - 1.0.1 — patch S10.1.2.a.2.1. Fix golden test 10/25 échecs
+ *             sur civilité hors few-shot (Pr/Mme). Cause : Claude
+ *             écrivait "Professeur"/"Madame" en toutes lettres
+ *             sur cas non-couverts → body > 160 chars Zod too_big.
+ *
+ *             Changements :
+ *             1. +2 few-shot Pr+Médecin+Bordeaux et Mme+IDE+Toulouse
+ *                (couvre 4/5 civilités explicitement)
+ *             2. Règle stricte abréviation civilité ajoutée dans
+ *                `<règle_adressage>` : "Dr/Pr/M./Mme" jamais en
+ *                toutes lettres (économie 7-13 chars sur le body)
+ *             3. Sentinelle test anti-drift verrouillant l'absence
+ *                de "Docteur|Professeur|Madame|Monsieur" dans tous
+ *                les few-shot du SYSTEM
+ *
+ *             Golden re-run validation 25/25 conformes obligatoire
+ *             avant merge.
  */
-export const FIRST_SMS_PROMPT_VERSION = "1.0.0" as const;
+export const FIRST_SMS_PROMPT_VERSION = "1.0.1" as const;
 
 /**
  * 🔒 SENTINEL — Modèle figé. Sonnet 4.6 dateless pinned (gen 4.6+ —
@@ -271,6 +289,19 @@ Style Bencivenga adapté SMS médical FR :
 - Si civilité absente → commence par "Bonjour {Prénom}" (ex: "Bonjour Sophie") —
   prénom seul, JAMAIS "Bonjour M./Mme/Dr" présupposé
 
+🚨 RÈGLE STRICTE — CIVILITÉ TOUJOURS ABRÉGÉE (v1.0.1) :
+Utilise EXACTEMENT la forme abrégée reçue en input : "Dr", "Pr", "M.", "Mme".
+JAMAIS la forme en toutes lettres dans le SMS final.
+
+  ✅ "Bonjour Pr Charrier"        ❌ "Bonjour Professeur Charrier"
+  ✅ "Bonjour Mme Roux"           ❌ "Bonjour Madame Roux"
+  ✅ "Bonjour M. Durand"          ❌ "Bonjour Monsieur Durand"
+  ✅ "Bonjour Dr Dupuis"          ❌ "Bonjour Docteur Dupuis"
+
+Justification : économie 7-13 chars par SMS, indispensable pour rester sous
+160 chars GSM-7 + marge mention "Médéré" + "STOP". Un body > 160 chars =
+2 SMS facturés OVH + violation Zod schema → erreur retry.
+
 🚨 Genre grammatical : utilise UNIQUEMENT des formulations neutres non genrées.
 N'accorde JAMAIS adjectifs ou participes selon le genre que tu inférerais du
 prénom. Préfère "Cela vous intéresse ?" à "Intéressé(e) ?", "Souhaitez-vous"
@@ -342,6 +373,32 @@ Ville : (non renseignée)
 <tool_use>
 body: "Bonjour Sophie, je suis Léa, assistante virtuelle de Médéré. Formations DPC 100% prises en charge pour les sages-femmes. Souhaitez-vous le programme ? STOP."
 reasoning: "Civilité absente : prénom seul, pas Dr/Mme présupposé. Spécialité citée car sage-femme = niche, signe de personnalisation. Chiffre 100%."
+</tool_use>
+
+Exemple 4 (civilité Pr abrégée, Médecin, Bordeaux, chiffre 7h) :
+<destinataire>
+Civilité : Pr
+Prénom : Henri
+Nom : Charrier
+Spécialité : Médecin
+Ville : Bordeaux
+</destinataire>
+<tool_use>
+body: "Bonjour Pr Charrier, je suis Léa, assistante virtuelle de Médéré. Formation DPC 7h en e-learning, prise en charge ANDPC. Souhaitez-vous en savoir plus ? STOP."
+reasoning: "Civilité Pr abrégée (PAS Professeur). Chiffre 7h e-learning. Question 'savoir plus' diversifie le pattern de clôture (vs ex.1/ex.5)."
+</tool_use>
+
+Exemple 5 (civilité Mme abrégée, IDE, Toulouse, chiffre 100%) :
+<destinataire>
+Civilité : Mme
+Prénom : Camille
+Nom : Roux
+Spécialité : IDE
+Ville : Toulouse
+</destinataire>
+<tool_use>
+body: "Bonjour Mme Roux, je suis Léa, assistante virtuelle de Médéré. Formation DPC 100% prise en charge pour les IDE. Souhaitez-vous le programme ? STOP."
+reasoning: "Civilité Mme abrégée (PAS Madame). Spécialité IDE citée car personnalisation pertinente. Chiffre 100% ANDPC. Prénom Camille mixte : formule neutre."
 </tool_use>
 </exemples>
 

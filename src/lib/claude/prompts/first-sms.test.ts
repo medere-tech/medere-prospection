@@ -36,8 +36,8 @@ import {
 // ─────────────────────────────────────────────────────────────────────────────
 
 describe("first-sms — sentinelles constantes verrouillées", () => {
-  it("FIRST_SMS_PROMPT_VERSION === '1.0.0' (semver initial S10.1.2.a)", () => {
-    expect(FIRST_SMS_PROMPT_VERSION).toBe("1.0.0");
+  it("FIRST_SMS_PROMPT_VERSION === '1.0.1' (patch S10.1.2.a.2.1 — fix civilité abrégée)", () => {
+    expect(FIRST_SMS_PROMPT_VERSION).toBe("1.0.1");
   });
 
   it("FIRST_SMS_MODEL === SONNET_4_6 (dateless pinned)", () => {
@@ -335,35 +335,35 @@ describe("Few-shot exemples — compliance regex sentinelle", () => {
   const { system } = buildFirstSmsPrompt({ contact: VALID_CONTACT });
   const bodies = extractFewShotBodies(system);
 
-  it("3 few-shot exemples extraits (Q-I4 worst-case coverage)", () => {
-    expect(bodies).toHaveLength(3);
+  it("5 few-shot exemples extraits (v1.0.1 — Q-I4 + Pr/Mme worst-case coverage)", () => {
+    expect(bodies).toHaveLength(5);
   });
 
-  it.each([0, 1, 2])("Exemple %i : body 50-160 chars", (idx) => {
+  it.each([0, 1, 2, 3, 4])("Exemple %i : body 50-160 chars", (idx) => {
     expect(bodies[idx]!.length).toBeGreaterThanOrEqual(FIRST_SMS_MIN_BODY_CHARS);
     expect(bodies[idx]!.length).toBeLessThanOrEqual(FIRST_SMS_MAX_BODY_CHARS);
   });
 
-  it.each([0, 1, 2])("Exemple %i : hasAIDisclosure (AI Act art. 50) ✓", (idx) => {
+  it.each([0, 1, 2, 3, 4])("Exemple %i : hasAIDisclosure (AI Act art. 50) ✓", (idx) => {
     expect(hasAIDisclosure(bodies[idx]!)).toBe(true);
   });
 
-  it.each([0, 1, 2])(
+  it.each([0, 1, 2, 3, 4])(
     "Exemple %i : hasAdvertiserIdentification 'Médéré' (L.34-5 al. 5 CPCE) ✓",
     (idx) => {
       expect(hasAdvertiserIdentification(bodies[idx]!)).toBe(true);
     },
   );
 
-  it.each([0, 1, 2])("Exemple %i : hasOptOut 'STOP' (L.34-5 CPCE) ✓", (idx) => {
+  it.each([0, 1, 2, 3, 4])("Exemple %i : hasOptOut 'STOP' (L.34-5 CPCE) ✓", (idx) => {
     expect(hasOptOut(bodies[idx]!)).toBe(true);
   });
 
-  it("Exemple 1 cible 'Dr Dupuis' (civilité présente)", () => {
+  it("Exemple 1 cible 'Dr Dupuis' (civilité Dr)", () => {
     expect(bodies[0]).toContain("Dr Dupuis");
   });
 
-  it("Exemple 2 cible 'Dr Martin' (civilité présente)", () => {
+  it("Exemple 2 cible 'Dr Martin' (civilité Dr)", () => {
     expect(bodies[1]).toContain("Dr Martin");
   });
 
@@ -371,6 +371,16 @@ describe("Few-shot exemples — compliance regex sentinelle", () => {
     expect(bodies[2]).toContain("Bonjour Sophie");
     // Anti-régression : Exemple 3 ne doit PAS commencer par "Bonjour Dr/Pr/M./Mme"
     expect(bodies[2]).not.toMatch(/^Bonjour (Dr|Pr|M\.|Mme) /);
+  });
+
+  it("Exemple 4 cible 'Pr Charrier' (v1.0.1 — civilité Pr abrégée, PAS Professeur)", () => {
+    expect(bodies[3]).toContain("Pr Charrier");
+    expect(bodies[3]).not.toContain("Professeur");
+  });
+
+  it("Exemple 5 cible 'Mme Roux' (v1.0.1 — civilité Mme abrégée, PAS Madame)", () => {
+    expect(bodies[4]).toContain("Mme Roux");
+    expect(bodies[4]).not.toContain("Madame");
   });
 
   it("Exemples ne contiennent PAS d'emoji", () => {
@@ -463,5 +473,60 @@ describe("SYSTEM phrase canonique ↔ regex compliance (sentinelle anti-drift)",
 
   it("SYSTEM contient 'STOP' instruit (rule 3 ai-disclosure wired)", () => {
     expect(__SYSTEM_TEMPLATE_FOR_TESTS).toContain(CANONICAL_STOP);
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// v1.0.1 — Sentinelle civilité abrégée (anti-drift golden test 10/25)
+//
+// Golden test S10.1.2.a.2.0 a révélé : Claude écrivait "Professeur"/"Madame"
+// en toutes lettres sur cas Pr/Mme hors few-shot → body > 160 chars
+// (Zod too_big). Fix v1.0.1 : ajout 2 few-shot + règle abréviation
+// stricte + cette sentinelle test verrouillant l'absence des formes
+// pleines dans la section <exemples> du SYSTEM prompt.
+//
+// Si un dev futur ajoute un few-shot avec "Docteur" / "Professeur" /
+// "Madame" / "Monsieur" en toutes lettres (régression), ce test casse
+// → on est forcé de re-passer par prompt-engineer + golden test.
+// ─────────────────────────────────────────────────────────────────────────────
+
+describe("v1.0.1 — sentinelle civilité abrégée (anti-drift)", () => {
+  const FORBIDDEN_FULL_CIVILITY_REGEX = /\b(Docteur|Professeur|Madame|Monsieur)\b/i;
+
+  it("aucun few-shot du SYSTEM prompt ne contient civilité en toutes lettres", () => {
+    const { system } = buildFirstSmsPrompt({
+      contact: { firstName: "T", lastName: "T", speciality: "Médecin", city: "" },
+    });
+
+    // Extraire le contenu de <exemples>...</exemples> pour cibler le check.
+    const exemplesMatch = system.match(/<exemples>([\s\S]*?)<\/exemples>/);
+    expect(exemplesMatch).toBeTruthy();
+
+    const exemplesContent = exemplesMatch![1]!;
+    // On vérifie UNIQUEMENT les `body: "..."` (les bodies envoyés au PS),
+    // pas les `<destinataire>` qui peuvent légitimement utiliser
+    // "Madame"/"Monsieur" comme label de champ. Or les `body:` sont les
+    // sorties que Claude doit imiter — d'où la sentinelle anti-drift cible.
+    const bodyMatches = exemplesContent.matchAll(/body: "([^"]+)"/g);
+    const bodies = Array.from(bodyMatches, (m) => m[1]!);
+    expect(bodies.length).toBeGreaterThan(0);
+
+    for (const body of bodies) {
+      const violations = body.match(FORBIDDEN_FULL_CIVILITY_REGEX);
+      expect(
+        violations,
+        `Body few-shot contient une civilité en toutes lettres (interdit v1.0.1) : "${body}". Match : ${violations?.[0]}`,
+      ).toBeNull();
+    }
+  });
+
+  it("la règle <règle_adressage> instruit explicitement l'abréviation", () => {
+    expect(__SYSTEM_TEMPLATE_FOR_TESTS).toContain("CIVILITÉ TOUJOURS ABRÉGÉE");
+    expect(__SYSTEM_TEMPLATE_FOR_TESTS).toContain("JAMAIS la forme en toutes lettres");
+  });
+
+  it("la règle liste les 4 abréviations explicitement (Dr/Pr/M./Mme)", () => {
+    // Sentinelle : si un dev retire ou renomme une abréviation, le test casse.
+    expect(__SYSTEM_TEMPLATE_FOR_TESTS).toMatch(/"Dr".*"Pr".*"M\.".*"Mme"/);
   });
 });
