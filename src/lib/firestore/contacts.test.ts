@@ -12,7 +12,7 @@ import { Timestamp } from "firebase-admin/firestore";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { __resetEnvCacheForTests } from "@/lib/security/env";
-import { InternalError, NotFoundError, ValidationError } from "@/lib/utils/errors";
+import { ConflictError, InternalError, NotFoundError, ValidationError } from "@/lib/utils/errors";
 import type { Contact } from "@/types/contact";
 
 import {
@@ -24,8 +24,13 @@ import {
 import { __AUDIT_COLLECTION_FOR_TESTS } from "./audit-log";
 import {
   __CONTACTS_COLLECTION_FOR_TESTS,
+  CONTACT_STATUS_VALUES,
+  createContact,
   getContact,
   getContactByPhone,
+  LIST_CONTACTS_DEFAULT_LIMIT,
+  LIST_CONTACTS_MAX_LIMIT,
+  listContacts,
   markOptedOut,
   updateContactStatus,
 } from "./contacts";
@@ -717,6 +722,344 @@ describe("contacts.ts", () => {
           });
         }),
       ).rejects.toBeInstanceOf(ValidationError);
+    });
+  });
+
+  // ───────────────────────────────────────────────────────────────────────
+  // listContacts (S10.1.2.c)
+  // ───────────────────────────────────────────────────────────────────────
+
+  describe("listContacts (S10.1.2.c)", () => {
+    /**
+     * Seed N contacts avec status/campaignId paramétrables. createdAt
+     * espacés de 1 seconde pour valider le tri DESC déterministe.
+     */
+    async function seedContacts(
+      count: number,
+      opts: {
+        status?: Contact["status"];
+        campaignId?: string;
+        idPrefix?: string;
+        baseTimeMs?: number;
+      } = {},
+    ): Promise<string[]> {
+      const status = opts.status ?? "ready";
+      const campaignId = opts.campaignId ?? "mvp-200-dentistes-idf";
+      const idPrefix = opts.idPrefix ?? "hs_list";
+      const baseTimeMs = opts.baseTimeMs ?? Date.now();
+      const ids: string[] = [];
+      for (let i = 0; i < count; i++) {
+        const id = `${idPrefix}_${i}`;
+        const ts = Timestamp.fromMillis(baseTimeMs + i * 1000);
+        const contact = buildValidContact({
+          hubspotId: id,
+          status,
+          campaignId,
+          createdAt: ts,
+          updatedAt: ts,
+        });
+        await getAdminDb().collection(__CONTACTS_COLLECTION_FOR_TESTS).doc(id).set(contact);
+        ids.push(id);
+      }
+      return ids;
+    }
+
+    it("filtre status=ready + campaignId=X → retourne les bons contacts", async () => {
+      await seedContacts(5, { status: "ready", campaignId: "campA" });
+      await seedContacts(3, {
+        status: "ready",
+        campaignId: "campB",
+        idPrefix: "hs_listB",
+      });
+      const res = await listContacts({
+        filters: { status: "ready", campaignId: "campA" },
+      });
+      expect(res.contacts).toHaveLength(5);
+      expect(res.contacts.every((c) => c.campaignId === "campA")).toBe(true);
+      expect(res.hasMore).toBe(false);
+      expect(res.nextCursor).toBeNull();
+    });
+
+    it("filtre status=ready SANS campaignId → retourne tous statuses ready toutes campagnes", async () => {
+      await seedContacts(3, { status: "ready", campaignId: "campA" });
+      await seedContacts(2, {
+        status: "ready",
+        campaignId: "campB",
+        idPrefix: "hs_listB",
+      });
+      const res = await listContacts({ filters: { status: "ready" } });
+      expect(res.contacts).toHaveLength(5);
+      expect(res.contacts.every((c) => c.status === "ready")).toBe(true);
+    });
+
+    it("filtre status=opted_out → retourne 0 si aucun contact opted_out (cas filtré)", async () => {
+      await seedContacts(5, { status: "ready" });
+      const res = await listContacts({ filters: { status: "opted_out" } });
+      expect(res.contacts).toEqual([]);
+      expect(res.hasMore).toBe(false);
+      expect(res.nextCursor).toBeNull();
+    });
+
+    it("default status = 'ready' quand filters.status absent", async () => {
+      await seedContacts(3, { status: "ready" });
+      await seedContacts(2, {
+        status: "archived",
+        idPrefix: "hs_listArch",
+      });
+      const res = await listContacts({});
+      expect(res.contacts).toHaveLength(3);
+      expect(res.contacts.every((c) => c.status === "ready")).toBe(true);
+    });
+
+    it("tri createdAt DESC → le plus récent en premier", async () => {
+      const baseTimeMs = Date.now();
+      await seedContacts(5, { baseTimeMs });
+      const res = await listContacts({});
+      // Indices 0..4 ont createdAt croissant. DESC → index 4 doit être en tête.
+      expect(res.contacts[0]!.hubspotId).toBe("hs_list_4");
+      expect(res.contacts[4]!.hubspotId).toBe("hs_list_0");
+    });
+
+    it("limit=10 + cursor → pagination cohérente (page 1 → page 2 pas de doublon)", async () => {
+      await seedContacts(25);
+      const page1 = await listContacts({ limit: 10 });
+      expect(page1.contacts).toHaveLength(10);
+      expect(page1.hasMore).toBe(true);
+      expect(page1.nextCursor).not.toBeNull();
+
+      const page2 = await listContacts({
+        limit: 10,
+        cursor: page1.nextCursor!,
+      });
+      expect(page2.contacts).toHaveLength(10);
+      expect(page2.hasMore).toBe(true);
+
+      const ids1 = new Set(page1.contacts.map((c) => c.hubspotId));
+      const ids2 = page2.contacts.map((c) => c.hubspotId);
+      expect(ids2.every((id) => !ids1.has(id))).toBe(true);
+
+      const page3 = await listContacts({
+        limit: 10,
+        cursor: page2.nextCursor!,
+      });
+      expect(page3.contacts).toHaveLength(5);
+      expect(page3.hasMore).toBe(false);
+      expect(page3.nextCursor).toBeNull();
+    });
+
+    it("limit > LIST_CONTACTS_MAX_LIMIT → ValidationError (anti-DoS)", async () => {
+      await expect(listContacts({ limit: 200 })).rejects.toBeInstanceOf(ValidationError);
+      await expect(listContacts({ limit: LIST_CONTACTS_MAX_LIMIT + 1 })).rejects.toBeInstanceOf(
+        ValidationError,
+      );
+    });
+
+    it("limit = LIST_CONTACTS_MAX_LIMIT → accepté (borne incluse)", async () => {
+      await seedContacts(5);
+      const res = await listContacts({ limit: LIST_CONTACTS_MAX_LIMIT });
+      expect(res.contacts).toHaveLength(5);
+    });
+
+    it("limit < 1 → ValidationError", async () => {
+      await expect(listContacts({ limit: 0 })).rejects.toBeInstanceOf(ValidationError);
+      await expect(listContacts({ limit: -1 })).rejects.toBeInstanceOf(ValidationError);
+    });
+
+    it("status non whitelisté (anti-bypass) → ValidationError AVANT query", async () => {
+      await expect(
+        // @ts-expect-error - sentinelle anti-bypass enum status
+        listContacts({ filters: { status: "foo" } }),
+      ).rejects.toBeInstanceOf(ValidationError);
+      await expect(
+        // @ts-expect-error - sentinelle anti-bypass : "superadmin" pas dans l'enum
+        listContacts({ filters: { status: "superadmin" } }),
+      ).rejects.toBeInstanceOf(ValidationError);
+    });
+
+    it("cursor inexistant → ValidationError (pas de fall-through silencieux page 1)", async () => {
+      await seedContacts(3);
+      await expect(listContacts({ cursor: "hs_does_not_exist" })).rejects.toBeInstanceOf(
+        ValidationError,
+      );
+    });
+
+    it("aucun résultat → {contacts: [], nextCursor: null, hasMore: false}", async () => {
+      const res = await listContacts({ filters: { status: "ready" } });
+      expect(res.contacts).toEqual([]);
+      expect(res.nextCursor).toBeNull();
+      expect(res.hasMore).toBe(false);
+    });
+
+    it("default limit = LIST_CONTACTS_DEFAULT_LIMIT quand omis", async () => {
+      await seedContacts(LIST_CONTACTS_DEFAULT_LIMIT + 5);
+      const res = await listContacts({});
+      expect(res.contacts).toHaveLength(LIST_CONTACTS_DEFAULT_LIMIT);
+      expect(res.hasMore).toBe(true);
+    });
+
+    it("ValidationError forensic NE contient JAMAIS le cursor brut (semi-sensible)", async () => {
+      const SECRET_CURSOR = "hs_NEVER_LOG_THIS_ID";
+      try {
+        await listContacts({ cursor: SECRET_CURSOR });
+        expect.fail("should have thrown");
+      } catch (e) {
+        expect(e).toBeInstanceOf(ValidationError);
+        const ctx = (e as ValidationError).context;
+        expect(JSON.stringify(ctx)).not.toContain(SECRET_CURSOR);
+      }
+    });
+
+    it("sentinelle CONTACT_STATUS_VALUES aligné sur ContactSchema.shape.status", () => {
+      // Garde le contrat : si ContactSchema.shape.status évolue, ce test
+      // attrape la dérive et force le dev à reviewer les impacts UI.
+      expect(CONTACT_STATUS_VALUES).toEqual([
+        "pending",
+        "enriched",
+        "ready",
+        "in_conversation",
+        "qualified",
+        "opted_out",
+        "archived",
+      ]);
+    });
+
+    it("sentinelle LIST_CONTACTS_DEFAULT_LIMIT = 50 + MAX = 100 (verrouillé)", () => {
+      expect(LIST_CONTACTS_DEFAULT_LIMIT).toBe(50);
+      expect(LIST_CONTACTS_MAX_LIMIT).toBe(100);
+    });
+  });
+
+  // ───────────────────────────────────────────────────────────────────────
+  // createContact (S10.1.2.c)
+  // ───────────────────────────────────────────────────────────────────────
+
+  describe("createContact (S10.1.2.c)", () => {
+    it("happy path → persiste le doc avec tous champs + retourne contactId = hubspotId", async () => {
+      const input = buildValidContact({ hubspotId: "hs_create_1" });
+      const res = await createContact(input);
+      expect(res.contactId).toBe("hs_create_1");
+
+      const persisted = await getContact("hs_create_1");
+      expect(persisted).not.toBeNull();
+      expect(persisted?.firstName).toBe(input.firstName);
+      expect(persisted?.phone.e164).toBe(input.phone.e164);
+      expect(persisted?.status).toBe(input.status);
+      expect(persisted?.campaignId).toBe(input.campaignId);
+    });
+
+    it("idempotence : 2x createContact même hubspotId → 2e throw ConflictError", async () => {
+      const input = buildValidContact({ hubspotId: "hs_idem_1" });
+      await createContact(input);
+      await expect(createContact(input)).rejects.toBeInstanceOf(ConflictError);
+    });
+
+    it("ConflictError porte context.reason = 'contact_already_exists' + hubspotId", async () => {
+      const input = buildValidContact({ hubspotId: "hs_idem_2" });
+      await createContact(input);
+      try {
+        await createContact(input);
+        expect.fail("should have thrown");
+      } catch (e) {
+        expect(e).toBeInstanceOf(ConflictError);
+        const ctx = (e as ConflictError).context as {
+          reason: string;
+          hubspotId: string;
+        };
+        expect(ctx.reason).toBe("contact_already_exists");
+        expect(ctx.hubspotId).toBe("hs_idem_2");
+      }
+    });
+
+    it("firstName vide → ValidationError (Zod min(1))", async () => {
+      const input = buildValidContact({
+        hubspotId: "hs_bad_firstname",
+        firstName: "",
+      });
+      await expect(createContact(input)).rejects.toBeInstanceOf(ValidationError);
+    });
+
+    it("phone.e164 invalide (sans +) → ValidationError", async () => {
+      const input = buildValidContact({
+        hubspotId: "hs_bad_phone",
+        phone: {
+          e164: "0612345678",
+          raw: "06 12 34 56 78",
+          type: "mobile",
+          valid: true,
+          lookupAt: Timestamp.now(),
+        },
+      });
+      await expect(createContact(input)).rejects.toBeInstanceOf(ValidationError);
+    });
+
+    it("speciality non whitelistée → ValidationError", async () => {
+      const input = buildValidContact({
+        hubspotId: "hs_bad_speciality",
+        // @ts-expect-error - test d'enum invalide
+        speciality: "kine",
+      });
+      await expect(createContact(input)).rejects.toBeInstanceOf(ValidationError);
+    });
+
+    it("consent.legitimateInterest < 20 chars → ValidationError (invariant RGPD)", async () => {
+      const input = buildValidContact({
+        hubspotId: "hs_bad_legit",
+        consent: {
+          legitimateInterest: "trop court",
+          optedOut: false,
+        },
+      });
+      await expect(createContact(input)).rejects.toBeInstanceOf(ValidationError);
+    });
+
+    it("createdAt + updatedAt override serveur (anti-spoofing backdate)", async () => {
+      // Caller tente de backdate à -100 jours pour bypasser rate limit.
+      const backdated = Timestamp.fromMillis(Date.now() - 100 * 24 * 60 * 60 * 1000);
+      const input = buildValidContact({
+        hubspotId: "hs_backdate",
+        createdAt: backdated,
+        updatedAt: backdated,
+      });
+
+      const beforeMs = Date.now();
+      await createContact(input);
+      const persisted = await getContact("hs_backdate");
+      const createdAtMs = (persisted!.createdAt as Timestamp).toMillis();
+
+      // Le createdAt persisté doit être ≥ beforeMs (override serveur),
+      // et clairement PAS le timestamp backdated.
+      expect(createdAtMs).toBeGreaterThanOrEqual(beforeMs);
+      expect(createdAtMs).not.toBe(backdated.toMillis());
+    });
+
+    it("hubspotId vide → ValidationError (min(1))", async () => {
+      const input = buildValidContact({ hubspotId: "" });
+      await expect(createContact(input)).rejects.toBeInstanceOf(ValidationError);
+    });
+
+    it("ValidationError forensic ne contient JAMAIS phone/email/nom brut", async () => {
+      const SECRET_PHONE = "+33799988877";
+      const input = buildValidContact({
+        hubspotId: "hs_pii_leak_check",
+        firstName: "", // déclenche ValidationError
+        phone: {
+          e164: SECRET_PHONE,
+          raw: "07 99 98 88 77",
+          type: "mobile",
+          valid: true,
+          lookupAt: Timestamp.now(),
+        },
+      });
+      try {
+        await createContact(input);
+        expect.fail("should have thrown");
+      } catch (e) {
+        expect(e).toBeInstanceOf(ValidationError);
+        const ctx = (e as ValidationError).context;
+        const serialized = JSON.stringify(ctx);
+        expect(serialized).not.toContain(SECRET_PHONE);
+        expect(serialized).not.toContain("07 99 98 88 77");
+      }
     });
   });
 });
