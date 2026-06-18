@@ -55,3 +55,8 @@ next-env.d.ts
 firebase-service-account.json
 firebase-service-account*.json
 *-firebase-adminsdk-*.json
+
+# tmp/ — golden test reports + scratch local (rapports JSON contiennent
+# des bodies SMS générés, potentiellement PII si tests sur vrais contacts).
+# JAMAIS COMMIT.
+tmp/
