@@ -52,7 +52,7 @@ await contactRef.set({
   firstName: "Jean",
   lastName: "Dupont",
   civilite: "Dr",
-  speciality: "dentiste",
+  speciality: "Chirurgien-dentiste",
   city: "Paris",
   postalCode: "75001",
   email: "test-mvp@example.com",

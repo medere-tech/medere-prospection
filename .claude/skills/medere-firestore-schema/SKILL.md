@@ -47,7 +47,7 @@ export interface Contact {
   firstName: string;
   lastName: string;
   civilite?: 'Dr' | 'Pr' | 'M.' | 'Mme';
-  speciality: 'dentiste' | 'generaliste' | 'ide' | 'autre';
+  speciality: ContactSpeciality; // 21-enum aligné HubSpot, cf. CONTACT_SPECIALITY_VALUES (S10.1.2.b)
   city: string;
   postalCode: string;
   email?: string;
@@ -100,7 +100,7 @@ export const ContactSchema = z.object({
   firstName: z.string().min(1),
   lastName: z.string().min(1),
   civilite: z.enum(['Dr', 'Pr', 'M.', 'Mme']).optional(),
-  speciality: z.enum(['dentiste', 'generaliste', 'ide', 'autre']),
+  speciality: z.enum(CONTACT_SPECIALITY_VALUES), // 21-enum, source-of-truth depuis contacts.ts (S10.1.2.b)
   city: z.string(),
   postalCode: z.string(),
   email: z.string().email().optional(),

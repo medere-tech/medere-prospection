@@ -92,7 +92,7 @@ function buildValidContact(overrides: Partial<Contact> = {}): Contact {
     firstName: "Jean",
     lastName: "Dupont",
     civilite: "Dr",
-    speciality: "dentiste",
+    speciality: "Chirurgien-dentiste",
     city: "Paris",
     postalCode: "75001",
     phone: {

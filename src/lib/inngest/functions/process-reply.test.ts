@@ -75,7 +75,7 @@ function makeFakeContact(hubspotId: string): Contact {
     hubspotId,
     firstName: "Jean",
     lastName: "Dupont",
-    speciality: "dentiste",
+    speciality: "Chirurgien-dentiste",
     city: "Paris",
     postalCode: "75001",
     phone: {

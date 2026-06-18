@@ -48,7 +48,7 @@ function buildValidContact(overrides: Partial<Contact> = {}): Contact {
     firstName: "Jean",
     lastName: "Dupont",
     civilite: "Dr",
-    speciality: "dentiste",
+    speciality: "Chirurgien-dentiste",
     city: "Paris",
     postalCode: "75001",
     phone: {
@@ -907,6 +907,14 @@ describe("contacts.ts", () => {
         const ctx = (e as ValidationError).context;
         expect(JSON.stringify(ctx)).not.toContain(SECRET_CURSOR);
       }
+    });
+
+    it("sentinelle CONTACT_SPECIALITY_VALUES.length === 21 (verrou anti-drift HubSpot)", async () => {
+      // Toute modif de la liste (ajout/retrait d'une spécialité) doit
+      // venir de HubSpot CRM Médéré, donc passer par Déthié → ce test
+      // attrape la dérive silencieuse.
+      const { CONTACT_SPECIALITY_VALUES } = await import("./contacts");
+      expect(CONTACT_SPECIALITY_VALUES.length).toBe(21);
     });
 
     it("sentinelle CONTACT_STATUS_VALUES aligné sur ContactSchema.shape.status", () => {

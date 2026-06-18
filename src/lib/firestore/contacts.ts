@@ -110,6 +110,56 @@ const TERMINAL_CONV_STATUSES_FOR_OPT_OUT: readonly ConversationStatus[] = [
 export type UpdatableContactFields = Pick<Contact, "status" | "assignedTo">;
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Speciality — enum aligné HubSpot (S10.1.2.b)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * Liste STRICTE des spécialités professionnelles, alignée 1:1 sur l'enum
+ * `profession` de la propriété HubSpot custom Médéré.
+ *
+ * 🔒 SENTINEL — toute modification (ajout / retrait / reformulation) DOIT :
+ *   1. Être validée par Déthié (alignement HubSpot CRM)
+ *   2. Re-passer la migration des 15+ fichiers de tests/seeds
+ *   3. Mettre à jour le `HUBSPOT_PROFESSION` mapping côté `lib/hubspot/mapper.ts`
+ *   4. Casser intentionnellement le build via le test sentinelle de
+ *      `contacts.test.ts` — si tu vois le test échouer, c'est volontaire,
+ *      pas un bug.
+ *
+ * 🚨 Caractères spéciaux PRÉSERVÉS EXACTEMENT (HubSpot string match strict) :
+ *   - Tirets : "Sage-Femme", "Pédicure-podologue", "Chirurgien-dentiste"
+ *   - Parenthèses : "Assistant(e) dentaire"
+ *   - Accents : "Médecin", "Pédiatre", "Étudiant", "Gynécologue", etc.
+ *   - Casse mixte : "Sage-Femme" (F maj), "Médecin vasculaire" (v min)
+ *
+ * Toute déviation casse le mapping HubSpot → Firestore — un contact dont
+ * `properties.profession` ne match aucune valeur ici throw
+ * `ValidationError` côté mapper (anti-fall-through silencieux).
+ */
+export const CONTACT_SPECIALITY_VALUES = [
+  "Médecin",
+  "Chirurgien-dentiste",
+  "Sage-Femme",
+  "Pharmacien",
+  "IDE",
+  "MKDE",
+  "Pédicure-podologue",
+  "Assistant(e) dentaire",
+  "Aide-soignante",
+  "Autre profession paramédicale",
+  "Orthophoniste",
+  "Étudiant",
+  "Autre",
+  "Infirmier",
+  "Pédiatre",
+  "Psychiatre",
+  "Gynécologue",
+  "Dermatologue",
+  "Radiologue",
+  "Médecin vasculaire",
+  "Psychologue",
+] as const;
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Schéma Zod (validation runtime à la lecture)
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -148,7 +198,7 @@ export const ContactSchema = z.object({
   firstName: z.string().min(1),
   lastName: z.string().min(1),
   civilite: z.enum(["Dr", "Pr", "M.", "Mme"]).optional(),
-  speciality: z.enum(["dentiste", "generaliste", "ide", "autre"]),
+  speciality: z.enum(CONTACT_SPECIALITY_VALUES),
   city: z.string(),
   postalCode: z.string(),
   email: z.email().optional(),

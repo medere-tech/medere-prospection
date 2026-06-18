@@ -108,7 +108,7 @@ function makeFakeContact(overrides: Record<string, unknown> = {}) {
     hubspotId: CONTACT_ID,
     firstName: "Jean",
     lastName: "Dupont",
-    speciality: "dentiste",
+    speciality: "Chirurgien-dentiste",
     phone: {
       e164: "+33612345678",
       raw: "06 12 34 56 78",

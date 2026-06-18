@@ -45,8 +45,18 @@ export type ContactSegment =
 /** Civilité affichée dans les SMS et le dashboard (FR, secteur médical). */
 export type ContactCivilite = "Dr" | "Pr" | "M." | "Mme";
 
-/** Spécialité du PS — l'enum MVP, à étendre quand on couvrira de nouveaux PS. */
-export type ContactSpeciality = "dentiste" | "generaliste" | "ide" | "autre";
+/**
+ * Spécialité du PS — alignée 1:1 sur l'enum `profession` HubSpot custom Médéré
+ * (S10.1.2.b). Source de vérité unique : `CONTACT_SPECIALITY_VALUES` exportée
+ * depuis `src/lib/firestore/contacts.ts`. NE PAS dupliquer ici.
+ *
+ * On RE-DÉRIVE le type via un import-as-type pour garder ce module
+ * (`src/types/`) compatible client (zéro dépendance Zod, cf. convention
+ * S6.3 doc l.1-19) — `(typeof CONTACT_SPECIALITY_VALUES)[number]` produit
+ * une union string littérale erasée à la compilation.
+ */
+import type { CONTACT_SPECIALITY_VALUES } from "@/lib/firestore/contacts";
+export type ContactSpeciality = (typeof CONTACT_SPECIALITY_VALUES)[number];
 
 /** Type de ligne téléphonique — heuristique pré-Twilio puis confirmé. */
 export type ContactPhoneType = "mobile" | "landline" | "voip" | "unknown";
