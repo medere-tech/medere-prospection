@@ -72,6 +72,31 @@ describe("parsePhone", () => {
   });
 });
 
+describe("parsePhone — defensive guards S10.1.3-FIX-TYPEERROR-NO-PHONE-001", () => {
+  // 🔒 Verrouille la garde anti-TypeError ajoutée pour S10.1.3 dry-run live.
+  // libphonenumber-js crash en isSupportedCountry sur input non-string —
+  // parsePhone doit retourner null gracieusement, JAMAIS throw TypeError.
+  it("retourne null sur undefined (pas TypeError)", () => {
+    expect(parsePhone(undefined as unknown as string)).toBeNull();
+  });
+
+  it("retourne null sur null (pas TypeError)", () => {
+    expect(parsePhone(null as unknown as string)).toBeNull();
+  });
+
+  it("retourne null sur '' (chaîne vide)", () => {
+    expect(parsePhone("")).toBeNull();
+  });
+
+  it("retourne null sur '   ' (whitespace only)", () => {
+    expect(parsePhone("   ")).toBeNull();
+  });
+
+  it("toE164 hérite de la garde — null sur undefined", () => {
+    expect(toE164(undefined as unknown as string)).toBeNull();
+  });
+});
+
 describe("E164_REGEX (sentinelles anti-drift)", () => {
   // 🔒 Sentinelle source de vérité unique. Si quelqu'un modifie la régex
   // dans phone.ts sans bumper ces tests, le build casse — c'est volontaire.

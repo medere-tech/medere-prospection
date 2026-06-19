@@ -274,6 +274,61 @@ describe("Phone normalisation", () => {
     ).toThrow(ValidationError);
   });
 
+  // ─── S10.1.3-FIX-TYPEERROR-NO-PHONE-001 — verrouillage cas dégénérés ────
+  // Reproduit le scenario dry-run live qui a crashé en TypeError
+  // (libphonenumber-js::isSupportedCountry sur phone undefined). Vérifie
+  // que la garde mapper.ts ligne 228 + la garde defense-in-depth phone.ts
+  // dans parsePhone produisent un ValidationError clean (pas un TypeError
+  // nu propagé jusqu'au CLI catch handler).
+
+  it("[S10.1.3-FIX] mobilephone=undefined ET phone=undefined → ValidationError", () => {
+    const raw = buildValidRaw({ mobilephone: undefined, phone: undefined });
+    expect(() =>
+      mapHubSpotContactToFirestoreContact({
+        raw,
+        campaignId: CAMPAIGN_ID,
+        now: FIXED_NOW,
+      }),
+    ).toThrow(ValidationError);
+  });
+
+  it("[S10.1.3-FIX] mobilephone='' ET phone='' → ValidationError", () => {
+    const raw = buildValidRaw({ mobilephone: "", phone: "" });
+    expect(() =>
+      mapHubSpotContactToFirestoreContact({
+        raw,
+        campaignId: CAMPAIGN_ID,
+        now: FIXED_NOW,
+      }),
+    ).toThrow(ValidationError);
+  });
+
+  it("[S10.1.3-FIX] mobilephone='   ' ET phone='   ' (whitespace only) → ValidationError", () => {
+    const raw = buildValidRaw({ mobilephone: "   ", phone: "   " });
+    expect(() =>
+      mapHubSpotContactToFirestoreContact({
+        raw,
+        campaignId: CAMPAIGN_ID,
+        now: FIXED_NOW,
+      }),
+    ).toThrow(ValidationError);
+  });
+
+  it("[S10.1.3-FIX] mobilephone='undefined' (string littérale 9 chars) → ValidationError", () => {
+    // Cas pathologique : opérateur HubSpot qui écrit le mot "undefined"
+    // dans le champ. normalizeString le laisse passer (non vide, non null),
+    // toE164 retourne null gracieusement (libphonenumber ne parse pas
+    // "undefined"), mapper throw via la branche "phone is not normalizable".
+    const raw = buildValidRaw({ mobilephone: "undefined", phone: "undefined" });
+    expect(() =>
+      mapHubSpotContactToFirestoreContact({
+        raw,
+        campaignId: CAMPAIGN_ID,
+        now: FIXED_NOW,
+      }),
+    ).toThrow(ValidationError);
+  });
+
   it("phone non normalisable (ex: 'abc') → ValidationError", () => {
     const raw = buildValidRaw({ mobilephone: "abc-not-a-phone" });
     expect(() =>
