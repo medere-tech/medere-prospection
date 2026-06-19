@@ -88,7 +88,31 @@ export interface HubspotClient {
   crm: {
     lists: {
       listsApi: {
+        /**
+         * `getAll` SDK route `GET /crm/v3/lists/?listIds=...` — c'est en
+         * réalité "fetch lists BY ID", PAS "énumérer toutes les listes".
+         * Sans `listIds`, l'API retourne `{lists: []}`.
+         *
+         * 🚨 S10.1.3-FIX-LISTS-DOSEARCH-001 : NE PAS UTILISER pour énumérer.
+         * Utiliser `doSearch` (POST /crm/v3/lists/search). Préservé ici
+         * uniquement pour back-compat type SDK + test sentinelle anti-régression.
+         */
         getAll(listIds?: Array<string>, includeFilters?: boolean): Promise<unknown>;
+        /**
+         * `doSearch` SDK route `POST /crm/v3/lists/search` — endpoint
+         * d'énumération/recherche des listes du portail. Pagination via
+         * `offset` + `hasMore`. `additionalProperties: ["size"]` récupère
+         * le size de chaque liste (sinon absent).
+         */
+        doSearch(request: {
+          query?: string;
+          count?: number;
+          offset?: number;
+          listIds?: Array<string>;
+          processingTypes?: Array<string>;
+          additionalProperties?: Array<string>;
+          sort?: string;
+        }): Promise<unknown>;
       };
       membershipsApi: {
         getPage(listId: string, after?: string, before?: string, limit?: number): Promise<unknown>;

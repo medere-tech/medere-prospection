@@ -30,7 +30,7 @@ function makeFakeClient(opts: {
   return {
     crm: {
       lists: {
-        listsApi: { getAll: vi.fn() },
+        listsApi: { getAll: vi.fn(), doSearch: vi.fn() },
         membershipsApi: {
           getPage: opts.getPage ?? vi.fn().mockResolvedValue({ results: [] }),
         },

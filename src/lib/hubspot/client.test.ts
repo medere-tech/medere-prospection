@@ -93,7 +93,7 @@ describe("__setHubspotClientForTests", () => {
     const fake: HubspotClient = {
       crm: {
         lists: {
-          listsApi: { getAll: vi.fn() },
+          listsApi: { getAll: vi.fn(), doSearch: vi.fn() },
           membershipsApi: { getPage: vi.fn() },
         },
         contacts: {
@@ -110,7 +110,7 @@ describe("__setHubspotClientForTests", () => {
     const fake = {
       crm: {
         lists: {
-          listsApi: { getAll: vi.fn() },
+          listsApi: { getAll: vi.fn(), doSearch: vi.fn() },
           membershipsApi: { getPage: vi.fn() },
         },
         contacts: {
