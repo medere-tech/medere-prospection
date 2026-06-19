@@ -128,10 +128,16 @@ export type AuditAction =
   | "prompt_changed"
   | "campaign_started"
   | "campaign_paused"
+  // S10.1.3 — mirror campaign_started pour clôture forensic seed/campagne
+  | "campaign_completed"
   // ── DATA ───────────────────────────────────────────────────────────────
   | "bloctel_imported"
   | "contact_deleted"
   | "contact_anonymized"
+  // S10.1.3 — seed HubSpot → Firestore (traçabilité forensic RGPD origine)
+  | "contact_imported_from_hubspot"
+  | "contact_created"
+  | "contact_import_skipped"
   // ── AUTH ───────────────────────────────────────────────────────────────
   | "login"
   | "role_changed"

@@ -23,6 +23,7 @@
     "emulator:check": "node scripts/setup-firebase-cache.mjs",
     "emulator:kill": "node scripts/kill-emulator-port.mjs",
     "firebase:deploy:indexes": "firebase deploy --only firestore:indexes",
+    "seed:hubspot": "tsx scripts/seed-contacts-from-hubspot.mjs",
     "prepare": "husky"
   },
   "dependencies": {

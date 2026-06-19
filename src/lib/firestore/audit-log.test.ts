@@ -99,10 +99,15 @@ const EXPECTED_AUDIT_ACTIONS: ReadonlySet<AuditAction> = new Set<AuditAction>([
   "prompt_changed",
   "campaign_started",
   "campaign_paused",
+  "campaign_completed", // S10.1.3 — mirror campaign_started pour clôture seed
   // DATA
   "bloctel_imported",
   "contact_deleted",
   "contact_anonymized",
+  // S10.1.3 — seed HubSpot → Firestore (traçabilité forensic RGPD origine)
+  "contact_imported_from_hubspot",
+  "contact_created",
+  "contact_import_skipped",
   // AUTH
   "login",
   "role_changed",
@@ -146,6 +151,20 @@ describe("ACTIONS whitelist — sentinelle anti-drift TS ↔ runtime (S9.1)", ()
     // retiré, `commitDraftToQueued` ne pourra plus poser cet audit en
     // branche blocked → trou forensique consent drift.
     expect(EXPECTED_AUDIT_ACTIONS.has("reply_draft_dropped")).toBe(true);
+  });
+
+  it("contient les 4 actions S10.1.3 seed (sentinelles dédiées)", () => {
+    // Verrouillage spécifique pour repérer un revert/squash accidentel
+    // des ajouts S10.1.3 (seed-runner HubSpot → Firestore).
+    // - campaign_completed : clôture forensic seed (mirror campaign_started)
+    // - contact_imported_from_hubspot : traçabilité origine HubSpot
+    //   (compliance-auditor S10.1.2.b F2 — 1 entrée par contact créé)
+    // - contact_created : générique (S10.1.2.c F1)
+    // - contact_import_skipped : erreur mapper localisée (anti-stop-the-world)
+    expect(EXPECTED_AUDIT_ACTIONS.has("campaign_completed")).toBe(true);
+    expect(EXPECTED_AUDIT_ACTIONS.has("contact_imported_from_hubspot")).toBe(true);
+    expect(EXPECTED_AUDIT_ACTIONS.has("contact_created")).toBe(true);
+    expect(EXPECTED_AUDIT_ACTIONS.has("contact_import_skipped")).toBe(true);
   });
 });
 
@@ -689,5 +708,137 @@ describe("S9.4.1 — sentinelle reply_draft_dropped anti-PII (defense-in-depth)"
 
     expect(docId).toMatch(/^[A-Za-z0-9]{20}$/);
     expect(await countAuditDocs()).toBe(1);
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// S10.1.3 — sentinelles append + anti-PII pour les 4 nouvelles actions seed
+// ─────────────────────────────────────────────────────────────────────────────
+
+describe("S10.1.3 — 4 nouvelles actions seed (cas append valides)", () => {
+  beforeEach(async () => {
+    vi.unstubAllEnvs();
+    vi.stubEnv("AUDIT_PII_PEPPER", PEPPER);
+    await fullReset();
+  });
+
+  afterEach(async () => {
+    vi.unstubAllEnvs();
+    await fullReset();
+  });
+
+  it("campaign_started peut être appendé avec payload mini valide", async () => {
+    const docId = await appendAuditLog({
+      actorId: "system:seed",
+      actorType: "system",
+      action: "campaign_started",
+      targetType: "campaign",
+      targetId: "hubspot-list-1234",
+      payload: {
+        listId: "1234",
+        listName: "SMS Dentistes IDF",
+        expectedCount: 200,
+        dryRun: false,
+      },
+    });
+    expect(docId).toMatch(/^[A-Za-z0-9]{20}$/);
+  });
+
+  it("campaign_completed peut être appendé avec payload stats finales", async () => {
+    const docId = await appendAuditLog({
+      actorId: "system:seed",
+      actorType: "system",
+      action: "campaign_completed",
+      targetType: "campaign",
+      targetId: "hubspot-list-1234",
+      payload: {
+        listId: "1234",
+        createdCount: 193,
+        skippedAlreadyExists: 4,
+        skippedMapperError: 3,
+        durationMs: 32_500,
+      },
+    });
+    expect(docId).toMatch(/^[A-Za-z0-9]{20}$/);
+  });
+
+  it("contact_imported_from_hubspot peut être appendé avec payload mini valide", async () => {
+    const docId = await appendAuditLog({
+      actorId: "system:seed",
+      actorType: "system",
+      action: "contact_imported_from_hubspot",
+      targetType: "contact",
+      targetId: "hs_med_idf_42",
+      payload: {
+        listId: "1234",
+        mappingVersion: "1.0.0",
+        source: "hubspot",
+      },
+    });
+    expect(docId).toMatch(/^[A-Za-z0-9]{20}$/);
+  });
+
+  it("contact_created peut être appendé (action générique)", async () => {
+    const docId = await appendAuditLog({
+      actorId: "system:seed",
+      actorType: "system",
+      action: "contact_created",
+      targetType: "contact",
+      targetId: "hs_med_idf_42",
+      payload: { source: "hubspot" },
+    });
+    expect(docId).toMatch(/^[A-Za-z0-9]{20}$/);
+  });
+
+  it("contact_import_skipped peut être appendé avec payload reason/field/errorCode", async () => {
+    const docId = await appendAuditLog({
+      actorId: "system:seed",
+      actorType: "system",
+      action: "contact_import_skipped",
+      targetType: "contact",
+      targetId: "hs_med_idf_99",
+      payload: {
+        reason: "mapper_failed",
+        field: "profession",
+        errorCode: "VALIDATION",
+      },
+    });
+    expect(docId).toMatch(/^[A-Za-z0-9]{20}$/);
+  });
+
+  it("anti-PII : contact_imported_from_hubspot REFUSE phone E.164 dans payload (scrubber)", async () => {
+    // Sentinelle compliance-critical : si un caller buggué tente d'inclure
+    // le téléphone du PS dans le payload audit, scrubber l'attrape AVANT
+    // l'écriture Firestore (AuditPiiError, pas d'écriture partielle).
+    await expect(
+      appendAuditLog({
+        actorId: "system:seed",
+        actorType: "system",
+        action: "contact_imported_from_hubspot",
+        targetType: "contact",
+        targetId: "hs_med_idf_42",
+        payload: {
+          listId: "1234",
+          source: "hubspot",
+          phone: "+33612345678", // PII E.164 → AuditPiiError
+        },
+      }),
+    ).rejects.toThrow(AuditPiiError);
+  });
+
+  it("anti-PII : contact_import_skipped REFUSE email dans payload (scrubber)", async () => {
+    await expect(
+      appendAuditLog({
+        actorId: "system:seed",
+        actorType: "system",
+        action: "contact_import_skipped",
+        targetType: "contact",
+        targetId: "hs_med_idf_99",
+        payload: {
+          reason: "mapper_failed",
+          email: "jean.dupont@cabinet-dentaire.fr", // PII → AuditPiiError
+        },
+      }),
+    ).rejects.toThrow(AuditPiiError);
   });
 });
