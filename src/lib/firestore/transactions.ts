@@ -127,6 +127,71 @@ const CONVERSATIONS_COLLECTION = "conversations";
 const RATE_LIMIT_WINDOW_DAYS = 30;
 
 // ─────────────────────────────────────────────────────────────────────────────
+// S10.1.4.c-FIX-FLAKY-001 — détection erreurs Firestore SDK de concurrence
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * Détecte les erreurs Firestore SDK qui signalent une race condition de
+ * commit échouée même après les 5 retries automatiques du SDK Admin.
+ *
+ * ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ * Couvre :
+ *
+ *   - **gRPC ABORTED (code 10)** ou `"aborted"` — vrai conflit de commit
+ *     déterministe. Le SDK Admin retry 5× automatiquement ; si après les
+ *     5 retries on voit propager ABORTED, c'est que la course persiste
+ *     (autre tx commit en boucle sur le même contact). Sémantiquement
+ *     équivalent à notre re-check applicatif `canSendMessage` qui aurait
+ *     dit "race" — on wrap pour cohérence côté caller (Inngest retry
+ *     naturel comme pour le re-check applicatif).
+ *
+ *   - **gRPC INVALID_ARGUMENT (code 3)** ou `"invalid-argument"` + message
+ *     préfixé `"Transaction is "` (variants: `"Transaction is closed"`,
+ *     `"Transaction is too old"`). Apparaît quand le SDK abandonne la tx
+ *     après que les retries internes aient épuisé leur budget temps ou que
+ *     la tx ait été marquée stale côté serveur Firestore. Forensiquement
+ *     équivalent à ABORTED — c'est une race qui n'a pas convergé.
+ *
+ * ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ * Ne wrap PAS :
+ *
+ *   - Les INVALID_ARGUMENT pour input caller mal-formé (ex: `tx.update`
+ *     sur une ref invalide, doc data avec type erroné) — message ne match
+ *     PAS `^Transaction is `, donc retourne false → propagation normale
+ *     vers le caller pour debug.
+ *
+ *   - FAILED_PRECONDITION (code 9) — peut avoir d'autres origines (assertions
+ *     côté serveur). Volontairement exclu pour éviter de masquer des bugs
+ *     applicatifs.
+ *
+ *   - Toutes les autres erreurs SDK (DEADLINE_EXCEEDED, UNAVAILABLE,
+ *     INTERNAL, etc.) — laissées propager pour que le caller Inngest
+ *     applique son propre policy retry par défaut.
+ *
+ * ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ * Note : l'erreur observée en flaky S10.1.4.c (concurrency.test.ts
+ * iterations 8/10 puis 1/10) avait le format gRPC standard
+ * `"3 INVALID_ARGUMENT: Transaction is …"` — le préfixe `"3 "` peut être
+ * stripé par certaines versions du SDK qui exposent juste
+ * `"Transaction is closed"` dans `.message`. Le regex `/Transaction is /i`
+ * tolère les 2 formes.
+ *
+ * @internal Helper interne `transactions.ts`. Exposé via `_FOR_TESTS` pour
+ *           unit testing de la logique de détection (cf. transactions.test.ts).
+ */
+function _isFirestoreConcurrencyError(err: unknown): boolean {
+  if (typeof err !== "object" || err === null) return false;
+  const e = err as { code?: unknown; message?: unknown };
+  const msg = typeof e.message === "string" ? e.message : "";
+
+  if (e.code === 10 || e.code === "aborted") return true;
+  if ((e.code === 3 || e.code === "invalid-argument") && /Transaction is /i.test(msg)) {
+    return true;
+  }
+  return false;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // API publique
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -378,51 +443,123 @@ export interface SendOutboundWithLockResult {
 export async function sendOutboundWithLock(
   args: SendOutboundWithLockArgs,
 ): Promise<SendOutboundWithLockResult> {
-  return withContactLock(args.contactId, async (tx) => {
-    // ── 1. Lecture + parse conversation DANS la tx ────────────────────────
-    const convRef = getAdminDb().collection(CONVERSATIONS_COLLECTION).doc(args.conversationId);
-    const convDoc = await tx.get(convRef);
-    if (!convDoc.exists) {
-      throw new NotFoundError({
-        message: `Conversation not found: ${args.conversationId}`,
-        context: { conversationId: args.conversationId },
-      });
-    }
-    const conv = _parseConversationOrThrow(convDoc.data(), args.conversationId);
+  // S10.1.4.c-FIX-FLAKY-001 — wrap la `withContactLock` pour convertir les
+  // erreurs Firestore SDK de concurrence (ABORTED, INVALID_ARGUMENT
+  // "Transaction is …") en `ComplianceConcurrencyError` sémantiquement
+  // équivalente au re-check applicatif `canSendMessage`.
+  //
+  // Pourquoi : le test `concurrency.test.ts > "race resilience 10 iterations"`
+  // attendait STRICTEMENT `ComplianceConcurrencyError` sur la rejection
+  // perdante. Mais quand le SDK Admin a épuisé ses retries internes (cas
+  // de race persistante ou tx marquée stale serveur), il propage l'erreur
+  // native INVALID_ARGUMENT. Le test devenait flaky (1× sur 8-10 environ).
+  //
+  // Le wrap ici est BORNÉ : on convertit UNIQUEMENT les patterns de
+  // concurrence prouvés (cf. `_isFirestoreConcurrencyError`). Les autres
+  // erreurs (NotFoundError, ValidationError, AuditPiiError, erreurs réseau
+  // génériques) propagent telles quelles vers le caller — pas de masquage.
+  //
+  // `observedRemainingQuota: 0` est une approximation forensique valide :
+  // si Firestore SDK a abandonné après 5 retries, c'est que l'autre tx a
+  // commit avant nous → quota observed = 0 vue par notre tx au moment de
+  // l'abandon. Sémantiquement équivalent au re-check `canSendMessage`
+  // applicatif qui aurait dit la même chose.
+  try {
+    return await withContactLock(args.contactId, async (tx) => {
+      // ── 1. Lecture + parse conversation DANS la tx ────────────────────────
+      const convRef = getAdminDb().collection(CONVERSATIONS_COLLECTION).doc(args.conversationId);
+      const convDoc = await tx.get(convRef);
+      if (!convDoc.exists) {
+        throw new NotFoundError({
+          message: `Conversation not found: ${args.conversationId}`,
+          context: { conversationId: args.conversationId },
+        });
+      }
+      const conv = _parseConversationOrThrow(convDoc.data(), args.conversationId);
 
-    // ── 2. Défense en profondeur : conv.contactId === args.contactId ──────
-    // Si le caller a fourni un convId qui n'appartient PAS au contact locké,
-    // le lock est inutile (autre tx pourrait modifier ce contact en
-    // parallèle). On refuse explicitement pour faire surface le bug
-    // d'orchestration côté caller.
-    if (conv.contactId !== args.contactId) {
-      throw new ValidationError({
-        message: `Conversation ${args.conversationId} belongs to contact ${conv.contactId}, not ${args.contactId}`,
-        context: {
+      // ── 2. Défense en profondeur : conv.contactId === args.contactId ──────
+      // Si le caller a fourni un convId qui n'appartient PAS au contact locké,
+      // le lock est inutile (autre tx pourrait modifier ce contact en
+      // parallèle). On refuse explicitement pour faire surface le bug
+      // d'orchestration côté caller.
+      if (conv.contactId !== args.contactId) {
+        throw new ValidationError({
+          message: `Conversation ${args.conversationId} belongs to contact ${conv.contactId}, not ${args.contactId}`,
+          context: {
+            conversationId: args.conversationId,
+            expectedContactId: args.contactId,
+            actualContactId: conv.contactId,
+          },
+        });
+      }
+
+      // ── 3. Lecture historique outbound DANS la tx (lock READ SET) ─────────
+      const recentOutbound = await listRecentOutboundInTx(
+        tx,
+        args.conversationId,
+        RATE_LIMIT_WINDOW_DAYS,
+      );
+
+      // ── 4. Re-check rate-limit DANS la tx ─────────────────────────────────
+      const rateLimitCheck = canSendMessage(recentOutbound);
+      if (!rateLimitCheck.allowed) {
+        // Race détectée : la pré-vérif HORS tx avait dit OK
+        // (`args.expectedRemainingQuota` reflète cette valeur), mais une autre
+        // tx a commit entre temps et saturé le plafond. Par construction de
+        // `canSendMessage` (`allowed === false` ⇔ `inWindow.length >= MAX`),
+        // le quota observé restant est 0.
+        throw new ComplianceConcurrencyError({
+          message: `Rate-limit race detected for contact ${args.contactId} on conversation ${args.conversationId}: ${rateLimitCheck.reason ?? "no_reason"}`,
+          context: {
+            contactId: args.contactId,
+            ruleName: "rate_limit_30d",
+            attemptedAt: new Date(),
+            expectedRemainingQuota: args.expectedRemainingQuota,
+            observedRemainingQuota: 0,
+          },
+        });
+      }
+
+      // ── 5. Write message + audit sms_sent interne (via addOutboundInTx) ───
+      const messageId = await addOutboundInTx(tx, args.conversationId, conv, args.input);
+
+      // ── 6. Audit sms_provider_dispatched DANS la même tx ──────────────────
+      // Payload = facts OVH bruts + IDs forensiques top-level. Pas de
+      // duplication avec args.dispatch (qui ne contient QUE les facts OVH
+      // OVHcloud-spécifiques). Sentinelle action = "sms_provider_dispatched"
+      // verbatim (test anti-régression dans `transactions.test.ts`).
+      const auditId = appendAuditLogTx(tx, {
+        actorId: "system",
+        actorType: "system",
+        action: "sms_provider_dispatched",
+        targetType: "message",
+        targetId: messageId,
+        payload: {
+          ovhMessageId: args.dispatch.ovhMessageId,
+          sender: args.dispatch.sender,
+          bodyLength: args.dispatch.bodyLength,
+          creditsRemoved: args.dispatch.creditsRemoved,
+          dryRun: args.dispatch.dryRun,
           conversationId: args.conversationId,
-          expectedContactId: args.contactId,
-          actualContactId: conv.contactId,
+          contactId: args.contactId,
+          campaignId: args.campaignId,
         },
       });
-    }
 
-    // ── 3. Lecture historique outbound DANS la tx (lock READ SET) ─────────
-    const recentOutbound = await listRecentOutboundInTx(
-      tx,
-      args.conversationId,
-      RATE_LIMIT_WINDOW_DAYS,
-    );
+      return { messageId, auditId };
+    });
+  } catch (err) {
+    // ComplianceConcurrencyError thrown DEPUIS le re-check applicatif —
+    // propagation directe (forme déjà attendue par le caller).
+    if (err instanceof ComplianceConcurrencyError) throw err;
 
-    // ── 4. Re-check rate-limit DANS la tx ─────────────────────────────────
-    const rateLimitCheck = canSendMessage(recentOutbound);
-    if (!rateLimitCheck.allowed) {
-      // Race détectée : la pré-vérif HORS tx avait dit OK
-      // (`args.expectedRemainingQuota` reflète cette valeur), mais une autre
-      // tx a commit entre temps et saturé le plafond. Par construction de
-      // `canSendMessage` (`allowed === false` ⇔ `inWindow.length >= MAX`),
-      // le quota observé restant est 0.
+    // Erreur Firestore SDK de concurrence (ABORTED, INVALID_ARGUMENT
+    // "Transaction is …") — wrap en ComplianceConcurrencyError pour
+    // cohérence sémantique avec le re-check applicatif.
+    if (_isFirestoreConcurrencyError(err)) {
+      const errMsg = err instanceof Error ? err.message : String(err);
       throw new ComplianceConcurrencyError({
-        message: `Rate-limit race detected for contact ${args.contactId} on conversation ${args.conversationId}: ${rateLimitCheck.reason ?? "no_reason"}`,
+        message: `Firestore SDK concurrency abort for contact ${args.contactId} on conversation ${args.conversationId}: ${errMsg}`,
         context: {
           contactId: args.contactId,
           ruleName: "rate_limit_30d",
@@ -430,37 +567,14 @@ export async function sendOutboundWithLock(
           expectedRemainingQuota: args.expectedRemainingQuota,
           observedRemainingQuota: 0,
         },
+        cause: err,
       });
     }
 
-    // ── 5. Write message + audit sms_sent interne (via addOutboundInTx) ───
-    const messageId = await addOutboundInTx(tx, args.conversationId, conv, args.input);
-
-    // ── 6. Audit sms_provider_dispatched DANS la même tx ──────────────────
-    // Payload = facts OVH bruts + IDs forensiques top-level. Pas de
-    // duplication avec args.dispatch (qui ne contient QUE les facts OVH
-    // OVHcloud-spécifiques). Sentinelle action = "sms_provider_dispatched"
-    // verbatim (test anti-régression dans `transactions.test.ts`).
-    const auditId = appendAuditLogTx(tx, {
-      actorId: "system",
-      actorType: "system",
-      action: "sms_provider_dispatched",
-      targetType: "message",
-      targetId: messageId,
-      payload: {
-        ovhMessageId: args.dispatch.ovhMessageId,
-        sender: args.dispatch.sender,
-        bodyLength: args.dispatch.bodyLength,
-        creditsRemoved: args.dispatch.creditsRemoved,
-        dryRun: args.dispatch.dryRun,
-        conversationId: args.conversationId,
-        contactId: args.contactId,
-        campaignId: args.campaignId,
-      },
-    });
-
-    return { messageId, auditId };
-  });
+    // Toute autre erreur (NotFoundError, ValidationError, AuditPiiError,
+    // erreurs réseau génériques) — propagation telle quelle.
+    throw err;
+  }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -475,3 +589,10 @@ export const __TRANSACTIONS_CONVERSATIONS_COLLECTION_FOR_TESTS = CONVERSATIONS_C
 
 /** @internal */
 export const __TRANSACTIONS_RATE_LIMIT_WINDOW_DAYS_FOR_TESTS = RATE_LIMIT_WINDOW_DAYS;
+
+/**
+ * @internal Exposé pour tests unitaires de la logique de détection des
+ * erreurs Firestore SDK de concurrence (FIX-FLAKY-001). NE PAS importer
+ * depuis du code applicatif — la fonction est privée par design.
+ */
+export const _isFirestoreConcurrencyError_FOR_TESTS = _isFirestoreConcurrencyError;

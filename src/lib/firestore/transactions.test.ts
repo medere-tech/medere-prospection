@@ -56,6 +56,7 @@ import {
   __TRANSACTIONS_CONTACTS_COLLECTION_FOR_TESTS,
   __TRANSACTIONS_CONVERSATIONS_COLLECTION_FOR_TESTS,
   __TRANSACTIONS_RATE_LIMIT_WINDOW_DAYS_FOR_TESTS,
+  _isFirestoreConcurrencyError_FOR_TESTS,
   sendOutboundWithLock,
   withContactLock,
 } from "./transactions";
@@ -858,5 +859,98 @@ describe("transactions.ts — sendOutboundWithLock (DEBT-001.3)", () => {
     // était absent ou mal nommé, NotFoundError serait thrown au step 1).
     const result = await sendOutboundWithLock(buildArgs({ contactId, convId, campaignId }));
     expect(result.messageId).toMatch(/^[A-Za-z0-9]{20}$/);
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// S10.1.4.c-FIX-FLAKY-001 — _isFirestoreConcurrencyError detection logic
+// ─────────────────────────────────────────────────────────────────────────────
+
+describe("_isFirestoreConcurrencyError (FIX-FLAKY-001)", () => {
+  describe("retourne true (wrapping en ComplianceConcurrencyError attendu)", () => {
+    it("gRPC ABORTED — code numérique 10", () => {
+      const err = Object.assign(new Error("10 ABORTED: Too much contention"), { code: 10 });
+      expect(_isFirestoreConcurrencyError_FOR_TESTS(err)).toBe(true);
+    });
+
+    it("gRPC ABORTED — code string 'aborted'", () => {
+      const err = Object.assign(new Error("Too much contention"), { code: "aborted" });
+      expect(_isFirestoreConcurrencyError_FOR_TESTS(err)).toBe(true);
+    });
+
+    it("gRPC INVALID_ARGUMENT (3) + 'Transaction is closed' (cas observé en flaky)", () => {
+      const err = Object.assign(new Error("3 INVALID_ARGUMENT: Transaction is closed."), {
+        code: 3,
+      });
+      expect(_isFirestoreConcurrencyError_FOR_TESTS(err)).toBe(true);
+    });
+
+    it("gRPC INVALID_ARGUMENT (3) + 'Transaction is too old'", () => {
+      const err = Object.assign(new Error("3 INVALID_ARGUMENT: Transaction is too old."), {
+        code: 3,
+      });
+      expect(_isFirestoreConcurrencyError_FOR_TESTS(err)).toBe(true);
+    });
+
+    it("INVALID_ARGUMENT — code string 'invalid-argument' + message Transaction is", () => {
+      const err = Object.assign(new Error("Transaction is closed"), { code: "invalid-argument" });
+      expect(_isFirestoreConcurrencyError_FOR_TESTS(err)).toBe(true);
+    });
+
+    it("message sans préfixe gRPC mais contient 'Transaction is' (variante SDK)", () => {
+      // Certaines versions du SDK exposent juste "Transaction is closed"
+      // sans le préfixe "3 " dans err.message.
+      const err = Object.assign(new Error("Transaction is closed because it has been aborted."), {
+        code: 3,
+      });
+      expect(_isFirestoreConcurrencyError_FOR_TESTS(err)).toBe(true);
+    });
+  });
+
+  describe("retourne false (PAS de wrap — propagation telle quelle)", () => {
+    it("INVALID_ARGUMENT pour input mal-formé caller (PAS 'Transaction is')", () => {
+      // Ex: tx.update sur une ref invalide. NE DOIT PAS être wrap en
+      // ComplianceConcurrencyError — c'est un vrai bug à surface.
+      const err = Object.assign(
+        new Error("3 INVALID_ARGUMENT: Cannot update field 'foo' (no such field)."),
+        { code: 3 },
+      );
+      expect(_isFirestoreConcurrencyError_FOR_TESTS(err)).toBe(false);
+    });
+
+    it("FAILED_PRECONDITION (code 9) — volontairement exclu", () => {
+      const err = Object.assign(new Error("9 FAILED_PRECONDITION: ..."), { code: 9 });
+      expect(_isFirestoreConcurrencyError_FOR_TESTS(err)).toBe(false);
+    });
+
+    it("DEADLINE_EXCEEDED (code 4)", () => {
+      const err = Object.assign(new Error("4 DEADLINE_EXCEEDED"), { code: 4 });
+      expect(_isFirestoreConcurrencyError_FOR_TESTS(err)).toBe(false);
+    });
+
+    it("UNAVAILABLE (code 14)", () => {
+      const err = Object.assign(new Error("14 UNAVAILABLE"), { code: 14 });
+      expect(_isFirestoreConcurrencyError_FOR_TESTS(err)).toBe(false);
+    });
+
+    it("ALREADY_EXISTS (code 6) — différent contexte sémantique", () => {
+      const err = Object.assign(new Error("6 ALREADY_EXISTS"), { code: 6 });
+      expect(_isFirestoreConcurrencyError_FOR_TESTS(err)).toBe(false);
+    });
+
+    it("erreur native sans code (Error standard)", () => {
+      expect(_isFirestoreConcurrencyError_FOR_TESTS(new Error("plain error"))).toBe(false);
+    });
+
+    it("non-objet (string, null, undefined)", () => {
+      expect(_isFirestoreConcurrencyError_FOR_TESTS("string")).toBe(false);
+      expect(_isFirestoreConcurrencyError_FOR_TESTS(null)).toBe(false);
+      expect(_isFirestoreConcurrencyError_FOR_TESTS(undefined)).toBe(false);
+      expect(_isFirestoreConcurrencyError_FOR_TESTS(42)).toBe(false);
+    });
+
+    it("objet sans message ni code", () => {
+      expect(_isFirestoreConcurrencyError_FOR_TESTS({})).toBe(false);
+    });
   });
 });
