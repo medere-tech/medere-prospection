@@ -57,8 +57,19 @@ import { appendAuditLogTx } from "@/lib/firestore/audit-log";
 import { _parseConversationOrThrow } from "@/lib/firestore/conversations";
 import { ConflictError, InternalError, NotFoundError, ValidationError } from "@/lib/utils/errors";
 import { E164_REGEX } from "@/lib/utils/phone";
-import type { Contact } from "@/types/contact";
+import { type Contact, CONTACT_STATUS_VALUES } from "@/types/contact";
 import type { Conversation, ConversationStatus } from "@/types/conversation";
+
+/**
+ * 🔒 Re-export pour rétrocompat (S10.1.5-FIX-SEC). Source de vérité unique
+ * dans `@/types/contact` — module pur sans dépendance Admin SDK pour
+ * éviter de polluer le bundle browser via `status-filter.tsx` (`"use client"`).
+ *
+ * Les tests serveur historiques (`audit-log.test.ts`, etc.) qui font
+ * `import { CONTACT_STATUS_VALUES } from "@/lib/firestore/contacts"`
+ * continuent à fonctionner via ce re-export.
+ */
+export { CONTACT_STATUS_VALUES };
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Constantes & types internes
@@ -209,15 +220,7 @@ export const ContactSchema = z.object({
   bloctelCheckedAt: TimestampLike.optional(),
   consent: ContactConsentSchema,
   enrichment: ContactEnrichmentSchema,
-  status: z.enum([
-    "pending",
-    "enriched",
-    "ready",
-    "in_conversation",
-    "qualified",
-    "opted_out",
-    "archived",
-  ]),
+  status: z.enum(CONTACT_STATUS_VALUES),
   campaignId: z.string(),
   assignedTo: z.string().optional(),
   createdAt: TimestampLike,
@@ -711,14 +714,6 @@ export const LIST_CONTACTS_DEFAULT_LIMIT = 50;
  * 🔒 SENTINEL — verrouillé par test sentinelle.
  */
 export const LIST_CONTACTS_MAX_LIMIT = 100;
-
-/**
- * Source de vérité unique des statuses valides — extrait directement de
- * `ContactSchema.shape.status.options` plutôt que dupliqué en string
- * array. Toute évolution du `ContactSchema` propage AUTOMATIQUEMENT ici
- * (et casse les tests sentinelle si la sémantique change).
- */
-export const CONTACT_STATUS_VALUES = ContactSchema.shape.status.options;
 
 /**
  * Schema Zod des filtres `listContacts`. Whitelist STRICTE :

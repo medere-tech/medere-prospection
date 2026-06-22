@@ -23,15 +23,33 @@ import type { Timestamp } from "firebase-admin/firestore";
 // Unions (réutilisées par les écrans dashboard et les wrappers)
 // ─────────────────────────────────────────────────────────────────────────────
 
+/**
+ * 🔒 Source de vérité unique des status. Tuple readonly `as const` — peut
+ * être passé directement à `z.enum()` côté serveur ET utilisé comme array
+ * itérable côté client (dropdown UI S10.1.5) sans tirer Zod ni Admin SDK
+ * dans le bundle browser.
+ *
+ * Avant S10.1.5-FIX-SEC : la constante vivait dans
+ * `src/lib/firestore/contacts.ts` (dérivée de `ContactSchema.shape.status.options`).
+ * `status-filter.tsx` (`"use client"`) qui l'importait risquait de tirer
+ * `firebase-admin/firestore` dans le bundle browser (defense-in-depth
+ * security-reviewer S10.1.5 Phase 7).
+ *
+ * Re-export depuis `lib/firestore/contacts` préservé pour rétrocompat —
+ * les tests serveur peuvent continuer à importer de là.
+ */
+export const CONTACT_STATUS_VALUES = [
+  "pending", // importé, pas encore enrichi
+  "enriched", // enrichi via Lusha, validation Twilio pas encore faite
+  "ready", // prêt à être contacté
+  "in_conversation", // conversation SMS en cours
+  "qualified", // intent positif, hand-off effectué
+  "opted_out", // a demandé STOP
+  "archived", // inactif, archivé
+] as const;
+
 /** État d'un contact dans le pipeline de prospection. */
-export type ContactStatus =
-  | "pending" // importé, pas encore enrichi
-  | "enriched" // enrichi via Lusha, validation Twilio pas encore faite
-  | "ready" // prêt à être contacté
-  | "in_conversation" // conversation SMS en cours
-  | "qualified" // intent positif, hand-off effectué
-  | "opted_out" // a demandé STOP
-  | "archived"; // inactif, archivé
+export type ContactStatus = (typeof CONTACT_STATUS_VALUES)[number];
 
 /**
  * Segmentation B2B/B2C : pilote la vérification Bloctel (obligatoire pour
