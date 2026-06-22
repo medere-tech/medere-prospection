@@ -130,6 +130,11 @@ export type AuditAction =
   | "campaign_paused"
   // S10.1.3 — mirror campaign_started pour clôture forensic seed/campagne
   | "campaign_completed"
+  // S10.1.4.c — admin déclenche l'envoi du 1er SMS via POST /api/admin/send-first-sms.
+  // Audit posé AVANT inngest.send (queue). Forensic AI Act + L.34-5 CPCE :
+  // trace l'initiation HUMAINE (vs system) du dispatch, payload sans PII
+  // (contactId opaque + campaignId regex-conforme + smsCharCount).
+  | "sms_send_initiated_by_admin"
   // ── DATA ───────────────────────────────────────────────────────────────
   | "bloctel_imported"
   | "contact_deleted"

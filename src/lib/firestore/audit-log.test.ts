@@ -100,6 +100,7 @@ const EXPECTED_AUDIT_ACTIONS: ReadonlySet<AuditAction> = new Set<AuditAction>([
   "campaign_started",
   "campaign_paused",
   "campaign_completed", // S10.1.3 — mirror campaign_started pour clôture seed
+  "sms_send_initiated_by_admin", // S10.1.4.c — admin POST /api/admin/send-first-sms
   // DATA
   "bloctel_imported",
   "contact_deleted",
@@ -165,6 +166,16 @@ describe("ACTIONS whitelist — sentinelle anti-drift TS ↔ runtime (S9.1)", ()
     expect(EXPECTED_AUDIT_ACTIONS.has("contact_imported_from_hubspot")).toBe(true);
     expect(EXPECTED_AUDIT_ACTIONS.has("contact_created")).toBe(true);
     expect(EXPECTED_AUDIT_ACTIONS.has("contact_import_skipped")).toBe(true);
+  });
+
+  it("contient l'action S10.1.4.c `sms_send_initiated_by_admin` (sentinelle dédiée)", () => {
+    // Verrouillage spécifique pour repérer un revert/squash accidentel de
+    // l'ajout S10.1.4.c. Cette action est CRITIQUE compliance : elle trace
+    // l'initiation HUMAINE (admin Clerk) de l'envoi du 1er SMS, distincte
+    // des actions système (sms_sent, sms_provider_dispatched). Sans elle,
+    // forensic AI Act + L.34-5 CPCE incapable de prouver qui a déclenché
+    // un envoi en cas de plainte PS.
+    expect(EXPECTED_AUDIT_ACTIONS.has("sms_send_initiated_by_admin")).toBe(true);
   });
 });
 

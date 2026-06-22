@@ -92,6 +92,9 @@ const ACTIONS = [
   "campaign_paused",
   // S10.1.3 — mirror campaign_started pour clôture forensic seed/campagne
   "campaign_completed",
+  // S10.1.4.c — admin déclenche l'envoi du 1er SMS via POST /api/admin/send-first-sms.
+  // Cf. types/audit-log.ts pour la sémantique. Sentinelle S9.1 anti-drift TS↔Zod.
+  "sms_send_initiated_by_admin",
   // ── DATA ───────────────────────────────────────────────────────────────
   "bloctel_imported",
   "contact_deleted",
