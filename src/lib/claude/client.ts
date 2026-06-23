@@ -202,10 +202,14 @@ function mapSdkError(err: unknown, context: Record<string, unknown>): never {
       context: { ...context, status: err.status },
     });
   }
+  // S10.1.7-SECURITY-CAUSE-LEAK-001 : PAS de `cause: err` même sur ce
+  // catch-all. L'erreur d'origine peut contenir un X-Api-Key tronqué
+  // dans son message (cas TypeError exotique côté fetch undici, ou
+  // wrapping interne SDK). Anti-leak via Pino sérialiseur par défaut.
+  // On capture la classe via `errKind` pour le forensic.
   throw new InternalError({
     message: "Unexpected error during Anthropic call",
-    context,
-    cause: err,
+    context: { ...context, errKind: err instanceof Error ? err.constructor.name : typeof err },
   });
 }
 

@@ -239,7 +239,14 @@ export async function getContactsInList(
       undefined,
       limit,
     );
-  } catch (err) {
+  } catch {
+    // SDK throw sur 401, 5xx, network. On wrap en ExternalServiceError
+    // retry-friendly SANS attacher `cause: err` (S10.1.7-SECURITY-CAUSE-
+    // LEAK-001) : le SDK HubSpot peut embarquer le token Bearer dans
+    // `err.message`, et si un caller logue `logger.error({ err: ext })`
+    // (sérialiseur Pino par défaut), la chaîne `err.cause.message` est
+    // sérialisée et fuit le token. Cohérent avec lists.ts:243-260.
+    // Forensic via context op/listId + Sentry côté serveur.
     throw new ExternalServiceError({
       message: "getContactsInList: HubSpot membershipsApi.getPage failed",
       context: {
@@ -248,7 +255,6 @@ export async function getContactsInList(
         // listId OK dans context (opaque ID interne HubSpot, pas PII).
         listId,
       },
-      cause: err,
     });
   }
 
@@ -275,7 +281,10 @@ export async function getContactsInList(
       properties: [...HUBSPOT_CONTACT_PROPERTIES],
       propertiesWithHistory: [],
     });
-  } catch (err) {
+  } catch {
+    // SDK throw sur 401, 5xx, network. PAS de `cause: err` (S10.1.7-SECURITY-
+    // CAUSE-LEAK-001) — même rationale que membershipsApi.getPage ci-dessus :
+    // le SDK HubSpot peut embarquer le token Bearer dans `err.message`.
     throw new ExternalServiceError({
       message: "getContactsInList: HubSpot contacts.batchApi.read failed",
       context: {
@@ -285,7 +294,6 @@ export async function getContactsInList(
         // recordIds.length OK (count), pas les IDs eux-mêmes (semi-PII).
         recordIdsCount: recordIds.length,
       },
-      cause: err,
     });
   }
 
@@ -323,8 +331,11 @@ export async function getContactsInList(
  * @throws ExternalServiceError si l'appel SDK échoue OU si le retour
  *                              est mal formé. Note : HubSpot retourne
  *                              404 pour un id inexistant — wrappé en
- *                              `ExternalServiceError` (le caller peut
- *                              extraire le statusCode via `cause`).
+ *                              `ExternalServiceError` SANS `cause`
+ *                              (S10.1.7-SECURITY-CAUSE-LEAK-001). Le
+ *                              statusCode original n'est plus surfacé ;
+ *                              utiliser un wrapper dédié `getContactOrNull`
+ *                              si la distinction 404 vs 5xx est nécessaire.
  */
 export async function getContact(hubspotId: string): Promise<HubspotContactRaw> {
   if (typeof hubspotId !== "string" || hubspotId.trim() === "") {
@@ -339,7 +350,15 @@ export async function getContact(hubspotId: string): Promise<HubspotContactRaw> 
   let raw: unknown;
   try {
     raw = await client.crm.contacts.basicApi.getById(hubspotId, [...HUBSPOT_CONTACT_PROPERTIES]);
-  } catch (err) {
+  } catch {
+    // SDK throw sur 401, 404, 5xx, network. PAS de `cause: err` (S10.1.7-
+    // SECURITY-CAUSE-LEAK-001) — le SDK HubSpot peut embarquer le token
+    // Bearer dans `err.message`. Forensic via context + Sentry.
+    //
+    // Note 404 : le statusCode original n'est plus extractible côté caller
+    // sans `cause`. Si un caller a besoin de distinguer 404 d'autres
+    // erreurs (cas rare), il faudra introduire un wrapper dédié
+    // `getContactOrNull()` qui catch et retourne null sur 404.
     throw new ExternalServiceError({
       message: "getContact: HubSpot contacts.basicApi.getById failed",
       context: {
@@ -350,7 +369,6 @@ export async function getContact(hubspotId: string): Promise<HubspotContactRaw> 
         // se fait via corrélation timestamp + fingerprint côté admin.
         hubspotIdFingerprint: shortFingerprint(hubspotId),
       },
-      cause: err,
     });
   }
 

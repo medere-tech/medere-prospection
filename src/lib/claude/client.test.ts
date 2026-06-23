@@ -456,7 +456,7 @@ describe("generate — mapping erreurs SDK", () => {
     }
   });
 
-  it("erreur non-SDK (TypeError exotique) → InternalError", async () => {
+  it("erreur non-SDK (TypeError exotique) → InternalError SANS cause (anti-leak)", async () => {
     const { client, create } = makeFakeClient();
     create.mockRejectedValueOnce(new TypeError("weird"));
     __setAnthropicClientForTests(client);
@@ -466,7 +466,13 @@ describe("generate — mapping erreurs SDK", () => {
       expect.fail("should have thrown");
     } catch (e) {
       expect(e).toBeInstanceOf(InternalError);
-      expect((e as InternalError).cause).toBeInstanceOf(TypeError);
+      // S10.1.7-SECURITY-CAUSE-LEAK-001 : `cause` doit être undefined.
+      // L'erreur d'origine peut contenir un X-Api-Key tronqué dans son
+      // message — si on l'attache à `cause`, Pino logger la sérialise
+      // par défaut via err.cause.message → leak. On capture la classe
+      // dans `context.errKind` pour préserver le forensic.
+      expect((e as InternalError).cause).toBeUndefined();
+      expect((e as InternalError).context?.errKind).toBe("TypeError");
     }
   });
 });
