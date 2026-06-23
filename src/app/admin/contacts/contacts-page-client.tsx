@@ -104,7 +104,12 @@ export function ContactsPageClient({ initialCampaigns }: ContactsPageClientProps
   const [cursor, setCursor] = useQueryState("cursor");
 
   const [state, setState] = useState<FetchState>({ kind: "idle" });
-  const [previewContactId, setPreviewContactId] = useState<string | null>(null);
+  /**
+   * S10.1.6 — on stocke le Contact COMPLET (pas juste l'ID) pour que la
+   * modal puisse rendre son header riche (nom, ville, phone masqué) sans
+   * fetch supplémentaire. Data déjà en cache via `/api/admin/contacts`.
+   */
+  const [previewContact, setPreviewContact] = useState<Contact | null>(null);
   /** Bumpé après send success → trigger refetch sans bouger filtres/cursor. */
   const [refetchKey, setRefetchKey] = useState(0);
 
@@ -134,7 +139,7 @@ export function ContactsPageClient({ initialCampaigns }: ContactsPageClientProps
     pageCount: -1,
     getCoreRowModel: getCoreRowModel(),
     meta: {
-      onPreview: setPreviewContactId,
+      onPreview: setPreviewContact,
     },
   });
 
@@ -247,8 +252,8 @@ export function ContactsPageClient({ initialCampaigns }: ContactsPageClientProps
       </div>
 
       <PreviewDialog
-        contactId={previewContactId}
-        onClose={() => setPreviewContactId(null)}
+        contact={previewContact}
+        onClose={() => setPreviewContact(null)}
         onSendSuccess={() => setRefetchKey((k) => k + 1)}
       />
     </div>

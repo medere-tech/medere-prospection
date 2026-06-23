@@ -7,10 +7,19 @@
  *   anti-shoulder-surfing, acte conscient admin).
  * - Cellule `status` : Badge shadcn avec variant par status.
  * - Cellule `actions` : DropdownMenu (Preview / Copier ID).
+ *     - S10.1.6 B1 : tooltip explicatif sur l'item Preview désactivé,
+ *       précisant les statuts compatibles. Le tooltip s'attache au
+ *       wrapper du DropdownMenuItem (qui reste focusable même quand
+ *       l'item interne est `data-disabled`).
  *
  * `onPreview` est injecté par le parent via `meta` TanStack (pattern
  * canonique pour passer des callbacks aux cell renderers sans recréer
  * les columns à chaque render).
+ *
+ * 🚨 S10.1.6 — signature `onPreview` passe de `(contactId: string) => void`
+ * à `(contact: Contact) => void` car le PreviewDialog a maintenant besoin
+ * du Contact complet pour afficher le header riche (nom, ville, phone
+ * masqué). Pas de fetch supplémentaire côté modal — data déjà en cache.
  */
 import type { ColumnDef } from "@tanstack/react-table";
 import { Copy, Eye, EyeOff, MoreHorizontal, Send } from "lucide-react";
@@ -27,6 +36,7 @@ import {
   DropdownMenuSeparator,
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
+import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
 import type { Contact, ContactStatus } from "@/types/contact";
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -36,7 +46,11 @@ import type { Contact, ContactStatus } from "@/types/contact";
 declare module "@tanstack/react-table" {
   // eslint-disable-next-line @typescript-eslint/no-unused-vars
   interface TableMeta<TData> {
-    onPreview?: (contactId: string) => void;
+    /**
+     * S10.1.6 — reçoit le Contact complet (pas juste le hubspotId) pour
+     * que la modal puisse rendre son header riche sans fetch supplémentaire.
+     */
+    onPreview?: (contact: Contact) => void;
   }
 }
 
@@ -50,8 +64,12 @@ declare module "@tanstack/react-table" {
  *
  * Différent de `maskPhone()` (lib/utils/phone) qui sert aux logs/audit
  * forensic — ici, c'est juste un masquage VISUEL réversible côté admin.
+ *
+ * 🚨 S10.1.6 — exporté pour réutilisation par `preview-dialog.tsx`
+ * (header riche du Dialog réutilise le même masquage que la cellule
+ * table, cohérence visuelle).
  */
-function maskPhoneForUI(e164: string): string {
+export function maskPhoneForUI(e164: string): string {
   if (e164.length < 5) return "••••";
   const head = e164.slice(0, 4); // +336 ou +337 etc.
   const tail = e164.slice(-2);
@@ -94,6 +112,17 @@ const STATUS_LABEL_FR: Record<ContactStatus, string> = {
   archived: "Archivé",
 };
 
+/**
+ * Statuts pour lesquels la preview du 1er SMS est disponible. Source de
+ * vérité côté serveur : `PREVIEW_ALLOWED_STATUSES` dans
+ * `src/app/api/admin/preview-first-sms/route.ts` (D-b1). Dupliquer ici
+ * pour le UI guard est ACCEPTABLE — le serveur reste autoritatif.
+ *
+ * Si un nouveau statut est ajouté côté serveur, mettre à jour ici aussi
+ * (sentinelle test S10.1.4.b).
+ */
+const PREVIEW_ALLOWED_STATUSES: readonly ContactStatus[] = ["pending", "enriched", "ready"];
+
 // ─────────────────────────────────────────────────────────────────────────────
 // PhoneCell — toggle masqué/clair par ligne
 // ─────────────────────────────────────────────────────────────────────────────
@@ -131,7 +160,7 @@ function PhoneCell({ e164 }: { e164: string }) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// ActionsCell — menu Preview / Copier ID
+// ActionsCell — menu Preview / Copier ID (S10.1.6 — tooltip B1)
 // ─────────────────────────────────────────────────────────────────────────────
 
 function ActionsCell({
@@ -139,7 +168,7 @@ function ActionsCell({
   onPreview,
 }: {
   contact: Contact;
-  onPreview?: (contactId: string) => void;
+  onPreview?: (contact: Contact) => void;
 }) {
   const handleCopyId = async () => {
     try {
@@ -150,7 +179,7 @@ function ActionsCell({
     }
   };
 
-  const previewDisabled = !["pending", "enriched", "ready"].includes(contact.status);
+  const previewDisabled = !PREVIEW_ALLOWED_STATUSES.includes(contact.status);
 
   return (
     <DropdownMenu>
@@ -170,10 +199,35 @@ function ActionsCell({
       <DropdownMenuContent align="end">
         <DropdownMenuLabel>Actions</DropdownMenuLabel>
         <DropdownMenuSeparator />
-        <DropdownMenuItem onClick={() => onPreview?.(contact.hubspotId)} disabled={previewDisabled}>
-          <Send className="size-3.5" aria-hidden />
-          Prévisualiser le 1er SMS
-        </DropdownMenuItem>
+        {previewDisabled ? (
+          // S10.1.6 B1 : item disabled + tooltip explicatif. On wrap dans
+          // un span focusable pour que le Tooltip se déclenche sur hover
+          // et focus clavier (le DropdownMenuItem `data-disabled` ne
+          // recevant pas les events pointeur quand `disabled`).
+          <TooltipProvider delay={150}>
+            <Tooltip>
+              <TooltipTrigger
+                render={
+                  <span tabIndex={0} className="block focus-visible:outline-none">
+                    <DropdownMenuItem disabled aria-disabled="true">
+                      <Send className="size-3.5" aria-hidden />
+                      Prévisualiser le 1er SMS
+                    </DropdownMenuItem>
+                  </span>
+                }
+              />
+              <TooltipContent side="left">
+                Disponible uniquement pour les statuts <strong>Importé</strong>,{" "}
+                <strong>Enrichi</strong> ou <strong>Prêt</strong>.
+              </TooltipContent>
+            </Tooltip>
+          </TooltipProvider>
+        ) : (
+          <DropdownMenuItem onClick={() => onPreview?.(contact)}>
+            <Send className="size-3.5" aria-hidden />
+            Prévisualiser le 1er SMS
+          </DropdownMenuItem>
+        )}
         <DropdownMenuItem onClick={handleCopyId}>
           <Copy className="size-3.5" aria-hidden />
           Copier l&apos;ID HubSpot
@@ -241,7 +295,9 @@ export const contactColumns: ColumnDef<Contact>[] = [
 ];
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Exposés pour tests
+// Exposés pour tests (S10.1.6 — `maskPhoneForUI` est désormais exporté
+// directement ci-dessus pour réutilisation par `preview-dialog.tsx`).
+// On garde l'alias `__FOR_TESTS` pour rétrocompat avec les tests existants.
 // ─────────────────────────────────────────────────────────────────────────────
 
 export { maskPhoneForUI as __maskPhoneForUI_FOR_TESTS };
