@@ -140,11 +140,22 @@ describe("PreviewDialog (S10.1.6 — UX premium)", () => {
     vi.spyOn(global, "fetch").mockResolvedValue(jsonResponse(PREVIEW_OK));
     render(<PreviewDialog contact={buildContact()} onClose={vi.fn()} />);
 
-    expect(screen.getByText("Dr Jean Dupont")).toBeInTheDocument();
+    // S10.1.7-Q1 : findByText (async) plutôt que getByText (sync) pour
+    // wrapper implicitement le rendu post-mount dans act(). Sinon, le
+    // fetch mock résout dans un microtask et trigger un setState après la
+    // fin du test → warning "An update to PreviewDialogContent inside a
+    // test was not wrapped in act(...)" en pre-push.
+    expect(await screen.findByText("Dr Jean Dupont")).toBeInTheDocument();
     expect(screen.getByText("Chirurgien-dentiste")).toBeInTheDocument();
     expect(screen.getByText(/Paris · 75001/)).toBeInTheDocument();
     // Téléphone masqué visuellement (cohérent avec PhoneCell de la table)
     expect(screen.getByText("+336 •• ••• •78")).toBeInTheDocument();
+
+    // Wait final pour s'assurer que le fetch résolu a settled le state
+    // (success) — évite que le test termine avant le setState du then().
+    await waitFor(() => {
+      expect(screen.getByText("Compliance OK")).toBeInTheDocument();
+    });
   });
 
   it("preview success preSendCheckPassed=true → smsBody + char count + pills + badge OK", async () => {
@@ -324,5 +335,195 @@ describe("PreviewDialog (S10.1.6 — UX premium)", () => {
     await waitFor(() => {
       expect(screen.getByText("Compliance OK")).toBeInTheDocument();
     });
+  });
+
+  // ───────────────────────────────────────────────────────────────────────
+  // S10.1.7-M1 : couverture handleConfirmSend success + error paths
+  // ───────────────────────────────────────────────────────────────────────
+
+  it("confirm + send success → transition 'sent' + toast.success + onSendSuccess + onClose après 2500ms", async () => {
+    const onSendSuccess = vi.fn();
+    const onClose = vi.fn();
+    // 1er fetch = preview, 2e fetch = send
+    const fetchSpy = vi
+      .spyOn(global, "fetch")
+      .mockResolvedValueOnce(jsonResponse(PREVIEW_OK))
+      .mockResolvedValueOnce(
+        jsonResponse({
+          jobId: "job_abc",
+          status: "queued",
+          contactId: "hs_abc",
+          smsCharCount: 60,
+        }),
+      );
+
+    // useFakeTimers AVANT render pour intercepter le setTimeout(2500ms)
+    // qu'utilise handleConfirmSend après succès.
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+
+    render(
+      <PreviewDialog contact={buildContact()} onClose={onClose} onSendSuccess={onSendSuccess} />,
+    );
+
+    // Attend que la preview soit chargée (sortie de l'état loading)
+    const sendBtn = await screen.findByRole("button", { name: /Envoyer le SMS/i });
+    await waitFor(() => expect(sendBtn).not.toBeDisabled());
+
+    // 1er clic : passe en mode confirming
+    await userEvent.click(sendBtn);
+
+    // 2e clic : confirme l'envoi définitif
+    const confirmBtn = screen.getByRole("button", { name: /Confirmer l'envoi définitif/i });
+    await userEvent.click(confirmBtn);
+
+    // Vérifie l'appel à /api/admin/send-first-sms
+    await waitFor(() => {
+      expect(fetchSpy).toHaveBeenCalledWith(
+        "/api/admin/send-first-sms",
+        expect.objectContaining({
+          method: "POST",
+          body: JSON.stringify({ contactId: "hs_abc", confirm: true }),
+        }),
+      );
+    });
+
+    // Transition "sent" visible : SMS envoyé à Dr Dupont
+    await waitFor(() => {
+      expect(screen.getByText(/SMS envoyé à Dr Dupont/)).toBeInTheDocument();
+    });
+
+    // toast.success + onSendSuccess appelés
+    const { toast } = await import("sonner");
+    expect(toast.success).toHaveBeenCalledWith(expect.stringContaining("SMS envoyé (60 car.)"));
+    expect(onSendSuccess).toHaveBeenCalledTimes(1);
+
+    // onClose pas encore appelé (avant 2500ms)
+    expect(onClose).not.toHaveBeenCalled();
+
+    // Avance le temps de 2500ms → setTimeout déclenché → onClose appelé
+    vi.advanceTimersByTime(2500);
+    expect(onClose).toHaveBeenCalledTimes(1);
+
+    vi.useRealTimers();
+  });
+
+  // ───────────────────────────────────────────────────────────────────────
+  // S10.1.7 : couverture branches (CharCountBadge tones + pills non-matched
+  // + ReasoningCollapsible toggle close)
+  // ───────────────────────────────────────────────────────────────────────
+
+  it("CharCountBadge tone 'warn' quand 161 ≤ charCount ≤ 320 (2 segments)", async () => {
+    const longBody = "x".repeat(200) + " STOP Léa";
+    vi.spyOn(global, "fetch").mockResolvedValue(
+      jsonResponse({ ...PREVIEW_OK, smsBody: longBody, charCount: 209 }),
+    );
+    render(<PreviewDialog contact={buildContact()} onClose={vi.fn()} />);
+
+    expect(await screen.findByLabelText(/209 caractères, 2 segments SMS/)).toBeInTheDocument();
+  });
+
+  it("CharCountBadge tone 'alert' quand charCount > 320 (3+ segments)", async () => {
+    const veryLong = "y".repeat(400) + " STOP Léa";
+    vi.spyOn(global, "fetch").mockResolvedValue(
+      jsonResponse({ ...PREVIEW_OK, smsBody: veryLong, charCount: 409 }),
+    );
+    render(<PreviewDialog contact={buildContact()} onClose={vi.fn()} />);
+
+    expect(await screen.findByLabelText(/409 caractères, 3 segments SMS/)).toBeInTheDocument();
+  });
+
+  it("ComplianceCheckPill matched=false quand smsBody ne contient ni 'STOP' ni 'Léa/IA' (signal compliance manquant)", async () => {
+    const bodyMissingTokens = "Hello Dr Dupont, message generic sans token compliance.";
+    vi.spyOn(global, "fetch").mockResolvedValue(
+      jsonResponse({ ...PREVIEW_OK, smsBody: bodyMissingTokens }),
+    );
+    render(<PreviewDialog contact={buildContact()} onClose={vi.fn()} />);
+
+    // Les pills affichent toujours leur label, même si non-matched (signal
+    // visuel "absent" via couleur ambre vs vert)
+    await waitFor(() => {
+      expect(screen.getByText("Annonce IA détectée")).toBeInTheDocument();
+      expect(screen.getByText("Token STOP présent")).toBeInTheDocument();
+    });
+  });
+
+  it("ReasoningCollapsible : ouvrir puis fermer → aria-expanded false + contenu démonté", async () => {
+    vi.spyOn(global, "fetch").mockResolvedValue(jsonResponse(PREVIEW_OK));
+    render(<PreviewDialog contact={buildContact()} onClose={vi.fn()} />);
+
+    await waitFor(() => {
+      expect(screen.getByText("Compliance OK")).toBeInTheDocument();
+    });
+
+    const toggle = screen.getByRole("button", { name: /Raisonnement Claude/i });
+    expect(toggle).toHaveAttribute("aria-expanded", "false");
+
+    // Open
+    await userEvent.click(toggle);
+    expect(toggle).toHaveAttribute("aria-expanded", "true");
+    expect(screen.getByText(PREVIEW_OK.reasoning)).toBeInTheDocument();
+
+    // Close (couvre la branche !open du conditional render)
+    await userEvent.click(toggle);
+    expect(toggle).toHaveAttribute("aria-expanded", "false");
+    expect(screen.queryByText(PREVIEW_OK.reasoning)).not.toBeInTheDocument();
+  });
+
+  it("send → erreur réseau (fetch throw TypeError) → toast.error générique (anti-leak)", async () => {
+    vi.spyOn(global, "fetch")
+      .mockResolvedValueOnce(jsonResponse(PREVIEW_OK))
+      .mockRejectedValueOnce(new TypeError("Failed to fetch"));
+
+    render(<PreviewDialog contact={buildContact()} onClose={vi.fn()} />);
+
+    const sendBtn = await screen.findByRole("button", { name: /Envoyer le SMS/i });
+    await waitFor(() => expect(sendBtn).not.toBeDisabled());
+    await userEvent.click(sendBtn);
+
+    const confirmBtn = screen.getByRole("button", {
+      name: /Confirmer l'envoi définitif/i,
+    });
+    await userEvent.click(confirmBtn);
+
+    const { toast } = await import("sonner");
+    await waitFor(() => {
+      expect(toast.error).toHaveBeenCalledWith(expect.stringContaining("Erreur réseau"));
+    });
+    // Pas de leak du message technique brut
+    const errCall = vi.mocked(toast.error).mock.calls[0];
+    expect(errCall?.[0]).not.toContain("Failed to fetch");
+  });
+
+  it("confirm + send error → toast.error + footer revient idle (modal reste ouverte)", async () => {
+    const onSendSuccess = vi.fn();
+    const onClose = vi.fn();
+    vi.spyOn(global, "fetch")
+      .mockResolvedValueOnce(jsonResponse(PREVIEW_OK))
+      .mockResolvedValueOnce(
+        jsonResponse({ error: { code: "INTERNAL", message: "OVH 500" } }, 500),
+      );
+
+    render(
+      <PreviewDialog contact={buildContact()} onClose={onClose} onSendSuccess={onSendSuccess} />,
+    );
+
+    const sendBtn = await screen.findByRole("button", { name: /Envoyer le SMS/i });
+    await waitFor(() => expect(sendBtn).not.toBeDisabled());
+    await userEvent.click(sendBtn);
+
+    const confirmBtn = screen.getByRole("button", {
+      name: /Confirmer l'envoi définitif/i,
+    });
+    await userEvent.click(confirmBtn);
+
+    const { toast } = await import("sonner");
+    await waitFor(() => {
+      expect(toast.error).toHaveBeenCalledWith(expect.stringContaining("OVH 500"));
+    });
+
+    // Footer revient idle (bouton "Envoyer le SMS" de nouveau présent)
+    expect(screen.getByRole("button", { name: /Envoyer le SMS/i })).toBeInTheDocument();
+    expect(onClose).not.toHaveBeenCalled();
+    expect(onSendSuccess).not.toHaveBeenCalled();
   });
 });

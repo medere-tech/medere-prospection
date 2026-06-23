@@ -27,6 +27,7 @@ import {
   TableHeader,
   TableRow,
 } from "@/components/ui/table";
+import { TooltipProvider } from "@/components/ui/tooltip";
 import type { HubspotListInfo } from "@/lib/hubspot/lists";
 import type { Contact } from "@/types/contact";
 
@@ -146,116 +147,126 @@ export function ContactsPageClient({ initialCampaigns }: ContactsPageClientProps
   const columnCount = contactColumns.length;
 
   return (
-    <div className="flex flex-col gap-6">
-      <header className="flex flex-col gap-1">
-        <h1 className="text-2xl font-bold tracking-tight">Contacts</h1>
-        <p className="text-sm text-muted-foreground">
-          Liste des professionnels de santé prospects. Sélectionnez une campagne pour filtrer.
-        </p>
-      </header>
+    // S10.1.7-M6 : TooltipProvider hoisté ici (vs S10.1.6 où chaque
+    // ActionsCell instanciait son propre TooltipProvider — N×provider
+    // dans le DOM pour N contacts). Un seul provider global pour toute
+    // la page suffit (delay partagé, idempotent côté base-ui).
+    <TooltipProvider delay={150}>
+      <div className="flex flex-col gap-6">
+        <header className="flex flex-col gap-1">
+          <h1 className="text-2xl font-bold tracking-tight">Contacts</h1>
+          <p className="text-sm text-muted-foreground">
+            Liste des professionnels de santé prospects. Sélectionnez une campagne pour filtrer.
+          </p>
+        </header>
 
-      <div className="flex flex-wrap items-end gap-3">
-        <CampaignSelect campaigns={initialCampaigns} onChange={resetCursor} />
-        <StatusFilter onChange={resetCursor} />
-      </div>
+        <div className="flex flex-wrap items-end gap-3">
+          <CampaignSelect campaigns={initialCampaigns} onChange={resetCursor} />
+          <StatusFilter onChange={resetCursor} />
+        </div>
 
-      {/* S10.1.5-FIX-UX : `overflow-x-auto` évite que les 5 colonnes
+        {/* S10.1.5-FIX-UX : `overflow-x-auto` évite que les 5 colonnes
           débordent sur iPad portrait (768px) — sinon casse le layout
           de la page entière. */}
-      <div className="rounded-md border overflow-x-auto">
-        <Table>
-          <TableHeader>
-            {table.getHeaderGroups().map((hg) => (
-              <TableRow key={hg.id}>
-                {hg.headers.map((h) => (
-                  <TableHead key={h.id}>
-                    {h.isPlaceholder ? null : flexRender(h.column.columnDef.header, h.getContext())}
-                  </TableHead>
-                ))}
-              </TableRow>
-            ))}
-          </TableHeader>
-          <TableBody aria-live="polite" aria-busy={state.kind === "loading"}>
-            {state.kind === "loading" &&
-              Array.from({ length: 5 }).map((_, idx) => (
-                <TableRow key={`skel-${idx}`}>
-                  <TableCell colSpan={columnCount}>
-                    <Skeleton className="h-8 w-full" />
-                  </TableCell>
-                </TableRow>
-              ))}
-
-            {state.kind === "error" && (
-              <TableRow>
-                <TableCell colSpan={columnCount}>
-                  <div className="flex flex-col items-center gap-1 py-8 text-sm">
-                    <span className="font-medium text-destructive">
-                      Impossible de charger les contacts ({state.status})
-                    </span>
-                    <span className="text-muted-foreground">{state.message}</span>
-                  </div>
-                </TableCell>
-              </TableRow>
-            )}
-
-            {state.kind === "success" && data.length === 0 && (
-              <TableRow>
-                <TableCell colSpan={columnCount}>
-                  <div className="flex flex-col items-center gap-2 py-8 text-sm text-muted-foreground">
-                    <span>Aucun contact trouvé pour ces filtres.</span>
-                    <span className="text-xs">Essayez une autre campagne ou un autre statut.</span>
-                  </div>
-                </TableCell>
-              </TableRow>
-            )}
-
-            {state.kind === "success" &&
-              data.length > 0 &&
-              table.getRowModel().rows.map((row) => (
-                <TableRow key={row.id}>
-                  {row.getVisibleCells().map((cell) => (
-                    <TableCell key={cell.id}>
-                      {flexRender(cell.column.columnDef.cell, cell.getContext())}
-                    </TableCell>
+        <div className="rounded-md border overflow-x-auto">
+          <Table>
+            <TableHeader>
+              {table.getHeaderGroups().map((hg) => (
+                <TableRow key={hg.id}>
+                  {hg.headers.map((h) => (
+                    <TableHead key={h.id}>
+                      {h.isPlaceholder
+                        ? null
+                        : flexRender(h.column.columnDef.header, h.getContext())}
+                    </TableHead>
                   ))}
                 </TableRow>
               ))}
-          </TableBody>
-        </Table>
-      </div>
+            </TableHeader>
+            <TableBody aria-live="polite" aria-busy={state.kind === "loading"}>
+              {state.kind === "loading" &&
+                Array.from({ length: 5 }).map((_, idx) => (
+                  <TableRow key={`skel-${idx}`}>
+                    <TableCell colSpan={columnCount}>
+                      <Skeleton className="h-8 w-full" />
+                    </TableCell>
+                  </TableRow>
+                ))}
 
-      <div className="flex items-center justify-between gap-2">
-        <span className="text-sm text-muted-foreground tabular-nums">
-          {state.kind === "success"
-            ? `${data.length} contact${data.length > 1 ? "s" : ""} affiché${data.length > 1 ? "s" : ""}`
-            : ""}
-        </span>
-        <div className="flex gap-2">
-          <Button
-            type="button"
-            variant="outline"
-            size="sm"
-            disabled={!cursor || state.kind === "loading"}
-            onClick={() => void setCursor(null)}
-          >
-            Première page
-          </Button>
-          <Button
-            type="button"
-            size="sm"
-            disabled={!hasMore || nextCursor === null || state.kind === "loading"}
-            onClick={() => nextCursor && void setCursor(nextCursor)}
-          >
-            Page suivante
-          </Button>
+              {state.kind === "error" && (
+                <TableRow>
+                  <TableCell colSpan={columnCount}>
+                    <div className="flex flex-col items-center gap-1 py-8 text-sm">
+                      <span className="font-medium text-destructive">
+                        Impossible de charger les contacts ({state.status})
+                      </span>
+                      <span className="text-muted-foreground">{state.message}</span>
+                    </div>
+                  </TableCell>
+                </TableRow>
+              )}
+
+              {state.kind === "success" && data.length === 0 && (
+                <TableRow>
+                  <TableCell colSpan={columnCount}>
+                    <div className="flex flex-col items-center gap-2 py-8 text-sm text-muted-foreground">
+                      <span>Aucun contact trouvé pour ces filtres.</span>
+                      <span className="text-xs">
+                        Essayez une autre campagne ou un autre statut.
+                      </span>
+                    </div>
+                  </TableCell>
+                </TableRow>
+              )}
+
+              {state.kind === "success" &&
+                data.length > 0 &&
+                table.getRowModel().rows.map((row) => (
+                  <TableRow key={row.id}>
+                    {row.getVisibleCells().map((cell) => (
+                      <TableCell key={cell.id}>
+                        {flexRender(cell.column.columnDef.cell, cell.getContext())}
+                      </TableCell>
+                    ))}
+                  </TableRow>
+                ))}
+            </TableBody>
+          </Table>
         </div>
-      </div>
 
-      <PreviewDialog
-        contact={previewContact}
-        onClose={() => setPreviewContact(null)}
-        onSendSuccess={() => setRefetchKey((k) => k + 1)}
-      />
-    </div>
+        <div className="flex items-center justify-between gap-2">
+          <span className="text-sm text-muted-foreground tabular-nums">
+            {state.kind === "success"
+              ? `${data.length} contact${data.length > 1 ? "s" : ""} affiché${data.length > 1 ? "s" : ""}`
+              : ""}
+          </span>
+          <div className="flex gap-2">
+            <Button
+              type="button"
+              variant="outline"
+              size="sm"
+              disabled={!cursor || state.kind === "loading"}
+              onClick={() => void setCursor(null)}
+            >
+              Première page
+            </Button>
+            <Button
+              type="button"
+              size="sm"
+              disabled={!hasMore || nextCursor === null || state.kind === "loading"}
+              onClick={() => nextCursor && void setCursor(nextCursor)}
+            >
+              Page suivante
+            </Button>
+          </div>
+        </div>
+
+        <PreviewDialog
+          contact={previewContact}
+          onClose={() => setPreviewContact(null)}
+          onSendSuccess={() => setRefetchKey((k) => k + 1)}
+        />
+      </div>
+    </TooltipProvider>
   );
 }

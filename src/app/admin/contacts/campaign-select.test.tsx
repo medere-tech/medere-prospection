@@ -25,6 +25,7 @@ import {
   __fromCampaignId_FOR_TESTS,
   __toCampaignId_FOR_TESTS,
   CampaignSelect,
+  handleCampaignChange,
 } from "./campaign-select";
 
 const CAMPAIGNS: HubspotListInfo[] = [
@@ -90,6 +91,46 @@ describe("CampaignSelect (S10.1.5 Phase 6)", () => {
       for (const id of listIds) {
         expect(__fromCampaignId_FOR_TESTS(__toCampaignId_FOR_TESTS(id))).toBe(id);
       }
+    });
+  });
+
+  describe("handleCampaignChange (S10.1.7-M5 — handler pur)", () => {
+    it("value=null → setCampaignId(null) + onChange(null)", () => {
+      const setCampaignId = vi.fn();
+      const onChange = vi.fn();
+      handleCampaignChange(null, setCampaignId, onChange);
+      expect(setCampaignId).toHaveBeenCalledWith(null);
+      expect(onChange).toHaveBeenCalledWith(null);
+    });
+
+    it('value="__all__" (sentinelle reset filtre) → setCampaignId(null) + onChange(null)', () => {
+      const setCampaignId = vi.fn();
+      const onChange = vi.fn();
+      handleCampaignChange("__all__", setCampaignId, onChange);
+      expect(setCampaignId).toHaveBeenCalledWith(null);
+      expect(onChange).toHaveBeenCalledWith(null);
+    });
+
+    it('value="" (vide) → setCampaignId(null) + onChange(null)', () => {
+      const setCampaignId = vi.fn();
+      const onChange = vi.fn();
+      handleCampaignChange("", setCampaignId, onChange);
+      expect(setCampaignId).toHaveBeenCalledWith(null);
+      expect(onChange).toHaveBeenCalledWith(null);
+    });
+
+    it("value=listId valide (ex: '200') → setCampaignId('hubspot-list-200') + onChange(...)", () => {
+      const setCampaignId = vi.fn();
+      const onChange = vi.fn();
+      handleCampaignChange("200", setCampaignId, onChange);
+      expect(setCampaignId).toHaveBeenCalledWith("hubspot-list-200");
+      expect(onChange).toHaveBeenCalledWith("hubspot-list-200");
+    });
+
+    it("onChange absent (optionnel) → ne throw pas, setCampaignId quand même appelé", () => {
+      const setCampaignId = vi.fn();
+      expect(() => handleCampaignChange("200", setCampaignId)).not.toThrow();
+      expect(setCampaignId).toHaveBeenCalledWith("hubspot-list-200");
     });
   });
 });

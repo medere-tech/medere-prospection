@@ -45,21 +45,32 @@ export interface StatusFilterProps {
   onChange?: (status: ContactStatus | null) => void;
 }
 
+/**
+ * Handler pur (S10.1.7-M4 — extrait pour testabilité). Branche la Base UI
+ * Select `onValueChange` → setStatus nuqs + callback parent. Type guard
+ * runtime sécurise le narrowing vers ContactStatus (anti-cast aveugle).
+ */
+export function handleStatusChange(
+  value: string | null,
+  setStatus: (v: string | null) => void,
+  onChange?: (status: ContactStatus | null) => void,
+): void {
+  if (value === null || value === "" || !isContactStatus(value)) {
+    void setStatus(null);
+    onChange?.(null);
+    return;
+  }
+  void setStatus(value);
+  onChange?.(value);
+}
+
+// Exposé pour tests — type guard pur, testable indépendamment.
+export { isContactStatus as __isContactStatus_FOR_TESTS };
+
 export function StatusFilter({ onChange }: StatusFilterProps) {
   const [status, setStatus] = useQueryState("status");
 
-  // Signature Base UI `onValueChange?: (value: string | null, eventDetails) => void`
-  // — `null` arrive sur déselection (Escape, outsidePress, focus loss).
-  // Type guard runtime sécurise le narrowing vers ContactStatus.
-  const handleChange = (value: string | null) => {
-    if (value === null || value === "" || !isContactStatus(value)) {
-      void setStatus(null);
-      onChange?.(null);
-      return;
-    }
-    void setStatus(value);
-    onChange?.(value);
-  };
+  const handleChange = (value: string | null) => handleStatusChange(value, setStatus, onChange);
 
   return (
     <div className="flex min-w-[180px] flex-col gap-1.5">

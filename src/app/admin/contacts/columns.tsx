@@ -23,7 +23,7 @@
  */
 import type { ColumnDef } from "@tanstack/react-table";
 import { Copy, Eye, EyeOff, MoreHorizontal, Send } from "lucide-react";
-import { useState } from "react";
+import { useId, useState } from "react";
 import { toast } from "sonner";
 
 import { Badge } from "@/components/ui/badge";
@@ -31,12 +31,13 @@ import { Button } from "@/components/ui/button";
 import {
   DropdownMenu,
   DropdownMenuContent,
+  DropdownMenuGroup,
   DropdownMenuItem,
   DropdownMenuLabel,
   DropdownMenuSeparator,
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
-import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
+import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import type { Contact, ContactStatus } from "@/types/contact";
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -170,6 +171,12 @@ function ActionsCell({
   contact: Contact;
   onPreview?: (contact: Contact) => void;
 }) {
+  // useId : génère un ID unique par instance pour `aria-describedby`.
+  // Évite les collisions HTML quand plusieurs ActionsCell sont rendues
+  // (1 par contact dans la table) — même si seul un DropdownMenuContent
+  // est mounted à la fois (Portal), garantit la robustesse en cas de
+  // refonte future (multi-select avec actions groupées, etc.).
+  const previewHelpId = useId();
   const handleCopyId = async () => {
     try {
       await navigator.clipboard.writeText(contact.hubspotId);
@@ -197,23 +204,34 @@ function ActionsCell({
         }
       />
       <DropdownMenuContent align="end">
-        <DropdownMenuLabel>Actions</DropdownMenuLabel>
-        <DropdownMenuSeparator />
-        {previewDisabled ? (
-          // S10.1.6 B1 : item disabled + tooltip explicatif. On wrap dans
-          // un span focusable pour que le Tooltip se déclenche sur hover
-          // et focus clavier (le DropdownMenuItem `data-disabled` ne
-          // recevant pas les events pointeur quand `disabled`).
-          <TooltipProvider delay={150}>
+        {/*
+          S10.1.7-M3-FIX : DropdownMenuLabel = MenuPrimitive.GroupLabel sous
+          le capot — exige un MenuPrimitive.Group parent (`DropdownMenuGroup`).
+          L'omission en S10.1.5 throw `MenuGroupContext is missing` en jsdom
+          (et probablement en strict dev en prod, masqué par le portal).
+        */}
+        <DropdownMenuGroup>
+          <DropdownMenuLabel>Actions</DropdownMenuLabel>
+          <DropdownMenuSeparator />
+          {previewDisabled ? (
+            // S10.1.7-M7 : item disabled + Tooltip via render={<DropdownMenuItem
+            // disabled .../>} (pas de <span tabIndex={0}> intermédiaire qui
+            // sortait du roving-tabindex du DropdownMenu base-ui). Le tooltip
+            // se déclenche au pointer hover et au focus clavier si l'item
+            // disabled reçoit le focus (comportement base-ui : ArrowDown
+            // s'arrête sur les disabled items "focusables non-activables",
+            // cf. ARIA APG Menu pattern + Base UI menu).
+            //
+            // `aria-describedby` ajouté pour les screen readers : annonce
+            // l'explication compliance même si le tooltip visuel n'est pas
+            // perçu (cf. WCAG 1.4.13 Content on Hover or Focus + 4.1.2 Name).
             <Tooltip>
               <TooltipTrigger
                 render={
-                  <span tabIndex={0} className="block focus-visible:outline-none">
-                    <DropdownMenuItem disabled aria-disabled="true">
-                      <Send className="size-3.5" aria-hidden />
-                      Prévisualiser le 1er SMS
-                    </DropdownMenuItem>
-                  </span>
+                  <DropdownMenuItem disabled aria-disabled="true" aria-describedby={previewHelpId}>
+                    <Send className="size-3.5" aria-hidden />
+                    Prévisualiser le 1er SMS
+                  </DropdownMenuItem>
                 }
               />
               <TooltipContent side="left">
@@ -221,17 +239,27 @@ function ActionsCell({
                 <strong>Enrichi</strong> ou <strong>Prêt</strong>.
               </TooltipContent>
             </Tooltip>
-          </TooltipProvider>
-        ) : (
-          <DropdownMenuItem onClick={() => onPreview?.(contact)}>
-            <Send className="size-3.5" aria-hidden />
-            Prévisualiser le 1er SMS
+          ) : (
+            <DropdownMenuItem onClick={() => onPreview?.(contact)}>
+              <Send className="size-3.5" aria-hidden />
+              Prévisualiser le 1er SMS
+            </DropdownMenuItem>
+          )}
+          <DropdownMenuItem onClick={handleCopyId}>
+            <Copy className="size-3.5" aria-hidden />
+            Copier l&apos;ID HubSpot
           </DropdownMenuItem>
-        )}
-        <DropdownMenuItem onClick={handleCopyId}>
-          <Copy className="size-3.5" aria-hidden />
-          Copier l&apos;ID HubSpot
-        </DropdownMenuItem>
+        </DropdownMenuGroup>
+        {/*
+          Span sr-only avec id unique : cible de `aria-describedby` sur le
+          DropdownMenuItem disabled. Toujours rendu dans le DropdownMenuContent
+          pour que la référence aria-describedby soit valide quand
+          previewDisabled=true. Pas visible visuellement (sr-only). Hors
+          DropdownMenuGroup pour ne pas perturber le composite widget pattern.
+        */}
+        <span id={previewHelpId} className="sr-only">
+          Prévisualisation disponible uniquement pour les statuts Importé, Enrichi ou Prêt.
+        </span>
       </DropdownMenuContent>
     </DropdownMenu>
   );
@@ -302,3 +330,9 @@ export const contactColumns: ColumnDef<Contact>[] = [
 
 export { maskPhoneForUI as __maskPhoneForUI_FOR_TESTS };
 export { STATUS_LABEL_FR as __STATUS_LABEL_FR_FOR_TESTS };
+// S10.1.7-M3 — exposés pour tests unitaires composants internes (couverture
+// ≥90%). Pattern projet : suffixe `__FOR_TESTS` pour signaler qu'on ne
+// consomme pas ces exports en prod.
+export { PhoneCell as __PhoneCell_FOR_TESTS };
+export { ActionsCell as __ActionsCell_FOR_TESTS };
+export { statusVariant as __statusVariant_FOR_TESTS };

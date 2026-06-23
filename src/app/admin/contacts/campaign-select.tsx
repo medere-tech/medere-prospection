@@ -37,23 +37,35 @@ function fromCampaignId(campaignId: string | null): string | null {
   return m ? (m[1] ?? null) : null;
 }
 
+/**
+ * Handler pur (S10.1.7-M5 — extrait pour testabilité). Logique branche
+ * la Base UI Select `onValueChange` → setCampaignId nuqs + callback parent.
+ *
+ * Signature Base UI : `onValueChange?: (value: string | null, eventDetails) => void`.
+ * `null` arrive sur déselection (Escape, outsidePress, focus loss).
+ * "__all__" est la sentinelle UI pour "pas de filtre" (URL state omis).
+ */
+export function handleCampaignChange(
+  value: string | null,
+  setCampaignId: (v: string | null) => void,
+  onChange?: (campaignId: string | null) => void,
+): void {
+  if (value === null || value === "__all__" || value === "") {
+    void setCampaignId(null);
+    onChange?.(null);
+    return;
+  }
+  const next = toCampaignId(value);
+  void setCampaignId(next);
+  onChange?.(next);
+}
+
 export function CampaignSelect({ campaigns, onChange }: CampaignSelectProps) {
   const [campaignId, setCampaignId] = useQueryState("campaignId");
   const selectedListId = fromCampaignId(campaignId);
 
-  // Signature Base UI `onValueChange?: (value: string | null, eventDetails) => void`
-  // — `null` arrive sur déselection (Escape, outsidePress, focus loss).
-  // "__all__" est la sentinelle UI pour "pas de filtre" (URL state omis).
-  const handleChange = (value: string | null) => {
-    if (value === null || value === "__all__" || value === "") {
-      void setCampaignId(null);
-      onChange?.(null);
-      return;
-    }
-    const next = toCampaignId(value);
-    void setCampaignId(next);
-    onChange?.(next);
-  };
+  const handleChange = (value: string | null) =>
+    handleCampaignChange(value, setCampaignId, onChange);
 
   return (
     <div className="flex min-w-[220px] flex-col gap-1.5">

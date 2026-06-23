@@ -120,11 +120,18 @@ describe("ContactsPageClient (S10.1.5 Phase 6)", () => {
 
     render(<ContactsPageClient initialCampaigns={CAMPAIGNS} />);
 
+    // S10.1.7-Q1-D : tous les expects dans le MÊME waitFor — re-poll
+    // jusqu'à ce que TOUT le sous-arbre settle (row Marie Curie +
+    // counter + speciality, ET le setState async interne de
+    // DropdownMenuTrigger base-ui dans ActionsCell). Sinon, les
+    // expects sync post-waitFor ratent le setState non-drainé
+    // → warning "An update to MenuTrigger inside a test was not
+    // wrapped in act(...)" en pre-push.
     await waitFor(() => {
       expect(screen.getByText(/Dr Marie Curie/)).toBeInTheDocument();
+      expect(screen.getByText(/1 contact affiché/)).toBeInTheDocument();
+      expect(screen.getByText(/Chirurgien-dentiste/)).toBeInTheDocument();
     });
-    expect(screen.getByText(/1 contact affiché/)).toBeInTheDocument();
-    expect(screen.getByText(/Chirurgien-dentiste/)).toBeInTheDocument();
   });
 
   it("empty state → 'Aucun contact trouvé' + suggestion", async () => {
@@ -190,5 +197,43 @@ describe("ContactsPageClient (S10.1.5 Phase 6)", () => {
 
     const firstBtn = await screen.findByRole("button", { name: "Première page" });
     expect(firstBtn).toBeDisabled();
+  });
+
+  // ───────────────────────────────────────────────────────────────────────
+  // S10.1.7-M2 : couverture pagination + refetch après send success
+  // ───────────────────────────────────────────────────────────────────────
+
+  it("'Première page' actif si cursor en URL → clic → setCursor(null)", async () => {
+    // Override useQueryState mock : "cursor" retourne une valeur non-null
+    const { useQueryState } = await import("nuqs");
+    vi.mocked(useQueryState).mockImplementation((key: string) => {
+      if (key === "cursor") return ["some-cursor-value", setCursorMock];
+      return [null, vi.fn()];
+    });
+
+    vi.spyOn(global, "fetch").mockResolvedValue(
+      jsonResponse({ contacts: [buildContact()], nextCursor: null, hasMore: false }),
+    );
+
+    render(<ContactsPageClient initialCampaigns={CAMPAIGNS} />);
+
+    const firstBtn = await screen.findByRole("button", { name: "Première page" });
+    await waitFor(() => expect(firstBtn).not.toBeDisabled());
+
+    await userEvent.click(firstBtn);
+    expect(setCursorMock).toHaveBeenCalledWith(null);
+  });
+
+  it("count contact unique → 'X contact affiché' (singulier sans s)", async () => {
+    vi.spyOn(global, "fetch").mockResolvedValue(
+      jsonResponse({ contacts: [buildContact()], nextCursor: null, hasMore: false }),
+    );
+
+    render(<ContactsPageClient initialCampaigns={CAMPAIGNS} />);
+
+    await waitFor(() => {
+      // "1 contact affiché" — singulier (vs pluriel testé plus haut)
+      expect(screen.getByText(/^1 contact affiché$/)).toBeInTheDocument();
+    });
   });
 });

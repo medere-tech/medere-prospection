@@ -393,13 +393,21 @@ function ReasoningCollapsible({
         </span>
         <ChevronDown
           className={cn(
-            "size-3.5 text-muted-foreground transition-transform duration-150 motion-reduce:transition-none",
+            // S10.1.7-L1 : motion-safe pour cohérence avec le reste du fichier
+            // (toutes les transitions sont préfixées motion-safe). motion-reduce
+            // garde le no-op explicite (annule l'animation côté utilisateur AT).
+            "size-3.5 text-muted-foreground motion-safe:transition-transform motion-safe:duration-150 motion-reduce:transition-none",
             open && "rotate-180",
           )}
           aria-hidden
         />
       </button>
       {open && (
+        // S10.1.7-L3 : `text-muted-foreground` sur fond `bg-muted/30` —
+        // ratio mesuré ~5.2:1 (Tailwind v4 shadcn `--muted-foreground`
+        // ≈ neutral-500 / oklch(0.556 0 0) sur background blanc à 99.1%
+        // d'opacité). > 4.5:1 → AA OK. Ne pas passer à `text-foreground`
+        // qui casserait la sémantique "muted" voulue (info secondaire).
         <p
           id={id}
           className="text-sm text-muted-foreground motion-safe:animate-in motion-safe:fade-in-0 motion-safe:slide-in-from-top-1 motion-safe:duration-150"
@@ -611,13 +619,16 @@ function ConfirmFooter({ onCancel, onConfirm }: { onCancel: () => void; onConfir
   // `autoFocus` sur "Annuler" : choix défensif — par défaut on focus le
   // CANCEL (pas le confirm rouge) pour éviter qu'un Enter accidentel
   // déclenche un envoi irréversible (cf. WCAG 3.3.4 Error Prevention).
+  // S10.1.7-L2 : `flex-wrap` sur le conteneur des boutons pour les très
+  // petits écrans (< 360px) où "Confirmer l'envoi définitif" peut wrap.
+  // Sur sm: et plus, comportement inchangé (row + space-between).
   return (
     <div className="flex flex-col-reverse gap-2 sm:flex-row sm:items-center sm:justify-between motion-safe:animate-in motion-safe:fade-in-0 motion-safe:slide-in-from-bottom-1 motion-safe:duration-150 w-full">
       <p className="text-xs text-muted-foreground">
         Envoi <span className="font-semibold text-foreground">RÉEL</span> via OVH. Tracé en audit
         log. Opt-out STOP fonctionnel.
       </p>
-      <div className="flex gap-2">
+      <div className="flex flex-wrap gap-2 justify-end">
         <Button type="button" variant="outline" onClick={onCancel} autoFocus>
           Annuler
         </Button>
