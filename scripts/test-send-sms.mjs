@@ -108,7 +108,7 @@ await contactRef.set({
   firstName: "Test",
   lastName: "Dentiste",
   civilite: "Dr",
-  speciality: "dentiste",
+  speciality: "Chirurgien-dentiste",
   city: "Paris",
   postalCode: "75001",
   email: "test-send-sms@example.com",

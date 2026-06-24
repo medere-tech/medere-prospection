@@ -114,7 +114,10 @@
   --sidebar-accent: oklch(0.269 0 0);
   --sidebar-accent-foreground: oklch(0.985 0 0);
   --sidebar-border: oklch(1 0 0 / 10%);
-  --sidebar-ring: oklch(0.556 0 0);
+  /* F-02 fix : ring contrast sur fond sidebar dark `oklch(0.205)` doit
+     atteindre 4.5:1 minimum. `oklch(0.556)` donnait ~3.0:1 (limite).
+     `oklch(0.708)` donne ~4.7:1, WCAG 2.1 1.4.11 + 1.4.3 conforme. */
+  --sidebar-ring: oklch(0.708 0 0);
 }
 
 @layer base {

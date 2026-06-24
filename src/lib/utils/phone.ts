@@ -1,16 +1,28 @@
 /**
- * Normalisation et masquage des numéros de téléphone (format E.164).
+ * Normalisation et masquage des numéros de téléphone (E.164).
  *
- * On utilise le bundle `libphonenumber-js/max` (et non le défaut `min`) : seul
- * `/max` embarque les metadata permettant à `getType()` de distinguer mobile /
+ * On utilise les metadata `/max` (et non le défaut `min`) : seul `/max`
+ * embarque les metadata permettant à `getType()` de distinguer mobile /
  * fixe / VoIP pour la France. Cette distinction pilote la segmentation B2C
  * (mobile perso → vérif Bloctel obligatoire), elle doit être fiable.
+ *
+ * 🚨 S10.1.3-FIX-TYPEERROR-NO-PHONE-001 — On importe
+ * `parsePhoneNumberFromString` depuis "/core" et on charge `metadata`
+ * explicitement depuis "/max/metadata" pour contourner le bug tsx#640
+ * (resolver TS qui charge le mauvais fichier metadata avec `allowJs:true`
+ * et `tsx >= 4.16.3`). Pattern validé par mainteneur tsx (privatenumber)
+ * et commentateurs sur l'issue.
+ * Référence : https://github.com/privatenumber/tsx/issues/640
+ *
+ * NE PAS revenir à `import "libphonenumber-js/max"` tant que tsx#640 n'est
+ * pas fixé officiellement.
  *
  * Le type renvoyé ici reste une heuristique : la source de vérité (carrier,
  * type confirmé) est Twilio Lookup, appelé en Phase 2.
  */
 import type { CountryCode } from "libphonenumber-js";
-import { parsePhoneNumberFromString } from "libphonenumber-js/max";
+import { parsePhoneNumberFromString } from "libphonenumber-js/core";
+import metadata from "libphonenumber-js/max/metadata";
 
 export type PhoneType = "mobile" | "landline" | "voip" | "unknown";
 
@@ -81,12 +93,31 @@ function mapType(libType: string | undefined): PhoneType {
 /**
  * Parse un numéro (national ou international) en best-effort.
  * Renvoie `null` si la chaîne n'est pas interprétable comme un numéro.
+ *
+ * 🚨 S10.1.3-FIX-TYPEERROR-NO-PHONE-001 (workaround tsx#640) :
+ * Utilise `libphonenumber-js/core` + `metadata` explicite, PAS
+ * `libphonenumber-js/max` direct. Voir en-tête module pour le détail.
+ *
+ * 🚨 Garde défensive (S10.1.3-FIX-TYPEERROR-NO-PHONE-001 v1) :
+ * `parsePhoneNumberFromString` crash en
+ * `TypeError: Cannot read properties of undefined (reading 'hasOwnProperty')`
+ * dans `isSupportedCountry` lorsque `raw` est `undefined`/`null`/non-string.
+ * Le typing TS `raw: string` ne garantit rien à runtime quand l'input vient
+ * d'un caller faillible (mapper HubSpot, SDK retour `unknown`). On garde
+ * l'API "safe by contract" : retour `null` sur input invalide, jamais de
+ * throw TypeError. Defense-in-depth — ne dispense pas les callers de leur
+ * garde amont (cf. `mapper.ts` ligne 228 sur `phoneRawSource === undefined`).
+ *
+ * 🔒 Verrouillé par tests sentinelles dans `phone.test.ts`.
  */
 export function parsePhone(
   raw: string,
   defaultCountry: CountryCode = DEFAULT_COUNTRY,
 ): ParsedPhone | null {
-  const parsed = parsePhoneNumberFromString(raw, defaultCountry);
+  if (typeof raw !== "string" || raw.trim() === "") {
+    return null;
+  }
+  const parsed = parsePhoneNumberFromString(raw, defaultCountry, metadata);
   if (!parsed) return null;
   return {
     e164: parsed.number,
@@ -108,9 +139,14 @@ export function toE164(raw: string, defaultCountry: CountryCode = DEFAULT_COUNTR
 /**
  * Vérifie qu'une chaîne est déjà un numéro E.164 valide (commence par `+`,
  * indicatif inclus). N'applique aucun pays par défaut.
+ *
+ * 🔒 Utilise `metadata` explicite — workaround tsx#640
+ * (cf. en-tête module). Sans ce 2e argument, `parsePhoneNumberFromString`
+ * tente de charger les metadata via le resolver tsx cassé et crash en
+ * TypeError dans `isSupportedCountry`.
  */
 export function isValidE164(value: string): boolean {
-  const parsed = parsePhoneNumberFromString(value);
+  const parsed = parsePhoneNumberFromString(value, metadata);
   return Boolean(parsed && parsed.isValid() && parsed.number === value);
 }
 

@@ -341,6 +341,155 @@ export async function getConversation(conversationId: string): Promise<Conversat
 }
 
 /**
+ * Détecte une erreur ALREADY_EXISTS du SDK firebase-admin sans dépendre
+ * d'un import gRPC direct. Pattern identique à `contacts.ts::isAlreadyExistsError`
+ * (S10.1.2.c) — gRPC code 6 OU string `"already-exists"` selon la surface API.
+ *
+ * Duplication assumée (vs partager via un module shared) : 10 lignes, défense
+ * en profondeur, scope limité à `contacts.ts` + `conversations.ts`. Toute
+ * 3ᵉ utilisation justifierait l'extraction.
+ */
+function isAlreadyExistsError(err: unknown): boolean {
+  if (typeof err !== "object" || err === null) return false;
+  const code = (err as { code?: unknown }).code;
+  return code === 6 || code === "already-exists";
+}
+
+/**
+ * Récupère OU crée une conversation initiale pour un couple
+ * `(contactId, campaignId)`. Idempotent par construction.
+ *
+ * ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ * Rôle métier (S10.1.4.c)
+ *
+ *   Posé pour la route `POST /api/admin/send-first-sms` (et futur bulk
+ *   S10.1.4.d). Le handler Inngest `sendFirstSmsHandler` exige une
+ *   conversation existante (`NonRetriableError("Conversation not found")`
+ *   si absente, l.220-222 de `send-first-sms.ts`) — ce helper garantit la
+ *   précondition avant `inngest.send`.
+ *
+ *   Idempotent : un re-click admin sur "Envoyer" pour le même contact ne
+ *   double pas la conv ; le 2ᵉ appel retourne `created: false` et la même
+ *   `conversationId`. Le caller (route) tire l'info pour décider d'auditer
+ *   différemment si besoin.
+ *
+ * ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ * docId composite — convention projet verrouillée S6.4
+ *
+ *   `conversationId = conversationDocId(contactId, campaignId)`
+ *                   = `${contactId}_${campaignId}`
+ *
+ *   Pourquoi PAS `conv.id = contactId` simple : `sendFirstSmsHandler`
+ *   (Inngest), `getActiveConversationByContactId` (process-reply S9.2.1),
+ *   `markOptedOut` étendu (S9.2.2.1) et 4 autres wrappers reposent sur le
+ *   composite. Casser cette convention = refactor cross-cutting hors
+ *   scope MVP. Cf. arbitrage A1 S10.1.4.c.
+ *
+ * ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ * Pattern atomique `ref.create()` + fallback `get()`
+ *
+ *   `ref.create(data)` est l'API firebase-admin WRITE-IF-NOT-EXISTS
+ *   atomique côté Firestore (pas de race entre check et write). Si une
+ *   conv existe déjà au moment du commit → erreur ALREADY_EXISTS, on
+ *   fallback sur `getConversation()` pour retourner l'existante.
+ *
+ *   Race extrême (create=already + get=null = quelqu'un a supprimé entre
+ *   les 2 calls) → `InternalError`. Pas un cas métier nominal.
+ *
+ *   Pas d'audit log posé ici — la conv créée par cette voie sera
+ *   immédiatement consommée par `sendFirstSmsHandler` qui pose les audits
+ *   forensic via `incrementMessageCount` + `sms_provider_dispatched`. Le
+ *   caller (route admin) pose son propre `sms_send_initiated_by_admin`
+ *   en amont qui contient déjà `{ contactId, campaignId }`.
+ *
+ * ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ * Valeurs initiales du document (alignées seedConversation tests +
+ * `scripts/test-send-sms.mjs`) :
+ *
+ *   channel:        "sms"           // Phase MVP
+ *   status:         "active"        // créée, en attente de 1er SMS
+ *   intent:         "unknown"       // pas encore classifié
+ *   messageCount:   0
+ *   outboundCount:  0
+ *   inboundCount:   0
+ *   followupCount:  0
+ *   createdAt/updatedAt: now
+ *
+ * @param contactId   ID Firestore du contact (= hubspotId, S6.3). Non vide.
+ * @param campaignId  Slug interne de campagne (ex: "hubspot-list-200"). Non vide.
+ *
+ * @returns `{ conversationId, created }` :
+ *           - `conversationId` : `${contactId}_${campaignId}`.
+ *           - `created`        : `true` si on a créé, `false` si déjà existait.
+ *
+ * @throws ValidationError  si `contactId` ou `campaignId` vide.
+ * @throws ValidationError  si doc existant est corrompu (Zod fail).
+ * @throws InternalError    si race extrême create=ALREADY_EXISTS + get=null.
+ */
+export async function getOrCreateInitialConversation(
+  contactId: string,
+  campaignId: string,
+): Promise<{ conversationId: string; created: boolean }> {
+  if (typeof contactId !== "string" || contactId.length === 0) {
+    throw new ValidationError({
+      message: "getOrCreateInitialConversation: contactId must be a non-empty string",
+      context: { op: "getOrCreateInitialConversation" },
+    });
+  }
+  if (typeof campaignId !== "string" || campaignId.length === 0) {
+    throw new ValidationError({
+      message: "getOrCreateInitialConversation: campaignId must be a non-empty string",
+      context: { op: "getOrCreateInitialConversation" },
+    });
+  }
+
+  const conversationId = conversationDocId(contactId, campaignId);
+  const ref = getAdminDb().collection(CONVERSATIONS_COLLECTION).doc(conversationId);
+  const now = Timestamp.now();
+
+  const doc: Conversation = {
+    contactId,
+    campaignId,
+    channel: "sms",
+    status: "active",
+    intent: "unknown",
+    messageCount: 0,
+    outboundCount: 0,
+    inboundCount: 0,
+    followupCount: 0,
+    createdAt: now,
+    updatedAt: now,
+  };
+
+  try {
+    await ref.create(doc);
+    return { conversationId, created: true };
+  } catch (err) {
+    if (isAlreadyExistsError(err)) {
+      // Idempotence : conv existe déjà. On re-fetch + valide Zod pour
+      // détecter une corruption éventuelle (defense-in-depth — sinon un
+      // doc corrompu serait silencieusement accepté).
+      const existing = await getConversation(conversationId);
+      if (existing === null) {
+        // Race extrême : create=ALREADY_EXISTS mais get retourne null.
+        // Quelqu'un a supprimé entre les 2 calls (TTL ? admin cleanup ?).
+        // Pas un cas nominal — surface en InternalError pour alerter.
+        throw new InternalError({
+          message:
+            "getOrCreateInitialConversation: race detected (create=ALREADY_EXISTS, get=null)",
+          context: {
+            op: "getOrCreateInitialConversation",
+            conversationId,
+          },
+        });
+      }
+      return { conversationId, created: false };
+    }
+    throw err;
+  }
+}
+
+/**
  * Résout `contactId → conversation active` pour le pipeline `process-reply`
  * (S9.2).
  *

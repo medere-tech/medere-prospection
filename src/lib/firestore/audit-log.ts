@@ -90,10 +90,23 @@ const ACTIONS = [
   "prompt_changed",
   "campaign_started",
   "campaign_paused",
+  // S10.1.3 — mirror campaign_started pour clôture forensic seed/campagne
+  "campaign_completed",
+  // S10.1.4.c — admin déclenche l'envoi du 1er SMS via POST /api/admin/send-first-sms.
+  // Cf. types/audit-log.ts pour la sémantique. Sentinelle S9.1 anti-drift TS↔Zod.
+  "sms_send_initiated_by_admin",
   // ── DATA ───────────────────────────────────────────────────────────────
   "bloctel_imported",
   "contact_deleted",
   "contact_anonymized",
+  // S10.1.3 — seed HubSpot → Firestore (traçabilité forensic RGPD origine)
+  "contact_imported_from_hubspot",
+  // S10.1.3 — réservé pour création contact MANUELLE (UI admin S10.1.5+ ou
+  // API admin futur). PAS posé par le seed HubSpot qui utilise
+  // `contact_imported_from_hubspot` (plus spécifique). Whitelist préservée
+  // pour éviter un futur PR cross-cutting (audit-log + types + tests + caller).
+  "contact_created",
+  "contact_import_skipped",
   // ── AUTH ───────────────────────────────────────────────────────────────
   "login",
   "role_changed",

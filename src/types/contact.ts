@@ -23,15 +23,33 @@ import type { Timestamp } from "firebase-admin/firestore";
 // Unions (réutilisées par les écrans dashboard et les wrappers)
 // ─────────────────────────────────────────────────────────────────────────────
 
+/**
+ * 🔒 Source de vérité unique des status. Tuple readonly `as const` — peut
+ * être passé directement à `z.enum()` côté serveur ET utilisé comme array
+ * itérable côté client (dropdown UI S10.1.5) sans tirer Zod ni Admin SDK
+ * dans le bundle browser.
+ *
+ * Avant S10.1.5-FIX-SEC : la constante vivait dans
+ * `src/lib/firestore/contacts.ts` (dérivée de `ContactSchema.shape.status.options`).
+ * `status-filter.tsx` (`"use client"`) qui l'importait risquait de tirer
+ * `firebase-admin/firestore` dans le bundle browser (defense-in-depth
+ * security-reviewer S10.1.5 Phase 7).
+ *
+ * Re-export depuis `lib/firestore/contacts` préservé pour rétrocompat —
+ * les tests serveur peuvent continuer à importer de là.
+ */
+export const CONTACT_STATUS_VALUES = [
+  "pending", // importé, pas encore enrichi
+  "enriched", // enrichi via Lusha, validation Twilio pas encore faite
+  "ready", // prêt à être contacté
+  "in_conversation", // conversation SMS en cours
+  "qualified", // intent positif, hand-off effectué
+  "opted_out", // a demandé STOP
+  "archived", // inactif, archivé
+] as const;
+
 /** État d'un contact dans le pipeline de prospection. */
-export type ContactStatus =
-  | "pending" // importé, pas encore enrichi
-  | "enriched" // enrichi via Lusha, validation Twilio pas encore faite
-  | "ready" // prêt à être contacté
-  | "in_conversation" // conversation SMS en cours
-  | "qualified" // intent positif, hand-off effectué
-  | "opted_out" // a demandé STOP
-  | "archived"; // inactif, archivé
+export type ContactStatus = (typeof CONTACT_STATUS_VALUES)[number];
 
 /**
  * Segmentation B2B/B2C : pilote la vérification Bloctel (obligatoire pour
@@ -45,8 +63,18 @@ export type ContactSegment =
 /** Civilité affichée dans les SMS et le dashboard (FR, secteur médical). */
 export type ContactCivilite = "Dr" | "Pr" | "M." | "Mme";
 
-/** Spécialité du PS — l'enum MVP, à étendre quand on couvrira de nouveaux PS. */
-export type ContactSpeciality = "dentiste" | "generaliste" | "ide" | "autre";
+/**
+ * Spécialité du PS — alignée 1:1 sur l'enum `profession` HubSpot custom Médéré
+ * (S10.1.2.b). Source de vérité unique : `CONTACT_SPECIALITY_VALUES` exportée
+ * depuis `src/lib/firestore/contacts.ts`. NE PAS dupliquer ici.
+ *
+ * On RE-DÉRIVE le type via un import-as-type pour garder ce module
+ * (`src/types/`) compatible client (zéro dépendance Zod, cf. convention
+ * S6.3 doc l.1-19) — `(typeof CONTACT_SPECIALITY_VALUES)[number]` produit
+ * une union string littérale erasée à la compilation.
+ */
+import type { CONTACT_SPECIALITY_VALUES } from "@/lib/firestore/contacts";
+export type ContactSpeciality = (typeof CONTACT_SPECIALITY_VALUES)[number];
 
 /** Type de ligne téléphonique — heuristique pré-Twilio puis confirmé. */
 export type ContactPhoneType = "mobile" | "landline" | "voip" | "unknown";

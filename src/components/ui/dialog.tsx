@@ -50,7 +50,12 @@ function DialogContent({
       <DialogPrimitive.Popup
         data-slot="dialog-content"
         className={cn(
-          "fixed top-1/2 left-1/2 z-50 grid w-full max-w-[calc(100%-2rem)] -translate-x-1/2 -translate-y-1/2 gap-4 rounded-xl bg-popover p-4 text-sm text-popover-foreground ring-1 ring-foreground/10 duration-100 outline-none sm:max-w-sm data-open:animate-in data-open:fade-in-0 data-open:zoom-in-95 data-closed:animate-out data-closed:fade-out-0 data-closed:zoom-out-95",
+          // S10.1.8 BLQ-1 : la contrainte `sm:max-w-sm` (384px sur tablette+)
+          // était poussée par défaut et écrasait `max-w-2xl` du PreviewDialog
+          // sur iPad portrait, masquant le bouton "Confirmer l'envoi". Chaque
+          // callsite définit désormais sa propre max-width (preview-dialog =
+          // `max-w-2xl`, command palette gère via son className propre).
+          "fixed top-1/2 left-1/2 z-50 grid w-full max-w-[calc(100%-2rem)] -translate-x-1/2 -translate-y-1/2 gap-4 rounded-xl bg-popover p-4 text-sm text-popover-foreground ring-1 ring-foreground/10 duration-100 outline-none data-open:animate-in data-open:fade-in-0 data-open:zoom-in-95 data-closed:animate-out data-closed:fade-out-0 data-closed:zoom-out-95",
           className,
         )}
         {...props}
@@ -62,7 +67,11 @@ function DialogContent({
             render={<Button variant="ghost" className="absolute top-2 right-2" size="icon-sm" />}
           >
             <XIcon />
-            <span className="sr-only">Close</span>
+            {/* S10.1.8 BLQ-3 : libellé FR différencié du bouton "Fermer" du
+                DialogFooter — la croix décrit explicitement l'action sur la
+                fenêtre modale, plus accessible pour VoiceOver/NVDA et évite
+                la collision DOM avec un footer "Fermer" textuel. */}
+            <span className="sr-only">Fermer la fenêtre</span>
           </DialogPrimitive.Close>
         )}
       </DialogPrimitive.Popup>
@@ -95,7 +104,7 @@ function DialogFooter({
     >
       {children}
       {showCloseButton && (
-        <DialogPrimitive.Close render={<Button variant="outline" />}>Close</DialogPrimitive.Close>
+        <DialogPrimitive.Close render={<Button variant="outline" />}>Fermer</DialogPrimitive.Close>
       )}
     </div>
   );

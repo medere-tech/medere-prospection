@@ -25,6 +25,21 @@ export default defineConfig({
     environment: "node",
     passWithNoTests: true,
     unstubEnvs: true,
+    /**
+     * S10.1.7 — testTimeout 15s (vs défaut Vitest 4 = 5000ms). Les tests
+     * UI React 19 + base-ui imports (DropdownMenu, Tooltip, Dialog) +
+     * jsdom env + premier render d'un composant lourd dépassent
+     * occasionnellement les 5s en Husky pre-push (pool: threads parallèle
+     * sur 50+ fichiers → pression CPU/mémoire). 15s aligné avec
+     * hookTimeout défaut + marge de sécurité CI.
+     *
+     * NB : un test cassé met désormais 15s à fail au lieu de 5s — c'est
+     * un trade-off accepté (3 false-negative pre-push S10.1.7 vs gain
+     * en stabilité). Si on observe des tests qui durent réellement
+     * > 5s en local (pas juste en CI), c'est un signal qu'ils sont à
+     * splitter (trop de logique dans un seul test).
+     */
+    testTimeout: 15_000,
     include: ["tests/**/*.{test,spec}.{ts,tsx}", "src/**/*.{test,spec}.{ts,tsx}"],
     // Les tests Firestore demandent un emulator up — exclus du run par
     // défaut pour ne pas casser `npm test` / pre-push.

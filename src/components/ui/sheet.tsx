@@ -65,7 +65,10 @@ function SheetContent({
             render={<Button variant="ghost" className="absolute top-3 right-3" size="icon-sm" />}
           >
             <XIcon />
-            <span className="sr-only">Close</span>
+            {/* S10.1.8 BLQ-3 : libellé FR explicite — cohérent avec
+                dialog.tsx, distingue la croix d'un éventuel bouton "Fermer"
+                textuel dans le SheetFooter. */}
+            <span className="sr-only">Fermer le panneau</span>
           </SheetPrimitive.Close>
         )}
       </SheetPrimitive.Popup>

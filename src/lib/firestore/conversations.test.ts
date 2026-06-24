@@ -42,6 +42,7 @@ import {
   conversationDocId,
   getActiveConversationByContactId,
   getConversation,
+  getOrCreateInitialConversation,
   incrementMessageCount,
   setConversationIntent,
   setHandoff,
@@ -820,6 +821,105 @@ describe("conversations.ts", () => {
         "in_dialogue",
         "qualified",
       ]);
+    });
+  });
+
+  // ─────────────────────────────────────────────────────────────────────
+  // getOrCreateInitialConversation (S10.1.4.c)
+  // ─────────────────────────────────────────────────────────────────────
+
+  describe("getOrCreateInitialConversation (S10.1.4.c)", () => {
+    it("première création → renvoie { conversationId composite, created: true }", async () => {
+      const { conversationId, created } = await getOrCreateInitialConversation(
+        "hs_abc",
+        "hubspot-list-200",
+      );
+
+      expect(conversationId).toBe("hs_abc_hubspot-list-200");
+      expect(created).toBe(true);
+
+      // Doc écrit avec les valeurs init attendues
+      const got = await getConversation(conversationId);
+      expect(got).not.toBeNull();
+      expect(got?.contactId).toBe("hs_abc");
+      expect(got?.campaignId).toBe("hubspot-list-200");
+      expect(got?.channel).toBe("sms");
+      expect(got?.status).toBe("active");
+      expect(got?.intent).toBe("unknown");
+      expect(got?.messageCount).toBe(0);
+      expect(got?.outboundCount).toBe(0);
+      expect(got?.inboundCount).toBe(0);
+      expect(got?.followupCount).toBe(0);
+    });
+
+    it("idempotence : 2e appel mêmes (contactId, campaignId) → created: false, MÊME conversationId", async () => {
+      const first = await getOrCreateInitialConversation("hs_abc", "hubspot-list-200");
+      expect(first.created).toBe(true);
+
+      const second = await getOrCreateInitialConversation("hs_abc", "hubspot-list-200");
+      expect(second.conversationId).toBe(first.conversationId);
+      expect(second.created).toBe(false);
+    });
+
+    it("idempotence : doc existant N'EST PAS écrasé (valeurs préservées)", async () => {
+      // 1er appel crée la conv
+      await getOrCreateInitialConversation("hs_abc", "hubspot-list-200");
+
+      // Simulation : un autre flow a entre-temps incrémenté la conv
+      await incrementMessageCount("hs_abc_hubspot-list-200", "outbound");
+
+      // 2ᵉ appel doit NE PAS reset les compteurs (idempotent read-only sur conv existante)
+      const { created } = await getOrCreateInitialConversation("hs_abc", "hubspot-list-200");
+      expect(created).toBe(false);
+
+      const got = await getConversation("hs_abc_hubspot-list-200");
+      expect(got?.messageCount).toBe(1); // pas remis à 0
+      expect(got?.outboundCount).toBe(1);
+    });
+
+    it("sentinelle composite : 2 contacts différents + même campaignId → 2 conversationIds distincts", async () => {
+      const a = await getOrCreateInitialConversation("hs_alice", "hubspot-list-200");
+      const b = await getOrCreateInitialConversation("hs_bob", "hubspot-list-200");
+
+      expect(a.conversationId).toBe("hs_alice_hubspot-list-200");
+      expect(b.conversationId).toBe("hs_bob_hubspot-list-200");
+      expect(a.conversationId).not.toBe(b.conversationId);
+      expect(a.created).toBe(true);
+      expect(b.created).toBe(true);
+    });
+
+    it("sentinelle composite : 1 contact + 2 campaignIds → 2 conversationIds distincts", async () => {
+      const c1 = await getOrCreateInitialConversation("hs_alice", "hubspot-list-200");
+      const c2 = await getOrCreateInitialConversation("hs_alice", "hubspot-list-300");
+
+      expect(c1.conversationId).toBe("hs_alice_hubspot-list-200");
+      expect(c2.conversationId).toBe("hs_alice_hubspot-list-300");
+      expect(c1.conversationId).not.toBe(c2.conversationId);
+      expect(c1.created).toBe(true);
+      expect(c2.created).toBe(true);
+    });
+
+    it("contactId vide → ValidationError sans I/O Firestore", async () => {
+      await expect(getOrCreateInitialConversation("", "hubspot-list-200")).rejects.toBeInstanceOf(
+        ValidationError,
+      );
+    });
+
+    it("campaignId vide → ValidationError sans I/O Firestore", async () => {
+      await expect(getOrCreateInitialConversation("hs_abc", "")).rejects.toBeInstanceOf(
+        ValidationError,
+      );
+    });
+
+    it("audit_log non touché (le helper ne pose AUCUN audit lui-même)", async () => {
+      expect(await countAuditDocs()).toBe(0);
+
+      await getOrCreateInitialConversation("hs_abc", "hubspot-list-200");
+      expect(await countAuditDocs()).toBe(0);
+
+      // 2ᵉ appel idempotent — toujours pas d'audit
+      await getOrCreateInitialConversation("hs_abc", "hubspot-list-200");
+      expect(await countAuditDocs()).toBe(0);
     });
   });
 });

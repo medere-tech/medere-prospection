@@ -23,11 +23,13 @@
     "emulator:check": "node scripts/setup-firebase-cache.mjs",
     "emulator:kill": "node scripts/kill-emulator-port.mjs",
     "firebase:deploy:indexes": "firebase deploy --only firestore:indexes",
+    "seed:hubspot": "tsx scripts/seed-contacts-from-hubspot.mjs",
     "prepare": "husky"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.99.0",
     "@base-ui/react": "^1.5.0",
+    "@clerk/localizations": "^4.8.2",
     "@clerk/nextjs": "^7.4.1",
     "@hookform/resolvers": "^5.4.0",
     "@hubspot/api-client": "^13.5.0",

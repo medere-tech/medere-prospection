@@ -55,10 +55,21 @@ import { z } from "zod";
 import { getAdminDb } from "@/lib/firestore/admin";
 import { appendAuditLogTx } from "@/lib/firestore/audit-log";
 import { _parseConversationOrThrow } from "@/lib/firestore/conversations";
-import { InternalError, NotFoundError, ValidationError } from "@/lib/utils/errors";
+import { ConflictError, InternalError, NotFoundError, ValidationError } from "@/lib/utils/errors";
 import { E164_REGEX } from "@/lib/utils/phone";
-import type { Contact } from "@/types/contact";
+import { type Contact, CONTACT_STATUS_VALUES } from "@/types/contact";
 import type { Conversation, ConversationStatus } from "@/types/conversation";
+
+/**
+ * 🔒 Re-export pour rétrocompat (S10.1.5-FIX-SEC). Source de vérité unique
+ * dans `@/types/contact` — module pur sans dépendance Admin SDK pour
+ * éviter de polluer le bundle browser via `status-filter.tsx` (`"use client"`).
+ *
+ * Les tests serveur historiques (`audit-log.test.ts`, etc.) qui font
+ * `import { CONTACT_STATUS_VALUES } from "@/lib/firestore/contacts"`
+ * continuent à fonctionner via ce re-export.
+ */
+export { CONTACT_STATUS_VALUES };
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Constantes & types internes
@@ -110,6 +121,56 @@ const TERMINAL_CONV_STATUSES_FOR_OPT_OUT: readonly ConversationStatus[] = [
 export type UpdatableContactFields = Pick<Contact, "status" | "assignedTo">;
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Speciality — enum aligné HubSpot (S10.1.2.b)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * Liste STRICTE des spécialités professionnelles, alignée 1:1 sur l'enum
+ * `profession` de la propriété HubSpot custom Médéré.
+ *
+ * 🔒 SENTINEL — toute modification (ajout / retrait / reformulation) DOIT :
+ *   1. Être validée par Déthié (alignement HubSpot CRM)
+ *   2. Re-passer la migration des 15+ fichiers de tests/seeds
+ *   3. Mettre à jour le `HUBSPOT_PROFESSION` mapping côté `lib/hubspot/mapper.ts`
+ *   4. Casser intentionnellement le build via le test sentinelle de
+ *      `contacts.test.ts` — si tu vois le test échouer, c'est volontaire,
+ *      pas un bug.
+ *
+ * 🚨 Caractères spéciaux PRÉSERVÉS EXACTEMENT (HubSpot string match strict) :
+ *   - Tirets : "Sage-Femme", "Pédicure-podologue", "Chirurgien-dentiste"
+ *   - Parenthèses : "Assistant(e) dentaire"
+ *   - Accents : "Médecin", "Pédiatre", "Étudiant", "Gynécologue", etc.
+ *   - Casse mixte : "Sage-Femme" (F maj), "Médecin vasculaire" (v min)
+ *
+ * Toute déviation casse le mapping HubSpot → Firestore — un contact dont
+ * `properties.profession` ne match aucune valeur ici throw
+ * `ValidationError` côté mapper (anti-fall-through silencieux).
+ */
+export const CONTACT_SPECIALITY_VALUES = [
+  "Médecin",
+  "Chirurgien-dentiste",
+  "Sage-Femme",
+  "Pharmacien",
+  "IDE",
+  "MKDE",
+  "Pédicure-podologue",
+  "Assistant(e) dentaire",
+  "Aide-soignante",
+  "Autre profession paramédicale",
+  "Orthophoniste",
+  "Étudiant",
+  "Autre",
+  "Infirmier",
+  "Pédiatre",
+  "Psychiatre",
+  "Gynécologue",
+  "Dermatologue",
+  "Radiologue",
+  "Médecin vasculaire",
+  "Psychologue",
+] as const;
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Schéma Zod (validation runtime à la lecture)
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -148,7 +209,7 @@ export const ContactSchema = z.object({
   firstName: z.string().min(1),
   lastName: z.string().min(1),
   civilite: z.enum(["Dr", "Pr", "M.", "Mme"]).optional(),
-  speciality: z.enum(["dentiste", "generaliste", "ide", "autre"]),
+  speciality: z.enum(CONTACT_SPECIALITY_VALUES),
   city: z.string(),
   postalCode: z.string(),
   email: z.email().optional(),
@@ -159,15 +220,7 @@ export const ContactSchema = z.object({
   bloctelCheckedAt: TimestampLike.optional(),
   consent: ContactConsentSchema,
   enrichment: ContactEnrichmentSchema,
-  status: z.enum([
-    "pending",
-    "enriched",
-    "ready",
-    "in_conversation",
-    "qualified",
-    "opted_out",
-    "archived",
-  ]),
+  status: z.enum(CONTACT_STATUS_VALUES),
   campaignId: z.string(),
   assignedTo: z.string().optional(),
   createdAt: TimestampLike,
@@ -635,6 +688,346 @@ export async function updateContactStatus(
       payload: { fields: keys },
     });
   });
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// listContacts (S10.1.2.c) — pagination cursor + filtres status/campaignId
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * Nombre de contacts par page par défaut quand `limit` est omis. Calibré
+ * pour TanStack Table server-side : 50 = bonne densité info-pour-1-écran
+ * desktop sans surcoût lecture inutile.
+ *
+ * 🔒 SENTINEL — verrouillé par test sentinelle (toute modification doit
+ * passer par une re-validation Déthié + ux-reviewer pour confirmer
+ * que la pagination 50 reste pertinente).
+ */
+export const LIST_CONTACTS_DEFAULT_LIMIT = 50;
+
+/**
+ * Plafond strict sur `limit` — anti-DoS Firestore quota. Au-delà, un
+ * caller buggué (ou un attaquant authentifié) pourrait drain le quota
+ * de lecture Firestore en quelques appels. 100 = 2× la valeur défaut,
+ * largement suffisant pour un export ponctuel.
+ *
+ * 🔒 SENTINEL — verrouillé par test sentinelle.
+ */
+export const LIST_CONTACTS_MAX_LIMIT = 100;
+
+/**
+ * Schema Zod des filtres `listContacts`. Whitelist STRICTE :
+ *   - `status`  : enum verrouillé via `ContactSchema.shape.status` (source unique).
+ *                 Un `status: "foo"` reçu de l'UI → `ValidationError` AVANT query.
+ *   - `campaignId` : string non vide. Pas de validation de format (campaign
+ *                    IDs sont des slugs internes, pas de regex stricte).
+ *
+ * Toute clé en plus → silencieusement strippée par Zod (NOT strict) —
+ * on tolère l'UI qui enverrait des champs futurs (forward-compat).
+ */
+const ListContactsFiltersSchema = z.object({
+  status: ContactSchema.shape.status.optional(),
+  campaignId: z.string().min(1).optional(),
+});
+
+/**
+ * Schema Zod input complet — validé en première ligne de `listContacts`.
+ *
+ *   - `filters.status` : default `"ready"` appliqué côté code (pas
+ *                        dans Zod pour rester explicite côté caller).
+ *   - `sortBy`/`sortOrder` : hard-coded `"createdAt"`/`"desc"` MVP —
+ *                            extensible dans une future signature sans
+ *                            casser l'API.
+ *   - `limit` : borné `[1, LIST_CONTACTS_MAX_LIMIT]`. Default 50 côté code.
+ *   - `cursor` : `contactId` opaque du dernier doc de la page précédente.
+ *                Validé côté code via un `get(cursor)` Firestore — si
+ *                inexistant → `ValidationError`.
+ */
+const ListContactsInputSchema = z.object({
+  filters: ListContactsFiltersSchema.optional(),
+  sortBy: z.literal("createdAt").optional(),
+  sortOrder: z.literal("desc").optional(),
+  limit: z.number().int().min(1).max(LIST_CONTACTS_MAX_LIMIT).optional(),
+  cursor: z.string().min(1).optional(),
+});
+
+/** Input typé du caller. Tous les champs sont optionnels — les defaults
+ * sont appliqués côté implémentation. */
+export type ListContactsInput = z.input<typeof ListContactsInputSchema>;
+
+/** Sortie typée — `Contact[]` strictement parsé + cursor pour la page suivante. */
+export interface ListContactsOutput {
+  contacts: Contact[];
+  /** `contactId` à passer dans `input.cursor` pour la page suivante.
+   *  `null` si c'est la dernière page. */
+  nextCursor: string | null;
+  /** True si une page suivante existe. Permet à l'UI de désactiver le
+   *  bouton "Suivant" sans tester `nextCursor === null` (redondant mais
+   *  explicite pour le contrat). */
+  hasMore: boolean;
+}
+
+/**
+ * Liste les contacts paginés via cursor.
+ *
+ * ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ * USAGE
+ *
+ *   ```ts
+ *   // Page 1 : 50 contacts "ready" de la campagne MVP, plus récents en haut
+ *   const page1 = await listContacts({
+ *     filters: { status: "ready", campaignId: "mvp-200-dentistes-idf" },
+ *   });
+ *   // → { contacts: [50 items], nextCursor: "hs_abc123", hasMore: true }
+ *
+ *   // Page 2 : passer le cursor renvoyé
+ *   const page2 = await listContacts({
+ *     filters: { status: "ready", campaignId: "mvp-200-dentistes-idf" },
+ *     cursor: page1.nextCursor!,
+ *   });
+ *   ```
+ *
+ * ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ * INDEX FIRESTORE COMPOSITE REQUIS (S10.1.2.c)
+ *
+ *   { "collectionGroup": "contacts", "queryScope": "COLLECTION",
+ *     "fields": [
+ *       { "fieldPath": "status",     "order": "ASCENDING" },
+ *       { "fieldPath": "campaignId", "order": "ASCENDING" },
+ *       { "fieldPath": "createdAt",  "order": "DESCENDING" }
+ *     ] }
+ *
+ * Sans déploiement de cet index (cf. `firestore.indexes.json`), la query
+ * combinant `where status` + `where campaignId` + `orderBy createdAt`
+ * throw `FAILED_PRECONDITION` côté Firestore Cloud. L'emulator local
+ * accepte sans index — piège connu, valider avec `npm run firebase:deploy:indexes`
+ * avant tout déploiement en prod.
+ *
+ * ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ * CURSOR PAGINATION — pattern `startAfter(DocumentSnapshot)`
+ *
+ * Le cursor exposé au caller est un `contactId` opaque (pas un
+ * `DocumentSnapshot` qui serait coûteux à sérialiser pour l'UI). On
+ * réhydrate côté serveur via un `get(cursorContactId)` :
+ *
+ *   - Cursor inexistant (contact supprimé, attaquant qui forge) →
+ *     `ValidationError` côté code (PAS de fall-through silencieux qui
+ *     retournerait la page 1 — surprise UX inacceptable).
+ *
+ *   - Cursor existant → `startAfter(snap)` continue après ce doc.
+ *
+ * Coût : 1 read supplémentaire par page (acceptable — 1 read = $0.06 / 1M).
+ *
+ * ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ * DÉTECTION `hasMore` — fetch limit + 1
+ *
+ * On fetch `limit + 1` docs : si on en récupère plus que `limit`, il y a
+ * une page suivante. Économie 1 round-trip vs un second `count()` Firestore.
+ * L'extra doc est strippé du retour.
+ *
+ * ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ * ⚠️ PII DOWNSTREAM — `Contact[]` retourné contient TOUTES les PII
+ *
+ * Mêmes responsabilités caller que `getContactByPhone` :
+ *   1. NE JAMAIS logger les contacts complets via Pino/Sentry.
+ *   2. NE JAMAIS les inclure brut dans un audit log payload.
+ *   3. NE JAMAIS renvoyer côté client sans filtrage par rôle + masking
+ *      (commercial ne voit pas tous les champs d'un contact non assigné).
+ *
+ * @throws ValidationError si l'input ne match pas `ListContactsInputSchema`
+ *                         OU si le cursor pointe sur un doc inexistant.
+ * @throws ValidationError si un doc Firestore est corrompu (Zod fail).
+ */
+export async function listContacts(input: ListContactsInput = {}): Promise<ListContactsOutput> {
+  const parsed = ListContactsInputSchema.safeParse(input);
+  if (!parsed.success) {
+    throw new ValidationError({
+      message: "listContacts: invalid input",
+      context: {
+        op: "listContacts",
+        issues: parsed.error.issues.map((i) => ({
+          path: i.path.join("."),
+          code: i.code,
+        })),
+      },
+    });
+  }
+
+  const { filters, limit: requestedLimit, cursor } = parsed.data;
+  const status = filters?.status ?? "ready";
+  const campaignId = filters?.campaignId;
+  const limit = requestedLimit ?? LIST_CONTACTS_DEFAULT_LIMIT;
+
+  // Build query : status (always) + campaignId (optional) + orderBy + cursor + limit.
+  let q: FirebaseFirestore.Query = getAdminDb()
+    .collection(CONTACTS_COLLECTION)
+    .where("status", "==", status);
+
+  if (campaignId !== undefined) {
+    q = q.where("campaignId", "==", campaignId);
+  }
+
+  q = q.orderBy("createdAt", "desc");
+
+  if (cursor !== undefined) {
+    const cursorSnap = await getAdminDb().collection(CONTACTS_COLLECTION).doc(cursor).get();
+    if (!cursorSnap.exists) {
+      throw new ValidationError({
+        message: "listContacts: cursor refers to a non-existent contact",
+        context: {
+          op: "listContacts",
+          // PAS de `cursor` dans context — hubspotId est semi-sensible
+          // (identifiant interne PS, à ne pas log/renvoyer).
+          cursorPresent: true,
+        },
+      });
+    }
+    q = q.startAfter(cursorSnap);
+  }
+
+  // Fetch limit+1 pour détecter `hasMore` en 1 round-trip.
+  const snap = await q.limit(limit + 1).get();
+  const docs = snap.docs;
+  const hasMore = docs.length > limit;
+  const pageDocs = hasMore ? docs.slice(0, limit) : docs;
+
+  const contacts = pageDocs.map((doc) => parseContactOrThrow(doc.data(), doc.id));
+
+  // nextCursor = id du DERNIER doc retourné (pas du extra fetch).
+  const nextCursor = hasMore && pageDocs.length > 0 ? pageDocs[pageDocs.length - 1]!.id : null;
+
+  return { contacts, nextCursor, hasMore };
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// createContact (S10.1.2.c) — write idempotent par hubspotId
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * Détecte une erreur ALREADY_EXISTS du SDK firebase-admin sans dépendre
+ * d'un import gRPC direct. Le SDK expose un `code` numérique (gRPC
+ * StatusCode) OU une string `"already-exists"` selon la version /
+ * surface API. On check les deux par défense en profondeur.
+ *
+ * gRPC ALREADY_EXISTS = 6 (cf. https://grpc.github.io/grpc/core/md_doc_statuscodes.html).
+ */
+function isAlreadyExistsError(err: unknown): boolean {
+  if (typeof err !== "object" || err === null) return false;
+  const code = (err as { code?: unknown }).code;
+  return code === 6 || code === "already-exists";
+}
+
+/**
+ * Input typé pour `createContact`. Strict whitelist via `ContactSchema` :
+ * un caller qui tenterait de passer un champ HubSpot brut non-mappé
+ * (ex: `hs_lifecyclestage`, `hs_lead_status`) verra ce champ
+ * silencieusement strippé par Zod (NOT strict mode) — pas d'erreur, mais
+ * pas de persistance non plus.
+ *
+ * Le `createdAt` et `updatedAt` fournis par le caller sont IGNORÉS et
+ * remplacés par `Timestamp.now()` côté serveur (anti-spoofing — un caller
+ * ne peut pas backdate un contact pour bypasser le 30-jours rate limit).
+ */
+export type CreateContactInput = Contact;
+
+/**
+ * Crée un contact en Firestore de manière idempotente par `hubspotId`.
+ *
+ * ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ * IDÉMPOTENCE ATOMIQUE — pattern `ref.create()` Firestore
+ *
+ * Le doc id = `input.hubspotId` (déterministe, anti-duplication).
+ * `ref.create(data)` est l'API firebase-admin qui WRITE-IF-NOT-EXISTS
+ * atomiquement côté Firestore — pas de race condition entre check et
+ * write (qu'un naïf `get + if-exists + set` aurait).
+ *
+ *   - Contact n'existe pas → créé, retourne `{ contactId }`.
+ *   - Contact existe déjà  → throw `ConflictError` (HTTP 409,
+ *                            sémantique RFC 7231).
+ *
+ * Le caller (seed S10.1.3, route API S10.1.4) décide comment réagir au
+ * conflict : skip silencieux pour un re-seed idempotent, OU surface
+ * l'erreur si c'est une création utilisateur.
+ *
+ * ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ * VALIDATION ZOD STRICTE PRE-WRITE
+ *
+ * `ContactSchema.parse(input)` valide TOUS les invariants RGPD/business :
+ *   - `consent.legitimateInterest` ≥ 20 chars (documentation art. 6.1.f RGPD)
+ *   - `phone.e164` regex `/^\+\d{10,15}$/`
+ *   - `status` ∈ enum 7 valeurs (whitelist contre injection workflow)
+ *   - `speciality` ∈ enum 4 valeurs
+ *   - `hubspotId`, `firstName`, `lastName`, `campaignId` non-vides
+ *
+ * Un input invalide → `ValidationError` AVANT tout I/O Firestore.
+ *
+ * ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ * TIMESTAMPS — override serveur (anti-spoofing)
+ *
+ * `createdAt` et `updatedAt` fournis par le caller sont SILENCIEUSEMENT
+ * remplacés par `Timestamp.now()`. Raison : un caller compromis ne doit
+ * pas pouvoir backdate un contact pour bypasser le rate limit 3-SMS/30j
+ * (qui compte depuis `createdAt` côté pre-send-check ailleurs).
+ *
+ * Note design — `Timestamp.now()` côté Admin SDK (pas `serverTimestamp()`)
+ * pour cohérence patterns projet (`addOutboundDraftInTx`, `markOptedOut`).
+ * Drift Vercel ↔ Firestore < 10ms, cosmétique.
+ *
+ * @throws ValidationError si `input` ne match pas `ContactSchema`.
+ * @throws ConflictError   si un contact avec ce `hubspotId` existe déjà.
+ */
+export async function createContact(input: CreateContactInput): Promise<{ contactId: string }> {
+  const parsed = ContactSchema.safeParse(input);
+  if (!parsed.success) {
+    throw new ValidationError({
+      message: "createContact: invalid input",
+      context: {
+        op: "createContact",
+        // PAS de `input` brut dans context — contient des PII (phone,
+        // email, nom). Seulement les paths sanitisés des champs invalides.
+        issues: parsed.error.issues.map((i) => ({
+          path: i.path.join("."),
+          code: i.code,
+        })),
+      },
+    });
+  }
+
+  const contactId = parsed.data.hubspotId;
+  const now = Timestamp.now();
+
+  // Construction explicite : on REPREND tous les champs validés ET on
+  // override `createdAt`/`updatedAt`. Pas de spread `...parsed.data`
+  // suivi de réécriture — l'ordre serait fragile.
+  const doc: Contact = {
+    ...(parsed.data as Contact),
+    createdAt: now,
+    updatedAt: now,
+  };
+
+  const ref = getAdminDb().collection(CONTACTS_COLLECTION).doc(contactId);
+
+  try {
+    await ref.create(doc);
+  } catch (err) {
+    if (isAlreadyExistsError(err)) {
+      throw new ConflictError({
+        message: "createContact: contact already exists for this hubspotId",
+        context: {
+          op: "createContact",
+          reason: "contact_already_exists",
+          // hubspotId est OPAQUE (identifiant interne), pas une PII E.164
+          // ni email — OK dans le context d'erreur (cohérent S6.5
+          // ConflictError handoff race condition).
+          hubspotId: contactId,
+        },
+        cause: err,
+      });
+    }
+    throw err;
+  }
+
+  return { contactId };
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
