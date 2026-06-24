@@ -65,6 +65,8 @@ import { getContact } from "@/lib/firestore/contacts";
 import { getOrCreateInitialConversation } from "@/lib/firestore/conversations";
 import { getInngestClient } from "@/lib/inngest/client";
 import { smsSendFirstRequested } from "@/lib/inngest/events";
+import { applyAdminRateLimit } from "@/lib/security/admin-rate-limit";
+import { createRateLimiter } from "@/lib/security/rate-limit";
 import { AppError, ConflictError, NotFoundError } from "@/lib/utils/errors";
 import { logger } from "@/lib/utils/logger";
 
@@ -101,6 +103,24 @@ function isSendAllowed(status: string): status is SendAllowedStatus {
   return (SEND_ALLOWED_STATUSES as readonly string[]).includes(status);
 }
 
+/**
+ * Rate-limit Upstash (S10.1.9 RATELIMIT-001) : 10 req/min par admin (clé
+ * Clerk userId) — plus restrictif que preview (30/min) car chaque appel
+ * déclenche un envoi SMS RÉEL via Inngest → OVH (coût ~0.07€/SMS + impact
+ * compliance L.34-5 CPCE si un admin compromis vide la liste "ready" en
+ * 30s). Inngest concurrency `{ key: contactId, limit: 1 }` protège déjà
+ * contre le double-send sur le MÊME contact, mais un attaquant peut
+ * itérer sur 200 contactIds différents — d'où le plafond global par admin.
+ *
+ * Lazy : aucun I/O à l'import (cf. test rate-limit.test.ts "ne lit pas
+ * l'env tant que check() n'est pas appelé").
+ */
+const sendFirstSmsLimiter = createRateLimiter({
+  limit: 10,
+  window: "1 m",
+  prefix: "admin-send-first-sms",
+});
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Handler POST
 // ─────────────────────────────────────────────────────────────────────────────
@@ -109,6 +129,13 @@ export async function POST(req: NextRequest): Promise<NextResponse> {
   try {
     // ── 1. Auth Clerk + RBAC admin (récupère userId pour actorId audit) ──
     const { userId: adminUserId } = await requireRole("admin");
+
+    // ── 1.bis. Rate-limit Upstash (S10.1.9 RATELIMIT-001) ─────────────────
+    // Court-circuit AVANT le parse + Claude + Inngest — la défense la plus
+    // précoce possible contre un admin compromis qui voudrait spammer les
+    // envois SMS réels (~0.07€/SMS + impact compliance).
+    const rateLimitResponse = await applyAdminRateLimit(sendFirstSmsLimiter, adminUserId);
+    if (rateLimitResponse) return rateLimitResponse;
 
     // ── 2. Parse body strict (anti-CSRF + anti-drift champs surnuméraires) ──
     let rawBody: unknown;

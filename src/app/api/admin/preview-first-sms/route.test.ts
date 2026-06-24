@@ -20,6 +20,13 @@ vi.mock("@/lib/auth/require-role", () => ({
   requireRole: vi.fn(),
 }));
 
+// S10.1.9 RATELIMIT-001 : mock le helper pour découpler les tests de route
+// du wrapper Upstash. Par défaut (beforeEach) on retourne null = pass-through.
+// Les tests dédiés "429" override avec une vraie NextResponse 429.
+vi.mock("@/lib/security/admin-rate-limit", () => ({
+  applyAdminRateLimit: vi.fn(),
+}));
+
 vi.mock("@/lib/claude/first-sms-generator", () => ({
   generateFirstSms: vi.fn(),
 }));
@@ -58,6 +65,7 @@ import { requireRole } from "@/lib/auth/require-role";
 import { generateFirstSms } from "@/lib/claude/first-sms-generator";
 import { preSendCheck } from "@/lib/compliance/pre-send-check";
 import { getContact } from "@/lib/firestore/contacts";
+import { applyAdminRateLimit } from "@/lib/security/admin-rate-limit";
 
 import { POST } from "./route";
 
@@ -65,6 +73,7 @@ const mockRequireRole = vi.mocked(requireRole);
 const mockGenerateFirstSms = vi.mocked(generateFirstSms);
 const mockGetContact = vi.mocked(getContact);
 const mockPreSendCheck = vi.mocked(preSendCheck);
+const mockApplyAdminRateLimit = vi.mocked(applyAdminRateLimit);
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Helpers
@@ -136,6 +145,8 @@ describe("POST /api/admin/preview-first-sms", () => {
       firstName: "Déthié",
       lastName: "Faye",
     });
+    // S10.1.9 RATELIMIT-001 : par défaut le rate-limit passe (null = OK).
+    mockApplyAdminRateLimit.mockResolvedValue(null);
   });
 
   describe("auth + RBAC", () => {
@@ -178,6 +189,38 @@ describe("POST /api/admin/preview-first-sms", () => {
 
       expect(res.status).toBe(403);
       expect(mockGenerateFirstSms).not.toHaveBeenCalled();
+    });
+  });
+
+  describe("rate-limit (S10.1.9 RATELIMIT-001)", () => {
+    it("renvoie 429 + Retry-After + body code RATE_LIMITED si rate-limit bloque", async () => {
+      const { NextResponse } = await import("next/server");
+      mockApplyAdminRateLimit.mockResolvedValue(
+        NextResponse.json(
+          { error: { code: "RATE_LIMITED", message: "Trop de requêtes. Réessayez plus tard." } },
+          { status: 429, headers: { "Retry-After": "23" } },
+        ),
+      );
+
+      const res = await POST(mockPost({ contactId: "hs_test_1" }));
+
+      expect(res.status).toBe(429);
+      expect(res.headers.get("Retry-After")).toBe("23");
+      const body = (await res.json()) as { error: { code: string } };
+      expect(body.error.code).toBe("RATE_LIMITED");
+      // Court-circuit : aucun fetch / aucune génération Claude.
+      expect(mockGetContact).not.toHaveBeenCalled();
+      expect(mockGenerateFirstSms).not.toHaveBeenCalled();
+    });
+
+    it("rate-limit appelé avec le Clerk userId extrait de requireRole", async () => {
+      mockGetContact.mockResolvedValue(buildFakeContact({ status: "ready" }));
+      mockGenerateFirstSms.mockResolvedValue(FAKE_GENERATION_OK);
+      mockPreSendCheck.mockReturnValue({ ok: true });
+
+      await POST(mockPost({ contactId: "hs_test_1" }));
+
+      expect(mockApplyAdminRateLimit).toHaveBeenCalledWith(expect.anything(), "user_admin_xxx");
     });
   });
 

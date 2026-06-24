@@ -12,6 +12,12 @@ vi.mock("@/lib/auth/require-role", () => ({
   requireRole: vi.fn(),
 }));
 
+// S10.1.9 RATELIMIT-001 : mock le helper pour découpler les tests de route
+// du wrapper Upstash. Par défaut (beforeEach) on retourne null = pass-through.
+vi.mock("@/lib/security/admin-rate-limit", () => ({
+  applyAdminRateLimit: vi.fn(),
+}));
+
 vi.mock("@/lib/hubspot/lists", () => ({
   listSmsLists: vi.fn(),
 }));
@@ -27,11 +33,13 @@ vi.mock("@/lib/utils/logger", () => ({
 
 import { requireRole } from "@/lib/auth/require-role";
 import { listSmsLists } from "@/lib/hubspot/lists";
+import { applyAdminRateLimit } from "@/lib/security/admin-rate-limit";
 
 import { GET } from "./route";
 
 const mockRequireRole = vi.mocked(requireRole);
 const mockListSmsLists = vi.mocked(listSmsLists);
+const mockApplyAdminRateLimit = vi.mocked(applyAdminRateLimit);
 
 const FAKE_CAMPAIGNS = [
   {
@@ -58,6 +66,34 @@ describe("GET /api/admin/campaigns", () => {
       role: "admin",
       firstName: "Déthié",
       lastName: "Faye",
+    });
+    // S10.1.9 RATELIMIT-001 : par défaut le rate-limit passe (null = OK).
+    mockApplyAdminRateLimit.mockResolvedValue(null);
+  });
+
+  describe("rate-limit (S10.1.9 RATELIMIT-001)", () => {
+    it("renvoie 429 + Retry-After + body RATE_LIMITED si rate-limit bloque", async () => {
+      const { NextResponse } = await import("next/server");
+      mockApplyAdminRateLimit.mockResolvedValue(
+        NextResponse.json(
+          { error: { code: "RATE_LIMITED", message: "Trop de requêtes. Réessayez plus tard." } },
+          { status: 429, headers: { "Retry-After": "7" } },
+        ),
+      );
+
+      const res = await GET();
+
+      expect(res.status).toBe(429);
+      expect(res.headers.get("Retry-After")).toBe("7");
+      const body = (await res.json()) as { error: { code: string } };
+      expect(body.error.code).toBe("RATE_LIMITED");
+      expect(mockListSmsLists).not.toHaveBeenCalled();
+    });
+
+    it("rate-limit appelé avec le Clerk userId extrait de requireRole", async () => {
+      mockListSmsLists.mockResolvedValue(FAKE_CAMPAIGNS);
+      await GET();
+      expect(mockApplyAdminRateLimit).toHaveBeenCalledWith(expect.anything(), "user_admin_xxx");
     });
   });
 

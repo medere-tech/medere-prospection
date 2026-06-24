@@ -51,6 +51,8 @@ import { requireRole } from "@/lib/auth/require-role";
 import { generateFirstSms } from "@/lib/claude/first-sms-generator";
 import { preSendCheck } from "@/lib/compliance/pre-send-check";
 import { getContact } from "@/lib/firestore/contacts";
+import { applyAdminRateLimit } from "@/lib/security/admin-rate-limit";
+import { createRateLimiter } from "@/lib/security/rate-limit";
 import { AppError, ConflictError, NotFoundError } from "@/lib/utils/errors";
 import { logger } from "@/lib/utils/logger";
 
@@ -81,6 +83,22 @@ function isPreviewAllowed(status: string): status is PreviewAllowedStatus {
   return (PREVIEW_ALLOWED_STATUSES as readonly string[]).includes(status);
 }
 
+/**
+ * Rate-limit Upstash (S10.1.9 RATELIMIT-001) : 30 req/min par admin (clé
+ * Clerk userId). La preview déclenche une génération Claude (~0.02€/req +
+ * ~2s latence) — un admin compromis pourrait spammer la route et engendrer
+ * des coûts non maîtrisés. Limit 30/min = ~1 toutes les 2s, largement
+ * suffisant pour un usage humain interactif depuis le dashboard.
+ *
+ * Lazy : `createRateLimiter` n'effectue aucun I/O à l'import, l'instance
+ * Upstash n'est construite qu'au 1er `check()` (cf. tests rate-limit l.127).
+ */
+const previewFirstSmsLimiter = createRateLimiter({
+  limit: 30,
+  window: "1 m",
+  prefix: "admin-preview-first-sms",
+});
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Handler POST
 // ─────────────────────────────────────────────────────────────────────────────
@@ -88,7 +106,14 @@ function isPreviewAllowed(status: string): status is PreviewAllowedStatus {
 export async function POST(req: NextRequest): Promise<NextResponse> {
   try {
     // ── 1. Auth Clerk + RBAC admin ────────────────────────────────────────
-    await requireRole("admin");
+    const { userId } = await requireRole("admin");
+
+    // ── 1.bis. Rate-limit Upstash (S10.1.9 RATELIMIT-001) ─────────────────
+    // Court-circuit AVANT le parse + fetch + Claude — refuse l'abus dès
+    // l'auth validée (le bénéfice du rate-limit est nul si on a déjà payé
+    // les ms Firestore + le call Claude).
+    const rateLimitResponse = await applyAdminRateLimit(previewFirstSmsLimiter, userId);
+    if (rateLimitResponse) return rateLimitResponse;
 
     // ── 2. Parse body Zod strict ──────────────────────────────────────────
     let rawBody: unknown;

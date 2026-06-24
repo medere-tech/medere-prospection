@@ -52,6 +52,8 @@ import {
   LIST_CONTACTS_MAX_LIMIT,
   listContacts,
 } from "@/lib/firestore/contacts";
+import { applyAdminRateLimit } from "@/lib/security/admin-rate-limit";
+import { createRateLimiter } from "@/lib/security/rate-limit";
 import { AppError } from "@/lib/utils/errors";
 import { logger } from "@/lib/utils/logger";
 
@@ -71,6 +73,21 @@ import { logger } from "@/lib/utils/logger";
  * explicite, jamais via `z.string().min(1)`.
  */
 const CAMPAIGN_ID_REGEX = /^hubspot-list-\d+$/;
+
+/**
+ * Rate-limit Upstash (S10.1.9 RATELIMIT-001) : 60 req/min par admin (clé
+ * Clerk userId). Lecture pure Firestore — pas de coût LLM ni d'envoi
+ * SMS — mais le quota global Vercel + Firestore reads facturés justifient
+ * un plafond raisonnable pour résister à un token compromis qui ferait
+ * de l'exfiltration en masse par pagination.
+ *
+ * Lazy : aucun I/O à l'import (cf. test rate-limit.test.ts).
+ */
+const contactsListLimiter = createRateLimiter({
+  limit: 60,
+  window: "1 m",
+  prefix: "admin-contacts-list",
+});
 
 const QuerySchema = z.object({
   cursor: z.string().min(1).optional(),
@@ -101,7 +118,11 @@ const QuerySchema = z.object({
 export async function GET(req: NextRequest): Promise<NextResponse> {
   try {
     // ── 1. Auth Clerk + RBAC admin ────────────────────────────────────────
-    await requireRole("admin");
+    const { userId } = await requireRole("admin");
+
+    // ── 1.bis. Rate-limit Upstash (S10.1.9 RATELIMIT-001) ─────────────────
+    const rateLimitResponse = await applyAdminRateLimit(contactsListLimiter, userId);
+    if (rateLimitResponse) return rateLimitResponse;
 
     // ── 2. Parse + valide query params ────────────────────────────────────
     const url = new URL(req.url);

@@ -23,6 +23,12 @@ vi.mock("@/lib/auth/require-role", () => ({
   requireRole: vi.fn(),
 }));
 
+// S10.1.9 RATELIMIT-001 : mock le helper pour découpler les tests de route
+// du wrapper Upstash. Par défaut (beforeEach) on retourne null = pass-through.
+vi.mock("@/lib/security/admin-rate-limit", () => ({
+  applyAdminRateLimit: vi.fn(),
+}));
+
 /**
  * `vi.importActual` préserve `CONTACT_STATUS_VALUES`, `LIST_CONTACTS_*` —
  * sinon le `z.enum(CONTACT_STATUS_VALUES)` au top-level de `route.ts`
@@ -55,11 +61,13 @@ import {
   LIST_CONTACTS_MAX_LIMIT,
   listContacts,
 } from "@/lib/firestore/contacts";
+import { applyAdminRateLimit } from "@/lib/security/admin-rate-limit";
 
 import { GET } from "./route";
 
 const mockRequireRole = vi.mocked(requireRole);
 const mockListContacts = vi.mocked(listContacts);
+const mockApplyAdminRateLimit = vi.mocked(applyAdminRateLimit);
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Helpers
@@ -119,6 +127,34 @@ describe("GET /api/admin/contacts", () => {
       role: "admin",
       firstName: "Déthié",
       lastName: "Faye",
+    });
+    // S10.1.9 RATELIMIT-001 : par défaut le rate-limit passe (null = OK).
+    mockApplyAdminRateLimit.mockResolvedValue(null);
+  });
+
+  describe("rate-limit (S10.1.9 RATELIMIT-001)", () => {
+    it("renvoie 429 + Retry-After + body RATE_LIMITED si rate-limit bloque", async () => {
+      const { NextResponse } = await import("next/server");
+      mockApplyAdminRateLimit.mockResolvedValue(
+        NextResponse.json(
+          { error: { code: "RATE_LIMITED", message: "Trop de requêtes. Réessayez plus tard." } },
+          { status: 429, headers: { "Retry-After": "5" } },
+        ),
+      );
+
+      const res = await GET(mockReq());
+
+      expect(res.status).toBe(429);
+      expect(res.headers.get("Retry-After")).toBe("5");
+      const body = (await res.json()) as { error: { code: string } };
+      expect(body.error.code).toBe("RATE_LIMITED");
+      expect(mockListContacts).not.toHaveBeenCalled();
+    });
+
+    it("rate-limit appelé avec le Clerk userId extrait de requireRole", async () => {
+      mockListContacts.mockResolvedValue({ contacts: [], nextCursor: null, hasMore: false });
+      await GET(mockReq());
+      expect(mockApplyAdminRateLimit).toHaveBeenCalledWith(expect.anything(), "user_admin_xxx");
     });
   });
 

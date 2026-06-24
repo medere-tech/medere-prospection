@@ -32,6 +32,12 @@ vi.mock("@/lib/auth/require-role", () => ({
   requireRole: vi.fn(),
 }));
 
+// S10.1.9 RATELIMIT-001 : mock le helper pour découpler les tests de route
+// du wrapper Upstash. Par défaut (beforeEach) on retourne null = pass-through.
+vi.mock("@/lib/security/admin-rate-limit", () => ({
+  applyAdminRateLimit: vi.fn(),
+}));
+
 vi.mock("@/lib/claude/first-sms-generator", () => ({
   generateFirstSms: vi.fn(),
 }));
@@ -88,6 +94,7 @@ import { appendAuditLog } from "@/lib/firestore/audit-log";
 import { getContact } from "@/lib/firestore/contacts";
 import { getOrCreateInitialConversation } from "@/lib/firestore/conversations";
 import { getInngestClient } from "@/lib/inngest/client";
+import { applyAdminRateLimit } from "@/lib/security/admin-rate-limit";
 
 import { POST } from "./route";
 
@@ -97,6 +104,7 @@ const mockGetContact = vi.mocked(getContact);
 const mockGetOrCreate = vi.mocked(getOrCreateInitialConversation);
 const mockAppendAuditLog = vi.mocked(appendAuditLog);
 const mockGetInngestClient = vi.mocked(getInngestClient);
+const mockApplyAdminRateLimit = vi.mocked(applyAdminRateLimit);
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Helpers
@@ -175,6 +183,45 @@ describe("POST /api/admin/send-first-sms", () => {
       role: "admin",
       firstName: "Déthié",
       lastName: "Faye",
+    });
+    // S10.1.9 RATELIMIT-001 : par défaut le rate-limit passe (null = OK).
+    mockApplyAdminRateLimit.mockResolvedValue(null);
+  });
+
+  describe("rate-limit (S10.1.9 RATELIMIT-001)", () => {
+    it("renvoie 429 + Retry-After + body RATE_LIMITED si rate-limit bloque", async () => {
+      const { NextResponse } = await import("next/server");
+      mockApplyAdminRateLimit.mockResolvedValue(
+        NextResponse.json(
+          { error: { code: "RATE_LIMITED", message: "Trop de requêtes. Réessayez plus tard." } },
+          { status: 429, headers: { "Retry-After": "12" } },
+        ),
+      );
+
+      const res = await POST(mockPost({ contactId: "hs_test_1", confirm: true }));
+
+      expect(res.status).toBe(429);
+      expect(res.headers.get("Retry-After")).toBe("12");
+      const body = (await res.json()) as { error: { code: string } };
+      expect(body.error.code).toBe("RATE_LIMITED");
+      // Court-circuit total : aucun audit posé, aucun Inngest event envoyé.
+      expect(mockAppendAuditLog).not.toHaveBeenCalled();
+      expect(mockGetContact).not.toHaveBeenCalled();
+    });
+
+    it("rate-limit appelé avec le Clerk userId extrait de requireRole", async () => {
+      mockGetContact.mockResolvedValue(buildFakeContact({ status: "ready" }));
+      mockGenerateFirstSms.mockResolvedValue(FAKE_GENERATION_OK);
+      mockGetOrCreate.mockResolvedValue({
+        conversationId: "hs_test_1_hubspot-list-200",
+        created: true,
+      });
+      mockAppendAuditLog.mockResolvedValue("audit_doc_xxx");
+      setupInngestSend(["evt_abc123"]);
+
+      await POST(mockPost({ contactId: "hs_test_1", confirm: true }));
+
+      expect(mockApplyAdminRateLimit).toHaveBeenCalledWith(expect.anything(), "user_admin_xxx");
     });
   });
 

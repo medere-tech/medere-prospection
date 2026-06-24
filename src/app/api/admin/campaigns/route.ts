@@ -18,14 +18,34 @@ import { NextResponse } from "next/server";
 
 import { requireRole } from "@/lib/auth/require-role";
 import { listSmsLists } from "@/lib/hubspot/lists";
+import { applyAdminRateLimit } from "@/lib/security/admin-rate-limit";
+import { createRateLimiter } from "@/lib/security/rate-limit";
 import { AppError } from "@/lib/utils/errors";
 import { logger } from "@/lib/utils/logger";
+
+/**
+ * Rate-limit Upstash (S10.1.9 RATELIMIT-001) : 60 req/min par admin (clé
+ * Clerk userId). Lecture HubSpot read-only — pas de coût LLM/SMS — mais
+ * un token compromis qui spam pourrait épuiser le quota HubSpot API
+ * partagé par le projet.
+ *
+ * Lazy : aucun I/O à l'import (cf. test rate-limit.test.ts).
+ */
+const campaignsListLimiter = createRateLimiter({
+  limit: 60,
+  window: "1 m",
+  prefix: "admin-campaigns-list",
+});
 
 // Pas de paramètre — Next.js accepte la signature `GET()` sans request,
 // la route ne lit aucun query param ni body (cf. campaigns/route.ts JSDoc).
 export async function GET(): Promise<NextResponse> {
   try {
-    await requireRole("admin");
+    const { userId } = await requireRole("admin");
+
+    // ── Rate-limit Upstash (S10.1.9 RATELIMIT-001) ────────────────────────
+    const rateLimitResponse = await applyAdminRateLimit(campaignsListLimiter, userId);
+    if (rateLimitResponse) return rateLimitResponse;
 
     const campaigns = await listSmsLists("SMS");
 
