@@ -67,14 +67,21 @@ function shortFingerprint(value: string): string {
 
 /**
  * Properties HubSpot fetchées pour mapping vers ContactSchema Firestore.
- * Liste figée S10.1.2.b — décision A-b2 arbitrée Déthié (9 properties,
- * `rpps` + `departement` skippés avec follow-ups Notion).
+ * Liste figée S10.1.2.b — décision A-b2 arbitrée Déthié.
  *
- * 🔒 SENTINEL — modification = re-validation Déthié + impact mapper.ts.
+ * 🔒 SENTINEL — modification = re-validation Déthié + impact mapper.ts
+ *    + impact compliance (les opt-out ci-dessous pilotent le filtre seed
+ *    S10.1.9 OPTOUT-FILTER-001 ; une suppression accidentelle masquerait
+ *    silencieusement les opt-out → import de contacts opposés au démarchage
+ *    → 375 k€ L.34-5 CPCE / 75 k€ Bloctel selon le canal).
  *
  * Ordre : standard HubSpot d'abord, custom Médéré ensuite. Pas de
  * dépendance à l'ordre côté API (l'API HubSpot retourne un dict, pas
  * un array ordonné).
+ *
+ * Note format API : l'API HubSpot v3 sérialise les bool natifs comme
+ * STRINGS "true"/"false" dans `properties{}`. Le mapper/seed-runner doit
+ * parser explicitement (cf. `extractOptOutFlags` dans mapper.ts).
  */
 export const HUBSPOT_CONTACT_PROPERTIES = [
   "firstname", // → firstName
@@ -86,6 +93,11 @@ export const HUBSPOT_CONTACT_PROPERTIES = [
   "zip", // → postalCode
   "civilite", // custom → civilite (via HUBSPOT_CIVILITE_MAP)
   "profession", // custom → speciality (via 21-enum CONTACT_SPECIALITY_VALUES)
+  // S10.1.9 OPTOUT-FILTER-001 — filtrées dans seed-runner.ts (étape A.0,
+  // AVANT mapping). Pas mappées vers Contact Firestore : le filtre est
+  // pre-import, l'info ne sert qu'au seed pour skip.
+  "hs_email_optout", // standard HubSpot, bool natif (API renvoie string)
+  "sms_opted_out", // custom Médéré (créé par Déthié S10.1.9), bool natif
 ] as const;
 
 /**

@@ -311,7 +311,7 @@ describe("getContact — validation + erreurs", () => {
 // ─────────────────────────────────────────────────────────────────────────────
 
 describe("Sentinelles contacts.ts", () => {
-  it("HUBSPOT_CONTACT_PROPERTIES = 9 props alignées Q-A-b2 S10.1.2.b.0", () => {
+  it("HUBSPOT_CONTACT_PROPERTIES = 11 props (9 alignées Q-A-b2 S10.1.2.b.0 + 2 opt-out S10.1.9 OPTOUT-FILTER-001)", () => {
     expect(HUBSPOT_CONTACT_PROPERTIES).toEqual([
       "firstname",
       "lastname",
@@ -322,6 +322,12 @@ describe("Sentinelles contacts.ts", () => {
       "zip",
       "civilite",
       "profession",
+      // S10.1.9 OPTOUT-FILTER-001 — propriétés opt-out (filtrées dans
+      // seed-runner.ts étape A.0, AVANT mapping). Suppression accidentelle
+      // ici masquerait les opt-out → import de contacts opposés au
+      // démarchage → 375 k€ L.34-5 CPCE / 75 k€ Bloctel.
+      "hs_email_optout",
+      "sms_opted_out",
     ]);
   });
 

@@ -180,6 +180,44 @@ function deriveSegmentFromPhoneType(phoneType: PhoneType): ContactSegment {
   }
 }
 
+/**
+ * Extrait les flags opt-out HubSpot depuis le `properties` raw d'un contact
+ * (S10.1.9 OPTOUT-FILTER-001).
+ *
+ *   - `hs_email_optout` : standard HubSpot, bool natif côté CRM.
+ *   - `sms_opted_out`   : custom Médéré (créée par Déthié S10.1.9), bool
+ *                          natif côté CRM.
+ *
+ * L'API HubSpot v3 retourne les bool comme STRINGS `"true"`/`"false"` dans
+ * `properties{}` (sérialisation SDK `@hubspot/api-client`). Defense-in-depth :
+ * on accepte aussi le bool natif `true` au cas où une future version du SDK
+ * changerait ce comportement (probabilité faible mais coût nul à protéger).
+ *
+ * Toute autre valeur (`null`, `"false"`, chaîne vide, propriété absente,
+ * `undefined`) → `false` (interprétation conservatrice : on considère qu'il
+ * n'y a PAS d'opt-out tant qu'on n'a pas explicitement `"true"` ou `true`).
+ *
+ * Le caller (`seed-runner.ts` étape A.0) reste responsable de la décision
+ * skip/proceed et de l'audit log forensique.
+ *
+ * 🔒 Verrouillé par tests `extractOptOutFlags` dans `mapper.test.ts`.
+ */
+export function extractOptOutFlags(raw: HubspotContactRaw): {
+  emailOptout: boolean;
+  smsOptout: boolean;
+} {
+  // Cast via `unknown` car `HubspotContactRaw.properties` est typé
+  // `Record<string, string | null>` côté projet — l'égalité `=== true`
+  // serait dead-code au compile-time sans ce cast. Le cast est volontaire,
+  // c'est précisément l'esprit defense-in-depth (cf. JSDoc ci-dessus).
+  const props = raw.properties as Record<string, unknown>;
+  const isTrueish = (v: unknown): boolean => v === "true" || v === true;
+  return {
+    emailOptout: isTrueish(props.hs_email_optout),
+    smsOptout: isTrueish(props.sms_opted_out),
+  };
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // mapHubSpotContactToFirestoreContact
 // ─────────────────────────────────────────────────────────────────────────────

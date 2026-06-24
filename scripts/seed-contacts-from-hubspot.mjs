@@ -221,6 +221,7 @@ try {
   console.log(`  Created               : ${stats.createdCount}`);
   console.log(`  Already exists (skip) : ${stats.skippedAlreadyExistsCount}`);
   console.log(`  Mapper errors (skip)  : ${stats.skippedMapperErrorCount}`);
+  console.log(`  HubSpot opt-out (skip): ${stats.skippedOptedOutCount}`);
   console.log(`  Duration              : ${Math.round(stats.durationMs / 1000)}s`);
   console.log(`  Started at            : ${stats.startedAt}`);
   console.log(`  Completed at          : ${stats.completedAt}`);

@@ -270,6 +270,9 @@ describe("runSeed — happy path 1 page", () => {
       createdCount: 2,
       skippedAlreadyExists: 0,
       skippedMapperError: 0,
+      // S10.1.9 OPTOUT-FILTER-001 : nouveau champ stats remonté dans
+      // l'audit campaign_completed (forensic post-run).
+      skippedOptedOut: 0,
     });
     expect(completedCall![0].payload.durationMs).toBeGreaterThanOrEqual(0);
   });
@@ -598,6 +601,55 @@ describe("runSeed — propagation SDK errors", () => {
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
+// S10.1.9 OPTOUT-FILTER-001 — runSeed intègre le filtre opt-out
+// ─────────────────────────────────────────────────────────────────────────────
+
+describe("runSeed — OPTOUT-FILTER-001 intégration", () => {
+  it("mix 3 contacts (1 email_optout, 1 sms_optout, 1 clean) → 1 created + 2 skipped_opted_out + audit campaign_completed cohérent", async () => {
+    const deps = makeMockDeps();
+    const cleanContact = makeRawContact(0);
+    const emailOptoutContact = makeRawContact(1, {
+      properties: {
+        ...makeRawContact(1).properties,
+        hs_email_optout: "true",
+      },
+    });
+    const smsOptoutContact = makeRawContact(2, {
+      properties: {
+        ...makeRawContact(2).properties,
+        sms_opted_out: "true",
+      },
+    });
+    (deps.getContactsInList as ReturnType<typeof vi.fn>).mockResolvedValue({
+      contacts: [cleanContact, emailOptoutContact, smsOptoutContact],
+      nextCursor: undefined,
+      hasMore: false,
+    });
+
+    const stats = await runSeed(VALID_INPUT, deps);
+
+    expect(stats.createdCount).toBe(1);
+    expect(stats.skippedOptedOutCount).toBe(2);
+    expect(stats.skippedMapperErrorCount).toBe(0);
+    expect(stats.skippedAlreadyExistsCount).toBe(0);
+    expect(stats.fetchedCount).toBe(3);
+
+    // 1 created + 2 skip = 3 contacts traités. Pas de mapper appelé sur les opt-out.
+    expect(deps.createContact).toHaveBeenCalledTimes(1);
+    expect(deps.mapHubSpotContactToFirestoreContact).toHaveBeenCalledTimes(1);
+
+    // Audit campaign_completed remonte le compteur.
+    const completedCall = (deps.appendAuditLog as ReturnType<typeof vi.fn>).mock.calls.find(
+      (c) => c[0].action === "campaign_completed",
+    );
+    expect(completedCall![0].payload).toMatchObject({
+      createdCount: 1,
+      skippedOptedOut: 2,
+    });
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Idempotence — 2 runs successifs sur même liste = même résultats
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -732,6 +784,131 @@ describe("processContact — outcomes unitaires", () => {
         payload: expect.objectContaining({ reason: "create_failed" }),
       }),
     );
+  });
+
+  // ───────────────────────────────────────────────────────────────────────
+  // S10.1.9 OPTOUT-FILTER-001 — filtre opt-out HubSpot (étape A.0)
+  // ───────────────────────────────────────────────────────────────────────
+  // L'API HubSpot v3 sérialise les bool comme strings "true"/"false". On
+  // teste avec "true" (cas nominal API). Le helper extractOptOutFlags a
+  // ses tests dédiés pour les cas bool natif + edge cases (mapper.test.ts).
+
+  describe("OPTOUT-FILTER-001 — skip avant mapper", () => {
+    it("hs_email_optout='true' → outcome 'skipped_opted_out' + audit reason='hubspot_opted_out' + context email_optout=true", async () => {
+      const deps = makeMockDeps();
+      const raw = makeRawContact(0, {
+        properties: {
+          ...makeRawContact(0).properties,
+          hs_email_optout: "true",
+        },
+      });
+
+      const outcome = await processContact(raw, "hubspot-list-1234", "1234", deps, false);
+
+      expect(outcome).toBe("skipped_opted_out");
+      // Mapper JAMAIS appelé — court-circuit total étape A.0 (cohérent
+      // avec philosophie "pas de risque", pas de coût mapper inutile).
+      expect(deps.mapHubSpotContactToFirestoreContact).not.toHaveBeenCalled();
+      expect(deps.createContact).not.toHaveBeenCalled();
+      expect(deps.appendAuditLog).toHaveBeenCalledTimes(1);
+      expect(deps.appendAuditLog).toHaveBeenCalledWith({
+        actorId: "system:seed",
+        actorType: "system",
+        action: "contact_import_skipped",
+        targetType: "contact",
+        targetId: "hs_med_0",
+        payload: {
+          reason: "hubspot_opted_out",
+          email_optout: true,
+          sms_optout: false,
+        },
+      });
+    });
+
+    it("sms_opted_out='true' → outcome 'skipped_opted_out' + context sms_optout=true", async () => {
+      const deps = makeMockDeps();
+      const raw = makeRawContact(0, {
+        properties: {
+          ...makeRawContact(0).properties,
+          sms_opted_out: "true",
+        },
+      });
+
+      const outcome = await processContact(raw, "hubspot-list-1234", "1234", deps, false);
+
+      expect(outcome).toBe("skipped_opted_out");
+      expect(deps.mapHubSpotContactToFirestoreContact).not.toHaveBeenCalled();
+      expect(deps.appendAuditLog).toHaveBeenCalledWith(
+        expect.objectContaining({
+          payload: { reason: "hubspot_opted_out", email_optout: false, sms_optout: true },
+        }),
+      );
+    });
+
+    it("les 2 props='true' → context email_optout=true ET sms_optout=true (forensic complet)", async () => {
+      const deps = makeMockDeps();
+      const raw = makeRawContact(0, {
+        properties: {
+          ...makeRawContact(0).properties,
+          hs_email_optout: "true",
+          sms_opted_out: "true",
+        },
+      });
+
+      const outcome = await processContact(raw, "hubspot-list-1234", "1234", deps, false);
+
+      expect(outcome).toBe("skipped_opted_out");
+      expect(deps.appendAuditLog).toHaveBeenCalledWith(
+        expect.objectContaining({
+          payload: { reason: "hubspot_opted_out", email_optout: true, sms_optout: true },
+        }),
+      );
+    });
+
+    it("aucun flag opt-out → mapping normal (outcome 'created'), pas de skip", async () => {
+      const deps = makeMockDeps();
+      // makeRawContact() ne pose ni hs_email_optout ni sms_opted_out →
+      // extractOptOutFlags retourne { false, false } → pas de skip.
+      const raw = makeRawContact(0);
+
+      const outcome = await processContact(raw, "hubspot-list-1234", "1234", deps, false);
+
+      expect(outcome).toBe("created");
+      expect(deps.mapHubSpotContactToFirestoreContact).toHaveBeenCalledTimes(1);
+      expect(deps.createContact).toHaveBeenCalledTimes(1);
+    });
+
+    it("dry-run + opt-out → outcome 'skipped_opted_out' + 0 audit (silent comme autres dry-run)", async () => {
+      const deps = makeMockDeps();
+      const raw = makeRawContact(0, {
+        properties: {
+          ...makeRawContact(0).properties,
+          hs_email_optout: "true",
+        },
+      });
+
+      const outcome = await processContact(raw, "hubspot-list-1234", "1234", deps, true);
+
+      expect(outcome).toBe("skipped_opted_out");
+      expect(deps.appendAuditLog).not.toHaveBeenCalled();
+    });
+
+    it("raw.id vide + opt-out → targetId fallback 'unknown-hs' (cohérent autres skip paths)", async () => {
+      const deps = makeMockDeps();
+      const raw = makeRawContact(0, {
+        id: "",
+        properties: {
+          ...makeRawContact(0).properties,
+          sms_opted_out: "true",
+        },
+      });
+
+      await processContact(raw, "hubspot-list-1234", "1234", deps, false);
+
+      expect(deps.appendAuditLog).toHaveBeenCalledWith(
+        expect.objectContaining({ targetId: "unknown-hs" }),
+      );
+    });
   });
 });
 

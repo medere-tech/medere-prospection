@@ -16,6 +16,7 @@ import type { Contact } from "@/types/contact";
 import type { HubspotContactRaw } from "./contacts";
 import {
   __deriveSegmentFromPhoneType_FOR_TESTS as deriveSegmentFromPhoneType,
+  extractOptOutFlags,
   HUBSPOT_CIVILITE_MAP,
   HUBSPOT_DEFAULT_LEGITIMATE_INTEREST,
   mapHubSpotContactToFirestoreContact,
@@ -541,6 +542,81 @@ describe("Segment derivation from phone.type (BLOCTEL-001)", () => {
     });
     expect(c.phone.type).toBe("landline");
     expect(c.segment).toBe("b2b_cabinet");
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// S10.1.9 OPTOUT-FILTER-001 — extractOptOutFlags
+// ─────────────────────────────────────────────────────────────────────────────
+// Helper utilisé par seed-runner.ts étape A.0 pour filtrer les contacts
+// HubSpot qui ont manifesté leur opposition. L'API HubSpot v3 sérialise les
+// bool comme STRINGS ("true"/"false") dans properties{} — defense-in-depth
+// le helper accepte aussi le bool natif au cas où le SDK change.
+
+describe("extractOptOutFlags (OPTOUT-FILTER-001)", () => {
+  function rawWith(props: Record<string, unknown>): HubspotContactRaw {
+    return { id: "hs_test_42", properties: props as Record<string, string | null> };
+  }
+
+  it("hs_email_optout='true' (string API HubSpot) → emailOptout=true", () => {
+    expect(extractOptOutFlags(rawWith({ hs_email_optout: "true" }))).toEqual({
+      emailOptout: true,
+      smsOptout: false,
+    });
+  });
+
+  it("sms_opted_out='true' (string API HubSpot) → smsOptout=true", () => {
+    expect(extractOptOutFlags(rawWith({ sms_opted_out: "true" }))).toEqual({
+      emailOptout: false,
+      smsOptout: true,
+    });
+  });
+
+  it("les 2 props='true' → emailOptout=true ET smsOptout=true", () => {
+    expect(extractOptOutFlags(rawWith({ hs_email_optout: "true", sms_opted_out: "true" }))).toEqual(
+      { emailOptout: true, smsOptout: true },
+    );
+  });
+
+  it("hs_email_optout=true (bool natif defense-in-depth si SDK change) → emailOptout=true", () => {
+    expect(extractOptOutFlags(rawWith({ hs_email_optout: true }))).toEqual({
+      emailOptout: true,
+      smsOptout: false,
+    });
+  });
+
+  it("sms_opted_out=true (bool natif defense-in-depth) → smsOptout=true", () => {
+    expect(extractOptOutFlags(rawWith({ sms_opted_out: true }))).toEqual({
+      emailOptout: false,
+      smsOptout: true,
+    });
+  });
+
+  it.each([
+    ["='false' (string)", { hs_email_optout: "false", sms_opted_out: "false" }],
+    ["=null", { hs_email_optout: null, sms_opted_out: null }],
+    ["absentes (props vide)", {}],
+    ["='' (vide)", { hs_email_optout: "", sms_opted_out: "" }],
+    ["='TRUE' (case mismatch)", { hs_email_optout: "TRUE", sms_opted_out: "True" }],
+    ["='1' (truthy non-canonique)", { hs_email_optout: "1", sms_opted_out: "1" }],
+  ])("interprétation conservatrice — toute valeur ≠ 'true'/true → false (%s)", (_label, props) => {
+    expect(extractOptOutFlags(rawWith(props))).toEqual({
+      emailOptout: false,
+      smsOptout: false,
+    });
+  });
+
+  it("autres propriétés du raw n'interfèrent pas (lit uniquement hs_email_optout + sms_opted_out)", () => {
+    expect(
+      extractOptOutFlags(
+        rawWith({
+          firstname: "Jean",
+          mobilephone: "0612345678",
+          hs_email_optout: "true",
+          // pas de sms_opted_out → false par défaut
+        }),
+      ),
+    ).toEqual({ emailOptout: true, smsOptout: false });
   });
 });
 

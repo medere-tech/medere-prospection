@@ -83,6 +83,7 @@
 
 import type { GetContactsInListOutput, HubspotContactRaw } from "@/lib/hubspot/contacts";
 import type { HubspotListInfo } from "@/lib/hubspot/lists";
+import { extractOptOutFlags } from "@/lib/hubspot/mapper";
 import { ConflictError, ValidationError } from "@/lib/utils/errors";
 import type { Contact } from "@/types/contact";
 
@@ -206,6 +207,13 @@ export interface SeedStats {
   createdCount: number;
   skippedAlreadyExistsCount: number;
   skippedMapperErrorCount: number;
+  /**
+   * S10.1.9 OPTOUT-FILTER-001 — Contacts skip car flag `hs_email_optout`
+   * OU `sms_opted_out` était `true` côté HubSpot. Compteur dédié (vs
+   * agrégation dans skippedMapperErrorCount) car le motif est sémantiquement
+   * distinct : non-erreur, choix éthique/légal délibéré.
+   */
+  skippedOptedOutCount: number;
   pagesProcessed: number;
   durationMs: number;
   startedAt: string;
@@ -217,7 +225,10 @@ export type ProcessContactOutcome =
   | "created"
   | "already_exists"
   | "skipped_mapper"
-  | "skipped_create_error";
+  | "skipped_create_error"
+  // S10.1.9 OPTOUT-FILTER-001 — contact skip avant mapper (étape A.0)
+  // car `hs_email_optout` OU `sms_opted_out` était true côté HubSpot.
+  | "skipped_opted_out";
 
 // ─────────────────────────────────────────────────────────────────────────────
 // processContact — pure-ish (1 contact, testable isolé)
@@ -242,6 +253,38 @@ export async function processContact(
   deps: SeedRunnerDeps,
   isDryRun: boolean,
 ): Promise<ProcessContactOutcome> {
+  // ── Étape A.0 : Filtre opt-out HubSpot (S10.1.9 OPTOUT-FILTER-001) ──────
+  // AVANT mapper : un contact qui a manifesté son opposition côté HubSpot
+  // (hs_email_optout=true OU sms_opted_out=true) ne doit JAMAIS être seedé
+  // dans Firestore — sinon il devient envoyable depuis le dashboard admin.
+  // Risque L.34-5 CPCE 375 k€ pour démarchage post-opposition.
+  // Logique conservatrice : OR (un seul flag true suffit à skip) — décision
+  // Déthié Q2 OPTOUT-FILTER-001 "philosophie pas de risque".
+  const { emailOptout, smsOptout } = extractOptOutFlags(raw);
+  if (emailOptout || smsOptout) {
+    if (!isDryRun) {
+      await deps.appendAuditLog({
+        actorId: "system:seed",
+        actorType: "system",
+        action: "contact_import_skipped",
+        targetType: "contact",
+        // raw.id = recordId HubSpot. Si absent (très rare, le mapper le
+        // détecterait ensuite), fallback fingerprint cohérent étape A.
+        targetId: typeof raw.id === "string" && raw.id.length > 0 ? raw.id : "unknown-hs",
+        payload: {
+          reason: "hubspot_opted_out",
+          // Context précis : permet de tracer FORENSIQUEMENT quel canal a
+          // déclenché le skip (email vs SMS vs les deux). Utile pour
+          // diagnostiquer une éventuelle dérive de qualité des listes
+          // HubSpot (ex: opérateur qui flag à tort, ou inversement).
+          email_optout: emailOptout,
+          sms_optout: smsOptout,
+        },
+      });
+    }
+    return "skipped_opted_out";
+  }
+
   // ── Étape A : Mapping HubSpot → Firestore ───────────────────────────────
   let mapped: Contact;
   try {
@@ -360,6 +403,7 @@ export async function runSeed(input: SeedRunInput, deps: SeedRunnerDeps): Promis
     createdCount: 0,
     skippedAlreadyExistsCount: 0,
     skippedMapperErrorCount: 0,
+    skippedOptedOutCount: 0,
     pagesProcessed: 0,
     durationMs: 0,
     startedAt: startedAtIso,
@@ -409,6 +453,9 @@ export async function runSeed(input: SeedRunInput, deps: SeedRunnerDeps): Promis
         case "skipped_create_error":
           stats.skippedMapperErrorCount++;
           break;
+        case "skipped_opted_out":
+          stats.skippedOptedOutCount++;
+          break;
       }
     }
 
@@ -432,6 +479,7 @@ export async function runSeed(input: SeedRunInput, deps: SeedRunnerDeps): Promis
         createdCount: stats.createdCount,
         skippedAlreadyExists: stats.skippedAlreadyExistsCount,
         skippedMapperError: stats.skippedMapperErrorCount,
+        skippedOptedOut: stats.skippedOptedOutCount,
         durationMs: stats.durationMs,
       },
     });
