@@ -15,6 +15,7 @@ import type { Contact } from "@/types/contact";
 
 import type { HubspotContactRaw } from "./contacts";
 import {
+  __deriveSegmentFromPhoneType_FOR_TESTS as deriveSegmentFromPhoneType,
   HUBSPOT_CIVILITE_MAP,
   HUBSPOT_DEFAULT_LEGITIMATE_INTEREST,
   mapHubSpotContactToFirestoreContact,
@@ -72,7 +73,9 @@ describe("mapHubSpotContactToFirestoreContact — happy path", () => {
     expect(c.phone.raw).toBe("0612345678");
     expect(c.phone.type).toBe("mobile");
     expect(c.phone.valid).toBe(true);
-    expect(c.segment).toBe("unknown");
+    // S10.1.9 BLOCTEL-001 : segment dérivé depuis phone.type. Mobile FR
+    // (06...) → b2c_mobile_perso (vérif Bloctel obligatoire L.34-5 CPCE).
+    expect(c.segment).toBe("b2c_mobile_perso");
     expect(c.bloctelChecked).toBe(false);
     expect(c.bloctelOptOut).toBe(false);
     expect(c.consent.legitimateInterest).toBe(HUBSPOT_DEFAULT_LEGITIMATE_INTEREST);
@@ -492,6 +495,52 @@ describe("Pure function & idempotence", () => {
       now: FIXED_NOW,
     });
     expect(raw).toEqual(snapshot);
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// S10.1.9 BLOCTEL-001 — Segment derivation from phone.type
+// ─────────────────────────────────────────────────────────────────────────────
+// Avant S10.1.9 : `segment` était hardcodé à "unknown" → 100% des contacts
+// seedés esquivaient la règle Bloctel. Risque CNIL 75 k€ par mobile perso
+// inscrit Bloctel envoyé sans check.
+//
+// On teste :
+//   1. Le helper `deriveSegmentFromPhoneType` en isolation (4 cas exhaustifs
+//      — switch TS garantit la complétude au compile-time).
+//   2. L'intégration via le mapper : mobile FR → b2c_mobile_perso, landline
+//      FR → b2b_cabinet. Le cas mobile est aussi couvert par le happy path
+//      ligne 75. Pas de test d'intégration VOIP/unknown via libphonenumber —
+//      les classifications dépendent de la version de metadata embarquée et
+//      sont sujettes à drift entre releases ; le helper en isolation suffit
+//      à verrouiller le mapping.
+
+describe("Segment derivation from phone.type (BLOCTEL-001)", () => {
+  it("helper: mobile → 'b2c_mobile_perso' (vérif Bloctel obligatoire)", () => {
+    expect(deriveSegmentFromPhoneType("mobile")).toBe("b2c_mobile_perso");
+  });
+
+  it("helper: landline → 'b2b_cabinet' (ligne pro exemptée Bloctel)", () => {
+    expect(deriveSegmentFromPhoneType("landline")).toBe("b2b_cabinet");
+  });
+
+  it("helper: voip → 'b2b_cabinet' (standard pro 3CX/RingCentral)", () => {
+    expect(deriveSegmentFromPhoneType("voip")).toBe("b2b_cabinet");
+  });
+
+  it("helper: unknown → 'unknown' (tracer l'incertitude, ne pas masquer)", () => {
+    expect(deriveSegmentFromPhoneType("unknown")).toBe("unknown");
+  });
+
+  it("intégration: landline FR (01... Paris) → segment 'b2b_cabinet'", () => {
+    const raw = buildValidRaw({ mobilephone: null, phone: "0145678901" });
+    const c = mapHubSpotContactToFirestoreContact({
+      raw,
+      campaignId: CAMPAIGN_ID,
+      now: FIXED_NOW,
+    });
+    expect(c.phone.type).toBe("landline");
+    expect(c.segment).toBe("b2b_cabinet");
   });
 });
 

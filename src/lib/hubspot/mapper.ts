@@ -58,8 +58,8 @@ import { Timestamp } from "firebase-admin/firestore";
 
 import { CONTACT_SPECIALITY_VALUES } from "@/lib/firestore/contacts";
 import { ValidationError } from "@/lib/utils/errors";
-import { parsePhone, toE164 } from "@/lib/utils/phone";
-import type { Contact, ContactCivilite, ContactSpeciality } from "@/types/contact";
+import { parsePhone, type PhoneType, toE164 } from "@/lib/utils/phone";
+import type { Contact, ContactCivilite, ContactSegment, ContactSpeciality } from "@/types/contact";
 
 import type { HubspotContactRaw } from "./contacts";
 
@@ -141,6 +141,43 @@ function shortFingerprint(value: string): string {
     hash = ((hash << 5) + hash + value.charCodeAt(i)) & 0xffffffff;
   }
   return (hash >>> 0).toString(16).padStart(8, "0");
+}
+
+/**
+ * Dérive le segment Bloctel depuis le type de ligne téléphonique heuristique
+ * (S10.1.9 BLOCTEL-001).
+ *
+ *   - mobile   → "b2c_mobile_perso" (vérif Bloctel obligatoire L.34-5 CPCE)
+ *   - landline → "b2b_cabinet"      (ligne pro exemptée Bloctel)
+ *   - voip     → "b2b_cabinet"      (standard téléphonique pro type 3CX /
+ *                                    RingCentral, contexte cabinet dentaire)
+ *   - unknown  → "unknown"          (préservé pour TRACER l'incertitude — ne
+ *                                    pas masquer derrière b2b_cabinet par
+ *                                    défaut, sinon un mobile perso mal-détecté
+ *                                    par libphonenumber-js comme
+ *                                    FIXED_LINE_OR_MOBILE échapperait
+ *                                    silencieusement au check Bloctel)
+ *
+ * Avant S10.1.9 : `segment` était hardcodé à `"unknown"` pour 100% des
+ * contacts seedés, ce qui court-circuitait systématiquement la règle Bloctel
+ * (`canSendB2C` autorise tout segment ≠ `b2c_mobile_perso`). Risque CNIL
+ * 75 000 € par PS portant un mobile perso inscrit Bloctel.
+ *
+ * 🔒 Verrouillé par tests exhaustifs dans `mapper.test.ts` (section
+ *    "Segment derivation from phone.type"). Le switch exhaustif TS interdit
+ *    qu'un nouveau `PhoneType` soit ajouté sans mise à jour de cette
+ *    fonction (compile error).
+ */
+function deriveSegmentFromPhoneType(phoneType: PhoneType): ContactSegment {
+  switch (phoneType) {
+    case "mobile":
+      return "b2c_mobile_perso";
+    case "landline":
+    case "voip":
+      return "b2b_cabinet";
+    case "unknown":
+      return "unknown";
+  }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -273,7 +310,7 @@ export function mapHubSpotContactToFirestoreContact(input: MapHubSpotContactInpu
       valid: phoneValid,
       lookupAt: now,
     },
-    segment: "unknown",
+    segment: deriveSegmentFromPhoneType(phoneType),
     bloctelChecked: false,
     bloctelOptOut: false,
     consent: {
@@ -292,3 +329,11 @@ export function mapHubSpotContactToFirestoreContact(input: MapHubSpotContactInpu
 
   return contact;
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Exposés pour tests (S10.1.9 BLOCTEL-001 — switch exhaustif testé en
+// isolation, indépendamment du parsing libphonenumber-js dont les fixtures
+// peuvent évoluer entre versions de metadata).
+// ─────────────────────────────────────────────────────────────────────────────
+
+export { deriveSegmentFromPhoneType as __deriveSegmentFromPhoneType_FOR_TESTS };
