@@ -196,7 +196,10 @@ function ActionsCell({
             type="button"
             variant="ghost"
             size="sm"
-            className="size-8 p-0"
+            // S10.1.8 BLQ-2 : 36px minimum (cible iPad doigts larges).
+            // WCAG 2.5.8 AA (24px) + iOS HIG (44px idéal) — compromis acceptable
+            // dans une TableCell dense, cohérent avec le hamburger header (44px).
+            className="size-9 p-0"
             aria-label="Actions sur le contact"
           >
             <MoreHorizontal className="size-4" aria-hidden />

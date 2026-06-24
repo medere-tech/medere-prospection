@@ -59,7 +59,7 @@ import {
   ShieldCheck,
   Sparkles,
 } from "lucide-react";
-import { useCallback, useEffect, useId, useState } from "react";
+import { useCallback, useEffect, useId, useRef, useState } from "react";
 import { toast } from "sonner";
 
 import { Badge } from "@/components/ui/badge";
@@ -705,6 +705,11 @@ function PreviewDialogContent({
   // contact (pattern canonique anti-`set-state-in-effect`).
   const [state, setState] = useState<PreviewState>({ kind: "loading" });
   const [sendState, setSendState] = useState<SendState>({ kind: "idle" });
+  // S10.1.8 BLQ-4 : ref pour le timer auto-close. Si l'admin ferme manuellement
+  // (Escape, clic croix, backdrop) avant les 2500ms, le cleanup démontage
+  // annule le timeout — évite `onClose()` fantôme + warning React setState on
+  // unmounted component.
+  const autoCloseTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   useEffect(() => {
     const ac = new AbortController();
@@ -713,6 +718,15 @@ function PreviewDialogContent({
     });
     return () => ac.abort();
   }, [contact.hubspotId]);
+
+  useEffect(() => {
+    return () => {
+      if (autoCloseTimerRef.current !== null) {
+        clearTimeout(autoCloseTimerRef.current);
+        autoCloseTimerRef.current = null;
+      }
+    };
+  }, []);
 
   const handleConfirmSend = useCallback(async () => {
     if (state.kind !== "success") return;
@@ -729,7 +743,10 @@ function PreviewDialogContent({
       // complète ("SMS envoyé à Dr X · N car · Tracé en audit log · STOP
       // fonctionnel") avant fermeture. UX-reviewer S10.1.6 : 1200ms était
       // trop court pour assimiler le détail compliance rassurant.
-      window.setTimeout(() => onClose(), 2500);
+      autoCloseTimerRef.current = setTimeout(() => {
+        autoCloseTimerRef.current = null;
+        onClose();
+      }, 2500);
     } else {
       setSendState({ kind: "idle" });
       toast.error(`Envoi refusé : ${result.message}`);
