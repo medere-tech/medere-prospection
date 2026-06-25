@@ -208,10 +208,16 @@ export async function POST(req: NextRequest): Promise<NextResponse> {
     }
 
     // Inattendu (bug, Claude API HS, Firestore HS) → 500 générique.
-    // On log juste `err.name` — pas la stack (qui pourrait fuiter du
-    // PII via fragments de docId/prompt). Sanitizer Pino couvre en aval.
+    // Log `errName + errMessage + errCode` (S10.1.12-LIST-CONTACTS-
+    // DIAGNOSIS-001) — `errName` seul rend les bugs Firestore/Claude
+    // opaques. PAS de `err.stack` (verbeux). Sanitizer Pino + Sentry
+    // serveur capturent la stack si configuré.
     logger.error(
-      { errName: err instanceof Error ? err.name : "unknown" },
+      {
+        errName: err instanceof Error ? err.name : "unknown",
+        errMessage: err instanceof Error ? err.message : undefined,
+        errCode: (err as { code?: unknown })?.code,
+      },
       "[POST /api/admin/preview-first-sms] unexpected error",
     );
     return NextResponse.json(

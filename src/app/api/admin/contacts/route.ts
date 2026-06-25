@@ -163,12 +163,19 @@ export async function GET(req: NextRequest): Promise<NextResponse> {
       return NextResponse.json(err.toClientBody(), { status: err.statusCode });
     }
 
-    // Inattendu → 500 générique. On log un message court SANS sérialiser
-    // `err` brut (la stack Firestore pourrait fuiter des fragments d'IDs
-    // semi-PII dans Vercel logs / Sentry). Le sanitizer Pino couvre déjà,
-    // mais on ajoute une couche : log juste `err.message`.
+    // Inattendu → 500 générique. On log `errName + errMessage + errCode`
+    // (S10.1.12-LIST-CONTACTS-DIAGNOSIS-001) — `errName` seul rend les bugs
+    // Firestore opaques (ex: `FAILED_PRECONDITION` pour index manquant
+    // contient le lien de création dans `err.message`, perdu si non loggé).
+    // Le sanitizer Pino projet couvre les fragments PII éventuels. PAS de
+    // `err.stack` (encore trop verbeux pour les logs Vercel) — Sentry serveur
+    // capture la stack séparément si configuré.
     logger.error(
-      { errName: err instanceof Error ? err.name : "unknown" },
+      {
+        errName: err instanceof Error ? err.name : "unknown",
+        errMessage: err instanceof Error ? err.message : undefined,
+        errCode: (err as { code?: unknown })?.code,
+      },
       "[GET /api/admin/contacts] unexpected error",
     );
     return NextResponse.json(

@@ -55,8 +55,14 @@ export async function GET(): Promise<NextResponse> {
       logger.warn(err.toLogObject(), "[GET /api/admin/campaigns] AppError");
       return NextResponse.json(err.toClientBody(), { status: err.statusCode });
     }
+    // Log `errName + errMessage + errCode` (S10.1.12-LIST-CONTACTS-
+    // DIAGNOSIS-001) — alignement avec les 3 autres routes admin.
     logger.error(
-      { errName: err instanceof Error ? err.name : "unknown" },
+      {
+        errName: err instanceof Error ? err.name : "unknown",
+        errMessage: err instanceof Error ? err.message : undefined,
+        errCode: (err as { code?: unknown })?.code,
+      },
       "[GET /api/admin/campaigns] unexpected error",
     );
     return NextResponse.json(
