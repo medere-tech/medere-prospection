@@ -4,6 +4,7 @@ import { frFR } from "@clerk/localizations";
 import { ClerkProvider } from "@clerk/nextjs";
 import type { Metadata } from "next";
 import { Geist, Geist_Mono } from "next/font/google";
+import { NuqsAdapter } from "nuqs/adapters/next/app";
 
 import { ThemeProvider } from "@/components/theme-provider";
 import { Toaster } from "@/components/ui/sonner";
@@ -41,8 +42,20 @@ export default function RootLayout({
         <body className="min-h-full flex flex-col bg-background text-foreground">
           <ThemeProvider>
             <TooltipProvider>
-              {children}
-              <Toaster richColors closeButton />
+              {/*
+                S10.1.11-NUQS-ADAPTER-001 : NuqsAdapter REQUIS pour tout
+                composant client qui utilise `useQueryState` / `useQueryStates`
+                (actuellement : src/app/admin/contacts/contacts-page-client.tsx).
+                Sans cet adapter, nuqs throw au runtime :
+                  "[nuqs] nuqs requires an adapter to work with your framework"
+                Toutes les tests UI mockent nuqs → ne couvrent pas l'absence
+                d'adapter. Garde-fou : sentinelle filesystem
+                src/app/layout-providers.sentinel.test.ts.
+              */}
+              <NuqsAdapter>
+                {children}
+                <Toaster richColors closeButton />
+              </NuqsAdapter>
             </TooltipProvider>
           </ThemeProvider>
         </body>
