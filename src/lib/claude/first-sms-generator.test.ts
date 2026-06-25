@@ -33,9 +33,24 @@ vi.mock("./client", () => ({
   generateWithTool: vi.fn(),
 }));
 
+// S10.1.14 : mock du logger pour assertions sur le retry path (logger.warn
+// appelé entre tentatives). Pino n'écrit pas via console.* donc les autres
+// sentinelles "Aucun log console.*" continuent à passer même avec ce mock.
+vi.mock("@/lib/utils/logger", () => ({
+  logger: {
+    debug: vi.fn(),
+    info: vi.fn(),
+    warn: vi.fn(),
+    error: vi.fn(),
+  },
+}));
+
+import { logger } from "@/lib/utils/logger";
+
 import { generateWithTool } from "./client";
 import {
   FIRST_SMS_GENERATOR_OP,
+  FIRST_SMS_MAX_ATTEMPTS,
   generateFirstSms,
   type GenerateFirstSmsArgs,
 } from "./first-sms-generator";
@@ -93,10 +108,12 @@ function makeToolUseResult(
 
 beforeEach(() => {
   mockedGenerate.mockReset();
+  vi.mocked(logger.warn).mockReset();
 });
 
 afterEach(() => {
   mockedGenerate.mockReset();
+  vi.mocked(logger.warn).mockReset();
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -413,9 +430,12 @@ describe("generateFirstSms — propagation erreurs SDK", () => {
     );
   });
 
-  it("Zod re-validation fail (body > 160) → ExternalServiceError du wrapper SDK", async () => {
-    // Le wrapper generateWithTool retransforme un Zod fail en ExternalServiceError
-    // (cf. client.ts:362). On simule ce code path : le mock throw directement.
+  it("Zod re-validation fail (body > 160) sur 2 attempts → ExternalServiceError final propagée (retry exhausted)", async () => {
+    // S10.1.14 : un seul fail Zod too_big déclencherait un retry naïf
+    // (cf. section "retry on Zod too_big" plus bas). Pour atteindre le
+    // throw final, il faut que les FIRST_SMS_MAX_ATTEMPTS (2) attempts
+    // throwent. `mockRejectedValue` (vs `mockRejectedValueOnce`) couvre
+    // toutes les invocations successives → retry exhausted → throw.
     mockedGenerate.mockRejectedValue(
       new ExternalServiceError({
         message: "Anthropic tool_use payload failed Zod validation",
@@ -425,6 +445,8 @@ describe("generateFirstSms — propagation erreurs SDK", () => {
     await expect(generateFirstSms({ contact: VALID_CONTACT })).rejects.toBeInstanceOf(
       ExternalServiceError,
     );
+    // Vérification : les 2 attempts ont bien été tentés avant le throw final.
+    expect(mockedGenerate).toHaveBeenCalledTimes(2);
   });
 });
 
@@ -494,6 +516,183 @@ describe("generateFirstSms — anti-fuite PII (sentinelles)", () => {
     expect(errSpy).not.toHaveBeenCalled();
     consoleSpy.mockRestore();
     errSpy.mockRestore();
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// S10.1.14 — retry naïf sur fluctuation Zod (too_big/too_small/invalid_*)
+// ─────────────────────────────────────────────────────────────────────────────
+// Contexte : Claude Sonnet 4.6 avec temp=0.3 dépasse parfois la limite Zod
+// `body.max(160)` malgré 3 contraintes dans le prompt SYSTEM. Cas vulnérables :
+// noms longs, spécialités longues, villes longues. 1 retry naïf (re-roll
+// dice avec même prompt) résout ~75% des transitoires en pratique.
+//
+// Comportement vérifié :
+//   - Erreur Zod éligible (too_big/too_small/invalid_value/invalid_type)
+//     + attempt < MAX → retry + log warn
+//   - Erreur non-éligible (ConfigError, RateLimitError, InternalError,
+//     ExternalServiceError sans issues Zod) → propagation directe, pas de retry
+//   - Retry exhausted → propage l'erreur du dernier attempt
+//   - logger.warn appelé EXACTEMENT 1 fois par retry (anti-spam log)
+//   - Zéro PII dans le log warn (juste op + attempt + issues path/code)
+
+function makeZodTooBigError(): ExternalServiceError {
+  return new ExternalServiceError({
+    message: "Anthropic tool_use payload failed Zod validation",
+    context: {
+      op: "generateWithTool",
+      tool: "first_sms_generator",
+      issues: [{ path: "body", code: "too_big" }],
+    },
+  });
+}
+
+describe("generateFirstSms — retry on Zod too_big (S10.1.14)", () => {
+  it("FIRST_SMS_MAX_ATTEMPTS === 2 (sentinelle constante)", () => {
+    expect(FIRST_SMS_MAX_ATTEMPTS).toBe(2);
+  });
+
+  it("retry-then-success : 1er attempt Zod too_big, 2e success → resolve avec body du 2e", async () => {
+    const SECOND_BODY =
+      "Bonjour Dr Dupuis, je suis Léa, assistante virtuelle de Médéré. Court SMS ok. STOP pour arrêter.";
+    mockedGenerate
+      .mockRejectedValueOnce(makeZodTooBigError())
+      .mockResolvedValueOnce(makeToolUseResult(SECOND_BODY));
+
+    const result = await generateFirstSms({ contact: VALID_CONTACT });
+
+    expect(result.body).toBe(SECOND_BODY);
+    expect(mockedGenerate).toHaveBeenCalledTimes(2);
+    // Log warn appelé EXACTEMENT 1 fois (entre les 2 attempts), pas 2.
+    expect(logger.warn).toHaveBeenCalledTimes(1);
+  });
+
+  it("retry-then-fail : les 2 attempts Zod too_big → throw l'erreur du 2e attempt", async () => {
+    const FIRST_ERR = makeZodTooBigError();
+    const SECOND_ERR = makeZodTooBigError();
+    mockedGenerate.mockRejectedValueOnce(FIRST_ERR).mockRejectedValueOnce(SECOND_ERR);
+
+    let thrown: unknown;
+    try {
+      await generateFirstSms({ contact: VALID_CONTACT });
+      expect.fail("should have thrown");
+    } catch (e) {
+      thrown = e;
+    }
+
+    expect(thrown).toBe(SECOND_ERR); // identity check — le 2e attempt propagé
+    expect(mockedGenerate).toHaveBeenCalledTimes(2);
+    // Log warn appelé EXACTEMENT 1 fois (avant le 2e attempt) — pas avant
+    // le throw final (le 2e attempt fail n'a plus de retry disponible).
+    expect(logger.warn).toHaveBeenCalledTimes(1);
+  });
+
+  it("non-retry-eligible ConfigError → PAS de retry, throw direct (1 seul appel)", async () => {
+    mockedGenerate.mockRejectedValueOnce(
+      new ConfigError({ message: "400 bad request", context: {} }),
+    );
+    await expect(generateFirstSms({ contact: VALID_CONTACT })).rejects.toBeInstanceOf(ConfigError);
+    expect(mockedGenerate).toHaveBeenCalledTimes(1);
+    expect(logger.warn).not.toHaveBeenCalled();
+  });
+
+  it("non-retry-eligible RateLimitError → PAS de retry (le caller Upstash gère)", async () => {
+    mockedGenerate.mockRejectedValueOnce(
+      new RateLimitError({ message: "429 too many requests", context: {} }),
+    );
+    await expect(generateFirstSms({ contact: VALID_CONTACT })).rejects.toBeInstanceOf(
+      RateLimitError,
+    );
+    expect(mockedGenerate).toHaveBeenCalledTimes(1);
+    expect(logger.warn).not.toHaveBeenCalled();
+  });
+
+  it("non-retry-eligible InternalError → PAS de retry, throw direct", async () => {
+    mockedGenerate.mockRejectedValueOnce(new InternalError({ message: "unexpected", context: {} }));
+    await expect(generateFirstSms({ contact: VALID_CONTACT })).rejects.toBeInstanceOf(
+      InternalError,
+    );
+    expect(mockedGenerate).toHaveBeenCalledTimes(1);
+    expect(logger.warn).not.toHaveBeenCalled();
+  });
+
+  it("ExternalServiceError SANS issues Zod (network/5xx) → PAS de retry", async () => {
+    // Cas typique : timeout réseau, 5xx Anthropic — wrapper mappe en
+    // ExternalServiceError mais SANS `context.issues` (qui n'est posé que
+    // par le code path Zod validation client.ts:362-379).
+    mockedGenerate.mockRejectedValueOnce(
+      new ExternalServiceError({
+        message: "Anthropic timeout after 30s",
+        context: { op: "generateWithTool", timeoutMs: 30000 },
+      }),
+    );
+    await expect(generateFirstSms({ contact: VALID_CONTACT })).rejects.toBeInstanceOf(
+      ExternalServiceError,
+    );
+    expect(mockedGenerate).toHaveBeenCalledTimes(1);
+    expect(logger.warn).not.toHaveBeenCalled();
+  });
+
+  it("autres codes Zod éligibles (too_small/invalid_value/invalid_type) déclenchent aussi le retry", async () => {
+    const codes = ["too_small", "invalid_value", "invalid_type"] as const;
+    for (const code of codes) {
+      mockedGenerate.mockReset();
+      vi.mocked(logger.warn).mockReset();
+      mockedGenerate
+        .mockRejectedValueOnce(
+          new ExternalServiceError({
+            message: `Anthropic tool_use payload failed Zod validation (${code})`,
+            context: { op: "generateWithTool", issues: [{ path: "body", code }] },
+          }),
+        )
+        .mockResolvedValueOnce(makeToolUseResult());
+
+      await expect(generateFirstSms({ contact: VALID_CONTACT })).resolves.toBeDefined();
+      expect(mockedGenerate).toHaveBeenCalledTimes(2);
+      expect(logger.warn).toHaveBeenCalledTimes(1);
+    }
+  });
+
+  it("ExternalServiceError avec code Zod NON-éligible → PAS de retry", async () => {
+    // Ex: `custom` (issue Zod custom side-validators). Pas dans la whitelist
+    // RETRY_ELIGIBLE_ZOD_CODES → propagation directe.
+    mockedGenerate.mockRejectedValueOnce(
+      new ExternalServiceError({
+        message: "Custom Zod validation failure",
+        context: {
+          op: "generateWithTool",
+          issues: [{ path: "reasoning", code: "custom" }],
+        },
+      }),
+    );
+    await expect(generateFirstSms({ contact: VALID_CONTACT })).rejects.toBeInstanceOf(
+      ExternalServiceError,
+    );
+    expect(mockedGenerate).toHaveBeenCalledTimes(1);
+    expect(logger.warn).not.toHaveBeenCalled();
+  });
+
+  it("log warn ne contient PAS de body ni de PII (zéro fuite télémétrie retry)", async () => {
+    // Body conforme triple-garde (3 marqueurs : "je suis Léa" pour AI, Médéré
+    // pour advertiser, STOP pour opt-out) avec marker secret SECRETNAME_NEVER_LOG
+    // pour détecter une fuite éventuelle dans le log warn du retry.
+    const FAKE_BODY =
+      "Bonjour Dr SECRETNAME_NEVER_LOG, je suis Léa de Médéré. Formation 660€. STOP pour arrêter.";
+    mockedGenerate
+      .mockRejectedValueOnce(makeZodTooBigError())
+      .mockResolvedValueOnce(makeToolUseResult(FAKE_BODY));
+
+    await generateFirstSms({ contact: VALID_CONTACT });
+
+    // Vérifie que TOUS les arguments passés à logger.warn sont PII-safe.
+    expect(logger.warn).toHaveBeenCalledTimes(1);
+    const firstCall = vi.mocked(logger.warn).mock.calls[0];
+    const serialized = JSON.stringify(firstCall);
+    expect(serialized).not.toContain("SECRETNAME_NEVER_LOG");
+    expect(serialized).not.toContain(FAKE_BODY);
+    // PII contact tests :
+    expect(serialized).not.toContain(VALID_CONTACT.firstName);
+    expect(serialized).not.toContain(VALID_CONTACT.lastName);
   });
 });
 
