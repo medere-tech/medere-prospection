@@ -788,20 +788,46 @@ export interface ListContactsOutput {
  *   ```
  *
  * ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
- * INDEX FIRESTORE COMPOSITE REQUIS (S10.1.2.c)
+ * INDEXES FIRESTORE COMPOSITES REQUIS (S10.1.2.c + S10.1.12b)
  *
- *   { "collectionGroup": "contacts", "queryScope": "COLLECTION",
- *     "fields": [
- *       { "fieldPath": "status",     "order": "ASCENDING" },
- *       { "fieldPath": "campaignId", "order": "ASCENDING" },
- *       { "fieldPath": "createdAt",  "order": "DESCENDING" }
- *     ] }
+ *   `campaignId` étant OPTIONNEL côté caller (cf. `ListContactsInput`),
+ *   la query produit DEUX shapes distinctes selon que le filtre est posé
+ *   ou non. Firestore exige un index composite qui matche EXACTEMENT les
+ *   fields utilisés — un seul "super-index" `(status, campaignId, createdAt)`
+ *   NE COUVRE PAS la query sans `campaignId` (Firestore est strict, pas
+ *   d'index sparse / pas de skip de field intermédiaire). Donc 2 indexes
+ *   distincts sont OBLIGATOIRES :
  *
- * Sans déploiement de cet index (cf. `firestore.indexes.json`), la query
- * combinant `where status` + `where campaignId` + `orderBy createdAt`
- * throw `FAILED_PRECONDITION` côté Firestore Cloud. L'emulator local
- * accepte sans index — piège connu, valider avec `npm run firebase:deploy:indexes`
- * avant tout déploiement en prod.
+ *   1. Query SANS campaignId — `where(status) + orderBy(createdAt)` :
+ *
+ *      { "collectionGroup": "contacts", "queryScope": "COLLECTION",
+ *        "fields": [
+ *          { "fieldPath": "status",    "order": "ASCENDING" },
+ *          { "fieldPath": "createdAt", "order": "DESCENDING" }
+ *        ] }
+ *
+ *      🚨 S10.1.12b — Cet index manquait initialement, ce qui rendait
+ *      `GET /api/admin/contacts?status=X` (sans campaignId) cassé en
+ *      `FAILED_PRECONDITION` côté Firestore Cloud. Le mode A (status seul)
+ *      vs mode B (status + campaignId) sont 2 chemins runtime distincts.
+ *
+ *   2. Query AVEC campaignId — `where(status) + where(campaignId) + orderBy(createdAt)` :
+ *
+ *      { "collectionGroup": "contacts", "queryScope": "COLLECTION",
+ *        "fields": [
+ *          { "fieldPath": "status",     "order": "ASCENDING" },
+ *          { "fieldPath": "campaignId", "order": "ASCENDING" },
+ *          { "fieldPath": "createdAt",  "order": "DESCENDING" }
+ *        ] }
+ *
+ *   Sans déploiement de CES DEUX indexes (cf. `firestore.indexes.json`),
+ *   les queries throwent `FAILED_PRECONDITION` côté Firestore Cloud (le
+ *   `err.message` contient le lien de création one-click vers la Firebase
+ *   Console — vérifier le log côté serveur). L'emulator local accepte
+ *   TOUTE query sans index : piège connu, valider avec
+ *   `npm run firebase:deploy:indexes` avant tout déploiement / runtime
+ *   pointant sur Firestore Cloud. Déploiement idempotent — un re-run ne
+ *   recrée pas les indexes déjà présents.
  *
  * ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
  * CURSOR PAGINATION — pattern `startAfter(DocumentSnapshot)`

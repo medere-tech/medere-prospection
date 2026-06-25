@@ -286,8 +286,15 @@ export async function POST(req: NextRequest): Promise<NextResponse> {
     }
 
     // Inattendu (Firestore HS, Claude HS, Inngest cloud HS) → 500 générique.
+    // Log `errName + errMessage + errCode` (S10.1.12-LIST-CONTACTS-
+    // DIAGNOSIS-001) — aligné avec le catch NonRetriableError ci-dessus
+    // qui logge déjà errMessage. PAS de `err.stack` (verbeux).
     logger.error(
-      { errName: err instanceof Error ? err.name : "unknown" },
+      {
+        errName: err instanceof Error ? err.name : "unknown",
+        errMessage: err instanceof Error ? err.message : undefined,
+        errCode: (err as { code?: unknown })?.code,
+      },
       "[POST /api/admin/send-first-sms] unexpected error",
     );
     return NextResponse.json(
