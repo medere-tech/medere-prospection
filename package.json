@@ -24,6 +24,7 @@
     "emulator:kill": "node scripts/kill-emulator-port.mjs",
     "firebase:deploy:indexes": "firebase deploy --only firestore:indexes",
     "seed:hubspot": "tsx scripts/seed-contacts-from-hubspot.mjs",
+    "golden": "tsx scripts/test-first-sms-golden.mjs",
     "prepare": "husky"
   },
   "dependencies": {
