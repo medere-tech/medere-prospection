@@ -68,6 +68,7 @@ import { hasAdvertiserIdentification } from "@/lib/compliance/advertiser-identif
 import { hasAIDisclosure } from "@/lib/compliance/ai-disclosure";
 import { hasOptOut } from "@/lib/compliance/opt-out";
 import { ExternalServiceError, ValidationError } from "@/lib/utils/errors";
+import { logger } from "@/lib/utils/logger";
 
 import { generateWithTool } from "./client";
 import {
@@ -78,7 +79,9 @@ import {
   FIRST_SMS_TEMPERATURE,
   FIRST_SMS_TOOL,
   type FirstSmsContact,
+  type FirstSmsToolInput,
 } from "./prompts/first-sms";
+import type { ToolUseResult } from "./types";
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Constantes
@@ -86,6 +89,73 @@ import {
 
 /** Identifiant d'opération pour logs/erreurs (snake_case projet). */
 export const FIRST_SMS_GENERATOR_OP = "first_sms.generate" as const;
+
+/**
+ * 🔒 SENTINEL — Nombre max de tentatives `generateWithTool` (S10.1.14).
+ *
+ * Claude Sonnet 4.6 avec `temperature=0.3` génère parfois un body > 160 chars
+ * malgré 3 emplacements de contrainte dans le SYSTEM prompt (golden test
+ * couvre l'essentiel, mais des edge cases persistent : noms longs/composés,
+ * spécialités longues, villes longues — cf. JSDoc `FIRST_SMS_PROMPT_VERSION`).
+ *
+ * 1 retry naïf (re-roll dice avec le même prompt) résout ~75% des cas
+ * transitoires en pratique (mesure empirique Claude Sonnet). Au-delà de
+ * 2 attempts, c'est un bug systémique du prompt — pas un transitoire —
+ * et on laisse remonter l'erreur (Inngest reprendra côté `/send`, l'admin
+ * verra une 502 explicite côté `/preview`).
+ *
+ * Latence ajoutée par le retry : +2-3s (acceptable preview UX avec spinner).
+ */
+export const FIRST_SMS_MAX_ATTEMPTS = 2 as const;
+
+/**
+ * Codes Zod éligibles au retry naïf — strictement les fluctuations LLM sur
+ * la STRUCTURE du payload tool_use, pas les bugs de configuration :
+ *
+ *   - `too_big`       : body > FIRST_SMS_MAX_BODY_CHARS (cas principal Déthié)
+ *   - `too_small`     : body < FIRST_SMS_MIN_BODY_CHARS (rare, prompt dégénéré)
+ *   - `invalid_value` : enum mismatch (rare sur ce tool, défensif)
+ *   - `invalid_type`  : type mismatch (rare, défensif — SDK assure le shape)
+ *
+ * Tout autre code Zod ou toute autre erreur (`ConfigError`, `RateLimitError`,
+ * réseau, etc.) → PAS de retry, propagation directe.
+ *
+ * 🔒 Set readonly — modification = re-validation S10.1.14 + impact télémétrie.
+ */
+const RETRY_ELIGIBLE_ZOD_CODES: ReadonlySet<string> = new Set([
+  "too_big",
+  "too_small",
+  "invalid_value",
+  "invalid_type",
+]);
+
+/**
+ * Détermine si une erreur de `generateWithTool` est due à une fluctuation
+ * Claude sur la STRUCTURE Zod du tool_use payload (= retry-eligible).
+ *
+ * Pattern défensif : on inspecte `context.issues: Array<{path, code}>` qui
+ * est posé par `client.ts:362-379` (déjà sanitisé là-bas — zéro PII).
+ *
+ * @returns `{ eligible: boolean, issues }` — `issues` est `[]` si l'erreur
+ *          n'a pas la forme attendue (non-`ExternalServiceError` ou pas
+ *          de `context.issues`), pour permettre un log forensique cohérent.
+ */
+function classifyZodFluctuation(err: unknown): {
+  eligible: boolean;
+  issues: Array<{ path: string; code: string }>;
+} {
+  if (!(err instanceof ExternalServiceError)) {
+    return { eligible: false, issues: [] };
+  }
+  const ctx = err.context as { issues?: Array<{ path: string; code: string }> } | undefined;
+  if (!ctx?.issues || !Array.isArray(ctx.issues)) {
+    return { eligible: false, issues: [] };
+  }
+  const eligible = ctx.issues.some(
+    (i) => typeof i.code === "string" && RETRY_ELIGIBLE_ZOD_CODES.has(i.code),
+  );
+  return { eligible, issues: ctx.issues };
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Types publics
@@ -165,21 +235,73 @@ export async function generateFirstSms(
   // ── 2. Build prompt (escapeXml sur tous champs externes) ──────────────
   const { system, user } = buildFirstSmsPrompt({ contact: args.contact });
 
-  // ── 3. Appel Claude (propagation erreurs SDK telles quelles) ──────────
-  // Pas de try/catch ici — les erreurs `generateWithTool` (ConfigError,
-  // RateLimitError, ExternalServiceError, InternalError) sont déjà
-  // typées AppError par `client.ts::mapSdkError`. Inngest mappera
-  // ConfigError → NonRetriableError automatiquement.
+  // ── 3. Appel Claude avec retry naïf sur fluctuation Zod (S10.1.14) ─────
+  // Boucle bornée par FIRST_SMS_MAX_ATTEMPTS. Retry-eligibility STRICTE
+  // (ExternalServiceError + issues Zod dans RETRY_ELIGIBLE_ZOD_CODES) —
+  // les ConfigError/RateLimitError/InternalError/network errors propagent
+  // tels quels (Inngest mappera ConfigError → NonRetriableError, RateLimit
+  // est géré côté caller Upstash, etc.).
+  //
+  // Re-roll naïf (même prompt) car avec temperature=0.3, ~75% des cas
+  // transitoires "body > 160 chars" passent au 2e dice. Pas d'injection
+  // de prompt extra "fais plus court" — diminishing returns + risque de
+  // dérive contenu.
+  //
+  // Latence : +2-3s par retry. Acceptable preview UX (loading state déjà
+  // géré côté UI). /send route via Inngest gère ses propres retries au
+  // niveau supérieur — le retry interne ici lui évite juste de gaspiller
+  // un slot Inngest sur un transitoire.
   const startedAt = Date.now();
-  const result = await generateWithTool({
-    model: FIRST_SMS_MODEL,
-    system,
-    user,
-    temperature: FIRST_SMS_TEMPERATURE,
-    maxTokens: FIRST_SMS_MAX_TOKENS,
-    tool: FIRST_SMS_TOOL,
-  });
+  let result: ToolUseResult<FirstSmsToolInput> | undefined;
+  let attempt = 0;
+  while (attempt < FIRST_SMS_MAX_ATTEMPTS) {
+    attempt++;
+    try {
+      result = await generateWithTool({
+        model: FIRST_SMS_MODEL,
+        system,
+        user,
+        temperature: FIRST_SMS_TEMPERATURE,
+        maxTokens: FIRST_SMS_MAX_TOKENS,
+        tool: FIRST_SMS_TOOL,
+      });
+      break;
+    } catch (err) {
+      const { eligible, issues } = classifyZodFluctuation(err);
+      // Eligible + il reste au moins 1 attempt → log + retry
+      if (eligible && attempt < FIRST_SMS_MAX_ATTEMPTS) {
+        // 🚨 ANTI-PII — `issues` est `[{path, code}]` déjà sanitisé par
+        // `client.ts:374-377`. Pas de `body`, pas de `reasoning`, pas de
+        // valeur reçue Zod. Le log Pino projet scrubber couvre en aval.
+        logger.warn(
+          {
+            op: `${FIRST_SMS_GENERATOR_OP}.retry`,
+            attempt,
+            maxAttempts: FIRST_SMS_MAX_ATTEMPTS,
+            issues,
+            model: FIRST_SMS_MODEL,
+            promptVersion: FIRST_SMS_PROMPT_VERSION,
+          },
+          "first-sms-generator: Anthropic Zod fluctuation, retrying",
+        );
+        continue;
+      }
+      // Non-eligible OU plus de retry disponible → propagation telle quelle
+      throw err;
+    }
+  }
   const generationDurationMs = Date.now() - startedAt;
+
+  // Invariant boucle : si on sort sans break OU throw, c'est un bug logique.
+  // Le `break` post-success et le `throw` post-exhaustion couvrent les 2
+  // chemins de sortie. Le `if (result === undefined)` ici est defense-in-
+  // depth pour le typecheck strict (sinon TS ne peut pas narrow).
+  if (result === undefined) {
+    throw new ExternalServiceError({
+      message: "generateFirstSms: retry loop exited without result (invariant violated)",
+      context: { op: FIRST_SMS_GENERATOR_OP, attempt, maxAttempts: FIRST_SMS_MAX_ATTEMPTS },
+    });
+  }
 
   const { body, reasoning } = result.toolInput;
 
