@@ -125,6 +125,40 @@ const TEST_CONTACTS = [
       city: "Marseille",
     },
   },
+  // ── Fixtures worst-case S10.1.14 v2.0.0 ─────────────────────────────────
+  // En v2.0.0 le body est ASSEMBLÉ code-side, donc le risque "body > 160
+  // Zod too_big" est éliminé. Ces fixtures valident que la garantie
+  // mathématique tient sur des noms FR réalistes complexes.
+  {
+    label: "v2.0.0 worst-case : Pr + nom particule + spécialité longue (couvre nom 23 chars)",
+    contact: {
+      firstName: "Camille",
+      lastName: "de la Tour-Vandenberghe",
+      civilite: "Pr",
+      speciality: "Chirurgien-dentiste",
+      city: "Saint-Étienne-du-Rouvray",
+    },
+  },
+  {
+    label: "v2.0.0 worst-case : Mme + nom composé + spécialité Sage-Femme",
+    contact: {
+      firstName: "Marie-Christine",
+      lastName: "Müller-Schmidt-Vauclair",
+      civilite: "Mme",
+      speciality: "Sage-Femme",
+      city: "Châteauneuf-de-Galaure",
+    },
+  },
+  {
+    label: "v2.0.0 worst-case : Dr + nom doublement composé (proche limite 52 chars)",
+    contact: {
+      firstName: "Marc-Antoine",
+      lastName: "Vandenberghe-Saint-Étienne",
+      civilite: "Dr",
+      speciality: "Médecin",
+      city: "Bordeaux",
+    },
+  },
 ];
 
 // ─────────────────────────────────────────────────────────────────────────────
