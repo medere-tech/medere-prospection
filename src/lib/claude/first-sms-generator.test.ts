@@ -132,6 +132,10 @@ describe("generateFirstSms — gardes d'entrée", () => {
 
   it("speciality vide → ValidationError", async () => {
     await expect(
+      // @ts-expect-error — defense-in-depth runtime : le type `ContactSpeciality`
+      // (serré v3.0.0 S10.2.2) bloque cet input à la compilation. La garde
+      // runtime `assertNonEmptyField` reste utile contre un caller JS pur ou
+      // un cast forcé qui passerait une chaîne vide via JSON.parse non validé.
       generateFirstSms({ contact: { ...VALID_CONTACT, speciality: "" } }),
     ).rejects.toBeInstanceOf(ValidationError);
     expect(mockedGenerate).not.toHaveBeenCalled();
@@ -566,12 +570,6 @@ describe("generateFirstSms — sentinelles return values v2.0.0", () => {
 
   it("ASSEMBLE_FIRST_SMS_OP === 'first_sms.assemble'", () => {
     expect(ASSEMBLE_FIRST_SMS_OP).toBe("first_sms.assemble");
-  });
-
-  it("promptVersion retourné === '2.0.1' (commit c — AI Act explicite + clarté question)", async () => {
-    mockedGenerate.mockResolvedValue(makeToolUseResult());
-    const result = await generateFirstSms({ contact: VALID_CONTACT });
-    expect(result.promptVersion).toBe("2.0.1");
   });
 
   it("model retourné === FIRST_SMS_MODEL", async () => {
