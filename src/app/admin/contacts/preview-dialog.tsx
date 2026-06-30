@@ -18,16 +18,13 @@
  *                  IA + pills compliance "Annonce IA détectée" / "STOP
  *                  présent". Char count coloré (≤160 vert, ≤320 ambre,
  *                  >320 orange) + nombre de segments SMS.
- *   4. Reasoning Claude : Collapsible custom (Button + state local +
- *      animate-in fade/slide). Collapsed par défaut, AUTO-EXPAND si
- *      preSendCheckPassed=false (l'admin doit voir le motif).
- *   5. Compliance badge :
+ *   4. Compliance badge :
  *      - OK   → Badge default vert "Compliance OK".
  *      - KO   → Card destructive avec code + rule en `<code>`.
- *   6. Confirm INLINE (pas d'AlertDialog imbriqué) : clic "Envoyer le
+ *   5. Confirm INLINE (pas d'AlertDialog imbriqué) : clic "Envoyer le
  *      SMS" → footer transitionne en 2 boutons "Annuler" / "Confirmer
  *      définitivement". La preview reste visible (anti-anxiété).
- *   7. Sending → overlay loader centré "Envoi via OVHcloud…".
+ *   6. Sending → overlay loader centré "Envoi via OVHcloud…".
  *      Sent → checkmark + message rassurant + auto-close après 1200ms.
  *
  * ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -51,15 +48,13 @@
 import {
   AlertTriangle,
   CheckCircle2,
-  ChevronDown,
   Loader2,
   MapPin,
   Phone,
   RefreshCw,
   ShieldCheck,
-  Sparkles,
 } from "lucide-react";
-import { useCallback, useEffect, useId, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { toast } from "sonner";
 
 import { Badge } from "@/components/ui/badge";
@@ -84,7 +79,6 @@ import { maskPhoneForUI } from "./columns";
 
 interface PreviewResponse {
   smsBody: string;
-  reasoning: string;
   charCount: number;
   preSendCheckPassed: boolean;
   preSendCheckCode?: string;
@@ -366,60 +360,6 @@ function SmsBodyPreview({ body, charCount }: { body: string; charCount: number }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Sub-component : ReasoningCollapsible (A4 — collapsed par défaut, auto-open si KO)
-// ─────────────────────────────────────────────────────────────────────────────
-
-function ReasoningCollapsible({
-  reasoning,
-  defaultOpen,
-}: {
-  reasoning: string;
-  defaultOpen: boolean;
-}) {
-  const [open, setOpen] = useState(defaultOpen);
-  const id = useId();
-  return (
-    <div className="flex flex-col gap-2 rounded-lg border bg-muted/30 p-3">
-      <button
-        type="button"
-        className="flex items-center justify-between gap-2 text-left focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/50 rounded"
-        onClick={() => setOpen((o) => !o)}
-        aria-expanded={open}
-        aria-controls={id}
-      >
-        <span className="inline-flex items-center gap-1.5 text-[11px] font-semibold uppercase tracking-wider text-muted-foreground">
-          <Sparkles className="size-3" aria-hidden />
-          Raisonnement Claude
-        </span>
-        <ChevronDown
-          className={cn(
-            // S10.1.7-L1 : motion-safe pour cohérence avec le reste du fichier
-            // (toutes les transitions sont préfixées motion-safe). motion-reduce
-            // garde le no-op explicite (annule l'animation côté utilisateur AT).
-            "size-3.5 text-muted-foreground motion-safe:transition-transform motion-safe:duration-150 motion-reduce:transition-none",
-            open && "rotate-180",
-          )}
-          aria-hidden
-        />
-      </button>
-      {open && (
-        // S10.1.7-L3 : `text-muted-foreground` sur fond `bg-muted/30` —
-        // ratio mesuré ~5.2:1 (Tailwind v4 shadcn `--muted-foreground`
-        // ≈ neutral-500 / oklch(0.556 0 0) sur background blanc à 99.1%
-        // d'opacité). > 4.5:1 → AA OK. Ne pas passer à `text-foreground`
-        // qui casserait la sémantique "muted" voulue (info secondaire).
-        <p
-          id={id}
-          className="text-sm text-muted-foreground motion-safe:animate-in motion-safe:fade-in-0 motion-safe:slide-in-from-top-1 motion-safe:duration-150"
-        >
-          {reasoning}
-        </p>
-      )}
-    </div>
-  );
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
 // Sub-component : ComplianceBadge (état OK/KO)
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -494,8 +434,6 @@ function PreviewSkeleton() {
             <Skeleton className="h-4 w-24 rounded-md" />
           </div>
         </div>
-        {/* Reasoning skeleton */}
-        <Skeleton className="h-10 w-full rounded-lg" />
         {/* Compliance badge skeleton */}
         <Skeleton className="h-5 w-40" />
       </div>
@@ -755,8 +693,6 @@ function PreviewDialogContent({
 
   const isOverlayShown = sendState.kind === "sending" || sendState.kind === "sent";
   const sendDisabled = state.kind !== "success" || !state.data.preSendCheckPassed;
-  // Auto-expand reasoning si pre-send-check KO (motif rejet visible).
-  const reasoningDefaultOpen = state.kind === "success" && !state.data.preSendCheckPassed;
   // Nom destinataire pour les transitions Sending/Sent — civilité + nom seul
   // (pas le prénom, conformément à la conv médicale FR : "Dr Dupont" et non
   // "Jean Dupont" dans un message d'envoi).
@@ -795,10 +731,6 @@ function PreviewDialogContent({
             {state.kind === "success" && (
               <div className="flex flex-col gap-4 motion-safe:animate-in motion-safe:fade-in-0 motion-safe:slide-in-from-bottom-1 motion-safe:duration-150">
                 <SmsBodyPreview body={state.data.smsBody} charCount={state.data.charCount} />
-                <ReasoningCollapsible
-                  reasoning={state.data.reasoning}
-                  defaultOpen={reasoningDefaultOpen}
-                />
                 <ComplianceBadge data={state.data} />
               </div>
             )}

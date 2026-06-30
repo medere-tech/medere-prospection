@@ -6,7 +6,8 @@
  *
  * Pas de mock SDK (pas d'appel Claude réel). Tests purs sur :
  *   - Constantes verrouillées (VERSION 3.0.0, MODEL, TEMPERATURE, bornes)
- *   - firstSmsToolInputSchema (accroche 30-50 + reasoning 1-200, inchangé v2)
+ *   - firstSmsToolInputSchema (accroche 30-50 — `reasoning` retiré v3.0.1
+ *     S10.2-REASONING-REMOVAL)
  *   - buildFirstSmsPrompt structure XML 11 blocs + escapeXml + injection
  *     indemnisation par profession via helper pur (S10.2.3)
  *   - 5 few-shot examples : extraction accroche-only + longueur + style
@@ -49,7 +50,6 @@ import {
   FIRST_SMS_MIN_BODY_CHARS,
   FIRST_SMS_MODEL,
   FIRST_SMS_PROMPT_VERSION,
-  FIRST_SMS_REASONING_MAX_CHARS,
   FIRST_SMS_TEMPERATURE,
   FIRST_SMS_TOOL,
   FIRST_SMS_TOOL_DESCRIPTION,
@@ -96,10 +96,6 @@ describe("first-sms — sentinelles constantes verrouillées v3.0.0", () => {
     expect(FIRST_SMS_MAX_ACCROCHE_CHARS).toBe(50);
   });
 
-  it("FIRST_SMS_REASONING_MAX_CHARS === 200 (forensic borné)", () => {
-    expect(FIRST_SMS_REASONING_MAX_CHARS).toBe(200);
-  });
-
   it("FIRST_SMS_TOOL_NAME === 'first_sms_generator' (snake_case SDK)", () => {
     expect(FIRST_SMS_TOOL_NAME).toBe("first_sms_generator");
   });
@@ -112,16 +108,15 @@ describe("first-sms — sentinelles constantes verrouillées v3.0.0", () => {
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Zod schema firstSmsToolInputSchema (accroche 30-50, reasoning 1-200, inchangé v2→v3)
+// Zod schema firstSmsToolInputSchema (accroche 30-50 ; `reasoning` retiré v3.0.1)
 // ─────────────────────────────────────────────────────────────────────────────
 
-describe("firstSmsToolInputSchema v3.0.0 — accept/reject accroche (shape inchangée v2.0.1)", () => {
+describe("firstSmsToolInputSchema v3.0.1 — accept/reject accroche (reasoning retiré)", () => {
   const VALID_ACCROCHE = "DPC 792€/an indemnisée. Cela vous intéresse ?"; // 45 chars
 
-  it("accepte accroche 30-50 + reasoning ≤ 200", () => {
+  it("accepte accroche 30-50", () => {
     const result = firstSmsToolInputSchema.safeParse({
       accroche: VALID_ACCROCHE,
-      reasoning: "Test reasoning court.",
     });
     expect(result.success).toBe(true);
   });
@@ -129,7 +124,6 @@ describe("firstSmsToolInputSchema v3.0.0 — accept/reject accroche (shape incha
   it("reject accroche < 30 chars", () => {
     const result = firstSmsToolInputSchema.safeParse({
       accroche: "Trop court.",
-      reasoning: "Test.",
     });
     expect(result.success).toBe(false);
   });
@@ -138,7 +132,6 @@ describe("firstSmsToolInputSchema v3.0.0 — accept/reject accroche (shape incha
     const tooLong = "x".repeat(51);
     const result = firstSmsToolInputSchema.safeParse({
       accroche: tooLong,
-      reasoning: "Test.",
     });
     expect(result.success).toBe(false);
   });
@@ -146,7 +139,6 @@ describe("firstSmsToolInputSchema v3.0.0 — accept/reject accroche (shape incha
   it("reject accroche = 29 (juste sous min)", () => {
     const result = firstSmsToolInputSchema.safeParse({
       accroche: "x".repeat(29),
-      reasoning: "Test.",
     });
     expect(result.success).toBe(false);
   });
@@ -154,7 +146,6 @@ describe("firstSmsToolInputSchema v3.0.0 — accept/reject accroche (shape incha
   it("accepte accroche = exactement 30 (borne incluse)", () => {
     const result = firstSmsToolInputSchema.safeParse({
       accroche: "x".repeat(30),
-      reasoning: "Test.",
     });
     expect(result.success).toBe(true);
   });
@@ -162,7 +153,6 @@ describe("firstSmsToolInputSchema v3.0.0 — accept/reject accroche (shape incha
   it("accepte accroche = exactement 50 (borne incluse)", () => {
     const result = firstSmsToolInputSchema.safeParse({
       accroche: "x".repeat(50),
-      reasoning: "Test.",
     });
     expect(result.success).toBe(true);
   });
@@ -170,23 +160,6 @@ describe("firstSmsToolInputSchema v3.0.0 — accept/reject accroche (shape incha
   it("reject ancien champ 'body' (v1 → v2 BREAKING tool schema, conservé v3)", () => {
     const result = firstSmsToolInputSchema.safeParse({
       body: "x".repeat(100), // ancien champ v1
-      reasoning: "Test.",
-    });
-    expect(result.success).toBe(false);
-  });
-
-  it("reject reasoning > 200 chars", () => {
-    const result = firstSmsToolInputSchema.safeParse({
-      accroche: VALID_ACCROCHE,
-      reasoning: "x".repeat(201),
-    });
-    expect(result.success).toBe(false);
-  });
-
-  it("reject reasoning vide (min 1)", () => {
-    const result = firstSmsToolInputSchema.safeParse({
-      accroche: VALID_ACCROCHE,
-      reasoning: "",
     });
     expect(result.success).toBe(false);
   });

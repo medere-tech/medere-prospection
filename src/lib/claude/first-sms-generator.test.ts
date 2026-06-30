@@ -84,11 +84,10 @@ const EXPECTED_ASSEMBLED_BODY =
 
 function makeToolUseResult(
   accroche: string = CONFORMING_ACCROCHE,
-  reasoning: string = "Test reasoning court.",
   usageOverrides: Partial<{ inputTokens: number; outputTokens: number }> = {},
 ): ToolUseResult<FirstSmsToolInput> {
   return {
-    toolInput: { accroche, reasoning },
+    toolInput: { accroche },
     usage: {
       inputTokens: usageOverrides.inputTokens ?? 250,
       outputTokens: usageOverrides.outputTokens ?? 60,
@@ -177,13 +176,12 @@ describe("generateFirstSms — gardes d'entrée", () => {
 // ─────────────────────────────────────────────────────────────────────────────
 
 describe("generateFirstSms — happy path v2.0.0 (body assemblé)", () => {
-  it("accroche conforme → body ASSEMBLÉ + reasoning + metadata", async () => {
+  it("accroche conforme → body ASSEMBLÉ + metadata", async () => {
     mockedGenerate.mockResolvedValue(makeToolUseResult());
 
     const result = await generateFirstSms({ contact: VALID_CONTACT });
 
     expect(result.body).toBe(EXPECTED_ASSEMBLED_BODY);
-    expect(result.reasoning).toBe("Test reasoning court.");
     expect(result.promptVersion).toBe(FIRST_SMS_PROMPT_VERSION);
     expect(result.model).toBe(FIRST_SMS_MODEL);
     expect(result.temperature).toBe(FIRST_SMS_TEMPERATURE);
@@ -240,7 +238,7 @@ describe("generateFirstSms — happy path v2.0.0 (body assemblé)", () => {
 
   it("metadata : tokens variés sont propagés correctement", async () => {
     mockedGenerate.mockResolvedValue(
-      makeToolUseResult(CONFORMING_ACCROCHE, "Reasoning", {
+      makeToolUseResult(CONFORMING_ACCROCHE, {
         inputTokens: 503,
         outputTokens: 47,
       }),

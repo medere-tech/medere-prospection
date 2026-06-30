@@ -159,6 +159,64 @@ const TEST_CONTACTS = [
       city: "Bordeaux",
     },
   },
+  // ── Fixtures angles morts S10.2 (extension coverage pré-relâche budget) ──
+  // 5 fixtures ciblant des combinaisons jamais mesurées en runtime :
+  // fallback "100% pris en charge" empilé avec métiers longs / spécialités
+  // rares (Pharmacien, Orthophoniste, Assistant(e) dentaire, Psychiatre,
+  // Pédicure-podologue). Stress-test du budget accroche avant relâche.
+  {
+    label:
+      "Pr+Pharmacien+Strasbourg (fallback 100% + ton formel + spécialité longue — empilement n°1)",
+    contact: {
+      firstName: "Antoine",
+      lastName: "Mercier",
+      civilite: "Pr",
+      speciality: "Pharmacien",
+      city: "Strasbourg",
+    },
+  },
+  {
+    label: "Dr+Orthophoniste+Nantes (fallback long + métier long + nom composé)",
+    contact: {
+      firstName: "Marie-Laure",
+      lastName: "Boucher-Lemoine",
+      civilite: "Dr",
+      speciality: "Orthophoniste",
+      city: "Nantes",
+    },
+  },
+  {
+    label:
+      "Mme+Assistant(e) dentaire+Reims (pire cas budget fallback — métier 21 chars avec parenthèse)",
+    contact: {
+      firstName: "Sandrine",
+      lastName: "Picard",
+      civilite: "Mme",
+      speciality: "Assistant(e) dentaire",
+      city: "Reims",
+    },
+  },
+  {
+    label:
+      "Dr+Psychiatre+Montpellier (bucket 945€/an jamais mesuré runtime — présent SYSTEM example seulement)",
+    contact: {
+      firstName: "Olivier",
+      lastName: "Fontaine",
+      civilite: "Dr",
+      speciality: "Psychiatre",
+      city: "Montpellier",
+    },
+  },
+  {
+    label: "M.+Pédicure-podologue+Grenoble (fallback + métier 18 chars)",
+    contact: {
+      firstName: "Vincent",
+      lastName: "Delacroix",
+      civilite: "M.",
+      speciality: "Pédicure-podologue",
+      city: "Grenoble",
+    },
+  },
 ];
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -267,7 +325,6 @@ for (const { label, contact } of TEST_CONTACTS) {
       contactReport.runs.push({
         runIdx: i + 1,
         body: result.body,
-        reasoning: result.reasoning,
         length,
         compliance: { hasAI, hasOpt, hasAdv, lengthOk },
         allPass,
@@ -299,7 +356,7 @@ for (const { label, contact } of TEST_CONTACTS) {
           code,
           message,
           // Diag-only : path + code sanitized depuis client.ts wrapper.
-          // Pas de body/reasoning brut (anti-fuite PII).
+          // Pas de body brut (anti-fuite PII).
           issues,
         },
         allPass: false,
@@ -339,7 +396,7 @@ if (compliancePassed === totalCalls) {
   console.log(
     "❌ GOLDEN TEST FAILED — " + (totalCalls - compliancePassed) + " bodies non conformes.",
   );
-  console.log("   Inspecte le rapport JSON pour les détails (bodies + reasoning).");
+  console.log("   Inspecte le rapport JSON pour les détails (bodies + flags).");
   console.log("   Actions possibles :");
   console.log("     1. Re-lancer (transitoire SDK ?)");
   console.log("     2. Renforcer SYSTEM prompt sur le marqueur manquant");

@@ -154,7 +154,6 @@ function buildFakeContact(overrides: Partial<Contact> = {}): Contact {
 
 const FAKE_GENERATION_OK = {
   body: "Bonjour Dr Dupont, Léa de Médéré. Court SMS de test. STOP pour ne plus recevoir.",
-  reasoning: "Court, vouvoiement, IA mentionnée, Médéré, STOP.",
   promptVersion: "1.0.1",
   model: "claude-sonnet-4-6",
   temperature: 0.4,

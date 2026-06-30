@@ -6,10 +6,10 @@
  * Couvre (préserve la couverture comportementale S10.1.5) :
  *   - contact null → modal fermée, pas de fetch
  *   - contact set → fetch preview au mount + affiche header riche +
- *     smsBody/reasoning + pills compliance (Annonce IA / STOP)
+ *     smsBody + pills compliance (Annonce IA / STOP)
  *   - preview success (preSendCheckPassed=true) → badge OK + send activable
  *   - preview success (preSendCheckPassed=false) → badge KO + code/rule +
- *     reasoning AUTO-EXPAND + send disabled
+ *     send disabled
  *   - preview error → message d'erreur + bouton "Réessayer"
  *   - bouton Réessayer → re-fetch (retryNonce bump)
  *   - abort race : change rapidement de contact → seul le dernier fetch
@@ -19,7 +19,6 @@
  *   - aria-live="polite" présent sur le conteneur d'état
  *
  * Tests E2E Playwright (S10.2+) couvriront :
- *   - reasoning collapsible toggle clavier
  *   - sending/sent transitions visuelles
  *   - send success → toast + onSendSuccess + onClose après 1200ms
  *   - reduced-motion (CSS `prefers-reduced-motion`)
@@ -48,14 +47,12 @@ import { PreviewDialog } from "./preview-dialog";
 
 const PREVIEW_OK = {
   smsBody: "Bonjour Dr Dupont, Léa de Médéré. STOP pour ne plus recevoir.",
-  reasoning: "Court, vouvoiement, IA mentionnée.",
   charCount: 60,
   preSendCheckPassed: true,
 };
 
 const PREVIEW_BLOCKED = {
   smsBody: "Bonjour Dr Dupont, Léa de Médéré. STOP pour ne plus recevoir.",
-  reasoning: "Court, vouvoiement, IA mentionnée.",
   charCount: 60,
   preSendCheckPassed: false,
   preSendCheckCode: "bloctel_not_checked",
@@ -174,7 +171,7 @@ describe("PreviewDialog (S10.1.6 — UX premium)", () => {
     expect(screen.getByText("Compliance OK")).toBeInTheDocument();
   });
 
-  it("preview success preSendCheckPassed=false → badge KO + code/rule + reasoning AUTO-EXPAND + send disabled", async () => {
+  it("preview success preSendCheckPassed=false → badge KO + code/rule + send disabled", async () => {
     vi.spyOn(global, "fetch").mockResolvedValue(jsonResponse(PREVIEW_BLOCKED));
     render(<PreviewDialog contact={buildContact()} onClose={vi.fn()} />);
 
@@ -183,38 +180,9 @@ describe("PreviewDialog (S10.1.6 — UX premium)", () => {
     });
     expect(screen.getByText("bloctel_not_checked")).toBeInTheDocument();
     expect(screen.getByText("bloctel")).toBeInTheDocument();
-    // Reasoning AUTO-EXPAND quand pre-send-check KO (l'admin doit voir le motif)
-    expect(screen.getByText(PREVIEW_BLOCKED.reasoning)).toBeInTheDocument();
     // Bouton Envoyer disabled
     const sendBtn = screen.getByRole("button", { name: /Envoyer le SMS/i });
     expect(sendBtn).toBeDisabled();
-  });
-
-  it("reasoning COLLAPSED par défaut quand pre-send-check OK", async () => {
-    vi.spyOn(global, "fetch").mockResolvedValue(jsonResponse(PREVIEW_OK));
-    render(<PreviewDialog contact={buildContact()} onClose={vi.fn()} />);
-
-    await waitFor(() => {
-      expect(screen.getByText("Compliance OK")).toBeInTheDocument();
-    });
-    // Toggle button visible avec aria-expanded=false
-    const toggle = screen.getByRole("button", { name: /Raisonnement Claude/i });
-    expect(toggle).toHaveAttribute("aria-expanded", "false");
-    // Reasoning content non visible (collapsed)
-    expect(screen.queryByText(PREVIEW_OK.reasoning)).not.toBeInTheDocument();
-  });
-
-  it("toggle reasoning : clic → aria-expanded=true + contenu visible", async () => {
-    vi.spyOn(global, "fetch").mockResolvedValue(jsonResponse(PREVIEW_OK));
-    render(<PreviewDialog contact={buildContact()} onClose={vi.fn()} />);
-
-    await waitFor(() => {
-      expect(screen.getByText("Compliance OK")).toBeInTheDocument();
-    });
-    const toggle = screen.getByRole("button", { name: /Raisonnement Claude/i });
-    await userEvent.click(toggle);
-    expect(toggle).toHaveAttribute("aria-expanded", "true");
-    expect(screen.getByText(PREVIEW_OK.reasoning)).toBeInTheDocument();
   });
 
   it("preview error 404 → message d'erreur lisible + bouton Réessayer", async () => {
@@ -259,11 +227,19 @@ describe("PreviewDialog (S10.1.6 — UX premium)", () => {
   });
 
   it("abort race : changement rapide de contact → seul le dernier fetch peuple l'UI", async () => {
+    // 🚨 Anti-piège highlight : `SmsBodyPreview` enrobe "Léa" et "STOP" dans
+    // des <mark> → le body complet est splité en plusieurs text nodes. On
+    // assert donc sur un FRAGMENT unique inséré DANS le body mais en dehors
+    // des zones highlightées, repérable comme une seule text-node continue.
+    const SECOND_FRAGMENT = "SECOND fetch wins";
+    const FIRST_FRAGMENT = "FIRST fetch should be ignored";
+    const SECOND_BODY = `Bonjour Dr Second, Léa de Médéré. ${SECOND_FRAGMENT}. STOP pour ne plus recevoir.`;
+    const FIRST_BODY = `Bonjour Dr First, Léa de Médéré. ${FIRST_FRAGMENT}. STOP pour ne plus recevoir.`;
     let resolveFirst: ((value: Response) => void) | undefined;
     const fetchSpy = vi
       .spyOn(global, "fetch")
       .mockImplementationOnce(() => new Promise<Response>((resolve) => (resolveFirst = resolve)))
-      .mockResolvedValueOnce(jsonResponse({ ...PREVIEW_OK, reasoning: "Second fetch wins." }));
+      .mockResolvedValueOnce(jsonResponse({ ...PREVIEW_OK, smsBody: SECOND_BODY }));
 
     const { rerender } = render(
       <PreviewDialog contact={buildContact({ hubspotId: "hs_first" })} onClose={vi.fn()} />,
@@ -275,16 +251,14 @@ describe("PreviewDialog (S10.1.6 — UX premium)", () => {
     );
 
     // Résout le 1er fetch APRÈS le rerender — il doit être ignoré (signal aborted)
-    resolveFirst?.(jsonResponse({ ...PREVIEW_OK, reasoning: "First fetch (should be ignored)." }));
+    resolveFirst?.(jsonResponse({ ...PREVIEW_OK, smsBody: FIRST_BODY }));
 
-    // Le reasoning est collapsed par défaut quand pre-send-check OK ;
-    // on toggle pour le voir et confirmer que c'est le 2e fetch qui a gagné.
-    const toggle = await screen.findByRole("button", { name: /Raisonnement Claude/i });
-    await userEvent.click(toggle);
+    // Assert sur un fragment unique du smsBody (en dehors des marks Léa/STOP) :
+    // seul le 2e fetch peut peupler l'UI.
     await waitFor(() => {
-      expect(screen.getByText("Second fetch wins.")).toBeInTheDocument();
+      expect(screen.getByText(new RegExp(SECOND_FRAGMENT))).toBeInTheDocument();
     });
-    expect(screen.queryByText("First fetch (should be ignored).")).not.toBeInTheDocument();
+    expect(screen.queryByText(new RegExp(FIRST_FRAGMENT))).not.toBeInTheDocument();
     expect(fetchSpy).toHaveBeenCalledTimes(2);
   });
 
@@ -408,8 +382,7 @@ describe("PreviewDialog (S10.1.6 — UX premium)", () => {
   });
 
   // ───────────────────────────────────────────────────────────────────────
-  // S10.1.7 : couverture branches (CharCountBadge tones + pills non-matched
-  // + ReasoningCollapsible toggle close)
+  // S10.1.7 : couverture branches (CharCountBadge tones + pills non-matched)
   // ───────────────────────────────────────────────────────────────────────
 
   it("CharCountBadge tone 'warn' quand 161 ≤ charCount ≤ 320 (2 segments)", async () => {
@@ -445,28 +418,6 @@ describe("PreviewDialog (S10.1.6 — UX premium)", () => {
       expect(screen.getByText("Annonce IA détectée")).toBeInTheDocument();
       expect(screen.getByText("Token STOP présent")).toBeInTheDocument();
     });
-  });
-
-  it("ReasoningCollapsible : ouvrir puis fermer → aria-expanded false + contenu démonté", async () => {
-    vi.spyOn(global, "fetch").mockResolvedValue(jsonResponse(PREVIEW_OK));
-    render(<PreviewDialog contact={buildContact()} onClose={vi.fn()} />);
-
-    await waitFor(() => {
-      expect(screen.getByText("Compliance OK")).toBeInTheDocument();
-    });
-
-    const toggle = screen.getByRole("button", { name: /Raisonnement Claude/i });
-    expect(toggle).toHaveAttribute("aria-expanded", "false");
-
-    // Open
-    await userEvent.click(toggle);
-    expect(toggle).toHaveAttribute("aria-expanded", "true");
-    expect(screen.getByText(PREVIEW_OK.reasoning)).toBeInTheDocument();
-
-    // Close (couvre la branche !open du conditional render)
-    await userEvent.click(toggle);
-    expect(toggle).toHaveAttribute("aria-expanded", "false");
-    expect(screen.queryByText(PREVIEW_OK.reasoning)).not.toBeInTheDocument();
   });
 
   it("send → erreur réseau (fetch throw TypeError) → toast.error générique (anti-leak)", async () => {

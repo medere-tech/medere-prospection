@@ -7,8 +7,8 @@
  * Pipeline v2.0.0 (refactor architectural S10.1.14) :
  *   1. Gardes d'entrée (firstName/lastName/speciality non vides)
  *   2. Build prompt via `buildFirstSmsPrompt` (escapeXml sur tous champs)
- *   3. Appel Claude `generateWithTool` (tool_use forcé + Zod schema v2 :
- *      { accroche: 30-65, reasoning: 1-200 })
+ *   3. Appel Claude `generateWithTool` (tool_use forcé + Zod schema v3.0.1 :
+ *      { accroche: 30-50 } — `reasoning` retiré v3.0.1 S10.2-REASONING-REMOVAL)
  *   4. **Assemble code-side via `assembleFirstSms()`** :
  *        `"Bonjour {civilité} {nom}, je suis Léa de Médéré. {accroche} STOP."`
  *      Garantie mathématique ≤ 160 chars pour 99%+ noms FR (nom ≤ 52 chars).
@@ -71,9 +71,6 @@
  *     dérive) JAMAIS loggé brut. L'AppError thrown N'INCLUT NI accroche
  *     NI body assemblé — seuls les LONGUEURS sont exposées pour télémétrie.
  *
- *   - `result.toolInput.reasoning` JAMAIS loggé brut (Claude pourrait
- *     citer indirectement le PS dans son explication).
- *
  *   - Si Claude fail Zod, `generateWithTool` throw `ExternalServiceError`
  *     avec `issues: [{path, code}]` sanitisé (déjà fait côté wrapper
  *     client.ts:370 — defense en profondeur).
@@ -133,7 +130,6 @@ export interface GenerateFirstSmsArgs {
  */
 export interface GenerateFirstSmsResult {
   body: string;
-  reasoning: string;
   promptVersion: typeof FIRST_SMS_PROMPT_VERSION;
   model: typeof FIRST_SMS_MODEL;
   temperature: typeof FIRST_SMS_TEMPERATURE;
@@ -293,7 +289,7 @@ export async function generateFirstSms(
   });
   const generationDurationMs = Date.now() - startedAt;
 
-  const { accroche, reasoning } = result.toolInput;
+  const { accroche } = result.toolInput;
 
   // ── 4. Assemble code-side (garantie ≤ 160 chars + garde-fou nom extrême) ──
   const body = assembleFirstSms({
@@ -309,7 +305,7 @@ export async function generateFirstSms(
   // defense-in-depth pour alerter si l'assemble est cassé dans un refactor
   // futur (ex: dev qui modifie la chaîne d'assemble sans relire la regex).
   //
-  // ⚠️ Le context NE CONTIENT JAMAIS `body` ni `reasoning` ni `args.contact`.
+  // ⚠️ Le context NE CONTIENT JAMAIS `body` ni `args.contact`.
   // Seuls `bodyLength`, `op`, `model`, `promptVersion` sont exposés —
   // suffisants pour télémétrie, zéro fuite PII.
 
@@ -358,7 +354,6 @@ export async function generateFirstSms(
   // ── 6. Retour structuré ────────────────────────────────────────────────
   return {
     body,
-    reasoning,
     promptVersion: FIRST_SMS_PROMPT_VERSION,
     model: FIRST_SMS_MODEL,
     temperature: FIRST_SMS_TEMPERATURE,
