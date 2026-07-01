@@ -88,12 +88,14 @@ import { ExternalServiceError, ValidationError } from "@/lib/utils/errors";
 import { generateWithTool } from "./client";
 import {
   buildFirstSmsPrompt,
+  buildFirstSmsTool,
+  FIRST_SMS_ASSEMBLE_OVERHEAD_CHARS,
   FIRST_SMS_MAX_BODY_CHARS,
   FIRST_SMS_MAX_TOKENS,
+  FIRST_SMS_MIN_ACCROCHE_CHARS,
   FIRST_SMS_MODEL,
   FIRST_SMS_PROMPT_VERSION,
   FIRST_SMS_TEMPERATURE,
-  FIRST_SMS_TOOL,
   type FirstSmsContact,
 } from "./prompts/first-sms";
 
@@ -160,7 +162,36 @@ function assertNonEmptyField(value: unknown, field: string): asserts value is st
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// assembleFirstSms — assemblage code-side (v2.0.0 S10.1.14)
+// computeAdressage — helper partagé v3.1.0 (S10.2.X.a)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * Helper PUR — calcule l'adressage utilisé dans le préfixe du body assemblé.
+ *
+ * 🚨 UNIQUE SOURCE DE VÉRITÉ : utilisé à la fois par `assembleFirstSms`
+ * (qui concatène ce string dans le SMS final) ET par `generateFirstSms`
+ * (qui calcule `accrocheMax = 99 − adressage.length` pour borner le Zod
+ * schema runtime + le USER prompt). Si ces deux call sites divergeaient,
+ * le budget annoncé à Claude ne correspondrait plus au préfixe réel →
+ * accroche au max acceptée par Zod, mais body assemblé > 160 → SMS perdu.
+ *
+ * Comportement (préservé bit-for-bit depuis v2.0.0) :
+ *   - civilité présente non vide → "{civilite} {lastName}"
+ *   - civilité undefined ou ""    → "{firstName}" seul
+ *
+ * @internal Exposé pour tests sentinelle.
+ */
+export function computeAdressage(input: {
+  civilite: string | undefined;
+  lastName: string;
+  firstName: string;
+}): string {
+  const { civilite, lastName, firstName } = input;
+  return civilite !== undefined && civilite.length > 0 ? `${civilite} ${lastName}` : firstName;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// assembleFirstSms — assemblage code-side (v2.0.0 S10.1.14, refactor v3.1.0)
 // ─────────────────────────────────────────────────────────────────────────────
 
 /**
@@ -210,14 +241,21 @@ export function assembleFirstSms(input: {
 }): string {
   const { civilite, lastName, firstName, accroche } = input;
 
-  // Adressage : civilité + nom (si civ présente) OU prénom seul (si absente).
-  // Cohérent avec la <règle_adressage> v1.0.1 (civilité abrégée Dr/Pr/M./Mme).
-  const adressage =
-    civilite !== undefined && civilite.length > 0 ? `${civilite} ${lastName}` : firstName;
+  // v3.1.0 — adressage extrait dans `computeAdressage` (helper partagé avec
+  // `generateFirstSms` pour le calcul `accrocheMax = 99 − adressage.length`).
+  // Comportement bit-for-bit identique au v2.x : civilité présente non vide →
+  // "{civ} {nom}", sinon → prénom seul.
+  const adressage = computeAdressage({ civilite, lastName, firstName });
 
   // 🚨 v2.0.1 — "assistante virtuelle" RESTAURÉ (AI Act art. 50 explicite).
   // Sentinelle sémantique dans `first-sms-generator.test.ts` verrouille la
   // présence littérale de cette sous-chaîne dans tout body assemblé.
+  //
+  // 🚨 v3.1.0 — TOUTE modification du préfixe/suffixe ci-dessous DOIT
+  // s'accompagner d'une mise à jour de `FIRST_SMS_ASSEMBLE_OVERHEAD_CHARS`
+  // (61 aujourd'hui = 8 + 47 + 6) sinon le budget annoncé à Claude diverge
+  // de la réalité de l'assemble = bug silencieux. Sentinelle dans
+  // `first-sms.test.ts`.
   const assembled = `Bonjour ${adressage}, je suis Léa, assistante virtuelle de Médéré. ${accroche} STOP.`;
 
   if (assembled.length > FIRST_SMS_MAX_BODY_CHARS) {
@@ -248,12 +286,17 @@ export function assembleFirstSms(input: {
  *
  * @throws ValidationError       si `contact.firstName`, `contact.lastName`,
  *                               ou `contact.speciality` sont vides/non-string.
+ * @throws ValidationError       (v3.1.0 reject upstream) si l'adressage
+ *                               HubSpot dépasse 69 chars (= accrocheMax < 30).
+ *                               Reason: `"adressage_exceeds_budget"`. Aucun
+ *                               appel Claude n'est émis dans ce cas.
  * @throws ExternalServiceError  si un des 3 marqueurs compliance est
  *                               absent du body assemblé (triple-garde,
  *                               cas rare car passe par construction en v2 —
  *                               défense-in-depth si assemble cassé futur).
- * @throws ExternalServiceError  si body assemblé > 160 chars (nom HubSpot
- *                               extrême > 52 chars — manual review).
+ * @throws ExternalServiceError  si body assemblé > 160 chars (filet
+ *                               defense-in-depth — devrait être impossible
+ *                               depuis v3.1.0 grâce au reject upstream).
  * @throws AppError              propagée du wrapper `generateWithTool`
  *                               (ConfigError, RateLimitError,
  *                               ExternalServiceError, InternalError).
@@ -269,10 +312,57 @@ export async function generateFirstSms(
   assertNonEmptyField(args.contact.speciality, "speciality");
   // `civilite` et `city` peuvent être undefined/vides (gérés par le builder).
 
-  // ── 2. Build prompt v2 (escapeXml sur tous champs externes) ───────────
-  const { system, user } = buildFirstSmsPrompt({ contact: args.contact });
+  // ── 2. Calcul adressage + budget dynamique (v3.1.0 S10.2.X.a) ────────
+  // L'adressage est calculé UNE seule fois ici et passé à 3 endroits :
+  //   (a) reject upstream (étape 2bis)
+  //   (b) buildFirstSmsPrompt → injection bloc <budget_accroche> USER
+  //   (c) buildFirstSmsTool → borne max Zod schema
+  // Garantit que le budget annoncé à Claude est exactement la borne du
+  // Zod schema (push schema down + pull validate up cohérents).
+  const adressage = computeAdressage({
+    civilite: args.contact.civilite,
+    lastName: args.contact.lastName,
+    firstName: args.contact.firstName,
+  });
+  const accrocheMax =
+    FIRST_SMS_MAX_BODY_CHARS - FIRST_SMS_ASSEMBLE_OVERHEAD_CHARS - adressage.length;
+  // = 160 − 61 − adressage.length = 99 − adressage.length
 
-  // ── 3. Appel Claude single-shot (propagation erreurs SDK telles quelles) ──
+  // ── 2bis. Reject upstream si budget < min (v3.1.0) ───────────────────
+  // Si l'adressage HubSpot dépasse 69 chars (= accrocheMax < 30 = MIN),
+  // aucune accroche valide n'existe → on throw AVANT tout appel Claude
+  // (économie API + message actionnable pour le commercial).
+  //
+  // 🚨 ANTI-PII — le `lastName` brut N'EST JAMAIS exposé : seules les
+  // longueurs et bornes sont propagées en context. Le commercial ouvre
+  // HubSpot pour voir le nom — pas Sentry.
+  if (accrocheMax < FIRST_SMS_MIN_ACCROCHE_CHARS) {
+    throw new ValidationError({
+      message:
+        `generateFirstSms: contact adressage too long for any valid accroche ` +
+        `(adressageLength=${adressage.length}, accrocheMax=${accrocheMax}, ` +
+        `min=${FIRST_SMS_MIN_ACCROCHE_CHARS}). Action: shorten lastName in HubSpot ` +
+        `(or fix civilite if it inflates the prefix).`,
+      context: {
+        op: FIRST_SMS_GENERATOR_OP,
+        reason: "adressage_exceeds_budget",
+        adressageLength: adressage.length,
+        accrocheMax,
+        minAccrocheChars: FIRST_SMS_MIN_ACCROCHE_CHARS,
+        maxBodyChars: FIRST_SMS_MAX_BODY_CHARS,
+        assembleOverhead: FIRST_SMS_ASSEMBLE_OVERHEAD_CHARS,
+        hasCivilite: args.contact.civilite !== undefined && args.contact.civilite.length > 0,
+      },
+    });
+  }
+
+  // ── 3. Build prompt v3.1.0 (escapeXml + injection budget bloc USER) ──
+  const { system, user } = buildFirstSmsPrompt({ contact: args.contact, accrocheMax });
+
+  // ── 4. Build tool factory v3.1.0 (MÊME accrocheMax que step 3) ───────
+  const tool = buildFirstSmsTool(accrocheMax);
+
+  // ── 5. Appel Claude single-shot (propagation erreurs SDK telles quelles) ──
   // Pas de try/catch/retry ici en v2.0.0 : la garantie mathématique de
   // l'assemble code-side couvre les cas qui faisaient échouer v1 (body >
   // 160). Les erreurs SDK transitoires (réseau, 5xx) sont gérées par
@@ -285,13 +375,13 @@ export async function generateFirstSms(
     user,
     temperature: FIRST_SMS_TEMPERATURE,
     maxTokens: FIRST_SMS_MAX_TOKENS,
-    tool: FIRST_SMS_TOOL,
+    tool,
   });
   const generationDurationMs = Date.now() - startedAt;
 
   const { accroche } = result.toolInput;
 
-  // ── 4. Assemble code-side (garantie ≤ 160 chars + garde-fou nom extrême) ──
+  // ── 6. Assemble code-side (garantie ≤ 160 chars + garde-fou nom extrême) ──
   const body = assembleFirstSms({
     civilite: args.contact.civilite,
     lastName: args.contact.lastName,
@@ -299,7 +389,7 @@ export async function generateFirstSms(
     accroche,
   });
 
-  // ── 5. Triple-garde post-gen ───────────────────────────────────────────
+  // ── 7. Triple-garde post-gen ───────────────────────────────────────────
   // En v2.0.0, ces 3 checks passent PAR CONSTRUCTION (l'assemble inclut
   // toujours "je suis Léa de Médéré." + "STOP."). Conservés en
   // defense-in-depth pour alerter si l'assemble est cassé dans un refactor
@@ -351,7 +441,7 @@ export async function generateFirstSms(
     });
   }
 
-  // ── 6. Retour structuré ────────────────────────────────────────────────
+  // ── 8. Retour structuré ────────────────────────────────────────────────
   return {
     body,
     promptVersion: FIRST_SMS_PROMPT_VERSION,

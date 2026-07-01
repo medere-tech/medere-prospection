@@ -36,19 +36,21 @@ import { generateWithTool } from "./client";
 import {
   ASSEMBLE_FIRST_SMS_OP,
   assembleFirstSms,
+  computeAdressage,
   FIRST_SMS_GENERATOR_OP,
   generateFirstSms,
   type GenerateFirstSmsArgs,
 } from "./first-sms-generator";
 import {
-  FIRST_SMS_MAX_ACCROCHE_CHARS,
+  buildFirstSmsTool,
+  FIRST_SMS_ASSEMBLE_OVERHEAD_CHARS,
   FIRST_SMS_MAX_BODY_CHARS,
   FIRST_SMS_MAX_TOKENS,
   FIRST_SMS_MIN_ACCROCHE_CHARS,
   FIRST_SMS_MODEL,
   FIRST_SMS_PROMPT_VERSION,
   FIRST_SMS_TEMPERATURE,
-  FIRST_SMS_TOOL,
+  FIRST_SMS_TOOL_NAME,
 } from "./prompts/first-sms";
 
 const mockedGenerate = generateWithTool as unknown as ReturnType<typeof vi.fn>;
@@ -221,17 +223,21 @@ describe("generateFirstSms — happy path v2.0.0 (body assemblé)", () => {
     expect(body.length).toBeLessThanOrEqual(FIRST_SMS_MAX_BODY_CHARS);
   });
 
-  it("appelle generateWithTool avec MODEL + TEMPERATURE + MAX_TOKENS + TOOL", async () => {
+  it("appelle generateWithTool avec MODEL + TEMPERATURE + MAX_TOKENS + tool factory produit", async () => {
     mockedGenerate.mockResolvedValue(makeToolUseResult());
     await generateFirstSms({ contact: VALID_CONTACT });
 
     expect(mockedGenerate).toHaveBeenCalledTimes(1);
+    // v3.1.0 — le tool est produit par `buildFirstSmsTool(accrocheMax)`
+    // (nouvelle instance par appel), donc on assert sur les propriétés
+    // stables (name + presence d'inputSchema) plutôt que sur une référence
+    // constante. Le couplage accrocheMax ↔ Zod max est testé séparément.
     expect(mockedGenerate).toHaveBeenCalledWith(
       expect.objectContaining({
         model: FIRST_SMS_MODEL,
         temperature: FIRST_SMS_TEMPERATURE,
         maxTokens: FIRST_SMS_MAX_TOKENS,
-        tool: FIRST_SMS_TOOL,
+        tool: expect.objectContaining({ name: FIRST_SMS_TOOL_NAME }),
       }),
     );
   });
@@ -330,14 +336,28 @@ describe("assembleFirstSms — structure préfixe/suffixe v2.0.1", () => {
 // ─────────────────────────────────────────────────────────────────────────────
 
 describe("assembleFirstSms — garde-fou ExternalServiceError si > 160 chars", () => {
-  it("nom très long + accroche max 65 → throw ExternalServiceError", () => {
-    const TOO_LONG_NAME = "x".repeat(60); // > 52 chars limite worst-case
+  it("nom très long + accroche au-delà du max dérivé → throw ExternalServiceError (defense-in-depth)", () => {
+    // CORR 1 v3.1.0 Déthié — longueur d'accroche DÉRIVÉE depuis les vraies
+    // constantes plutôt qu'un littéral hérité du plafond statique 50.
+    // Configuration : nom = 60 chars + civilité "Mme" → adressage 64 chars
+    // → accrocheMax(160) = 99 − 64 = 35. Pour forcer body > 160, on dépasse
+    // d'1 char au-delà du max dérivé.
+    const TOO_LONG_NAME = "x".repeat(60);
+    const adressageLen = computeAdressage({
+      civilite: "Mme",
+      lastName: TOO_LONG_NAME,
+      firstName: "Marie",
+    }).length;
+    const accrocheLenOverflow =
+      FIRST_SMS_MAX_BODY_CHARS - FIRST_SMS_ASSEMBLE_OVERHEAD_CHARS - adressageLen + 1;
+    expect(accrocheLenOverflow).toBeGreaterThanOrEqual(FIRST_SMS_MIN_ACCROCHE_CHARS);
+
     expect(() =>
       assembleFirstSms({
         civilite: "Mme",
         lastName: TOO_LONG_NAME,
         firstName: "Marie",
-        accroche: "y".repeat(FIRST_SMS_MAX_ACCROCHE_CHARS),
+        accroche: "y".repeat(accrocheLenOverflow),
       }),
     ).toThrow(ExternalServiceError);
   });
@@ -373,17 +393,26 @@ describe("assembleFirstSms — garde-fou ExternalServiceError si > 160 chars", (
     }
   });
 
-  it("nom exactement à la limite (assemble = 160) → OK (pas de throw) v2.0.1", () => {
-    // v2.0.1 recalcul : "Bonjour Mme " (12) + nom_X (45) +
-    // ", je suis Léa, assistante virtuelle de Médéré. " (47) +
-    // accroche (50) + " STOP." (6) = 160 chars.
-    const NAME_45_CHARS = "x".repeat(45);
-    const ACCROCHE_50_CHARS = "y".repeat(FIRST_SMS_MAX_ACCROCHE_CHARS);
+  it("nom exactement à la limite (assemble = 160 chars exactement) → OK (pas de throw)", () => {
+    // CORR 1 v3.1.0 Déthié — longueur d'accroche DÉRIVÉE depuis les
+    // vraies constantes. Configuration : nom 45 + civilité "Mme" →
+    // adressage 49 chars → accrocheAtLimit = 99 − 49 = 50.
+    // Body assemblé = 8 + 49 + 47 + 50 + 6 = 160 EXACTEMENT.
+    const NAME_45 = "x".repeat(45);
+    const adressageLen = computeAdressage({
+      civilite: "Mme",
+      lastName: NAME_45,
+      firstName: "Z",
+    }).length;
+    const accrocheAtLimit =
+      FIRST_SMS_MAX_BODY_CHARS - FIRST_SMS_ASSEMBLE_OVERHEAD_CHARS - adressageLen;
+    expect(accrocheAtLimit).toBeGreaterThanOrEqual(FIRST_SMS_MIN_ACCROCHE_CHARS);
+
     const body = assembleFirstSms({
       civilite: "Mme",
-      lastName: NAME_45_CHARS,
+      lastName: NAME_45,
       firstName: "Z",
-      accroche: ACCROCHE_50_CHARS,
+      accroche: "y".repeat(accrocheAtLimit),
     });
     expect(body.length).toBe(FIRST_SMS_MAX_BODY_CHARS); // exactement 160
   });
@@ -393,8 +422,16 @@ describe("assembleFirstSms — garde-fou ExternalServiceError si > 160 chars", (
 // Sentinelle fuzz — garantie ≤ 160 chars sur cas réalistes (~50 combinaisons)
 // ─────────────────────────────────────────────────────────────────────────────
 
-describe("assembleFirstSms — sentinelle fuzz ≤ 160 chars (cas réalistes FR)", () => {
-  // 5 civilités × 10 noms × min/max accroche = 100 combinaisons
+describe("assembleFirstSms — sentinelle fuzz ≤ 160 chars (cas réalistes FR, plages budgets v3.1.0)", () => {
+  // CORR 1 v3.1.0 Déthié — fuzz refactoré pour itérer sur PLUSIEURS
+  // longueurs d'accroche (pas une borne fixe héritée du plafond statique).
+  // Pour chaque (civilité × nom × accrocheLen), on calcule le budget réel
+  // via `computeAdressage` (helper partagé prod) ; si accrocheLen >
+  // accrocheMaxForThisContact, on SKIP ce cas (Claude n'aurait jamais pu
+  // produire cette accroche pour ce contact — le reject upstream l'aurait
+  // bloqué). Sinon, on vérifie que l'assemble produit body ≤ 160 +
+  // marqueurs compliance par construction.
+
   const CIVILITES: ReadonlyArray<string | undefined> = [
     undefined, // → "Bonjour {prénom}"
     "Dr",
@@ -419,36 +456,43 @@ describe("assembleFirstSms — sentinelle fuzz ≤ 160 chars (cas réalistes FR)
     "Saint-Étienne-du-Rouvray-Lévêque", // ~32 chars
   ];
 
-  // ACCROCHE_MIN/MAX dimensionnés EXACTEMENT aux bornes Zod (30 et 65) :
-  // c'est précisément le worst-case fuzz que la sentinelle doit couvrir.
-  // Contenu arbitraire (répétition `x`/`y`) — la sentinelle teste la
-  // garantie mathématique d'assembleFirstSms, pas la qualité commerciale
-  // de l'accroche (tests few-shot s'en chargent dans first-sms.test.ts).
-  const ACCROCHE_MIN = "x".repeat(FIRST_SMS_MIN_ACCROCHE_CHARS); // 30 chars
-  const ACCROCHE_MAX_LEN = "y".repeat(FIRST_SMS_MAX_ACCROCHE_CHARS); // 65 chars
-  expect(ACCROCHE_MIN.length).toBe(FIRST_SMS_MIN_ACCROCHE_CHARS);
-  expect(ACCROCHE_MAX_LEN.length).toBe(FIRST_SMS_MAX_ACCROCHE_CHARS);
+  // Plage de longueurs d'accroche représentative : min (30), médian (50),
+  // long (70), max typique (92 = adressage court "Dr Pham" 7 chars). Sur les
+  // adressages longs, certaines de ces longueurs sont SKIP (Claude n'aurait
+  // jamais pu produire cette accroche pour ce contact — `generateFirstSms`
+  // l'aurait reject upstream via ValidationError).
+  const ACCROCHE_LENGTHS = [FIRST_SMS_MIN_ACCROCHE_CHARS, 50, 70, 92] as const;
 
-  it.each(
-    CIVILITES.flatMap((civilite) =>
-      NOMS_REALISTES.flatMap((nom) =>
-        [ACCROCHE_MIN, ACCROCHE_MAX_LEN].map(
-          (accroche) =>
-            [
-              `civilite=${civilite ?? "∅"} nom=${nom} accroche=${accroche.length}`,
-              civilite,
-              nom,
-              accroche,
-            ] as const,
-        ),
-      ),
+  type FuzzCase = readonly [string, string | undefined, string, number];
+  const fuzzCases: FuzzCase[] = CIVILITES.flatMap((civilite) =>
+    NOMS_REALISTES.flatMap((nom) =>
+      ACCROCHE_LENGTHS.flatMap((accrocheLen): FuzzCase[] => {
+        const adressageLen = computeAdressage({
+          civilite,
+          lastName: nom,
+          firstName: "Marie",
+        }).length;
+        const accrocheMaxForThisContact =
+          FIRST_SMS_MAX_BODY_CHARS - FIRST_SMS_ASSEMBLE_OVERHEAD_CHARS - adressageLen;
+        if (accrocheLen > accrocheMaxForThisContact) return [];
+        return [
+          [
+            `civilite=${civilite ?? "?"} nom=${nom} accrocheLen=${accrocheLen}`,
+            civilite,
+            nom,
+            accrocheLen,
+          ],
+        ];
+      }),
     ),
-  )("%s → body assemblé ≤ 160 chars", (_label, civilite, nom, accroche) => {
+  );
+
+  it.each(fuzzCases)("%s → body assemblé ≤ 160 chars", (_label, civilite, nom, accrocheLen) => {
     const body = assembleFirstSms({
       civilite,
       lastName: nom,
       firstName: "Marie", // prénom court fixe (utilisé seulement si civ undefined)
-      accroche,
+      accroche: "y".repeat(accrocheLen),
     });
     expect(body.length).toBeLessThanOrEqual(FIRST_SMS_MAX_BODY_CHARS);
     // Sentinelle : les 3 marqueurs compliance sont TOUJOURS présents par construction.
@@ -580,5 +624,186 @@ describe("generateFirstSms — sentinelles return values v2.0.0", () => {
     mockedGenerate.mockResolvedValue(makeToolUseResult());
     const result = await generateFirstSms({ contact: VALID_CONTACT });
     expect(result.temperature).toBe(0.3);
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// computeAdressage v3.1.0 — helper partagé (UNIQUE source de vérité)
+// ─────────────────────────────────────────────────────────────────────────────
+
+describe("computeAdressage v3.1.0 — helper partagé prod assemble + budget", () => {
+  it("civilité 'Dr' + nom court 'Pham' → 'Dr Pham' (len 7)", () => {
+    expect(computeAdressage({ civilite: "Dr", lastName: "Pham", firstName: "Marie" })).toBe(
+      "Dr Pham",
+    );
+  });
+
+  it("civilité 'Pr' + nom 'Charrier' → 'Pr Charrier' (len 11)", () => {
+    expect(computeAdressage({ civilite: "Pr", lastName: "Charrier", firstName: "Henri" })).toBe(
+      "Pr Charrier",
+    );
+  });
+
+  it("civilité 'Mme' + nom 'Roux' → 'Mme Roux' (len 8)", () => {
+    expect(computeAdressage({ civilite: "Mme", lastName: "Roux", firstName: "Camille" })).toBe(
+      "Mme Roux",
+    );
+  });
+
+  it("civilité 'M.' + nom 'Lê' → 'M. Lê' (len 5)", () => {
+    expect(computeAdressage({ civilite: "M.", lastName: "Lê", firstName: "Jean" })).toBe("M. Lê");
+  });
+
+  it("civilité undefined → prénom seul 'Sophie' (len 6)", () => {
+    expect(
+      computeAdressage({ civilite: undefined, lastName: "Bernard", firstName: "Sophie" }),
+    ).toBe("Sophie");
+  });
+
+  it("civilité '' (string vide) → prénom seul (= traité comme undefined)", () => {
+    expect(computeAdressage({ civilite: "", lastName: "Bernard", firstName: "Sophie" })).toBe(
+      "Sophie",
+    );
+  });
+
+  it("comportement bit-for-bit identique à l'ancien ternaire (v2.x → v3.1.0)", () => {
+    // Régression : pour chaque combinaison testée, computeAdressage doit
+    // produire EXACTEMENT le même string que l'ancien `civilite !== undefined
+    // && civilite.length > 0 ? "${civilite} ${lastName}" : firstName`.
+    const cases: ReadonlyArray<{
+      civilite: string | undefined;
+      lastName: string;
+      firstName: string;
+    }> = [
+      { civilite: "Dr", lastName: "Dupuis", firstName: "Marie" },
+      { civilite: "Pr", lastName: "Charrier", firstName: "Henri" },
+      { civilite: "M.", lastName: "Lê", firstName: "Jean" },
+      { civilite: "Mme", lastName: "Roux", firstName: "Camille" },
+      { civilite: undefined, lastName: "Bernard", firstName: "Sophie" },
+      { civilite: "", lastName: "Bernard", firstName: "Sophie" },
+    ];
+    for (const c of cases) {
+      const expected =
+        c.civilite !== undefined && c.civilite.length > 0
+          ? `${c.civilite} ${c.lastName}`
+          : c.firstName;
+      expect(computeAdressage(c)).toBe(expected);
+    }
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Reject upstream v3.1.0 — ValidationError si adressage > 69 chars
+// ─────────────────────────────────────────────────────────────────────────────
+
+describe("generateFirstSms v3.1.0 — reject upstream si adressage > 69 chars", () => {
+  it("adressage à la limite (69 chars exactement = accrocheMax 30 = min) → PAS de reject", async () => {
+    // Construction : civilité "Dr" (2 chars) + " " (1) + nom 66 chars = 69.
+    // accrocheMax = 99 - 69 = 30 = FIRST_SMS_MIN_ACCROCHE_CHARS → OK borne incluse.
+    const NAME_66 = "x".repeat(66);
+    mockedGenerate.mockResolvedValue(makeToolUseResult("z".repeat(FIRST_SMS_MIN_ACCROCHE_CHARS)));
+    await expect(
+      generateFirstSms({ contact: { ...VALID_CONTACT, civilite: "Dr", lastName: NAME_66 } }),
+    ).resolves.toBeDefined();
+    expect(mockedGenerate).toHaveBeenCalledTimes(1);
+  });
+
+  it("adressage 70 chars (accrocheMax 29 < min 30) → throw ValidationError SANS appeler Claude", async () => {
+    // civilité "Dr" (2) + " " (1) + nom 67 = 70 chars adressage.
+    const NAME_67 = "x".repeat(67);
+    await expect(
+      generateFirstSms({ contact: { ...VALID_CONTACT, civilite: "Dr", lastName: NAME_67 } }),
+    ).rejects.toBeInstanceOf(ValidationError);
+    expect(mockedGenerate).not.toHaveBeenCalled();
+  });
+
+  it("reject upstream context : op + reason + longueurs (PAS de nom brut, anti-PII)", async () => {
+    const SECRET_LASTNAME = "SECRET-LASTNAME-PII-NEVER-LOG" + "x".repeat(50);
+    try {
+      await generateFirstSms({
+        contact: { ...VALID_CONTACT, civilite: "Dr", lastName: SECRET_LASTNAME },
+      });
+      expect.fail("should have thrown ValidationError");
+    } catch (e) {
+      expect(e).toBeInstanceOf(ValidationError);
+      const ctx = (e as ValidationError).context as Record<string, unknown>;
+      const serialized = JSON.stringify({ message: (e as Error).message, context: ctx });
+
+      // Anti-PII : le nom brut N'EST JAMAIS exposé.
+      expect(serialized).not.toContain(SECRET_LASTNAME);
+
+      // Forensic utile : op, reason, longueurs, bornes.
+      expect(ctx.op).toBe(FIRST_SMS_GENERATOR_OP);
+      expect(ctx.reason).toBe("adressage_exceeds_budget");
+      expect(ctx.adressageLength).toBe(
+        computeAdressage({ civilite: "Dr", lastName: SECRET_LASTNAME, firstName: "Marie" }).length,
+      );
+      expect(ctx.accrocheMax).toBeLessThan(FIRST_SMS_MIN_ACCROCHE_CHARS);
+      expect(ctx.minAccrocheChars).toBe(FIRST_SMS_MIN_ACCROCHE_CHARS);
+      expect(ctx.maxBodyChars).toBe(FIRST_SMS_MAX_BODY_CHARS);
+      expect(ctx.assembleOverhead).toBe(FIRST_SMS_ASSEMBLE_OVERHEAD_CHARS);
+      expect(ctx.hasCivilite).toBe(true);
+    }
+  });
+
+  it("reject upstream message contient 'shorten lastName in HubSpot' (actionnable commercial)", async () => {
+    const NAME_67 = "x".repeat(67);
+    try {
+      await generateFirstSms({
+        contact: { ...VALID_CONTACT, civilite: "Dr", lastName: NAME_67 },
+      });
+      expect.fail("should have thrown");
+    } catch (e) {
+      expect((e as Error).message).toContain("shorten lastName in HubSpot");
+    }
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Budget dynamique v3.1.0 — accrocheMax cohérent USER ↔ tool Zod
+// ─────────────────────────────────────────────────────────────────────────────
+
+describe("generateFirstSms v3.1.0 — cohérence accrocheMax USER ↔ tool Zod", () => {
+  it("contact 'Dr Pham' (adressage 7) → tool Zod accepte accroche 92 chars, reject 93", async () => {
+    mockedGenerate.mockResolvedValue(makeToolUseResult());
+    await generateFirstSms({
+      contact: { ...VALID_CONTACT, civilite: "Dr", lastName: "Pham" },
+    });
+
+    expect(mockedGenerate).toHaveBeenCalledTimes(1);
+    const callArgs = mockedGenerate.mock.calls[0]![0] as { tool: { inputSchema: unknown } };
+    const tool = callArgs.tool as ReturnType<typeof buildFirstSmsTool>;
+    expect(tool.inputSchema.safeParse({ accroche: "x".repeat(92) }).success).toBe(true);
+    expect(tool.inputSchema.safeParse({ accroche: "x".repeat(93) }).success).toBe(false);
+  });
+
+  it("contact undefined+'Marie' (adressage 5) → tool Zod accepte 94 chars, reject 95", async () => {
+    mockedGenerate.mockResolvedValue(makeToolUseResult());
+    await generateFirstSms({
+      contact: { ...VALID_CONTACT, civilite: undefined, firstName: "Marie", lastName: "X" },
+    });
+
+    const callArgs = mockedGenerate.mock.calls[0]![0] as { tool: { inputSchema: unknown } };
+    const tool = callArgs.tool as ReturnType<typeof buildFirstSmsTool>;
+    expect(tool.inputSchema.safeParse({ accroche: "x".repeat(94) }).success).toBe(true);
+    expect(tool.inputSchema.safeParse({ accroche: "x".repeat(95) }).success).toBe(false);
+  });
+
+  it("contact 'Pr Charrier' (adressage 11) → tool Zod accepte 88, reject 89 ; USER annonce 'entre 30 et 88'", async () => {
+    mockedGenerate.mockResolvedValue(makeToolUseResult());
+    await generateFirstSms({
+      contact: { ...VALID_CONTACT, civilite: "Pr", lastName: "Charrier" },
+    });
+
+    const callArgs = mockedGenerate.mock.calls[0]![0] as {
+      user: string;
+      tool: { inputSchema: unknown };
+    };
+    const tool = callArgs.tool as ReturnType<typeof buildFirstSmsTool>;
+    // Cohérence USER ↔ tool : la borne annoncée à Claude (USER) = la borne
+    // qu'on lui demande de respecter (tool Zod max).
+    expect(callArgs.user).toContain("entre 30 et 88 caractères");
+    expect(tool.inputSchema.safeParse({ accroche: "x".repeat(88) }).success).toBe(true);
+    expect(tool.inputSchema.safeParse({ accroche: "x".repeat(89) }).success).toBe(false);
   });
 });
