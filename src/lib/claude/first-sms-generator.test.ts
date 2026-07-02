@@ -74,7 +74,7 @@ const VALID_CONTACT: GenerateFirstSmsArgs["contact"] = {
  * `"Bonjour Dr Dupuis, je suis Léa, assistante virtuelle de Médéré. {ACCROCHE} STOP."`
  * = 71 + 45 = 116 chars (largement ≤ 160).
  */
-const CONFORMING_ACCROCHE = "DPC 660€/an indemnisée. Cela vous intéresse ?"; // 45 chars
+const CONFORMING_ACCROCHE = "DPC 792€/an indemnisés. Cela vous intéresse ?"; // 45 chars
 
 /**
  * Body que `assembleFirstSms()` retourne pour VALID_CONTACT + CONFORMING_ACCROCHE.
@@ -82,7 +82,7 @@ const CONFORMING_ACCROCHE = "DPC 660€/an indemnisée. Cela vous intéresse ?";
  * + STOP) par construction.
  */
 const EXPECTED_ASSEMBLED_BODY =
-  "Bonjour Dr Dupuis, je suis Léa, assistante virtuelle de Médéré. DPC 660€/an indemnisée. Cela vous intéresse ? STOP.";
+  "Bonjour Dr Dupuis, je suis Léa, assistante virtuelle de Médéré. DPC 792€/an indemnisés. Cela vous intéresse ? STOP.";
 
 function makeToolUseResult(
   accroche: string = CONFORMING_ACCROCHE,
@@ -148,7 +148,7 @@ describe("generateFirstSms — gardes d'entrée", () => {
       contact: { ...VALID_CONTACT, civilite: undefined },
     });
     expect(result.body).toBe(
-      "Bonjour Marie, je suis Léa, assistante virtuelle de Médéré. DPC 660€/an indemnisée. Cela vous intéresse ? STOP.",
+      "Bonjour Marie, je suis Léa, assistante virtuelle de Médéré. DPC 792€/an indemnisés. Cela vous intéresse ? STOP.",
     );
   });
 
@@ -265,10 +265,10 @@ describe("assembleFirstSms — structure préfixe/suffixe v2.0.1", () => {
       civilite: "Dr",
       lastName: "Dupuis",
       firstName: "Marie",
-      accroche: "DPC 660€/an. Cela vous intéresse ?",
+      accroche: "DPC 792€/an. Cela vous intéresse ?",
     });
     expect(body).toBe(
-      "Bonjour Dr Dupuis, je suis Léa, assistante virtuelle de Médéré. DPC 660€/an. Cela vous intéresse ? STOP.",
+      "Bonjour Dr Dupuis, je suis Léa, assistante virtuelle de Médéré. DPC 792€/an. Cela vous intéresse ? STOP.",
     );
   });
 
@@ -289,7 +289,7 @@ describe("assembleFirstSms — structure préfixe/suffixe v2.0.1", () => {
       civilite: "",
       lastName: "Bernard",
       firstName: "Sophie",
-      accroche: "DPC indemnisée 660€/an. Cela vous tente ?",
+      accroche: "DPC indemnisée 792€/an. Cela vous tente ?",
     });
     expect(body.startsWith("Bonjour Sophie,")).toBe(true);
     expect(body.includes("Bernard")).toBe(false);
@@ -305,7 +305,7 @@ describe("assembleFirstSms — structure préfixe/suffixe v2.0.1", () => {
       civilite,
       lastName: "Dupuis",
       firstName: "Marie",
-      accroche: "DPC 660€/an. Plus d'infos ?",
+      accroche: "DPC 792€/an. Plus d'infos ?",
     });
     expect(body.startsWith(expectedPrefix)).toBe(true);
   });
@@ -719,6 +719,22 @@ describe("generateFirstSms v3.1.0 — reject upstream si adressage > 69 chars", 
 
   it("reject upstream context : op + reason + longueurs (PAS de nom brut, anti-PII)", async () => {
     const SECRET_LASTNAME = "SECRET-LASTNAME-PII-NEVER-LOG" + "x".repeat(50);
+
+    // 🔒 Preuve setup (S10.2.6 B5) — garantit mécaniquement que l'invariant
+    // du test tient : adressage > 69 chars force le reject upstream. Sans
+    // cette assertion en tête, si le seuil prod (69) évolue ou si le setup
+    // dérive silencieusement, le `not.toContain(SECRET_LASTNAME)` pourrait
+    // devenir vacuous (assertion vraie sur une path différente du test).
+    const setupAdressage = computeAdressage({
+      civilite: "Dr",
+      lastName: SECRET_LASTNAME,
+      firstName: "Marie",
+    });
+    expect(
+      setupAdressage.length,
+      "setup requires adressage > 69 to fire reject upstream (non-vacuous PII assertion)",
+    ).toBeGreaterThan(69);
+
     try {
       await generateFirstSms({
         contact: { ...VALID_CONTACT, civilite: "Dr", lastName: SECRET_LASTNAME },
