@@ -68,7 +68,7 @@ Créer ou améliorer les prompts qui pilotent l'IA de prospection Médéré. La 
 Bencivenga = le plus grand copywriter du 20e siècle. Ses 6 principes traduits :
 
 1. **Clarté** : compréhensible en 3 secondes par un médecin entre 2 consultations
-2. **Preuve > promesse** : chiffres concrets ("indemnisation 660€/an"), pas adjectifs creux ("incroyable")
+2. **Preuve > promesse** : chiffres concrets ("indemnisation 792€/an"), pas adjectifs creux ("incroyable")
 3. **Empathie** : parle à un humain occupé, pas à une cible marketing
 4. **Naturel** : ton professionnel conversationnel, pas robotique
 5. **Un message, un objectif** : une seule question, une seule offre, une seule action
