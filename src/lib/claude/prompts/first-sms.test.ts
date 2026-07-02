@@ -68,9 +68,9 @@ import {
 // Constantes verrouillées (verrous compliance-critical)
 // ─────────────────────────────────────────────────────────────────────────────
 
-describe("first-sms — sentinelles constantes verrouillées v3.1.0", () => {
-  it("FIRST_SMS_PROMPT_VERSION === '3.1.0' (S10.2.X.a — budget dynamique accroche)", () => {
-    expect(FIRST_SMS_PROMPT_VERSION).toBe("3.1.0");
+describe("first-sms — sentinelles constantes verrouillées v3.2.0", () => {
+  it("FIRST_SMS_PROMPT_VERSION === '3.2.0' (S10.2.X.b — mot de sens 'indemnisés' systématique)", () => {
+    expect(FIRST_SMS_PROMPT_VERSION).toBe("3.2.0");
   });
 
   it("FIRST_SMS_MODEL === SONNET_4_6 (dateless pinned)", () => {
@@ -650,19 +650,24 @@ function extractFewShotAccroches(system: string): string[] {
 }
 
 /**
- * Borne de calibrage LOCALE des accroches few-shot v3.1.0.
+ * Borne de calibrage LOCALE des accroches few-shot v3.2.0.
  *
  * Les 5 accroches d'exemple du bloc <exemples> sont volontairement courtes
- * (longueurs absolues : 34, 40, 38, 35, 39 chars — médiane 38) pour MONTRER
+ * (longueurs absolues : 45, 51, 38, 46, 50 chars — médiane 46) pour MONTRER
  * à Claude que la concision est une vertu, indépendamment du budget runtime
  * qui peut aller jusqu'à 94 chars.
+ *
+ * v3.2.0 — les 4 few-shot chiffrés portent désormais le mot de sens
+ * "indemnisés" collé au montant (règle canonique <indemnisation> §2). +11
+ * chars par accroche chiffrée par rapport à v3.1.0 (Ex1 34→45, Ex2 40→51,
+ * Ex4 35→46, Ex5 39→50). Ex3 (fallback) reste à 38 chars.
  *
  * Cette borne n'est PAS la borne max runtime (qui est dynamique, calculée
  * par contact dans `generateFirstSms`). C'est la discipline pédagogique des
  * few-shot : si un nouveau Pourquoi-c'est-bon dépasse cette borne, c'est
  * qu'on a perdu le calibrage pédagogique — re-calibrer avant de merger.
  */
-const FEW_SHOT_CALIBRATION_MAX_CHARS = 50;
+const FEW_SHOT_CALIBRATION_MAX_CHARS = 55;
 
 describe("Few-shot v3.1.0 — accroche-only + discipline calibrage", () => {
   const { system } = buildFirstSmsPrompt({
@@ -729,6 +734,86 @@ describe("Few-shot v3.1.0 — accroche-only + discipline calibrage", () => {
     for (const accroche of accroches) {
       expect(accroche).not.toMatch(/!/);
     }
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// v3.2.0 — Sentinelle "mot de sens obligatoire sur montant chiffré"
+//
+// Règle canonique (bloc <indemnisation> §2) : toute accroche qui cite un
+// montant en euros DOIT être immédiatement suivie d'un mot ∈ {indemnisés,
+// versés}, au pluriel. Le fallback "100% pris en charge" est explicitement
+// EXCLU (règle §3 : anti-empilement redondant).
+//
+// Verrouille contre régression : un futur few-shot chiffré ajouté sans mot
+// de sens = rouge immédiat. Un futur fallback pollué par "indemnisés" =
+// rouge immédiat.
+// ─────────────────────────────────────────────────────────────────────────────
+
+describe("v3.2.0 — sentinelle mot de sens obligatoire sur montants chiffrés", () => {
+  it("toute few-shot du SYSTEM qui contient un montant en euros contient un mot ∈ {indemnisés, versés}", () => {
+    const accroches = extractFewShotAccroches(__SYSTEM_TEMPLATE_FOR_TESTS);
+    const chiffrees = accroches.filter((a) => /\d+€/.test(a));
+    expect(
+      chiffrees.length,
+      "au moins 4 few-shot chiffrées attendues (Ex1, Ex2, Ex4, Ex5)",
+    ).toBeGreaterThanOrEqual(4);
+    for (const accroche of chiffrees) {
+      expect(
+        accroche,
+        `Few-shot chiffrée sans mot de sens (règle canonique §2 violée) : "${accroche}"`,
+      ).toMatch(/\b(indemnisés|versés)\b/i);
+    }
+  });
+
+  it("aucune few-shot fallback '100% pris en charge' ne contient 'indemnisés' ni 'versés' (règle §3 anti-empilement redondant)", () => {
+    const accroches = extractFewShotAccroches(__SYSTEM_TEMPLATE_FOR_TESTS);
+    const fallback = accroches.filter((a) => a.includes("100%"));
+    expect(fallback.length).toBeGreaterThanOrEqual(1);
+    for (const accroche of fallback) {
+      expect(
+        accroche,
+        `Few-shot fallback pollué par mot de sens (règle §3 violée) : "${accroche}"`,
+      ).not.toMatch(/\b(indemnisés|versés)\b/i);
+    }
+  });
+
+  it("SYSTEM contient le marqueur canonique 'MOT DE SENS OBLIGATOIRE' (bloc <indemnisation> §2)", () => {
+    expect(__SYSTEM_TEMPLATE_FOR_TESTS).toContain("MOT DE SENS OBLIGATOIRE");
+  });
+
+  it("SYSTEM contient le vocabulaire fermé '{indemnisés, versés}' (règle canonique)", () => {
+    expect(__SYSTEM_TEMPLATE_FOR_TESTS).toContain("{indemnisés, versés}");
+  });
+
+  it("SYSTEM impose explicitement le pluriel (accord avec 'euros')", () => {
+    // On vérifie la présence du raisonnement pluriel, sans figer la prose
+    // exacte. Sentinelle sur le concept ("pluriel" + "euros") pour attraper
+    // toute reformulation qui perdrait la règle grammaticale.
+    expect(__SYSTEM_TEMPLATE_FOR_TESTS).toMatch(/PLURIEL/);
+    expect(__SYSTEM_TEMPLATE_FOR_TESTS).toContain('accord se fait avec "euros"');
+  });
+
+  it("principe 10 : 'preuve chiffrée AVEC son mot de sens' (indissociable)", () => {
+    // Sentinelle sur la reformulation du principe 10 (le label chiffré ne
+    // va JAMAIS nu). Attrape toute régression qui retomberait sur "garde
+    // toujours la preuve chiffrée (le label)" nue.
+    expect(__SYSTEM_TEMPLATE_FOR_TESTS).toContain("preuve chiffrée AVEC son mot de sens");
+    expect(__SYSTEM_TEMPLATE_FOR_TESTS).toContain("INDISSOCIABLES");
+  });
+
+  it("anti-pattern 3 : accord au pluriel 'indemnisés' (correction v3.2.0 bug latent v3.0.0)", () => {
+    // Sentinelle anti-régression sur la correction d'accord. Le "BON" de
+    // l'anti-pattern 3 utilisait "indemnisé" (singulier) depuis v3.0.0 —
+    // corrigé en "indemnisés" (pluriel, accord avec "euros") en v3.2.0.
+    const antiPattern3Match = __SYSTEM_TEMPLATE_FOR_TESTS.match(
+      /BON : "DPC 945€\/an indemnisé(s?)\. Cela vous intéresse \?"/,
+    );
+    expect(antiPattern3Match, "anti-pattern 3 BON introuvable dans le SYSTEM").toBeTruthy();
+    expect(
+      antiPattern3Match![1],
+      "anti-pattern 3 BON DOIT être 'indemnisés' (pluriel), pas 'indemnisé' (singulier)",
+    ).toBe("s");
   });
 });
 

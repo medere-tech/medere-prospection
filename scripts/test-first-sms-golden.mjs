@@ -276,11 +276,20 @@ const report = {
   temperature: FIRST_SMS_TEMPERATURE,
   totalCalls: 0,
   compliancePassed: 0,
+  // v3.2.0 — flag qualité SÉPARÉ des 3 flags légaux (SOFT, n'affecte pas
+  // exit code). Décision Q-G : le mot de sens "indemnisés" est une
+  // optimisation de clarté, pas une obligation légale — pas de hard-fail
+  // au niveau du script (cohérent avec l'absence de garde-fou runtime
+  // dans first-sms-generator.ts).
+  qualityBodiesWithAmount: 0,
+  qualitySensWordPassed: 0,
   contacts: [],
 };
 
 let totalCalls = 0;
 let compliancePassed = 0;
+let qualityBodiesWithAmount = 0;
+let qualitySensWordPassed = 0;
 let totalDurationMs = 0;
 let totalTokensInput = 0;
 let totalTokensOutput = 0;
@@ -310,14 +319,28 @@ for (const { label, contact } of TEST_CONTACTS) {
       const lengthOk = length >= FIRST_SMS_MIN_BODY_CHARS && length <= FIRST_SMS_MAX_BODY_CHARS;
       const allPass = hasAI && hasOpt && hasAdv && lengthOk;
 
+      // v3.2.0 — flag qualité SÉPARÉ (règle canonique <indemnisation> §2).
+      // Si le body contient un montant en euros, il DOIT contenir un mot
+      // de sens ∈ {indemnisés, versés}. Non-applicable pour les fallback
+      // "100% pris en charge" (règle §3 : anti-empilement redondant) →
+      // hasSensWord = null.
+      const hasAmount = /\d+€/.test(result.body);
+      const hasSensWord = hasAmount ? /\b(indemnisés|versés)\b/i.test(result.body) : null;
+      if (hasAmount) {
+        qualityBodiesWithAmount++;
+        if (hasSensWord === true) qualitySensWordPassed++;
+      }
+
       totalDurationMs += result.generationDurationMs;
       totalTokensInput += result.tokensInput;
       totalTokensOutput += result.tokensOutput;
 
       if (allPass) compliancePassed++;
 
-      // Console : pas le body brut, juste flags + length.
-      const flags = `AI=${hasAI ? "✓" : "✗"} STOP=${hasOpt ? "✓" : "✗"} MEDERE=${hasAdv ? "✓" : "✗"} len=${length}`;
+      // Console : pas le body brut, juste flags + length. Le flag SENS est
+      // visible mais séparé — un ✗ sur SENS ne fait PAS échouer le run.
+      const sensFlag = hasSensWord === null ? "n/a" : hasSensWord ? "✓" : "✗";
+      const flags = `AI=${hasAI ? "✓" : "✗"} STOP=${hasOpt ? "✓" : "✗"} MEDERE=${hasAdv ? "✓" : "✗"} SENS=${sensFlag} len=${length}`;
       console.log(
         `  Run ${i + 1}/${RUNS_PER_CONTACT}: ${allPass ? "✅" : "❌"} ${flags} (${result.generationDurationMs}ms)`,
       );
@@ -327,6 +350,7 @@ for (const { label, contact } of TEST_CONTACTS) {
         body: result.body,
         length,
         compliance: { hasAI, hasOpt, hasAdv, lengthOk },
+        qualityFlags: { hasAmount, hasSensWord },
         allPass,
         durationMs: result.generationDurationMs,
         tokensInput: result.tokensInput,
@@ -368,6 +392,8 @@ for (const { label, contact } of TEST_CONTACTS) {
 
 report.totalCalls = totalCalls;
 report.compliancePassed = compliancePassed;
+report.qualityBodiesWithAmount = qualityBodiesWithAmount;
+report.qualitySensWordPassed = qualitySensWordPassed;
 report.averageDurationMs = Math.round(totalDurationMs / totalCalls);
 report.totalTokensInput = totalTokensInput;
 report.totalTokensOutput = totalTokensOutput;
@@ -385,6 +411,12 @@ console.log("=".repeat(80));
 console.log(`Average duration : ${report.averageDurationMs}ms/call`);
 console.log(`Total tokens in  : ${totalTokensInput}`);
 console.log(`Total tokens out : ${totalTokensOutput}`);
+console.log(
+  `Qualité (mot de sens) : ${qualitySensWordPassed}/${qualityBodiesWithAmount} bodies chiffrés portent un mot ∈ {indemnisés, versés}` +
+    (qualityBodiesWithAmount > 0 && qualitySensWordPassed < qualityBodiesWithAmount
+      ? " ⚠️ (flag SOFT — n'affecte pas exit code, mais À VÉRIFIER dans le rapport JSON)"
+      : ""),
+);
 console.log(`Rapport JSON     : ${outputPath}`);
 console.log();
 

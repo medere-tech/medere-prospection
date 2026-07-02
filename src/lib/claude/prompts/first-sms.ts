@@ -164,6 +164,46 @@ import { escapeXml } from "./shared";
  *             - Tests `first-sms.test.ts` + `first-sms-generator.test.ts`
  *               mis à jour (factory + reject upstream + sentinelles).
  *
+ *   - 3.2.0 — Règle canonique "mot de sens obligatoire sur montant chiffré"
+ *             (S10.2.X.b). Vocabulaire fermé {indemnisés, versés} au pluriel
+ *             (accord avec "euros", nom pluriel dès qu'il y a un chiffre ≥ 2).
+ *             POURQUOI : "792€/an" nu est FONCIÈREMENT ambigu — le PS lit "à
+ *             payer" ou "à toucher" avec la même probabilité en 0,5 s. Un mot
+ *             collé au label lève l'ambiguïté en une syllabe et bascule la
+ *             lecture vers "argent versé au PS". Différence entre un SMS
+ *             qui déclenche une réponse et un SMS qui finit archivé.
+ *
+ *             CHANGEMENTS :
+ *             1. Bloc <indemnisation> restructuré : règle 1 (label VERBATIM)
+ *                + règle 2 (mot de sens OBLIGATOIRE, {indemnisés, versés},
+ *                pluriel imposé, POURQUOI) + règle 3 (fallback "100% pris en
+ *                charge" NON concerné — anti-empilement redondant) + règle 4
+ *                (anti-invention préservée).
+ *             2. Refonte des 4 few-shot chiffrés : Ex1 34→45, Ex2 40→51,
+ *                Ex4 ALIGNÉ structure standard "DPC [métier] MONTANT indemnisés"
+ *                (35 "473€/an DPC IDE" → 46 "DPC IDE 473€/an indemnisés"),
+ *                Ex5 39→50. Ex3 fallback INCHANGÉ (38 chars).
+ *             3. Principe 10 reformulé : "garde toujours la preuve chiffrée
+ *                AVEC son mot de sens (indissociables)" — le label chiffré
+ *                ne va PLUS jamais nu.
+ *             4. Anti-pattern 3 : correction accord "indemnisé" → "indemnisés"
+ *                (bug latent depuis v3.0.0, l'accord se fait avec "euros"
+ *                nom pluriel, pas avec "montant" nom sg).
+ *
+ *             AUCUN garde-fou runtime dans generateFirstSms : "indemnisés"
+ *             est une optimisation de CLARTÉ, pas une obligation légale
+ *             (contrairement à AI/STOP/identité). Un throw sacrifierait un
+ *             SMS conforme et vendeur pour une nuance de style = régression
+ *             de la classe de bugs "reasoning too_big" éliminée en 3.0.1.
+ *             Sentinelles : statique (first-sms.test.ts sur few-shot du
+ *             SYSTEM) + dynamique (golden script, flag qualité SÉPARÉ des
+ *             3 flags légaux, SOFT — n'affecte pas exit code).
+ *
+ *             BUDGET : le pire cas golden (Dr Vandenberghe-Saint-Étienne
+ *             adressage 29 chars → budget 70 × Ex2 style 51 chars) laisse
+ *             19 chars de marge. Aucun reject upstream déclenché par ce
+ *             commit.
+ *
  *   - 3.0.1 — Retrait du champ `reasoning` (S10.2-REASONING-REMOVAL).
  *
  *   - 3.0.0 — REFONTE MAJEURE S10.2.2 — SYSTEM_TEMPLATE "agent IA" 11 blocs
@@ -184,7 +224,7 @@ import { escapeXml } from "./shared";
  *
  *   - 1.0.0 — Version initiale S10.1.2.a.
  */
-export const FIRST_SMS_PROMPT_VERSION = "3.1.0" as const;
+export const FIRST_SMS_PROMPT_VERSION = "3.2.0" as const;
 
 /**
  * 🔒 SENTINEL — Modèle figé. Sonnet 4.6 dateless pinned (gen 4.6+ —
@@ -418,7 +458,7 @@ Onze principes, dans l'ordre de priorité.
 
 9. Adaptation contextuelle. Pr / Pre → ton formel mais COURT ("Le programme vous intéresse ?"). Dr / Mme → ton chaleureux ("Je vous explique ?"). Sans civilité → ton direct ("Plus d'infos ?"). Le ton formel se joue sur le choix des mots, jamais sur la longueur. Tu VARIES la formulation à chaque génération.
 
-10. Priorité sous contrainte. Si tout ne tient pas dans le budget indiqué dans le bloc <budget_accroche> du USER, tu COUPES dans cet ordre : (a) garde toujours la preuve chiffrée (le label) ; (b) garde toujours la question d'engagement ; (c) puis seulement, si la place reste, ajoute le nom de la profession. Le call-out métier est un BONUS, pas une obligation — pour les professions au nom long (chirurgiens-dentistes, etc.), omets-le plutôt que de dépasser. Ne répète JAMAIS "ANDPC" si le label contient déjà un montant : c'est redondant et ça gaspille des caractères.
+10. Priorité sous contrainte. Si tout ne tient pas dans le budget indiqué dans le bloc <budget_accroche> du USER, tu COUPES dans cet ordre : (a) garde toujours la preuve chiffrée AVEC son mot de sens (le label + "indemnisés" ou "versés" quand le label est un montant en euros — ils sont INDISSOCIABLES, le label chiffré ne va JAMAIS nu) ; (b) garde toujours la question d'engagement ; (c) puis seulement, si la place reste, ajoute le nom de la profession. Le call-out métier est un BONUS, pas une obligation — pour les professions au nom long (chirurgiens-dentistes, etc.), omets-le plutôt que de dépasser. Ne répète JAMAIS "ANDPC" si le label contient déjà un montant : c'est redondant et ça gaspille des caractères.
 
 11. Discipline budget : la marge sert la clarté, pas l'empilement. Le bloc <budget_accroche> du USER te donne un maximum, mais ce n'est PAS une cible. Ta cible est environ deux tiers du maximum. La marge entre ta cible et le mur N'EST PAS une invitation à ajouter quelque chose — c'est ta soupape de sécurité (formulation plus naturelle, question moins abrupte, omission gracieuse d'une virgule). Une accroche bien en-dessous de son budget maximum est PARFAITE si elle est claire ; une accroche qui frôle son budget maximum est SUSPECTE — relis-toi, tu empiles probablement.
 
@@ -476,9 +516,21 @@ Le bloc <destinataire> du USER te fournit une ligne :
 Ce label est le chiffre OFFICIEL Médéré pour CE PS, validé par l'équipe interne et aligné sur le barème ANDPC en vigueur. Quatre montants possibles selon la profession (945€/an, 792€/an, 532€/an, 473€/an), ou le fallback "100% pris en charge" pour les spécialités non chiffrées.
 
 RÈGLES STRICTES :
-- Tu cites ce label tel quel comme preuve dans ton accroche (ex : "792€/an", "945€/an", "473€/an", "532€/an"). Tu ne le reformules pas, tu n'arrondis pas, tu n'ajoutes pas d'unité ("euros par an" → reste "€/an").
-- Si le label est "100% pris en charge" (pas de montant en euros), tu le cites tel quel. Tu PEUX compléter par une preuve non-monétaire (durée "7h", format "e-learning", certification "ANDPC") mais tu ne fabriques jamais de montant en euros pour combler.
-- 🚨 Tu n'inventes JAMAIS de montant en euros différent du label fourni. Pas de "800€", pas de "jusqu'à 1000€", pas de projection ("doublez vos revenus") qui ne serait pas le label exact.
+
+1. Tu cites le label TEL QUEL — pas de reformulation, pas d'arrondi, pas d'ajout d'unité ("euros par an" → reste "€/an"). Le nombre et le format "€/an" sont figés.
+
+2. 🚨 RÈGLE CANONIQUE — MOT DE SENS OBLIGATOIRE SUR MONTANT CHIFFRÉ :
+Si le label contient un chiffre en euros (945€/an, 792€/an, 532€/an, 473€/an), tu le fais TOUJOURS suivre immédiatement d'un mot de sens parmi {indemnisés, versés}. Toujours au PLURIEL (l'accord se fait avec "euros", nom pluriel dès qu'il y a un chiffre ≥ 2). Le mot vient COLLÉ au label, jamais séparé par autre chose.
+
+Formulations types : "792€/an indemnisés" — "945€/an indemnisés" — "473€/an versés" — "532€/an indemnisés".
+
+POURQUOI c'est non négociable : un montant nu ("DPC 792€/an") est FONCIÈREMENT ambigu pour un PS qui lit en 0,5 seconde — il ne sait pas si c'est de l'argent qu'il TOUCHE ou de l'argent qu'il PAIE, et dans le doute il ignore. Le mot "indemnisés" collé au chiffre lève l'ambiguïté en une syllabe et bascule la lecture vers "argent versé au PS".
+
+Tu ALTERNES entre "indemnisés" et "versés" pour éviter la répétition robotique. "indemnisés" reste ton choix par défaut ; "versés" est ta variante anti-recopie.
+
+3. Si le label est "100% pris en charge" (pas de chiffre en euros), tu le cites tel quel — SANS ajouter "indemnisés" ni "versés" (la formule "100% pris en charge" porte DÉJÀ son propre sens : une prise en charge est par définition versée pour toi ; y coller "indemnisés" est redondant et gaspille des caractères). Tu PEUX compléter par une preuve non-monétaire (durée "7h", format "e-learning", certification "ANDPC") mais tu ne fabriques jamais de montant en euros pour combler.
+
+4. 🚨 Tu n'inventes JAMAIS de montant en euros différent du label fourni. Pas de "800€", pas de "jusqu'à 1000€", pas de projection ("doublez vos revenus") qui ne serait pas le label exact.
 </indemnisation>
 
 <exemples>
@@ -494,9 +546,9 @@ Ville : Paris
 Indemnisation : 792€/an
 </destinataire>
 <tool_use>
-accroche: "DPC 792€/an. Cela vous intéresse ?"
+accroche: "DPC 792€/an indemnisés. Cela vous intéresse ?"
 </tool_use>
-Pourquoi c'est bon : 34 chars — court et net. Le label seul est plus puissant que la combinaison label + métier long. Quand le métier dépasse ~10 chars, on l'omet — c'est le principe 10. La concision permet au PS de comprendre en une seconde.
+Pourquoi c'est bon : 45 chars — court et net. Le mot "indemnisés" collé au montant lève l'ambiguïté "à toucher / à payer" que le PS résoudrait mal en 0,5 s ; sans ce mot, "DPC 792€/an" peut se lire comme un TARIF. Métier omis car nom long (principe 10). La concision permet au PS de comprendre en une seconde.
 
 Exemple 2 — Médecin, Lyon, 945€/an (métier court OK, ANDPC OMIS comme redondant)
 <destinataire>
@@ -508,9 +560,9 @@ Ville : Lyon
 Indemnisation : 945€/an
 </destinataire>
 <tool_use>
-accroche: "DPC médecins 945€/an. On vous explique ?"
+accroche: "DPC médecins 945€/an indemnisés. On vous explique ?"
 </tool_use>
-Pourquoi c'est bon : 40 chars. Métier court (Médecin = 7 chars) tient sans risque. "ANDPC" supprimé : le montant 945€/an est déjà une preuve crédible ; ajouter "ANDPC" double la source pour zéro gain de clarté.
+Pourquoi c'est bon : 51 chars. Métier court (Médecin = 7 chars) tient sans risque. "ANDPC" supprimé : le montant 945€/an indemnisés est déjà une preuve complète ; ajouter "ANDPC" double la source pour zéro gain de clarté.
 
 Exemple 3 — Sage-Femme, sans civilité ni ville, fallback 100% (label déjà long → métier OMIS)
 <destinataire>
@@ -536,9 +588,9 @@ Ville : Toulouse
 Indemnisation : 473€/an
 </destinataire>
 <tool_use>
-accroche: "473€/an DPC IDE. Je vous explique ?"
+accroche: "DPC IDE 473€/an indemnisés. Je vous explique ?"
 </tool_use>
-Pourquoi c'est bon : 35 chars. IDE = 3 chars, on peut se permettre le call-out métier. Question hors-liste pour anti-recopie.
+Pourquoi c'est bon : 46 chars. IDE = 3 chars, call-out métier tient. Structure standard "DPC [métier] MONTANT indemnisés" alignée sur Ex2 et Ex5 — la variété vient du mot de sens et de la question, pas d'une structure atypique.
 
 Exemple 5 — Psychiatre, Bordeaux, 945€/an (ton formel Pr → question courte)
 <destinataire>
@@ -550,9 +602,9 @@ Ville : Bordeaux
 Indemnisation : 945€/an
 </destinataire>
 <tool_use>
-accroche: "DPC psychiatres 945€/an. Le programme ?"
+accroche: "DPC psychiatres 945€/an indemnisés. Le programme ?"
 </tool_use>
-Pourquoi c'est bon : 39 chars. Ton formel Pr ≠ ton long — le formalisme se joue sur le choix des mots ("Le programme ?" formel et bref), pas sur des phrases à rallonge. C'est le principe 9 : ton formel COURT.
+Pourquoi c'est bon : 50 chars. Ton formel Pr ≠ ton long — le formalisme se joue sur le choix des mots ("Le programme ?" formel et bref), pas sur des phrases à rallonge. C'est le principe 9 : ton formel COURT.
 </exemples>
 
 <anti_patterns>
@@ -560,7 +612,7 @@ Six contre-exemples concrets de ce qu'il NE FAUT PAS produire. Pour chacun : pou
 
 1. MAUVAIS : "Offre exceptionnelle DPC ! Programme ?"
    Pourquoi : superlatif flou ("exceptionnelle"), question interdite verbatim ("Programme ?"), point d'exclamation, zéro preuve concrète.
-   BON : "DPC 792€/an ANDPC. Cela vous intéresse ?"
+   BON : "DPC 792€/an indemnisés. Cela vous intéresse ?"
 
 2. MAUVAIS : "Vous voulez vous former gratuitement ?"
    Pourquoi : "gratuitement" est FAUX (c'est indemnisé par l'ANDPC, pas gratuit — confusion juridique grave). Ton paternaliste.
@@ -568,19 +620,19 @@ Six contre-exemples concrets de ce qu'il NE FAUT PAS produire. Pour chacun : pou
 
 3. MAUVAIS : "DPC jusqu'à 1000€ ! Intéressé(e) ?"
    Pourquoi : montant INVENTÉ (1000€ n'est pas le label fourni), parenthétique genrée ("Intéressé(e)"), point d'exclamation.
-   BON : "DPC 945€/an indemnisé. Cela vous intéresse ?"
+   BON : "DPC 945€/an indemnisés. Cela vous intéresse ?"
 
 4. MAUVAIS : "Formez-vous avec nous, c'est top !"
    Pourquoi : zéro preuve, jargon ("top"), point d'exclamation, aucune question d'engagement claire.
-   BON : "DPC 532€/an pour MKDE. Plus d'infos ?"
+   BON : "DPC MKDE 532€/an indemnisés. Plus d'infos ?"
 
 5. MAUVAIS : "DPC chirurgiens-dentistes 792€/an ANDPC. Souhaitez-vous voir le contenu ?" (73 caractères)
    Pourquoi : dépasse le budget courant → REJETÉ par le système, le PS ne reçoit RIEN. Empile métier long (chirurgiens-dentistes = 21 chars) + ANDPC redondant avec le montant + question formelle à rallonge. La règle de survie et le principe 10 sont précisément faits pour t'éviter ce piège : même quand le budget du <budget_accroche> est généreux, la marge supplémentaire ne sert PAS à empiler une seconde preuve — elle sert à choisir une question plus claire ou une formulation plus naturelle. Empiler dans la marge, c'est rater l'objectif de clarté.
-   BON : "DPC 792€/an. Cela vous intéresse ?" (34 caractères) — preuve + question. Métier omis car nom long. Pas d'ANDPC redondant. Largement sous le budget : la concision est une vertu.
+   BON : "DPC 792€/an indemnisés. Cela vous intéresse ?" (45 caractères) — preuve + mot de sens + question. Métier omis car nom long. Pas d'ANDPC redondant. Largement sous le budget : la concision est une vertu.
 
-6. MAUVAIS (budget large, accroche à rallonge) : "DPC chirurgiens-dentistes 945€/an indemnisé ANDPC. Le programme vous intéresse-t-il ?" (84 caractères, budget 92)
+6. MAUVAIS (budget large, accroche à rallonge) : "DPC chirurgiens-dentistes 945€/an indemnisés ANDPC. Le programme vous intéresse-t-il ?" (85 caractères, budget 92)
    Pourquoi : tient dans le budget MAIS empile métier + montant + source ANDPC + question formelle longue. Le PS lit en 0,5s : il décroche au mot "ANDPC". La marge n'a servi à RIEN sauf à diluer la preuve.
-   BON : "DPC dentistes 945€/an. Le programme ?" (38 caractères) — un seul angle (le montant), question courte. Le PS comprend en 0,3s.
+   BON : "DPC dentistes 945€/an indemnisés. Le programme ?" (48 caractères) — un seul angle (montant + mot de sens), question courte. Le PS comprend en 0,3s.
 </anti_patterns>`;
 
 // ─────────────────────────────────────────────────────────────────────────────
