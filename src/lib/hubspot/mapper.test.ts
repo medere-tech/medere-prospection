@@ -15,7 +15,7 @@ import type { Contact } from "@/types/contact";
 
 import type { HubspotContactRaw } from "./contacts";
 import {
-  __deriveSegmentFromPhoneType_FOR_TESTS as deriveSegmentFromPhoneType,
+  __deriveSegmentForMedereContact_FOR_TESTS as deriveSegmentForMedereContact,
   extractOptOutFlags,
   HUBSPOT_CIVILITE_MAP,
   HUBSPOT_DEFAULT_LEGITIMATE_INTEREST,
@@ -74,9 +74,10 @@ describe("mapHubSpotContactToFirestoreContact — happy path", () => {
     expect(c.phone.raw).toBe("0612345678");
     expect(c.phone.type).toBe("mobile");
     expect(c.phone.valid).toBe(true);
-    // S10.1.9 BLOCTEL-001 : segment dérivé depuis phone.type. Mobile FR
-    // (06...) → b2c_mobile_perso (vérif Bloctel obligatoire L.34-5 CPCE).
-    expect(c.segment).toBe("b2c_mobile_perso");
+    // S10.2.8 : tout PS Médéré (base DPC) est classé B2B, quel que soit
+    // phone.type (mobile 06/07 inclus). Bloctel = canal téléphonique
+    // vocal (art. L.223-1 code conso), ne s'applique pas au SMS.
+    expect(c.segment).toBe("b2b_cabinet");
     expect(c.bloctelChecked).toBe(false);
     expect(c.bloctelOptOut).toBe(false);
     expect(c.consent.legitimateInterest).toBe(HUBSPOT_DEFAULT_LEGITIMATE_INTEREST);
@@ -500,37 +501,36 @@ describe("Pure function & idempotence", () => {
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
-// S10.1.9 BLOCTEL-001 — Segment derivation from phone.type
+// S10.2.8 — Segment pour contact Médéré (invariant : toujours b2b_cabinet)
 // ─────────────────────────────────────────────────────────────────────────────
-// Avant S10.1.9 : `segment` était hardcodé à "unknown" → 100% des contacts
-// seedés esquivaient la règle Bloctel. Risque CNIL 75 k€ par mobile perso
-// inscrit Bloctel envoyé sans check.
+// POSTULAT MÉTIER : le mapper HubSpot Médéré ne mappe QUE des PS pros de la
+// base DPC (validation stricte `profession ∈ CONTACT_SPECIALITY_VALUES` en
+// amont, throw sinon). Tout contact qui sort du mapper est donc B2B au sens
+// marketing SMS, quel que soit `phone.type` (mobile 06/07 inclus).
 //
-// On teste :
-//   1. Le helper `deriveSegmentFromPhoneType` en isolation (4 cas exhaustifs
-//      — switch TS garantit la complétude au compile-time).
-//   2. L'intégration via le mapper : mobile FR → b2c_mobile_perso, landline
-//      FR → b2b_cabinet. Le cas mobile est aussi couvert par le happy path
-//      ligne 75. Pas de test d'intégration VOIP/unknown via libphonenumber —
-//      les classifications dépendent de la version de metadata embarquée et
-//      sont sujettes à drift entre releases ; le helper en isolation suffit
-//      à verrouiller le mapping.
+// Le régime Bloctel (art. L.223-1 code conso) vise le démarchage TÉLÉPHONIQUE
+// VOCAL — il ne s'applique pas au SMS (régi par L.34-5 CPCE). La garde
+// `canSendB2C` (règle 7 preSendCheck) reste dormante : `b2b_cabinet` la
+// court-circuite. Conservée pour un éventuel canal voix futur.
+//
+// Note historique : une version antérieure (S10.1.9 BLOCTEL-001) dérivait le
+// segment depuis `phone.type` (mobile → b2c_mobile_perso). Cette narrative
+// était fausse pour SMS. Corrigée par S10.2.8 après vérif bloctel.gouv.fr.
 
-describe("Segment derivation from phone.type (BLOCTEL-001)", () => {
-  it("helper: mobile → 'b2c_mobile_perso' (vérif Bloctel obligatoire)", () => {
-    expect(deriveSegmentFromPhoneType("mobile")).toBe("b2c_mobile_perso");
+describe("Segment for Médéré contact (S10.2.8 — always b2b_cabinet)", () => {
+  it("helper: retourne 'b2b_cabinet' (invariant PS pro DPC)", () => {
+    expect(deriveSegmentForMedereContact()).toBe("b2b_cabinet");
   });
 
-  it("helper: landline → 'b2b_cabinet' (ligne pro exemptée Bloctel)", () => {
-    expect(deriveSegmentFromPhoneType("landline")).toBe("b2b_cabinet");
-  });
-
-  it("helper: voip → 'b2b_cabinet' (standard pro 3CX/RingCentral)", () => {
-    expect(deriveSegmentFromPhoneType("voip")).toBe("b2b_cabinet");
-  });
-
-  it("helper: unknown → 'unknown' (tracer l'incertitude, ne pas masquer)", () => {
-    expect(deriveSegmentFromPhoneType("unknown")).toBe("unknown");
+  it("intégration: mobile FR (06...) → segment 'b2b_cabinet' (PAS b2c_mobile_perso)", () => {
+    const raw = buildValidRaw({ mobilephone: "0612345678", phone: null });
+    const c = mapHubSpotContactToFirestoreContact({
+      raw,
+      campaignId: CAMPAIGN_ID,
+      now: FIXED_NOW,
+    });
+    expect(c.phone.type).toBe("mobile");
+    expect(c.segment).toBe("b2b_cabinet");
   });
 
   it("intégration: landline FR (01... Paris) → segment 'b2b_cabinet'", () => {

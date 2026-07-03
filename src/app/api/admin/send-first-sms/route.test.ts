@@ -136,7 +136,7 @@ function buildFakeContact(overrides: Partial<Contact> = {}): Contact {
       valid: true,
       lookupAt: now,
     },
-    segment: "b2c_mobile_perso",
+    segment: "b2b_cabinet",
     bloctelChecked: true,
     bloctelOptOut: false,
     consent: {

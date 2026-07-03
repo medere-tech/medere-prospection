@@ -58,7 +58,7 @@ import { Timestamp } from "firebase-admin/firestore";
 
 import { CONTACT_SPECIALITY_VALUES } from "@/lib/firestore/contacts";
 import { ValidationError } from "@/lib/utils/errors";
-import { parsePhone, type PhoneType, toE164 } from "@/lib/utils/phone";
+import { parsePhone, toE164 } from "@/lib/utils/phone";
 import type { Contact, ContactCivilite, ContactSegment, ContactSpeciality } from "@/types/contact";
 
 import type { HubspotContactRaw } from "./contacts";
@@ -144,40 +144,38 @@ function shortFingerprint(value: string): string {
 }
 
 /**
- * Dérive le segment Bloctel depuis le type de ligne téléphonique heuristique
- * (S10.1.9 BLOCTEL-001).
+ * Segment Firestore pour un contact Médéré.
  *
- *   - mobile   → "b2c_mobile_perso" (vérif Bloctel obligatoire L.34-5 CPCE)
- *   - landline → "b2b_cabinet"      (ligne pro exemptée Bloctel)
- *   - voip     → "b2b_cabinet"      (standard téléphonique pro type 3CX /
- *                                    RingCentral, contexte cabinet dentaire)
- *   - unknown  → "unknown"          (préservé pour TRACER l'incertitude — ne
- *                                    pas masquer derrière b2b_cabinet par
- *                                    défaut, sinon un mobile perso mal-détecté
- *                                    par libphonenumber-js comme
- *                                    FIXED_LINE_OR_MOBILE échapperait
- *                                    silencieusement au check Bloctel)
+ * POSTULAT MÉTIER : le mapper HubSpot ne mappe QUE des professionnels de
+ * santé de la base DPC Médéré. Par construction (la validation stricte
+ * `profession ∈ CONTACT_SPECIALITY_VALUES` en amont throw sinon), tout
+ * contact qui arrive ici est un PS pro. Il est donc classé B2B, quel que
+ * soit le type de ligne téléphonique (mobile 06/07 inclus).
  *
- * Avant S10.1.9 : `segment` était hardcodé à `"unknown"` pour 100% des
- * contacts seedés, ce qui court-circuitait systématiquement la règle Bloctel
- * (`canSendB2C` autorise tout segment ≠ `b2c_mobile_perso`). Risque CNIL
- * 75 000 € par PS portant un mobile perso inscrit Bloctel.
+ * Pourquoi PAS `b2c_mobile_perso` même pour un mobile 06/07 :
+ * Le régime Bloctel (art. L.223-1 code conso) vise le démarchage
+ * TÉLÉPHONIQUE VOCAL. Il ne s'applique PAS au canal SMS. Le SMS commercial
+ * est régi séparément par L.34-5 CPCE (opt-in ou intérêt légitime B2B +
+ * STOP obligatoire + identité annonceur). La sanction Bloctel de 75 k€ /
+ * 375 k€ n'est PAS encourue par un SMS. Un PS avec un mobile perso reste
+ * un PS pro au sens marketing SMS.
  *
- * 🔒 Verrouillé par tests exhaustifs dans `mapper.test.ts` (section
- *    "Segment derivation from phone.type"). Le switch exhaustif TS interdit
- *    qu'un nouveau `PhoneType` soit ajouté sans mise à jour de cette
- *    fonction (compile error).
+ * La garde `canSendB2C` (`src/lib/compliance/bloctel.ts`, règle 7 de
+ * `preSendCheck`) reste dormante côté production : `b2b_cabinet` la
+ * court-circuite à `allowed: true`. Elle est conservée en défense-en-
+ * profondeur pour un éventuel canal voix futur (si Médéré ajoute un jour
+ * du démarchage téléphonique, il faudra alors marquer certains contacts
+ * en `b2c_mobile_perso` et alimenter les flags Bloctel via un autre chemin
+ * de code, pas via ce mapper).
+ *
+ * Note historique : une version antérieure (S10.1.9 BLOCTEL-001) dérivait
+ * le segment depuis `phone.type` (mobile → `b2c_mobile_perso`) en invoquant
+ * un risque CNIL 75 k€. Cette narrative était une mauvaise application du
+ * régime Bloctel au canal SMS. Corrigée par S10.2.8 après vérification
+ * bloctel.gouv.fr.
  */
-function deriveSegmentFromPhoneType(phoneType: PhoneType): ContactSegment {
-  switch (phoneType) {
-    case "mobile":
-      return "b2c_mobile_perso";
-    case "landline":
-    case "voip":
-      return "b2b_cabinet";
-    case "unknown":
-      return "unknown";
-  }
+function deriveSegmentForMedereContact(): ContactSegment {
+  return "b2b_cabinet";
 }
 
 /**
@@ -348,7 +346,7 @@ export function mapHubSpotContactToFirestoreContact(input: MapHubSpotContactInpu
       valid: phoneValid,
       lookupAt: now,
     },
-    segment: deriveSegmentFromPhoneType(phoneType),
+    segment: deriveSegmentForMedereContact(),
     bloctelChecked: false,
     bloctelOptOut: false,
     consent: {
@@ -369,9 +367,9 @@ export function mapHubSpotContactToFirestoreContact(input: MapHubSpotContactInpu
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Exposés pour tests (S10.1.9 BLOCTEL-001 — switch exhaustif testé en
-// isolation, indépendamment du parsing libphonenumber-js dont les fixtures
-// peuvent évoluer entre versions de metadata).
+// Exposés pour tests (S10.2.8 — helper exposé pour verrouiller l'invariant
+// "tout PS Médéré → b2b_cabinet" en isolation. Fonction sans paramètre : la
+// sortie constante EST l'invariant à protéger).
 // ─────────────────────────────────────────────────────────────────────────────
 
-export { deriveSegmentFromPhoneType as __deriveSegmentFromPhoneType_FOR_TESTS };
+export { deriveSegmentForMedereContact as __deriveSegmentForMedereContact_FOR_TESTS };
