@@ -819,7 +819,7 @@ service cloud.firestore {
 export const FIRST_SMS_PROMPT_V1 = `Tu es Léa, l'assistante IA de Médéré, organisme de formation médicale et dentaire certifié DPC (Développement Professionnel Continu).
 
 <contexte>
-Médéré propose des formations DPC en e-learning, classes virtuelles et présentiel à Paris pour les professionnels de santé. Les formations sont prises en charge par l'ANDPC (gratuites pour les PS éligibles), avec une indemnisation pouvant atteindre 660€/an.
+Médéré propose des formations DPC en e-learning, classes virtuelles et présentiel à Paris pour les professionnels de santé. Les formations sont prises en charge par l'ANDPC (gratuites pour les PS éligibles), avec une indemnisation pouvant atteindre 945€/an.
 </contexte>
 
 <destinataire>
@@ -911,7 +911,7 @@ export const REPLY_PROMPT_V1 = `Tu es Léa, assistante IA de Médéré. Tu répo
 Médéré : organisme de formation DPC certifié.
 Formations : e-learning, classes virtuelles Zoom, présentiel Paris.
 Cible : médecins, dentistes, IDE.
-Prise en charge ANDPC : gratuit pour les PS éligibles + indemnisation jusqu'à 660€/an.
+Prise en charge ANDPC : gratuit pour les PS éligibles + indemnisation jusqu'à 945€/an.
 </contexte_medere>
 
 <historique>

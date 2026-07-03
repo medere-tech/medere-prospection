@@ -3,7 +3,7 @@
  *
  * Scope : route handler unit (mocks Clerk + Firestore + Claude + preSendCheck).
  * Vérifie auth/authz, validation Zod, status guards (D-b1), exclusion
- * `humanReason` de la response (D-b3), anti-leak phone dans le reasoning.
+ * `humanReason` de la response (D-b3).
  */
 import { Timestamp } from "firebase-admin/firestore";
 import { NextRequest } from "next/server";
@@ -123,7 +123,6 @@ function buildFakeContact(overrides: Partial<Contact> = {}): Contact {
 
 const FAKE_GENERATION_OK = {
   body: "Bonjour Dr Dupont, Léa de Médéré. Court SMS de test. STOP pour ne plus recevoir.",
-  reasoning: "Court, vouvoiement, mention IA, mention Médéré, STOP présent.",
   promptVersion: "1.0.1",
   model: "claude-sonnet-4-6",
   temperature: 0.4,
@@ -150,7 +149,7 @@ describe("POST /api/admin/preview-first-sms", () => {
   });
 
   describe("auth + RBAC", () => {
-    it("renvoie 200 + smsBody + reasoning + check OK pour un contact 'ready'", async () => {
+    it("renvoie 200 + smsBody + check OK pour un contact 'ready'", async () => {
       mockGetContact.mockResolvedValue(buildFakeContact({ status: "ready" }));
       mockGenerateFirstSms.mockResolvedValue(FAKE_GENERATION_OK);
       mockPreSendCheck.mockReturnValue({ ok: true });
@@ -160,12 +159,10 @@ describe("POST /api/admin/preview-first-sms", () => {
       expect(res.status).toBe(200);
       const body = (await res.json()) as {
         smsBody: string;
-        reasoning: string;
         charCount: number;
         preSendCheckPassed: boolean;
       };
       expect(body.smsBody).toBe(FAKE_GENERATION_OK.body);
-      expect(body.reasoning).toBe(FAKE_GENERATION_OK.reasoning);
       expect(body.charCount).toBe(FAKE_GENERATION_OK.body.length);
       expect(body.preSendCheckPassed).toBe(true);
     });
@@ -421,7 +418,6 @@ describe("POST /api/admin/preview-first-sms", () => {
       mockGenerateFirstSms.mockResolvedValue({
         ...FAKE_GENERATION_OK,
         body: "Bonjour Dr Dupont, Léa de Médéré. STOP pour ne plus recevoir.",
-        reasoning: "Court, vouvoiement, IA mentionnée.",
       });
       mockPreSendCheck.mockReturnValue({ ok: true });
 

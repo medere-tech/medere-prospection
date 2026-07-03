@@ -13,10 +13,10 @@
  *     2. Parse body Zod strict (contactId).
  *     3. `getContact(contactId)` Firestore → 404 si absent.
  *     4. Status guard `["pending", "enriched", "ready"]` → 409 sinon.
- *     5. `generateFirstSms({ contact: subset })` → body + reasoning + metadata.
+ *     5. `generateFirstSms({ contact: subset })` → body + metadata.
  *     6. `preSendCheck` en DRY-RUN (fonction pure, no-op par design) sur
  *        `recentOutboundMessages: []` + `messageCount: 0` (1er SMS).
- *     7. Response JSON : { smsBody, reasoning, charCount, preSendCheck* }.
+ *     7. Response JSON : { smsBody, charCount, preSendCheck* }.
  *
  * ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
  * Décisions S10.1.4.b
@@ -190,7 +190,6 @@ export async function POST(req: NextRequest): Promise<NextResponse> {
     // typés suffisent — l'UI mappera vers un label FR utilisateur.
     return NextResponse.json({
       smsBody: result.body,
-      reasoning: result.reasoning,
       charCount: result.body.length,
       preSendCheckPassed: check.ok,
       ...(check.ok

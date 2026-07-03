@@ -159,6 +159,64 @@ const TEST_CONTACTS = [
       city: "Bordeaux",
     },
   },
+  // ── Fixtures angles morts S10.2 (extension coverage pré-relâche budget) ──
+  // 5 fixtures ciblant des combinaisons jamais mesurées en runtime :
+  // fallback "100% pris en charge" empilé avec métiers longs / spécialités
+  // rares (Pharmacien, Orthophoniste, Assistant(e) dentaire, Psychiatre,
+  // Pédicure-podologue). Stress-test du budget accroche avant relâche.
+  {
+    label:
+      "Pr+Pharmacien+Strasbourg (fallback 100% + ton formel + spécialité longue — empilement n°1)",
+    contact: {
+      firstName: "Antoine",
+      lastName: "Mercier",
+      civilite: "Pr",
+      speciality: "Pharmacien",
+      city: "Strasbourg",
+    },
+  },
+  {
+    label: "Dr+Orthophoniste+Nantes (fallback long + métier long + nom composé)",
+    contact: {
+      firstName: "Marie-Laure",
+      lastName: "Boucher-Lemoine",
+      civilite: "Dr",
+      speciality: "Orthophoniste",
+      city: "Nantes",
+    },
+  },
+  {
+    label:
+      "Mme+Assistant(e) dentaire+Reims (pire cas budget fallback — métier 21 chars avec parenthèse)",
+    contact: {
+      firstName: "Sandrine",
+      lastName: "Picard",
+      civilite: "Mme",
+      speciality: "Assistant(e) dentaire",
+      city: "Reims",
+    },
+  },
+  {
+    label:
+      "Dr+Psychiatre+Montpellier (bucket 945€/an jamais mesuré runtime — présent SYSTEM example seulement)",
+    contact: {
+      firstName: "Olivier",
+      lastName: "Fontaine",
+      civilite: "Dr",
+      speciality: "Psychiatre",
+      city: "Montpellier",
+    },
+  },
+  {
+    label: "M.+Pédicure-podologue+Grenoble (fallback + métier 18 chars)",
+    contact: {
+      firstName: "Vincent",
+      lastName: "Delacroix",
+      civilite: "M.",
+      speciality: "Pédicure-podologue",
+      city: "Grenoble",
+    },
+  },
 ];
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -218,11 +276,20 @@ const report = {
   temperature: FIRST_SMS_TEMPERATURE,
   totalCalls: 0,
   compliancePassed: 0,
+  // v3.2.0 — flag qualité SÉPARÉ des 3 flags légaux (SOFT, n'affecte pas
+  // exit code). Décision Q-G : le mot de sens "indemnisés" est une
+  // optimisation de clarté, pas une obligation légale — pas de hard-fail
+  // au niveau du script (cohérent avec l'absence de garde-fou runtime
+  // dans first-sms-generator.ts).
+  qualityBodiesWithAmount: 0,
+  qualitySensWordPassed: 0,
   contacts: [],
 };
 
 let totalCalls = 0;
 let compliancePassed = 0;
+let qualityBodiesWithAmount = 0;
+let qualitySensWordPassed = 0;
 let totalDurationMs = 0;
 let totalTokensInput = 0;
 let totalTokensOutput = 0;
@@ -252,14 +319,28 @@ for (const { label, contact } of TEST_CONTACTS) {
       const lengthOk = length >= FIRST_SMS_MIN_BODY_CHARS && length <= FIRST_SMS_MAX_BODY_CHARS;
       const allPass = hasAI && hasOpt && hasAdv && lengthOk;
 
+      // v3.2.0 — flag qualité SÉPARÉ (règle canonique <indemnisation> §2).
+      // Si le body contient un montant en euros, il DOIT contenir un mot
+      // de sens ∈ {indemnisés, versés}. Non-applicable pour les fallback
+      // "100% pris en charge" (règle §3 : anti-empilement redondant) →
+      // hasSensWord = null.
+      const hasAmount = /\d+€/.test(result.body);
+      const hasSensWord = hasAmount ? /\b(indemnisés|versés)\b/i.test(result.body) : null;
+      if (hasAmount) {
+        qualityBodiesWithAmount++;
+        if (hasSensWord === true) qualitySensWordPassed++;
+      }
+
       totalDurationMs += result.generationDurationMs;
       totalTokensInput += result.tokensInput;
       totalTokensOutput += result.tokensOutput;
 
       if (allPass) compliancePassed++;
 
-      // Console : pas le body brut, juste flags + length.
-      const flags = `AI=${hasAI ? "✓" : "✗"} STOP=${hasOpt ? "✓" : "✗"} MEDERE=${hasAdv ? "✓" : "✗"} len=${length}`;
+      // Console : pas le body brut, juste flags + length. Le flag SENS est
+      // visible mais séparé — un ✗ sur SENS ne fait PAS échouer le run.
+      const sensFlag = hasSensWord === null ? "n/a" : hasSensWord ? "✓" : "✗";
+      const flags = `AI=${hasAI ? "✓" : "✗"} STOP=${hasOpt ? "✓" : "✗"} MEDERE=${hasAdv ? "✓" : "✗"} SENS=${sensFlag} len=${length}`;
       console.log(
         `  Run ${i + 1}/${RUNS_PER_CONTACT}: ${allPass ? "✅" : "❌"} ${flags} (${result.generationDurationMs}ms)`,
       );
@@ -267,9 +348,9 @@ for (const { label, contact } of TEST_CONTACTS) {
       contactReport.runs.push({
         runIdx: i + 1,
         body: result.body,
-        reasoning: result.reasoning,
         length,
         compliance: { hasAI, hasOpt, hasAdv, lengthOk },
+        qualityFlags: { hasAmount, hasSensWord },
         allPass,
         durationMs: result.generationDurationMs,
         tokensInput: result.tokensInput,
@@ -299,7 +380,7 @@ for (const { label, contact } of TEST_CONTACTS) {
           code,
           message,
           // Diag-only : path + code sanitized depuis client.ts wrapper.
-          // Pas de body/reasoning brut (anti-fuite PII).
+          // Pas de body brut (anti-fuite PII).
           issues,
         },
         allPass: false,
@@ -311,6 +392,8 @@ for (const { label, contact } of TEST_CONTACTS) {
 
 report.totalCalls = totalCalls;
 report.compliancePassed = compliancePassed;
+report.qualityBodiesWithAmount = qualityBodiesWithAmount;
+report.qualitySensWordPassed = qualitySensWordPassed;
 report.averageDurationMs = Math.round(totalDurationMs / totalCalls);
 report.totalTokensInput = totalTokensInput;
 report.totalTokensOutput = totalTokensOutput;
@@ -328,6 +411,12 @@ console.log("=".repeat(80));
 console.log(`Average duration : ${report.averageDurationMs}ms/call`);
 console.log(`Total tokens in  : ${totalTokensInput}`);
 console.log(`Total tokens out : ${totalTokensOutput}`);
+console.log(
+  `Qualité (mot de sens) : ${qualitySensWordPassed}/${qualityBodiesWithAmount} bodies chiffrés portent un mot ∈ {indemnisés, versés}` +
+    (qualityBodiesWithAmount > 0 && qualitySensWordPassed < qualityBodiesWithAmount
+      ? " ⚠️ (flag SOFT — n'affecte pas exit code, mais À VÉRIFIER dans le rapport JSON)"
+      : ""),
+);
 console.log(`Rapport JSON     : ${outputPath}`);
 console.log();
 
@@ -339,7 +428,7 @@ if (compliancePassed === totalCalls) {
   console.log(
     "❌ GOLDEN TEST FAILED — " + (totalCalls - compliancePassed) + " bodies non conformes.",
   );
-  console.log("   Inspecte le rapport JSON pour les détails (bodies + reasoning).");
+  console.log("   Inspecte le rapport JSON pour les détails (bodies + flags).");
   console.log("   Actions possibles :");
   console.log("     1. Re-lancer (transitoire SDK ?)");
   console.log("     2. Renforcer SYSTEM prompt sur le marqueur manquant");

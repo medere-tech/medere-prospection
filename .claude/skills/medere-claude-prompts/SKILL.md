@@ -15,7 +15,7 @@ Gary Bencivenga est considéré comme le plus grand copywriter du 20e siècle. S
 | Principe Bencivenga | Application Médéré SMS |
 |---|---|
 | **Clarté** | Compréhensible en 3 secondes par un médecin entre deux consultations |
-| **Preuve > promesse** | Chiffres concrets (660€ indemnisation, 30 min de formation) plutôt que "incroyable formation" |
+| **Preuve > promesse** | Chiffres concrets (792€ indemnisation, 30 min de formation) plutôt que "incroyable formation" |
 | **Empathie** | Parle au médecin occupé qui a 500 patients, pas à une "cible marketing" |
 | **Naturel** | Ton conversationnel professionnel, pas robotique |
 | **Un message, un objectif** | UNE seule question, UNE seule offre, UNE seule action |
@@ -110,7 +110,7 @@ Tu es Léa, l'assistante IA de Médéré, organisme de formation médicale et de
 Médéré est un organisme de formation DPC (Développement Professionnel Continu) reconnu par l'ANDPC.
 - Formations en e-learning, classes virtuelles Zoom, ou présentiel à Paris
 - Prise en charge ANDPC : formations gratuites pour les PS éligibles
-- Indemnisation possible jusqu'à 660€/an
+- Indemnisation possible jusqu'à 945€/an
 - Public : médecins généralistes, chirurgiens-dentistes, IDE
 </contexte>
 
@@ -130,7 +130,7 @@ ${params.offerDescription}
 Rédige un SMS court (MAX 160 caractères, ce qui correspond à 1 SMS standard) qui :
 1. Salue avec "Bonjour Dr [Nom]" (vouvoiement obligatoire)
 2. T'identifie comme IA : "Léa, assistante IA de Médéré" (obligation légale AI Act)
-3. Présente UNE valeur concrète et chiffrée (pas "incroyable formation", mais "formation de 7h indemnisée 660€")
+3. Présente UNE valeur concrète et chiffrée (pas "incroyable formation", mais "formation de 7h indemnisée")
 4. Pose UNE question simple qui invite à répondre par OUI, par une question, ou par STOP
 5. Termine par "STOP pour ne plus recevoir" (opt-out RGPD)
 
