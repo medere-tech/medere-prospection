@@ -69,3 +69,52 @@ export interface SmsResult {
   messageIds: readonly string[];
   creditsRemoved: number;
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Réception SMS entrant (webhook OVH — S9.6, INFRA-SMS-001)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * Payload BRUT d'un SMS entrant OVH, tel que capturé en réel sur le service
+ * SMS `sms-ng66707-1` via `GET /sms/{serviceName}/incoming/{id}` lors de
+ * S9.6-EXPLORE (numéro Time2Chat `+33939070545`).
+ *
+ * ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ * ⚠️ POINTS D'ATTENTION FIGÉS PAR LA CAPTURE RÉELLE
+ *
+ *   - `id` est un **NUMBER**, pas une string (contrairement au guess du
+ *     skill `medere-ovh-sms:284-291` qui documentait un `z.union([string,
+ *     number])`). Le parser (`parse-incoming.ts`) le convertit en string
+ *     via `String(id)` avant émission de l'event Inngest
+ *     `medere/sms.reply.received` (schema `ovhMessageId: z.string().min(1)`).
+ *
+ *   - `sender` est **déjà en E.164** avec le préfixe `+` (ex: `+33775745453`).
+ *     Le parser VALIDE via `E164_REGEX` mais ne RE-NORMALISE PAS —
+ *     évite toute réinterprétation via `libphonenumber-js` d'un numéro
+ *     déjà canonique côté OVH.
+ *
+ * ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ * DIVERGENCE ATTENDUE ENTRE CE TYPE ET LE SCHEMA ZOD DU PARSER
+ *
+ * Ce type reflète le format RÉEL COMPLET tel qu'OVH le renvoie sur GET.
+ * Le schema Zod du parser (`OvhInboundRawSchema` dans `parse-incoming.ts`)
+ * ne rend REQUIRED que les 3 champs qui alimentent l'event downstream
+ * (`id`, `sender`, `message`) et rend OPTIONNELS les 3 champs de confort
+ * (`creationDatetime`, `credits`, `tag`) — tolérance aux payloads
+ * minimalistes qu'OVH pourrait émettre via son callback POST (format non
+ * confirmé, cf. JSDoc route `/api/webhooks/ovh-sms/route.ts`).
+ */
+export interface OvhInboundSms {
+  /** ID OVH unique du SMS entrant. NUMBER dans la réponse OVH. */
+  id: number;
+  /** Numéro de l'expéditeur du SMS entrant, déjà en E.164 (ex: `+33775745453`). */
+  sender: string;
+  /** Corps brut du SMS entrant, jusqu'à 1600 chars = 10 segments GSM-7. */
+  message: string;
+  /** ISO 8601 avec offset timezone (ex: `2026-07-15T12:24:10+02:00`). */
+  creationDatetime: string;
+  /** Crédits SMS consommés côté OVH (typiquement 0 pour un entrant). */
+  credits: number;
+  /** Tag OVH (souvent vide). */
+  tag: string;
+}
