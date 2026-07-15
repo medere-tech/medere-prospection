@@ -377,7 +377,7 @@ OVH_APP_KEY=                         # https://api.ovh.com/createApp/
 OVH_APP_SECRET=
 OVH_CONSUMER_KEY=                    # Restreint à POST /sms/*/jobs
 OVH_SMS_SERVICE_NAME=                # ex: sms-ab12345-1
-OVH_SMS_SENDER=Medere                # Sender ID (max 11 chars)
+OVH_SMS_SENDER=Medere                # Sender ID : alpha ≤11 chars OU E.164 (ex Time2Chat +33939070545, S9.7)
 OVH_WEBHOOK_SECRET=                  # Pour signer les webhooks entrants
 
 # === Twilio (Lookup uniquement) ===
