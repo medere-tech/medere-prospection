@@ -1,19 +1,16 @@
 /**
- * Tests POST /api/webhooks/ovh-sms (S9.6, INFRA-SMS-001).
+ * Tests POST /api/webhooks/ovh-sms (S9.6-FIX2, INFRA-SMS-001).
  *
  * Scope : route handler unit (mocks env + rate-limit + inngest). Vérifie :
- *   - 200 sur payload JSON + token valides → inngest.send appelé avec
- *     EXACTEMENT {phone, body, ovhMessageId}
- *   - 200 sur payload form-urlencoded (id STRING → converti en NUMBER
- *     puis mappé vers ovhMessageId STRING)
- *   - 401 sur token absent
- *   - 401 sur token invalide (timing-safe compare)
- *   - 400 sur body JSON malformé (transport-level)
- *   - 400 sur shape invalide (parser Zod)
- *   - 400 sur sender non-E.164
+ *   - 200 sur payload form-urlencoded RÉEL (senderid + id number + ...)
+ *     avec inngest.send appelé avec EXACTEMENT {phone, body, ovhMessageId}
+ *   - 200 sur payload JSON équivalent (fallback défensif défini dans la route)
+ *   - normalisation E.164 via senderid=0612345678 → phone="+33612345678"
+ *   - 401 sur token absent / invalide / vide
+ *   - 400 sur body malformé / shape invalide / senderid non-normalisable
  *   - 429 sur rate-limit dépassé + header Retry-After
  *   - anti-leak : la réponse d'erreur ne contient jamais le body brut ni
- *     le sender
+ *     le senderid
  *
  * ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
  * PATTERN MOCK — vi.hoisted pour référence stable
@@ -69,24 +66,64 @@ vi.mock("@/lib/utils/logger", () => ({
 import { POST } from "./route";
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Constantes / fixtures
+// Constantes / fixtures — CALLBACK PUSH format (S9.6-FIX2)
 // ─────────────────────────────────────────────────────────────────────────────
 
 const VALID_TOKEN = "test-secret-min-16-chars-long-xxx";
 
-const REAL_OVH_INBOUND = {
-  credits: 0,
-  creationDatetime: "2026-07-15T12:24:10+02:00",
-  id: 118791103,
-  sender: "+33775745453",
+/**
+ * Payload callback push RÉEL (capturé prod S9.6-FIX). Format
+ * `application/x-www-form-urlencoded` côté transport → toutes les valeurs
+ * sont des STRINGS quand elles arrivent via `URLSearchParams`. La route
+ * convertit `id` string→number (`route.ts:143-144`) avant de passer au
+ * parser (qui exige `z.number().int()`).
+ */
+const REAL_CALLBACK_FIELDS = {
+  id: "118791103",
+  senderid: "+33775745453",
   message: "Test réception Medere 1",
+  keyword: "",
+  shortcode: "+33939070545",
   tag: "",
+  token: VALID_TOKEN,
 } as const;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Helpers
 // ─────────────────────────────────────────────────────────────────────────────
 
+/**
+ * Request form-urlencoded — c'est le format RÉEL du callback push OVH.
+ * `id` est envoyé en string via URLSearchParams (comme OVH le fait), la
+ * route le convertit en number côté `readRawPayload`.
+ */
+function buildFormRequest(
+  fields: Record<string, string>,
+  opts: { token?: string | null; ip?: string } = {},
+): NextRequest {
+  const url = new URL("https://medere.example/api/webhooks/ovh-sms");
+  if (opts.token !== null) {
+    url.searchParams.set("token", opts.token ?? VALID_TOKEN);
+  }
+  const form = new URLSearchParams();
+  for (const [k, v] of Object.entries(fields)) form.append(k, v);
+  return new NextRequest(url, {
+    method: "POST",
+    body: form.toString(),
+    headers: {
+      "content-type": "application/x-www-form-urlencoded",
+      "x-forwarded-for": opts.ip ?? "203.0.113.42",
+    },
+  });
+}
+
+/**
+ * Request JSON — fallback défensif défini dans `readRawPayload` (Content-Type
+ * absent ou `application/json`). Le format callback push OVH réel est
+ * form-urlencoded ; ce helper couvre le path JSON pour prouver que la route
+ * gère aussi ce transport (les valeurs numériques restent native, pas de
+ * conversion).
+ */
 function buildJsonRequest(
   body: unknown,
   opts: { token?: string | null; ip?: string } = {},
@@ -100,26 +137,6 @@ function buildJsonRequest(
     body: typeof body === "string" ? body : JSON.stringify(body),
     headers: {
       "content-type": "application/json",
-      "x-forwarded-for": opts.ip ?? "203.0.113.42",
-    },
-  });
-}
-
-function buildFormRequest(
-  body: Record<string, string>,
-  opts: { token?: string | null; ip?: string } = {},
-): NextRequest {
-  const url = new URL("https://medere.example/api/webhooks/ovh-sms");
-  if (opts.token !== null) {
-    url.searchParams.set("token", opts.token ?? VALID_TOKEN);
-  }
-  const form = new URLSearchParams();
-  for (const [k, v] of Object.entries(body)) form.append(k, v);
-  return new NextRequest(url, {
-    method: "POST",
-    body: form.toString(),
-    headers: {
-      "content-type": "application/x-www-form-urlencoded",
       "x-forwarded-for": opts.ip ?? "203.0.113.42",
     },
   });
@@ -159,12 +176,12 @@ describe("POST /api/webhooks/ovh-sms", () => {
   });
 
   // ───────────────────────────────────────────────────────────────────────
-  // 200 happy path
+  // 200 happy path — callback push réel
   // ───────────────────────────────────────────────────────────────────────
 
-  describe("200 happy path", () => {
-    it("payload JSON valide + token valide → 200 + inngest.send appelé avec {phone, body, ovhMessageId}", async () => {
-      const res = await POST(buildJsonRequest(REAL_OVH_INBOUND));
+  describe("200 happy path (callback push form-urlencoded)", () => {
+    it("payload form-urlencoded réel + token valide → 200 + inngest.send avec {phone, body, ovhMessageId}", async () => {
+      const res = await POST(buildFormRequest(REAL_CALLBACK_FIELDS));
 
       expect(res.status).toBe(200);
       const body = (await res.json()) as { ok: boolean };
@@ -179,12 +196,25 @@ describe("POST /api/webhooks/ovh-sms", () => {
       });
     });
 
-    it("payload form-urlencoded → id STRING converti en NUMBER puis ovhMessageId STRING", async () => {
+    it("normalise senderid national FR (0612345678 → +33612345678)", async () => {
       const res = await POST(
         buildFormRequest({
-          id: "118791103",
-          sender: "+33775745453",
-          message: "Test form",
+          ...REAL_CALLBACK_FIELDS,
+          senderid: "0612345678",
+        }),
+      );
+
+      expect(res.status).toBe(200);
+      const event = mockInngestSend.mock.calls[0]?.[0] as { data: Record<string, unknown> };
+      expect(event.data).toMatchObject({ phone: "+33612345678" });
+    });
+
+    it("payload JSON équivalent (fallback défensif) → 200 avec id NUMBER natif", async () => {
+      const res = await POST(
+        buildJsonRequest({
+          id: 118791103, // number natif en JSON
+          senderid: "+33775745453",
+          message: "Test JSON",
         }),
       );
 
@@ -192,26 +222,33 @@ describe("POST /api/webhooks/ovh-sms", () => {
       const event = mockInngestSend.mock.calls[0]?.[0] as { data: Record<string, unknown> };
       expect(event.data).toEqual({
         phone: "+33775745453",
-        body: "Test form",
+        body: "Test JSON",
         ovhMessageId: "118791103",
       });
     });
 
     it("event.id NON forgé manuellement (règle anti-PII events.ts:49-73)", async () => {
-      await POST(buildJsonRequest(REAL_OVH_INBOUND));
+      await POST(buildFormRequest(REAL_CALLBACK_FIELDS));
 
       const event = mockInngestSend.mock.calls[0]?.[0] as { id?: string };
       expect(event.id).toBeUndefined();
     });
+
+    it("les champs OVH annexes (keyword/shortcode/tag/token) ne fuitent PAS dans l'event data", async () => {
+      await POST(buildFormRequest(REAL_CALLBACK_FIELDS));
+
+      const event = mockInngestSend.mock.calls[0]?.[0] as { data: Record<string, unknown> };
+      expect(Object.keys(event.data).sort()).toEqual(["body", "ovhMessageId", "phone"]);
+    });
   });
 
   // ───────────────────────────────────────────────────────────────────────
-  // 401 authentification (token)
+  // 401 authentification (token) — inchangé S9.6-FIX2
   // ───────────────────────────────────────────────────────────────────────
 
   describe("401 token verification", () => {
     it("renvoie 401 si token absent (query param manquant)", async () => {
-      const res = await POST(buildJsonRequest(REAL_OVH_INBOUND, { token: null }));
+      const res = await POST(buildFormRequest(REAL_CALLBACK_FIELDS, { token: null }));
 
       expect(res.status).toBe(401);
       const body = (await res.json()) as { error: { code: string } };
@@ -221,7 +258,7 @@ describe("POST /api/webhooks/ovh-sms", () => {
 
     it("renvoie 401 si token invalide (mauvais secret)", async () => {
       const res = await POST(
-        buildJsonRequest(REAL_OVH_INBOUND, { token: "wrong-secret-not-matching" }),
+        buildFormRequest(REAL_CALLBACK_FIELDS, { token: "wrong-secret-not-matching" }),
       );
 
       expect(res.status).toBe(401);
@@ -229,7 +266,7 @@ describe("POST /api/webhooks/ovh-sms", () => {
     });
 
     it("renvoie 401 si token vide (string vide)", async () => {
-      const res = await POST(buildJsonRequest(REAL_OVH_INBOUND, { token: "" }));
+      const res = await POST(buildFormRequest(REAL_CALLBACK_FIELDS, { token: "" }));
 
       expect(res.status).toBe(401);
       expect(mockInngestSend).not.toHaveBeenCalled();
@@ -237,7 +274,7 @@ describe("POST /api/webhooks/ovh-sms", () => {
   });
 
   // ───────────────────────────────────────────────────────────────────────
-  // 400 shape / parse
+  // 400 shape / parse — nouveaux tests format callback push
   // ───────────────────────────────────────────────────────────────────────
 
   describe("400 validation", () => {
@@ -262,21 +299,50 @@ describe("POST /api/webhooks/ovh-sms", () => {
     });
 
     it("renvoie 400 si shape invalide (champ id absent)", async () => {
-      const res = await POST(buildJsonRequest({ sender: "+33775745453", message: "test" }));
+      const withoutId: Record<string, string> = { ...REAL_CALLBACK_FIELDS };
+      delete withoutId.id;
+      const res = await POST(buildFormRequest(withoutId));
 
       expect(res.status).toBe(400);
       expect(mockInngestSend).not.toHaveBeenCalled();
     });
 
-    it("renvoie 400 si sender non-E.164 (national FR sans +33)", async () => {
-      const res = await POST(buildJsonRequest({ ...REAL_OVH_INBOUND, sender: "0775745453" }));
+    it("renvoie 400 si senderid absent", async () => {
+      const withoutSenderid: Record<string, string> = { ...REAL_CALLBACK_FIELDS };
+      delete withoutSenderid.senderid;
+      const res = await POST(buildFormRequest(withoutSenderid));
+
+      expect(res.status).toBe(400);
+      expect(mockInngestSend).not.toHaveBeenCalled();
+    });
+
+    it("renvoie 400 si senderid non-normalisable en E.164 (junk string)", async () => {
+      const res = await POST(
+        buildFormRequest({ ...REAL_CALLBACK_FIELDS, senderid: "notaphonenumber" }),
+      );
 
       expect(res.status).toBe(400);
       expect(mockInngestSend).not.toHaveBeenCalled();
     });
 
     it("renvoie 400 si message vide", async () => {
-      const res = await POST(buildJsonRequest({ ...REAL_OVH_INBOUND, message: "" }));
+      const res = await POST(buildFormRequest({ ...REAL_CALLBACK_FIELDS, message: "" }));
+
+      expect(res.status).toBe(400);
+      expect(mockInngestSend).not.toHaveBeenCalled();
+    });
+
+    it("renvoie 400 anti-régression : format LEGACY 'sender' rejeté (dédié au callback push senderid)", async () => {
+      // Sentinelle : si demain quelqu'un remet accidentellement le format
+      // GET incoming (champ `sender`) au lieu du callback push (senderid),
+      // ce test doit casser.
+      const res = await POST(
+        buildFormRequest({
+          id: "42",
+          sender: "+33775745453", // ancien nom de champ
+          message: "test",
+        } as unknown as Record<string, string>),
+      );
 
       expect(res.status).toBe(400);
       expect(mockInngestSend).not.toHaveBeenCalled();
@@ -284,7 +350,7 @@ describe("POST /api/webhooks/ovh-sms", () => {
   });
 
   // ───────────────────────────────────────────────────────────────────────
-  // 429 rate-limit
+  // 429 rate-limit — inchangé S9.6-FIX2
   // ───────────────────────────────────────────────────────────────────────
 
   describe("429 rate-limit", () => {
@@ -296,7 +362,7 @@ describe("POST /api/webhooks/ovh-sms", () => {
         reason: "rate_limited",
       });
 
-      const res = await POST(buildJsonRequest(REAL_OVH_INBOUND));
+      const res = await POST(buildFormRequest(REAL_CALLBACK_FIELDS));
 
       expect(res.status).toBe(429);
       expect(res.headers.get("Retry-After")).toMatch(/^\d+$/);
@@ -313,7 +379,7 @@ describe("POST /api/webhooks/ovh-sms", () => {
         reason: "rate_limited",
       });
 
-      const res = await POST(buildJsonRequest(REAL_OVH_INBOUND));
+      const res = await POST(buildFormRequest(REAL_CALLBACK_FIELDS));
 
       expect(res.status).toBe(429);
       const retryAfter = Number.parseInt(res.headers.get("Retry-After") ?? "0", 10);
@@ -328,7 +394,7 @@ describe("POST /api/webhooks/ovh-sms", () => {
         reason: "rate_limiter_unavailable",
       });
 
-      const res = await POST(buildJsonRequest(REAL_OVH_INBOUND));
+      const res = await POST(buildFormRequest(REAL_CALLBACK_FIELDS));
 
       expect(res.status).toBe(429);
       expect(mockInngestSend).not.toHaveBeenCalled();
@@ -340,19 +406,23 @@ describe("POST /api/webhooks/ovh-sms", () => {
   // ───────────────────────────────────────────────────────────────────────
 
   describe("anti-leak — la réponse d'erreur ne fuit rien de sensible", () => {
-    it("400 shape invalide → la réponse ne contient PAS le sender/body brut", async () => {
-      const res = await POST(buildJsonRequest({ ...REAL_OVH_INBOUND, sender: "0775745453" }));
+    it("400 shape invalide → la réponse ne contient PAS le senderid/message brut", async () => {
+      // Junk sans aucun chiffre — sinon libphonenumber-js extrait un numéro
+      // valide de la string, ce qui ferait passer la normalisation.
+      const res = await POST(
+        buildFormRequest({ ...REAL_CALLBACK_FIELDS, senderid: "notaphonenumberatall" }),
+      );
 
       expect(res.status).toBe(400);
       const bodyText = await res.text();
-      expect(bodyText).not.toContain("0775745453");
-      expect(bodyText).not.toContain(REAL_OVH_INBOUND.message);
+      expect(bodyText).not.toContain("notaphonenumberatall");
+      expect(bodyText).not.toContain(REAL_CALLBACK_FIELDS.message);
       const parsed = JSON.parse(bodyText) as { error: { message: string } };
       expect(parsed.error.message).toBe("Données invalides.");
     });
 
     it("401 token invalide → la réponse ne contient PAS le token attendu ni reçu", async () => {
-      const res = await POST(buildJsonRequest(REAL_OVH_INBOUND, { token: "wrong-secret-xxx" }));
+      const res = await POST(buildFormRequest(REAL_CALLBACK_FIELDS, { token: "wrong-secret-xxx" }));
 
       expect(res.status).toBe(401);
       const bodyText = await res.text();
@@ -362,7 +432,7 @@ describe("POST /api/webhooks/ovh-sms", () => {
   });
 
   // ───────────────────────────────────────────────────────────────────────
-  // Ordre : rate-limit AVANT token, token AVANT parse
+  // Ordre des couches défensives
   // ───────────────────────────────────────────────────────────────────────
 
   describe("ordre des couches défensives", () => {
@@ -375,7 +445,7 @@ describe("POST /api/webhooks/ovh-sms", () => {
       });
 
       // Token invalide ET rate-limit dépassé → doit renvoyer 429 (pas 401)
-      const res = await POST(buildJsonRequest(REAL_OVH_INBOUND, { token: "wrong-secret" }));
+      const res = await POST(buildFormRequest(REAL_CALLBACK_FIELDS, { token: "wrong-secret" }));
 
       expect(res.status).toBe(429);
       expect(mockInngestSend).not.toHaveBeenCalled();
@@ -383,12 +453,9 @@ describe("POST /api/webhooks/ovh-sms", () => {
 
     it("token invalide court-circuite AVANT parse body (économie CPU + anti-leak)", async () => {
       // Body invalide (id absent) ET token invalide → doit renvoyer 401 (pas 400)
-      const res = await POST(
-        buildJsonRequest(
-          { sender: "+33775745453", message: "test" }, // id absent → serait 400
-          { token: "wrong-secret" },
-        ),
-      );
+      const withoutId: Record<string, string> = { ...REAL_CALLBACK_FIELDS };
+      delete withoutId.id;
+      const res = await POST(buildFormRequest(withoutId, { token: "wrong-secret" }));
 
       expect(res.status).toBe(401);
       expect(mockInngestSend).not.toHaveBeenCalled();
