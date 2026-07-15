@@ -1,13 +1,14 @@
 /**
- * Tests parseIncomingOvhSms (S9.6, INFRA-SMS-001).
+ * Tests parseIncomingOvhSms — CALLBACK PUSH (S9.6-FIX2, INFRA-SMS-001).
  *
- * Scope : parser pur (Zod + validation E.164). Vérifie :
- *   - happy path sur le payload OVH réel capturé (S9.6-EXPLORE)
+ * Scope : parser pur (Zod + normalisation E.164). Vérifie :
+ *   - happy path sur le format callback push RÉEL (senderid, id number, etc.)
  *   - conversion id NUMBER → ovhMessageId STRING
- *   - validation stricte E.164 du sender
+ *   - normalisation E.164 du senderid (0033XXX, 33XXX, +33XXX, 06XX)
  *   - throw ValidationError sur toutes les shapes invalides
- *   - tolérance aux champs optionnels absents (payload callback minimaliste)
+ *   - tolérance aux champs OVH optionnels (keyword, shortcode, tag, token)
  *   - strip des champs surnuméraires (compat future OVH)
+ *   - anti-PII : le sender complet ne fuit jamais dans err.context
  */
 import { describe, expect, it } from "vitest";
 
@@ -16,25 +17,26 @@ import { ValidationError } from "@/lib/utils/errors";
 import { parseIncomingOvhSms } from "./parse-incoming";
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Fixture — payload OVH réel capturé S9.6-EXPLORE sur sms-ng66707-1
+// Fixture — payload callback push RÉEL (capturé prod S9.6-FIX diag)
 // ─────────────────────────────────────────────────────────────────────────────
 
-const REAL_OVH_INBOUND = {
-  credits: 0,
-  creationDatetime: "2026-07-15T12:24:10+02:00",
+const REAL_OVH_CALLBACK = {
   id: 118791103,
-  sender: "+33775745453",
+  senderid: "+33775745453",
   message: "Test réception Medere 1",
+  keyword: "",
+  shortcode: "+33939070545",
   tag: "",
+  token: "shared-secret-value",
 } as const;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Happy path
 // ─────────────────────────────────────────────────────────────────────────────
 
-describe("parseIncomingOvhSms — happy path", () => {
-  it("mappe le payload OVH réel vers {phone, body, ovhMessageId}", () => {
-    const result = parseIncomingOvhSms(REAL_OVH_INBOUND);
+describe("parseIncomingOvhSms — happy path (callback push format)", () => {
+  it("mappe le payload OVH callback réel vers {phone, body, ovhMessageId}", () => {
+    const result = parseIncomingOvhSms(REAL_OVH_CALLBACK);
     expect(result).toEqual({
       phone: "+33775745453",
       body: "Test réception Medere 1",
@@ -43,45 +45,98 @@ describe("parseIncomingOvhSms — happy path", () => {
   });
 
   it("convertit id NUMBER en ovhMessageId STRING (contrat SmsReplyReceivedDataSchema)", () => {
-    const result = parseIncomingOvhSms({ ...REAL_OVH_INBOUND, id: 42 });
+    const result = parseIncomingOvhSms({ ...REAL_OVH_CALLBACK, id: 42 });
     expect(result.ovhMessageId).toBe("42");
     expect(typeof result.ovhMessageId).toBe("string");
   });
 
-  it("préserve le sender E.164 tel quel, sans re-normalisation", () => {
-    const result = parseIncomingOvhSms({ ...REAL_OVH_INBOUND, sender: "+33612345678" });
-    expect(result.phone).toBe("+33612345678");
-  });
-
   it("préserve le message tel quel, sans trim ni normalisation", () => {
     const withSpaces = "  Bonjour Léa, oui je suis intéressé  ";
-    const result = parseIncomingOvhSms({ ...REAL_OVH_INBOUND, message: withSpaces });
+    const result = parseIncomingOvhSms({ ...REAL_OVH_CALLBACK, message: withSpaces });
     expect(result.body).toBe(withSpaces);
   });
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Tolérance aux champs optionnels
+// Normalisation E.164 via toE164('FR')
 // ─────────────────────────────────────────────────────────────────────────────
 
-describe("parseIncomingOvhSms — payload minimaliste (compat callback OVH)", () => {
-  it("accepte un payload avec uniquement id/sender/message (creationDatetime absent)", () => {
+describe("parseIncomingOvhSms — normalisation E.164 du senderid", () => {
+  it("accepte senderid déjà E.164 canonique (+33775745453)", () => {
+    const result = parseIncomingOvhSms({ ...REAL_OVH_CALLBACK, senderid: "+33612345678" });
+    expect(result.phone).toBe("+33612345678");
+  });
+
+  it("normalise senderid national FR sans + (0612345678 → +33612345678)", () => {
+    const result = parseIncomingOvhSms({ ...REAL_OVH_CALLBACK, senderid: "0612345678" });
+    expect(result.phone).toBe("+33612345678");
+  });
+
+  it("normalise senderid préfixe international 00 (0033612345678 → +33612345678)", () => {
+    const result = parseIncomingOvhSms({ ...REAL_OVH_CALLBACK, senderid: "0033612345678" });
+    expect(result.phone).toBe("+33612345678");
+  });
+
+  it("normalise senderid E.164 sans + (33612345678 → +33612345678)", () => {
+    const result = parseIncomingOvhSms({ ...REAL_OVH_CALLBACK, senderid: "33612345678" });
+    expect(result.phone).toBe("+33612345678");
+  });
+
+  it("throw si senderid non-numérique (contient lettres)", () => {
+    expect(() => parseIncomingOvhSms({ ...REAL_OVH_CALLBACK, senderid: "notaphone" })).toThrow(
+      ValidationError,
+    );
+  });
+
+  it("throw si senderid trop court pour être un vrai numéro FR", () => {
+    expect(() => parseIncomingOvhSms({ ...REAL_OVH_CALLBACK, senderid: "123" })).toThrow(
+      ValidationError,
+    );
+  });
+
+  it("le message d'erreur ne fuit PAS le senderid complet (anti-PII)", () => {
+    try {
+      parseIncomingOvhSms({ ...REAL_OVH_CALLBACK, senderid: "notaphonenumber123" });
+      expect.fail("should have thrown");
+    } catch (err) {
+      expect(err).toBeInstanceOf(ValidationError);
+      if (err instanceof ValidationError) {
+        expect(err.message).not.toContain("notaphonenumber123");
+        expect(JSON.stringify(err.context)).not.toContain("notaphonenumber123");
+        // Seul senderidLength doit apparaître pour observabilité.
+        expect(err.context).toMatchObject({ senderidLength: 18 });
+      }
+    }
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Tolérance aux champs OVH optionnels + strip surnuméraires
+// ─────────────────────────────────────────────────────────────────────────────
+
+describe("parseIncomingOvhSms — champs optionnels + surnuméraires", () => {
+  it("accepte un payload minimal (id/senderid/message uniquement)", () => {
     const result = parseIncomingOvhSms({
       id: 42,
-      sender: "+33775745453",
+      senderid: "+33612345678",
       message: "OK",
     });
     expect(result).toEqual({
-      phone: "+33775745453",
+      phone: "+33612345678",
       body: "OK",
       ovhMessageId: "42",
     });
   });
 
-  it("strip les champs surnuméraires sans throw (compat future OVH)", () => {
+  it("accepte keyword/shortcode/tag/token présents sans les rejeter", () => {
+    const result = parseIncomingOvhSms(REAL_OVH_CALLBACK);
+    // Le résultat downstream ne contient QUE les 3 champs event, pas les extras.
+    expect(Object.keys(result).sort()).toEqual(["body", "ovhMessageId", "phone"]);
+  });
+
+  it("strip les champs surnuméraires OVH sans throw (compat future)", () => {
     const result = parseIncomingOvhSms({
-      ...REAL_OVH_INBOUND,
-      // Simulation d'un nouveau champ OVH ajouté dans le futur.
+      ...REAL_OVH_CALLBACK,
       newFieldAddedByOvh: "some_value",
       anotherOne: 123,
     });
@@ -90,6 +145,13 @@ describe("parseIncomingOvhSms — payload minimaliste (compat callback OVH)", ()
       body: "Test réception Medere 1",
       ovhMessageId: "118791103",
     });
+  });
+
+  it("IGNORE le token du body (l'auth vit dans le query param côté route)", () => {
+    const result = parseIncomingOvhSms({ ...REAL_OVH_CALLBACK, token: "any-value-here" });
+    // Aucune assertion sur token → pas exposé côté event. Ce test verrouille
+    // qu'on ne s'appuie PAS sur token pour la logique métier downstream.
+    expect(result).not.toHaveProperty("token");
   });
 });
 
@@ -107,96 +169,66 @@ describe("parseIncomingOvhSms — throw ValidationError sur shape invalide", () 
   });
 
   it("throw si id absent", () => {
-    expect(() => parseIncomingOvhSms({ sender: "+33775745453", message: "test" })).toThrow(
+    expect(() => parseIncomingOvhSms({ senderid: "+33612345678", message: "test" })).toThrow(
       ValidationError,
     );
   });
 
-  it("throw si id est une string (contrat NUMBER strict)", () => {
-    expect(() => parseIncomingOvhSms({ ...REAL_OVH_INBOUND, id: "118791103" })).toThrow(
+  it("throw si id est une string (contrat NUMBER strict côté route)", () => {
+    expect(() => parseIncomingOvhSms({ ...REAL_OVH_CALLBACK, id: "118791103" })).toThrow(
       ValidationError,
     );
   });
 
   it("throw si id n'est pas un entier (float)", () => {
-    expect(() => parseIncomingOvhSms({ ...REAL_OVH_INBOUND, id: 42.5 })).toThrow(ValidationError);
+    expect(() => parseIncomingOvhSms({ ...REAL_OVH_CALLBACK, id: 42.5 })).toThrow(ValidationError);
   });
 
-  it("throw si sender absent", () => {
-    const withoutSender: Record<string, unknown> = { ...REAL_OVH_INBOUND };
-    delete withoutSender.sender;
-    expect(() => parseIncomingOvhSms(withoutSender)).toThrow(ValidationError);
+  it("throw si senderid absent", () => {
+    const withoutSenderid: Record<string, unknown> = { ...REAL_OVH_CALLBACK };
+    delete withoutSenderid.senderid;
+    expect(() => parseIncomingOvhSms(withoutSenderid)).toThrow(ValidationError);
   });
 
-  it("throw si sender vide", () => {
-    expect(() => parseIncomingOvhSms({ ...REAL_OVH_INBOUND, sender: "" })).toThrow(ValidationError);
+  it("throw si senderid vide", () => {
+    expect(() => parseIncomingOvhSms({ ...REAL_OVH_CALLBACK, senderid: "" })).toThrow(
+      ValidationError,
+    );
   });
 
   it("throw si message absent", () => {
-    const withoutMessage: Record<string, unknown> = { ...REAL_OVH_INBOUND };
+    const withoutMessage: Record<string, unknown> = { ...REAL_OVH_CALLBACK };
     delete withoutMessage.message;
     expect(() => parseIncomingOvhSms(withoutMessage)).toThrow(ValidationError);
   });
 
   it("throw si message vide", () => {
-    expect(() => parseIncomingOvhSms({ ...REAL_OVH_INBOUND, message: "" })).toThrow(
+    expect(() => parseIncomingOvhSms({ ...REAL_OVH_CALLBACK, message: "" })).toThrow(
       ValidationError,
     );
   });
 
   it("throw si message > 1600 chars (borne GSM-7 x10 segments)", () => {
-    expect(() => parseIncomingOvhSms({ ...REAL_OVH_INBOUND, message: "x".repeat(1601) })).toThrow(
+    expect(() => parseIncomingOvhSms({ ...REAL_OVH_CALLBACK, message: "x".repeat(1601) })).toThrow(
       ValidationError,
     );
   });
 
   it("accepte un message pile 1600 chars (borne inclusive)", () => {
-    const result = parseIncomingOvhSms({ ...REAL_OVH_INBOUND, message: "x".repeat(1600) });
+    const result = parseIncomingOvhSms({ ...REAL_OVH_CALLBACK, message: "x".repeat(1600) });
     expect(result.body.length).toBe(1600);
   });
-});
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Validation E.164 stricte du sender
-// ─────────────────────────────────────────────────────────────────────────────
-
-describe("parseIncomingOvhSms — validation E.164 stricte du sender", () => {
-  it("throw si sender au format national FR sans +33 (0775...)", () => {
-    expect(() => parseIncomingOvhSms({ ...REAL_OVH_INBOUND, sender: "0775745453" })).toThrow(
-      ValidationError,
-    );
-  });
-
-  it("throw si sender au format +33 avec leading zero (regex E164 refuse)", () => {
-    expect(() => parseIncomingOvhSms({ ...REAL_OVH_INBOUND, sender: "+0612345678" })).toThrow(
-      ValidationError,
-    );
-  });
-
-  it("throw si sender contient un espace", () => {
-    expect(() => parseIncomingOvhSms({ ...REAL_OVH_INBOUND, sender: "+33 6 12 34 56 78" })).toThrow(
-      ValidationError,
-    );
-  });
-
-  it("throw si sender contient des lettres", () => {
-    expect(() => parseIncomingOvhSms({ ...REAL_OVH_INBOUND, sender: "+33abc" })).toThrow(
-      ValidationError,
-    );
-  });
-
-  it("le message d'erreur ne fuit PAS le sender complet (anti-PII)", () => {
-    try {
-      parseIncomingOvhSms({ ...REAL_OVH_INBOUND, sender: "0775745453" });
-      expect.fail("should have thrown");
-    } catch (err) {
-      expect(err).toBeInstanceOf(ValidationError);
-      if (err instanceof ValidationError) {
-        expect(err.message).not.toContain("0775745453");
-        expect(JSON.stringify(err.context)).not.toContain("0775745453");
-        // Seul senderLength doit apparaître pour observabilité.
-        expect(err.context).toMatchObject({ senderLength: 10 });
-      }
-    }
+  it("throw si le NOM d'ancien champ 'sender' est fourni au lieu de 'senderid' (anti-régression S9.6-FIX2)", () => {
+    // Sentinelle : vérifie qu'un payload GET /incoming (qui a `sender`) est
+    // bien rejeté par ce parser (dédié au callback push, format `senderid`).
+    // Si demain quelqu'un remet accidentellement `sender` dans le schema, ce
+    // test casse.
+    const legacyGetIncomingShape: Record<string, unknown> = {
+      id: 118791103,
+      sender: "+33775745453", // ← ancien nom de champ
+      message: "test",
+    };
+    expect(() => parseIncomingOvhSms(legacyGetIncomingShape)).toThrow(ValidationError);
   });
 });

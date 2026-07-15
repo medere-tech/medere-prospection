@@ -71,50 +71,57 @@ export interface SmsResult {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Réception SMS entrant (webhook OVH — S9.6, INFRA-SMS-001)
+// Réception SMS entrant — CALLBACK PUSH (webhook OVH, S9.6-FIX2, INFRA-SMS-001)
 // ─────────────────────────────────────────────────────────────────────────────
 
 /**
- * Payload BRUT d'un SMS entrant OVH, tel que capturé en réel sur le service
- * SMS `sms-ng66707-1` via `GET /sms/{serviceName}/incoming/{id}` lors de
- * S9.6-EXPLORE (numéro Time2Chat `+33939070545`).
+ * Payload BRUT du CALLBACK PUSH OVH inbound, tel que capturé en prod via le
+ * log diagnostic S9.6-FIX sur le webhook `/api/webhooks/ovh-sms`.
  *
  * ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
- * ⚠️ POINTS D'ATTENTION FIGÉS PAR LA CAPTURE RÉELLE
+ * FORMAT RÉEL FIGÉ (S9.6-FIX2)
  *
- *   - `id` est un **NUMBER**, pas une string (contrairement au guess du
- *     skill `medere-ovh-sms:284-291` qui documentait un `z.union([string,
- *     number])`). Le parser (`parse-incoming.ts`) le convertit en string
- *     via `String(id)` avant émission de l'event Inngest
- *     `medere/sms.reply.received` (schema `ovhMessageId: z.string().min(1)`).
+ *   Content-Type : application/x-www-form-urlencoded
+ *   Champs       :
+ *     id         : number  — ID OVH unique du SMS entrant
+ *     senderid   : string  — numéro expéditeur (PS qui répond)
+ *     message    : string  — corps brut du SMS (1-1600 chars)
+ *     keyword    : string  — optionnel, mot-clef configuré côté OVH
+ *     shortcode  : string  — optionnel, numéro Time2Chat de destination
+ *     tag        : string  — optionnel, tag OVH (souvent vide)
+ *     token      : string  — optionnel, shared secret dupliqué du query
  *
- *   - `sender` est **déjà en E.164** avec le préfixe `+` (ex: `+33775745453`).
- *     Le parser VALIDE via `E164_REGEX` mais ne RE-NORMALISE PAS —
- *     évite toute réinterprétation via `libphonenumber-js` d'un numéro
- *     déjà canonique côté OVH.
+ * ⚠️ POINTS D'ATTENTION
  *
- * ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
- * DIVERGENCE ATTENDUE ENTRE CE TYPE ET LE SCHEMA ZOD DU PARSER
+ *   - `id` est un NUMBER dans le body form-urlencoded (converti par la
+ *     route `route.ts:143-144` avant passage au parser).
  *
- * Ce type reflète le format RÉEL COMPLET tel qu'OVH le renvoie sur GET.
- * Le schema Zod du parser (`OvhInboundRawSchema` dans `parse-incoming.ts`)
- * ne rend REQUIRED que les 3 champs qui alimentent l'event downstream
- * (`id`, `sender`, `message`) et rend OPTIONNELS les 3 champs de confort
- * (`creationDatetime`, `credits`, `tag`) — tolérance aux payloads
- * minimalistes qu'OVH pourrait émettre via son callback POST (format non
- * confirmé, cf. JSDoc route `/api/webhooks/ovh-sms/route.ts`).
+ *   - `senderid` (PAS `sender`) est le nom du champ dans le callback push.
+ *     Ce format DIFFÈRE du `GET /sms/{svc}/incoming/{id}` qui renvoie
+ *     `sender`. Le parser `parseIncomingOvhSms` cible EXCLUSIVEMENT le
+ *     callback push — si un futur poller consomme le GET incoming, écrire
+ *     un parser SÉPARÉ (single responsibility, éviter la conflation).
+ *
+ *   - `senderid` n'est PAS garanti E.164 par OVH — le parser le normalise
+ *     via `toE164('FR')` (supporte `0033XXX`, `33XXX`, `+33XXX`, `06XX`).
+ *
+ *   - `token` du body est IGNORÉ par le parser — l'authentification vit
+ *     dans le query param (`route.ts` step 2, `verifyOvhWebhookToken`).
+ *     Ne pas s'appuyer sur sa présence côté parser.
  */
-export interface OvhInboundSms {
-  /** ID OVH unique du SMS entrant. NUMBER dans la réponse OVH. */
+export interface OvhCallbackPush {
+  /** ID OVH unique du SMS entrant. NUMBER dans le payload OVH. */
   id: number;
-  /** Numéro de l'expéditeur du SMS entrant, déjà en E.164 (ex: `+33775745453`). */
-  sender: string;
-  /** Corps brut du SMS entrant, jusqu'à 1600 chars = 10 segments GSM-7. */
+  /** Numéro de l'expéditeur (PS). Format non garanti E.164 — normalisé par le parser. */
+  senderid: string;
+  /** Corps brut du SMS, jusqu'à 1600 chars = 10 segments GSM-7. */
   message: string;
-  /** ISO 8601 avec offset timezone (ex: `2026-07-15T12:24:10+02:00`). */
-  creationDatetime: string;
-  /** Crédits SMS consommés côté OVH (typiquement 0 pour un entrant). */
-  credits: number;
-  /** Tag OVH (souvent vide). */
-  tag: string;
+  /** Mot-clef OVH configuré (optionnel). */
+  keyword?: string;
+  /** Numéro Time2Chat de destination (optionnel, ex: `+33939070545`). */
+  shortcode?: string;
+  /** Tag OVH (souvent vide, optionnel). */
+  tag?: string;
+  /** Shared secret dupliqué du query param `?token=` (ignoré par le parser). */
+  token?: string;
 }
