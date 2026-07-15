@@ -214,6 +214,48 @@ export async function POST(req: NextRequest): Promise<NextResponse> {
       );
     }
 
+    // TODO S9.6-FIX: retirer ce bloc DIAGNOSTIC TEMPORAIRE après capture du
+    // format réel envoyé par le callback push OVH (qui diffère du GET
+    // /sms/{svc}/incoming/{id} sur lequel le parser a été codé). Objectif :
+    // voir la SHAPE du payload (Content-Type + clés + types) SANS logger
+    // les valeurs (anti-PII). Pour `sender` spécifiquement, on ajoute
+    // typeof + longueur (jamais le numéro complet) pour comprendre le
+    // mismatch de type que Zod rejette.
+    {
+      const contentType = req.headers.get("content-type") ?? "(absent)";
+      const isObj =
+        rawPayload !== null && typeof rawPayload === "object" && !Array.isArray(rawPayload);
+      const asRecord = isObj ? (rawPayload as Record<string, unknown>) : {};
+      const keys = isObj ? Object.keys(asRecord) : [];
+      const typesByKey = Object.fromEntries(
+        Object.entries(asRecord).map(([k, v]) => [
+          k,
+          Array.isArray(v) ? `array(${v.length})` : v === null ? "null" : typeof v,
+        ]),
+      );
+      // Sender uniquement — typeof + longueur pour disambiguer
+      // string("+33..."/"33..."/"0..." vs number vs undefined vs autre).
+      const senderRaw = isObj ? asRecord.sender : undefined;
+      const senderShape = {
+        typeof: typeof senderRaw,
+        isArray: Array.isArray(senderRaw),
+        isNull: senderRaw === null,
+        length: typeof senderRaw === "string" ? senderRaw.length : null,
+      };
+      logger.info(
+        {
+          diag: "S9.6-FIX",
+          contentType,
+          payloadType: typeof rawPayload,
+          isObj,
+          keys,
+          typesByKey,
+          senderShape,
+        },
+        "[POST /api/webhooks/ovh-sms] DIAGNOSTIC payload shape (TODO S9.6-FIX: retirer)",
+      );
+    }
+
     // ── 4. Parse strict (Zod + validation E.164 stricte) ──────────────────
     let eventData;
     try {
