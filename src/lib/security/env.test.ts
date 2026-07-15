@@ -184,8 +184,30 @@ describe("getOvhEnv", () => {
     expect(() => getOvhEnv()).toThrow(ConfigError);
   });
 
-  it("throws si OVH_SMS_SENDER > 11 chars (limite OVH)", () => {
+  it("throws si OVH_SMS_SENDER alphanumérique > 11 chars (limite alpha OVH)", () => {
     setEnv({ ...OVH_VALID, OVH_SMS_SENDER: "MedereTooLong" });
+    expect(() => getOvhEnv()).toThrow(ConfigError);
+  });
+
+  it("throws si OVH_SMS_SENDER alpha 12 chars sans + (ni alpha≤11 ni E.164) — S9.7", () => {
+    setEnv({ ...OVH_VALID, OVH_SMS_SENDER: "abcdefghijkl" });
+    expect(() => getOvhEnv()).toThrow(ConfigError);
+  });
+
+  it("accepte OVH_SMS_SENDER format E.164 (Time2Chat +33939070545) — S9.7", () => {
+    setEnv({ ...OVH_VALID, OVH_SMS_SENDER: "+33939070545" });
+    expect(getOvhEnv().OVH_SMS_SENDER).toBe("+33939070545");
+  });
+
+  it("throws si OVH_SMS_SENDER pseudo-E.164 trop court (min E.164 = +1+6 digits) — S9.7", () => {
+    // `+339390` = 7 chars = + + 6 digits total → fail E164_REGEX (min 8 chars)
+    // ET fail alpha (contient `+`).
+    setEnv({ ...OVH_VALID, OVH_SMS_SENDER: "+339390" });
+    expect(() => getOvhEnv()).toThrow(ConfigError);
+  });
+
+  it("throws si OVH_SMS_SENDER contient un séparateur (espaces/tirets) — S9.7", () => {
+    setEnv({ ...OVH_VALID, OVH_SMS_SENDER: "+33 6 12" });
     expect(() => getOvhEnv()).toThrow(ConfigError);
   });
 

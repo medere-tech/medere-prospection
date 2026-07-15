@@ -32,6 +32,7 @@
 import { z } from "zod";
 
 import { ConfigError } from "@/lib/utils/errors";
+import { E164_REGEX } from "@/lib/utils/phone";
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Schémas par service
@@ -99,8 +100,30 @@ const ovhEnvSchema = z.object({
   OVH_APP_SECRET: z.string().min(1),
   OVH_CONSUMER_KEY: z.string().min(1),
   OVH_SMS_SERVICE_NAME: z.string().min(1),
-  /** Sender ID OVH : limite documentée à 11 caractères alphanumériques. */
-  OVH_SMS_SENDER: z.string().min(1).max(11),
+  /**
+   * Sender ID OVH — DEUX formats acceptés (S9.7) :
+   *
+   *   - Alphanumérique 1-11 chars (`Medere`, `MEDEREFR`, `Léa`…) — format
+   *     historique, mais **NON répondable** côté PS (les alpha ID SMS ne
+   *     peuvent pas être répondus).
+   *   - Numéro E.164 (`+33939070545`, `+33XXX…`) — format Time2Chat OVH,
+   *     **répondable** → active la boucle conversationnelle (webhook
+   *     `/api/webhooks/ovh-sms`).
+   *
+   * Choix opérationnel S9.7 : la prod utilise `+33939070545` (Time2Chat)
+   * pour permettre les réponses PS. Le validator accepte les 2 formats
+   * pour ne pas casser les env dev/test qui utilisent encore un alpha.
+   *
+   * Borne globale `max(16)` = `+` + 15 digits (max E.164 international).
+   */
+  OVH_SMS_SENDER: z
+    .string()
+    .min(1)
+    .max(16)
+    .refine(
+      (v) => /^[A-Za-z0-9]{1,11}$/.test(v) || E164_REGEX.test(v),
+      "sender: alpha <=11 chars OU E.164",
+    ),
   /** Secret du webhook OVH entrant — min 16 chars pour résister à la brute force. */
   OVH_WEBHOOK_SECRET: z.string().min(16),
 });
