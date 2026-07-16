@@ -394,8 +394,13 @@ LUSHA_API_KEY=
 # === Slack ===
 SLACK_BOT_TOKEN=                     # xoxb-...
 SLACK_SIGNING_SECRET=                # Pour vérifier les webhooks
-SLACK_HANDOFF_CHANNEL_ID=            # Canal #leads-chauds
+SLACK_ORPHAN_LEADS_CHANNEL_ID=       # Canal orphelins (S9.9), fallback hand-off
 SLACK_USER_IDS=                      # JSON: { "dentaire": "U..." }
+
+# === Airtable (S9.9 — source commerciaux) ===
+AIRTABLE_PAT=                        # pat... (scope data.records:read)
+AIRTABLE_BASE_ID=                    # app...
+AIRTABLE_COMMERCIAUX_TABLE_ID=       # tbl...
 
 # === Firebase Admin ===
 FIREBASE_PROJECT_ID=
