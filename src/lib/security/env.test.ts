@@ -4,6 +4,7 @@ import { ConfigError } from "@/lib/utils/errors";
 
 import {
   __resetEnvCacheForTests,
+  getAirtableEnv,
   getAnthropicEnv,
   getAuditEnv,
   getClerkEnv,
@@ -333,23 +334,24 @@ describe("getSlackEnv", () => {
     SLACK_SIGNING_SECRET: "signsecret",
   };
 
-  it("ok avec required seuls (handoff + user_ids optional)", () => {
+  it("ok avec required seuls (orphan channel + user_ids optional)", () => {
     setEnv({
       ...SLACK_OK,
-      SLACK_HANDOFF_CHANNEL_ID: undefined,
+      SLACK_ORPHAN_LEADS_CHANNEL_ID: undefined,
       SLACK_USER_IDS: undefined,
     });
     const env = getSlackEnv();
-    expect(env.SLACK_HANDOFF_CHANNEL_ID).toBeUndefined();
+    expect(env.SLACK_ORPHAN_LEADS_CHANNEL_ID).toBeUndefined();
     expect(env.SLACK_USER_IDS).toBeUndefined();
   });
 
-  it("ok avec handoff channel et user_ids JSON valides", () => {
+  it("ok avec orphan channel et user_ids JSON valides", () => {
     setEnv({
       ...SLACK_OK,
-      SLACK_HANDOFF_CHANNEL_ID: "C0123ABC",
+      SLACK_ORPHAN_LEADS_CHANNEL_ID: "C0123ABC",
       SLACK_USER_IDS: JSON.stringify({ dentaire: "U05UVHGBURX" }),
     });
+    expect(getSlackEnv().SLACK_ORPHAN_LEADS_CHANNEL_ID).toBe("C0123ABC");
     expect(getSlackEnv().SLACK_USER_IDS).toEqual({ dentaire: "U05UVHGBURX" });
   });
 
@@ -358,8 +360,8 @@ describe("getSlackEnv", () => {
     expect(() => getSlackEnv()).toThrow(ConfigError);
   });
 
-  it("throws si HANDOFF_CHANNEL_ID mal formé", () => {
-    setEnv({ ...SLACK_OK, SLACK_HANDOFF_CHANNEL_ID: "not-a-channel" });
+  it("throws si ORPHAN_LEADS_CHANNEL_ID mal formé", () => {
+    setEnv({ ...SLACK_OK, SLACK_ORPHAN_LEADS_CHANNEL_ID: "not-a-channel" });
     expect(() => getSlackEnv()).toThrow(ConfigError);
   });
 
@@ -381,6 +383,85 @@ describe("getSlackEnv", () => {
   it("throws si USER_IDS est null", () => {
     setEnv({ ...SLACK_OK, SLACK_USER_IDS: "null" });
     expect(() => getSlackEnv()).toThrow(ConfigError);
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// AIRTABLE (S9.9 — source commerciaux hand-off)
+// ─────────────────────────────────────────────────────────────────────────────
+
+describe("getAirtableEnv", () => {
+  const AIRTABLE_OK = {
+    AIRTABLE_PAT: "patFakeXyz.abcdef0123456789",
+    AIRTABLE_BASE_ID: "app3GnMOzJn7VHMji",
+    AIRTABLE_COMMERCIAUX_TABLE_ID: "tblaDpXcgiNZfcJiO",
+  } as const;
+
+  it("ok avec PAT + base id + table id bien formés", () => {
+    setEnv(AIRTABLE_OK);
+    const env = getAirtableEnv();
+    expect(env.AIRTABLE_PAT).toMatch(/^pat/);
+    expect(env.AIRTABLE_BASE_ID).toBe("app3GnMOzJn7VHMji");
+    expect(env.AIRTABLE_COMMERCIAUX_TABLE_ID).toBe("tblaDpXcgiNZfcJiO");
+  });
+
+  it("throws si PAT sans préfixe pat (sentinelle format)", () => {
+    setEnv({ ...AIRTABLE_OK, AIRTABLE_PAT: "keyABC123" });
+    expect(() => getAirtableEnv()).toThrow(ConfigError);
+  });
+
+  it("throws si PAT vide", () => {
+    setEnv({ ...AIRTABLE_OK, AIRTABLE_PAT: "" });
+    expect(() => getAirtableEnv()).toThrow(ConfigError);
+  });
+
+  it("throws si BASE_ID sans préfixe app (sentinelle format)", () => {
+    setEnv({ ...AIRTABLE_OK, AIRTABLE_BASE_ID: "3GnMOzJn7VHMji" });
+    expect(() => getAirtableEnv()).toThrow(ConfigError);
+  });
+
+  it("throws si BASE_ID préfixé app mais avec caractères invalides", () => {
+    setEnv({ ...AIRTABLE_OK, AIRTABLE_BASE_ID: "app_with_underscore" });
+    expect(() => getAirtableEnv()).toThrow(ConfigError);
+  });
+
+  it("throws si TABLE_ID sans préfixe tbl (sentinelle format)", () => {
+    setEnv({ ...AIRTABLE_OK, AIRTABLE_COMMERCIAUX_TABLE_ID: "aDpXcgiNZfcJiO" });
+    expect(() => getAirtableEnv()).toThrow(ConfigError);
+  });
+
+  it("throws si TABLE_ID préfixé tbl mais avec caractères invalides", () => {
+    setEnv({ ...AIRTABLE_OK, AIRTABLE_COMMERCIAUX_TABLE_ID: "tbl-with-dash" });
+    expect(() => getAirtableEnv()).toThrow(ConfigError);
+  });
+
+  it("throws si toutes les vars manquent (message liste tous les champs)", () => {
+    setEnv({
+      AIRTABLE_PAT: undefined,
+      AIRTABLE_BASE_ID: undefined,
+      AIRTABLE_COMMERCIAUX_TABLE_ID: undefined,
+    });
+    try {
+      getAirtableEnv();
+      expect.fail("should have thrown");
+    } catch (e) {
+      expect(e).toBeInstanceOf(ConfigError);
+      const err = e as ConfigError;
+      expect(err.message).toContain("AIRTABLE_PAT");
+      expect(err.message).toContain("AIRTABLE_BASE_ID");
+      expect(err.message).toContain("AIRTABLE_COMMERCIAUX_TABLE_ID");
+    }
+  });
+
+  it("PAT mal formé : la valeur ne fuit pas dans l'erreur (anti-leak)", () => {
+    const REAL_LEAK_VALUE = "leaked-airtable-pat-do-not-log-xyz123";
+    setEnv({ ...AIRTABLE_OK, AIRTABLE_PAT: REAL_LEAK_VALUE });
+    try {
+      getAirtableEnv();
+      expect.fail("should have thrown");
+    } catch (e) {
+      expect(captureErrorPayload(e)).not.toContain(REAL_LEAK_VALUE);
+    }
   });
 });
 
@@ -727,6 +808,9 @@ describe("validateAllEnvNow", () => {
       HUBSPOT_ACCESS_TOKEN: undefined,
       SLACK_BOT_TOKEN: undefined,
       SLACK_SIGNING_SECRET: undefined,
+      AIRTABLE_PAT: undefined,
+      AIRTABLE_BASE_ID: undefined,
+      AIRTABLE_COMMERCIAUX_TABLE_ID: undefined,
       FIREBASE_PROJECT_ID: undefined,
       FIREBASE_CLIENT_EMAIL: undefined,
       FIREBASE_PRIVATE_KEY: undefined,
@@ -747,6 +831,8 @@ describe("validateAllEnvNow", () => {
     expect(Array.isArray(report.anthropic)).toBe(true);
     expect(report.ovh).not.toBe("ok");
     expect(report.firebase).not.toBe("ok");
+    expect(report.airtable).not.toBe("ok"); // 3 vars strictes, aucun defaut
+    expect(Array.isArray(report.airtable)).toBe(true);
     expect(report.audit).not.toBe("ok"); // requis (jamais optional)
     expect(Array.isArray(report.audit)).toBe(true);
   });

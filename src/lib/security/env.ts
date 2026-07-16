@@ -23,7 +23,8 @@
  *
  *   - `NEXT_PUBLIC_APP_URL`, `APP_SECRET` (non utilisées Phase 1)
  *   - `HUBSPOT_PORTAL_ID` (URLs UI uniquement, pas requise par l'API client)
- *   - `SLACK_HANDOFF_CHANNEL_ID`, `SLACK_USER_IDS` (Phase 4 hand-off)
+ *   - `SLACK_ORPHAN_LEADS_CHANNEL_ID`, `SLACK_USER_IDS` (S9.9 hand-off — required une
+ *     fois la Phase 4 branchée, optional tant que le module hand-off n'est pas livré)
  *   - `SENTRY_DSN`, `NEXT_PUBLIC_SENTRY_DSN` (S8 différée)
  *
  * Tout le reste est REQUIRED : appeler `getXxxEnv()` sans les vars → throw clair.
@@ -185,13 +186,43 @@ const slackUserIdsSchema = z.string().transform((value, ctx): Record<string, str
 const slackEnvSchema = z.object({
   SLACK_BOT_TOKEN: z.string().startsWith("xoxb-"),
   SLACK_SIGNING_SECRET: z.string().min(1),
-  /** Optional Phase 1 : Phase 4 hand-off. Format = channel ID Slack (C…/G…). */
-  SLACK_HANDOFF_CHANNEL_ID: z
+  /**
+   * Optional Phase 1 : canal Slack où sont notifiés les leads INTERESSE dont
+   * le propriétaire HubSpot n'a pas de ligne exploitable dans Airtable
+   * Commerciaux (owner sans slack_user_id, inactif, ou contact sans owner).
+   * Filet de secours quand le routage owner→DM ne peut pas résoudre de
+   * Slack ID. Format = channel ID Slack (C…/G…). Required une fois le
+   * module hand-off livré ; laissé optional pour ne pas bloquer le boot
+   * tant que le consumer prod n'est pas branché.
+   */
+  SLACK_ORPHAN_LEADS_CHANNEL_ID: z
     .string()
     .regex(/^[CG][A-Z0-9]+$/, "must be a Slack channel ID")
     .optional(),
   /** Optional Phase 1 : Phase 4 hand-off. JSON `{ specialty: slackUserId }`. */
   SLACK_USER_IDS: slackUserIdsSchema.optional(),
+});
+
+/**
+ * Airtable — source de vérité des commerciaux/AE Médéré (mapping spécialité →
+ * owner). Utilisé Phase 4 par le module hand-off pour router un lead vers le
+ * bon commercial (fallback canal orphelins si spécialité non couverte).
+ *
+ * Les 3 vars sont required strict : le getter n'est appelé QUE quand le module
+ * hand-off tourne, donc pas d'impact au boot Phase 1 (validation paresseuse).
+ *
+ *   - `AIRTABLE_PAT`                    : Personal Access Token, commence par `pat`
+ *     (obtenir : https://airtable.com/create/tokens — scope minimal
+ *     `data.records:read` sur la base ciblée).
+ *   - `AIRTABLE_BASE_ID`                : ID base (`app…`).
+ *   - `AIRTABLE_COMMERCIAUX_TABLE_ID`   : ID table commerciaux (`tbl…`).
+ */
+const airtableEnvSchema = z.object({
+  AIRTABLE_PAT: z.string().startsWith("pat"),
+  AIRTABLE_BASE_ID: z.string().regex(/^app[A-Za-z0-9]+$/, "must be an Airtable base id"),
+  AIRTABLE_COMMERCIAUX_TABLE_ID: z
+    .string()
+    .regex(/^tbl[A-Za-z0-9]+$/, "must be an Airtable table id"),
 });
 
 const firebaseEnvSchema = z.object({
@@ -297,6 +328,7 @@ interface EnvCache {
   hubspot?: z.infer<typeof hubspotEnvSchema>;
   lusha?: z.infer<typeof lushaEnvSchema>;
   slack?: z.infer<typeof slackEnvSchema>;
+  airtable?: z.infer<typeof airtableEnvSchema>;
   firebase?: z.infer<typeof firebaseEnvSchema>;
   inngest?: z.infer<typeof inngestEnvSchema>;
   sentry?: z.infer<typeof sentryEnvSchema>;
@@ -347,6 +379,10 @@ export function getLushaEnv() {
 
 export function getSlackEnv() {
   return memoize("slack", () => parseOrThrow(slackEnvSchema, "slack"));
+}
+
+export function getAirtableEnv() {
+  return memoize("airtable", () => parseOrThrow(airtableEnvSchema, "airtable"));
 }
 
 export function getFirebaseEnv() {
@@ -410,6 +446,7 @@ const DEFAULT_SERVICES: EnvServiceEntry[] = [
   { name: "hubspot", fn: getHubspotEnv },
   { name: "lusha", fn: getLushaEnv },
   { name: "slack", fn: getSlackEnv },
+  { name: "airtable", fn: getAirtableEnv },
   { name: "firebase", fn: getFirebaseEnv },
   { name: "inngest", fn: getInngestEnv },
   { name: "sentry", fn: getSentryEnv },
