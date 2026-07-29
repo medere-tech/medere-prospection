@@ -307,7 +307,7 @@ import {
   listRecentMessages,
 } from "@/lib/firestore/messages";
 import { getInngestClient } from "@/lib/inngest/client";
-import { smsReplyReceived, smsReplySendRequested } from "@/lib/inngest/events";
+import { handoffRequested, smsReplyReceived, smsReplySendRequested } from "@/lib/inngest/events";
 import { hashPii, PHONE_HASH_PREFIX, safePhoneHash } from "@/lib/utils/pii-detector";
 import type { ReplyGeneratedPayload } from "@/types/audit-log";
 
@@ -1034,6 +1034,56 @@ export async function processReplyHandler(
     id: `reply.send.${draftMessageId}`,
   });
 
+  // ── Step 8e — dispatch-handoff-event (S9.9-PR4) ──────────────────────
+  // Émet `medere/handoff.requested` UNIQUEMENT sur `intent === "INTERESSE"`.
+  // Le futur handler `slack-handoff` (S9.9-PR5) résoudra owner HubSpot →
+  // commercial Airtable → sendHandoffNotification (DM ou canal orphelins).
+  //
+  // 🚨 ORDRE CRITIQUE — step 8e APRÈS step 8d. Le SMS auto part TOUJOURS
+  // en premier ; le hand-off ne bloque JAMAIS la réponse au PS. Si le
+  // step 8e throw (Inngest cloud transient), la memoization Inngest sert
+  // step 8d depuis le cache au retry → 0 double-dispatch OVH → 0 double
+  // SMS au PS. Le SMS auto est déjà parti — le hand-off est resservi
+  // jusqu'à succès (retries: 3).
+  //
+  // 🚨 CONDITION INTERESSE-ONLY — sur OBJECTION/NEUTRE le PS a répondu mais
+  // pas assez chaud pour un hand-off commercial (la boucle Claude continue
+  // via step 8d). Sur STOP (short_form ou classifier_long_form) le PS
+  // opted-out : ce step n'est même pas atteint (early return step 5/7).
+  //
+  // 🚨 IDEMPOTENCE — eventId déterministe `handoff.${draftMessageId}`,
+  // miroir strict `reply.send.${draftMessageId}` (step 8d) :
+  //   1. Memoization native Inngest `step.sendEvent` par (parent eventId,
+  //      stepName) — couvre 95% des retry intra-pipeline.
+  //   2. Déduplication 60s native Inngest sur `event.id` — belt-and-braces
+  //      si cache memoization est perdu (fenêtre étroite).
+  //   3. Filet ultime PR5 — le handler `slack-handoff` sera idempotent
+  //      côté audit Firestore (`audit_log/{docId}` — pas de docId
+  //      déterministe encore mais posé APRÈS `chat.postMessage` OK ;
+  //      double-notif Slack théorique en cas de retry sans (1) et (2),
+  //      MAIS l'eventId déterministe (2) l'exclut à 60s).
+  //
+  // 🚨 ANTI-PII event.id — `handoff.${draftMessageId}` est scrubber-safe
+  // par construction (draftMessageId = Firestore auto-ID `[A-Za-z0-9]{20}`).
+  // Sentinelle test verrouille le format strict `/^handoff\.[A-Za-z0-9]+$/`.
+  //
+  // 🚨 ANTI-PII event.data — payload minimaliste `{contactId,
+  // conversationId, draftMessageId}` (cf. arbitrage Q-B3 S9.4.0 étendu
+  // S9.9-PR4). Pas de firstName/speciality/city/body/phone — le consumer
+  // PR5 les charge à la volée depuis Firestore au moment du post Slack
+  // (état frais vs état stale figé T0).
+  if (nonStopIntent === "INTERESSE") {
+    await step.sendEvent("dispatch-handoff-event", {
+      name: handoffRequested.name,
+      data: {
+        contactId,
+        conversationId,
+        draftMessageId,
+      },
+      id: `handoff.${draftMessageId}`,
+    });
+  }
+
   // ── Step 9 — audit-reply-processed (étendu draftMessageId) ────────────
   await postReplyProcessedAudit({
     contactId,
@@ -1061,9 +1111,9 @@ export async function processReplyHandler(
 // ─────────────────────────────────────────────────────────────────────────────
 
 /**
- * Inngest function `process-reply` — pipeline déterministe 13 steps
- * distincts (12 `step.run` + 1 `step.sendEvent` = step 8d) sur branche
- * `classified` (post-S9.4.3) :
+ * Inngest function `process-reply` — pipeline déterministe 14 steps
+ * distincts (12 `step.run` + 2 `step.sendEvent` = step 8d + 8e) sur branche
+ * `classified` INTERESSE (post-S9.9-PR4) :
  *   1. resolve-contact
  *   2. resolve-conversation
  *   3. dedup-by-external-id
@@ -1075,11 +1125,15 @@ export async function processReplyHandler(
  *   8a. claude-generate-{intent}  (S9.3.3b, non-STOP only)
  *   8b. store-draft               (S9.3.3b, non-STOP only)
  *   8c. audit-reply-generated     (S9.3.3b, non-STOP only)
- *   8d. dispatch-reply-event      (S9.4.3, non-STOP only) 🆕
+ *   8d. dispatch-reply-event      (S9.4.3, non-STOP only)
+ *   8e. dispatch-handoff-event    (S9.9-PR4, INTERESSE only) 🆕
  *   9. audit-reply-processed
  *
- * Branche STOP (short-form ou classifier_long_form) : skip steps 8a-8d,
+ * Branche STOP (short-form ou classifier_long_form) : skip steps 8a-8e,
  * step 9 est appelé pour forensic.
+ *
+ * Branche OBJECTION/NEUTRE : skip step 8e (le hand-off Slack est réservé
+ * aux leads chauds INTERESSE). Steps 8a-8d + 9 exécutés normalement.
  *
  * **Trigger** : event `medere/sms.reply.received` (`SmsReplyReceivedDataSchema`).
  *

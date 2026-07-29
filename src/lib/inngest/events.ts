@@ -129,6 +129,24 @@ const SMS_REPLY_RECEIVED = "medere/sms.reply.received";
  */
 const SMS_REPLY_SEND_REQUESTED = "medere/sms.reply.send-requested";
 
+/**
+ * Nom de l'event "hand-off commercial demandé pour un lead INTERESSE". Stable.
+ *
+ * Émis par `process-reply.ts` step 8e (S9.9-PR4) UNIQUEMENT sur la branche
+ * classifier `intent === "INTERESSE"`, APRÈS le dispatch du SMS auto (step
+ * 8d). Le SMS auto part TOUJOURS en premier — le hand-off ne bloque jamais
+ * la réponse au PS.
+ *
+ * Consommé par la future Inngest function `slack-handoff` (S9.9-PR5) qui
+ * fera : owner HubSpot → resolve commercial Airtable → sendHandoffNotification
+ * (DM ou canal orphelins) → audit `handoff` / `handoff_unassigned` /
+ * `handoff_airtable_unavailable`.
+ *
+ * **En PR4** : l'event est émis mais n'a AUCUN consumer. Inngest l'ingère
+ * et le drop silencieusement — comportement documenté du contrat SDK v4.
+ */
+const HANDOFF_REQUESTED = "medere/handoff.requested";
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Schemas Zod (data des events) — exportés pour réutilisation
 // ─────────────────────────────────────────────────────────────────────────────
@@ -239,6 +257,57 @@ export const SmsReplySendRequestedDataSchema = z.strictObject({
 /** Type inféré (Output = Input — aucun transform). */
 export type SmsReplySendRequestedData = z.infer<typeof SmsReplySendRequestedDataSchema>;
 
+/**
+ * Schéma data de `medere/handoff.requested` (S9.9-PR4).
+ *
+ * **Émis par** : `process-reply.ts` step 8e sur la branche classifier
+ * `intent === "INTERESSE"` UNIQUEMENT, APRÈS l'émission du dispatch OVH
+ * (step 8d). Non émis sur OBJECTION/NEUTRE/STOP.
+ *
+ * **Consommé par** : (aucun en PR4). PR5 branchera `slack-handoff` Inngest
+ * function : resolve owner HubSpot → lookup commercial Airtable → post DM
+ * ou canal orphelins Slack.
+ *
+ * **Sémantique** (payload minimaliste — miroir strict Q-B3 S9.4.0) :
+ *   - `contactId` : hubspotId opaque. Utilisé par PR5 pour lookup owner
+ *     HubSpot (contact.hubspot_owner_id → Airtable Commerciaux).
+ *   - `conversationId` : docId composite `${contactId}_${campaignId}`.
+ *     Utilisé pour construire l'URL dashboard commercial (deep-link
+ *     `/conversations/${conversationId}`).
+ *   - `draftMessageId` : Firestore auto-ID `[A-Za-z0-9]{20}` du draft SMS
+ *     auto envoyé au PS en step 8d. Sert de source de vérité pour
+ *     l'eventId déterministe `handoff.${draftMessageId}` (idempotence
+ *     natif Inngest 60s, defense-in-depth vs memoization step.sendEvent).
+ *
+ * 🚨 **PAS d'`intent` dans le payload** : implicite `INTERESSE` par
+ * construction (non émis sinon). Miroir Q-B3 S9.4.0 — minimiser surface
+ * PII Inngest cloud + drift contrat.
+ *
+ * 🚨 **PAS de contexte PS** : ni firstName, ni speciality, ni city, ni
+ * lastInboundBody. Le consumer PR5 les charge à la volée depuis
+ * `contacts/{contactId}` + `messages/` (dernière inbound) au moment du
+ * post Slack. Motif : les fields PS peuvent évoluer entre l'émission
+ * (T0) et la consommation (T0+retry), l'event ne doit pas figer un état
+ * stale.
+ *
+ * 🚨 **`event.id` INTERDIT avec PII** (cf. règle globale l.49-73) —
+ * phone, email, ovhMessageId interdits dans le forge d'event.id par
+ * l'émetteur S9.9-PR4. Pattern retenu : `handoff.${draftMessageId}`
+ * (Firestore auto-ID `[A-Za-z0-9]{20}` = scrubber-safe par construction,
+ * miroir `reply.send.${draftMessageId}` S9.4.3).
+ *
+ * `strictObject` (vs `object`) — anti-bypass identique
+ * `SmsReplySendRequestedDataSchema`.
+ */
+export const HandoffRequestedDataSchema = z.strictObject({
+  contactId: z.string().min(1),
+  conversationId: z.string().min(1),
+  draftMessageId: z.string().min(1),
+});
+
+/** Type inféré (Output = Input — aucun transform). */
+export type HandoffRequestedData = z.infer<typeof HandoffRequestedDataSchema>;
+
 // ─────────────────────────────────────────────────────────────────────────────
 // EventType Inngest — réutilisables comme triggers + .send() payloads
 // ─────────────────────────────────────────────────────────────────────────────
@@ -275,6 +344,16 @@ export const smsReplySendRequested = eventType(SMS_REPLY_SEND_REQUESTED, {
   schema: SmsReplySendRequestedDataSchema,
 });
 
+/**
+ * Event typé "hand-off commercial demandé" (S9.9-PR4). À utiliser comme
+ * trigger (`triggers: [{ event: handoffRequested }]` — PR5) et comme
+ * payload (`inngest.send(handoffRequested.create({ contactId,
+ * conversationId, draftMessageId }))`).
+ */
+export const handoffRequested = eventType(HANDOFF_REQUESTED, {
+  schema: HandoffRequestedDataSchema,
+});
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Exposés pour tests sentinelles
 // ─────────────────────────────────────────────────────────────────────────────
@@ -284,6 +363,7 @@ export const __EVENT_NAMES_FOR_TESTS = {
   SMS_SEND_FIRST_REQUESTED,
   SMS_REPLY_RECEIVED,
   SMS_REPLY_SEND_REQUESTED,
+  HANDOFF_REQUESTED,
 } as const;
 
 /** @internal */
