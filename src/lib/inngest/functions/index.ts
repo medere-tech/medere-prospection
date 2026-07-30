@@ -10,3 +10,4 @@ export { monitorOrphanMessages } from "./monitor-orphan-messages";
 export { processReply } from "./process-reply";
 export { sendFirstSms } from "./send-first-sms";
 export { sendReply } from "./send-reply";
+export { slackHandoff } from "./slack-handoff";
