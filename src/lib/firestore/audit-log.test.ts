@@ -94,6 +94,7 @@ const EXPECTED_AUDIT_ACTIONS: ReadonlySet<AuditAction> = new Set<AuditAction>([
   "opt_out",
   "handoff",
   "handoff_accepted",
+  "handoff_unassigned", // S9.9-PR5a — lead INTERESSE non routé (branche orphelins slack-handoff)
   // CAMPAIGN / ADMIN
   "manual_override",
   "prompt_changed",
