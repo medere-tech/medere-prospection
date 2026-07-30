@@ -85,6 +85,10 @@ const ACTIONS = [
   "opt_out",
   "handoff",
   "handoff_accepted",
+  // S9.9-PR5a — lead INTERESSE non routé vers un commercial (branche
+  // orphelins de `slack-handoff` S9.9-PR5b). Cf. types/audit-log.ts pour
+  // la sémantique complète + `HandoffUnassignedPayload` typé.
+  "handoff_unassigned",
   // ── CAMPAIGN / ADMIN ───────────────────────────────────────────────────
   "manual_override",
   "prompt_changed",

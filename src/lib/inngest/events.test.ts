@@ -3,6 +3,8 @@ import { describe, expect, it } from "vitest";
 import {
   __BODY_MAX_LENGTH_FOR_TESTS,
   __EVENT_NAMES_FOR_TESTS,
+  handoffRequested,
+  HandoffRequestedDataSchema,
   smsReplyReceived,
   SmsReplyReceivedDataSchema,
   smsReplySendRequested,
@@ -37,6 +39,14 @@ describe("EVENT_NAMES — sentinelles anti-régression", () => {
     );
   });
 
+  it("HANDOFF_REQUESTED est figé à 'medere/handoff.requested' (S9.9-PR4)", () => {
+    // Sentinelle anti-régression : ce nom est le contrat entre
+    // process-reply.ts step 8e (émetteur S9.9-PR4) et la future Inngest
+    // function `slack-handoff` (consommateur S9.9-PR5). Le modifier
+    // casserait la boucle hand-off Slack.
+    expect(__EVENT_NAMES_FOR_TESTS.HANDOFF_REQUESTED).toBe("medere/handoff.requested");
+  });
+
   it("EventType `smsSendFirstRequested.name` correspond à la constante", () => {
     expect(smsSendFirstRequested.name).toBe(__EVENT_NAMES_FOR_TESTS.SMS_SEND_FIRST_REQUESTED);
   });
@@ -47,6 +57,10 @@ describe("EVENT_NAMES — sentinelles anti-régression", () => {
 
   it("EventType `smsReplySendRequested.name` correspond à la constante (S9.4.2)", () => {
     expect(smsReplySendRequested.name).toBe(__EVENT_NAMES_FOR_TESTS.SMS_REPLY_SEND_REQUESTED);
+  });
+
+  it("EventType `handoffRequested.name` correspond à la constante (S9.9-PR4)", () => {
+    expect(handoffRequested.name).toBe(__EVENT_NAMES_FOR_TESTS.HANDOFF_REQUESTED);
   });
 });
 
@@ -250,6 +264,78 @@ describe("SmsReplySendRequestedDataSchema", () => {
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
+// HandoffRequestedDataSchema — validation runtime (S9.9-PR4)
+// ─────────────────────────────────────────────────────────────────────────────
+
+describe("HandoffRequestedDataSchema", () => {
+  const validData = {
+    contactId: "hs_dent_paris_01",
+    conversationId: "hs_dent_paris_01_dentistes-idf-mai-2026",
+    draftMessageId: "draft_FirestoreAutoId20a",
+  };
+
+  it("accepte un payload bien formé", () => {
+    const result = HandoffRequestedDataSchema.safeParse(validData);
+    expect(result.success).toBe(true);
+  });
+
+  it("refuse contactId vide", () => {
+    const result = HandoffRequestedDataSchema.safeParse({ ...validData, contactId: "" });
+    expect(result.success).toBe(false);
+  });
+
+  it("refuse conversationId vide", () => {
+    const result = HandoffRequestedDataSchema.safeParse({ ...validData, conversationId: "" });
+    expect(result.success).toBe(false);
+  });
+
+  it("refuse draftMessageId vide", () => {
+    const result = HandoffRequestedDataSchema.safeParse({ ...validData, draftMessageId: "" });
+    expect(result.success).toBe(false);
+  });
+
+  it("strictObject : refuse un champ inattendu (anti-bypass, ex: intent, phone, body)", () => {
+    // Sentinelle CRITIQUE : le contrat Q-B3 S9.4.0 impose payload
+    // minimaliste. Si un caller injecte `intent: "INTERESSE"` (redondant,
+    // implicite par la sémantique de l'event) ou pire `phone`/`body`
+    // (PII → Inngest cloud), le schéma doit throw plutôt que stripper
+    // silencieusement.
+    const sneakyIntent = { ...validData, intent: "INTERESSE" };
+    expect(HandoffRequestedDataSchema.safeParse(sneakyIntent).success).toBe(false);
+
+    const sneakyPhone = { ...validData, phone: "+33612345678" };
+    expect(HandoffRequestedDataSchema.safeParse(sneakyPhone).success).toBe(false);
+
+    const sneakyBody = { ...validData, body: "hello" };
+    expect(HandoffRequestedDataSchema.safeParse(sneakyBody).success).toBe(false);
+  });
+
+  it("refuse contactId manquant", () => {
+    const result = HandoffRequestedDataSchema.safeParse({
+      conversationId: "cv1",
+      draftMessageId: "msg1",
+    });
+    expect(result.success).toBe(false);
+  });
+
+  it("refuse conversationId manquant", () => {
+    const result = HandoffRequestedDataSchema.safeParse({
+      contactId: "ct1",
+      draftMessageId: "msg1",
+    });
+    expect(result.success).toBe(false);
+  });
+
+  it("refuse draftMessageId manquant", () => {
+    const result = HandoffRequestedDataSchema.safeParse({
+      contactId: "ct1",
+      conversationId: "cv1",
+    });
+    expect(result.success).toBe(false);
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
 // EventType — contrat structurel
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -294,6 +380,26 @@ describe("EventType — structure Inngest", () => {
     });
     expect(payload.name).toBe("medere/sms.send-first.requested");
     expect(payload.data).toEqual({ contactId: "c1", campaignId: "k1", body: "Bonjour" });
+  });
+
+  it("handoffRequested expose `.name`, `.schema` et `.create()` (S9.9-PR4)", () => {
+    expect(typeof handoffRequested.name).toBe("string");
+    expect(handoffRequested.schema).toBe(HandoffRequestedDataSchema);
+    expect(typeof handoffRequested.create).toBe("function");
+  });
+
+  it("handoffRequested.create() produit un payload `{ name, data }` (S9.9-PR4)", () => {
+    const payload = handoffRequested.create({
+      contactId: "ct_test",
+      conversationId: "ct_test_camp",
+      draftMessageId: "draft_FirestoreAutoId20",
+    });
+    expect(payload.name).toBe("medere/handoff.requested");
+    expect(payload.data).toEqual({
+      contactId: "ct_test",
+      conversationId: "ct_test_camp",
+      draftMessageId: "draft_FirestoreAutoId20",
+    });
   });
 });
 

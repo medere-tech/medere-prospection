@@ -852,8 +852,15 @@ describe("Step 7 — branch-by-intent", () => {
     // medere/sms.reply.send-requested vers le handler send-reply.ts.
     // eventId déterministe `reply.send.${draftMessageId}` pour
     // déduplication 60s Inngest (defense-in-depth).
+    //
+    // S9.9-PR4 — filtre par stepName (au lieu de count total) car sur
+    // INTERESSE, step 8e `dispatch-handoff-event` s'ajoute (2 sendEvent
+    // totaux). Sur OBJECTION/NEUTRE ce sera 1 seul.
     const sendEventSpy = ctx.step.sendEvent as ReturnType<typeof vi.fn>;
-    expect(sendEventSpy).toHaveBeenCalledTimes(1);
+    const dispatchReplyCalls = sendEventSpy.mock.calls.filter(
+      ([name]) => name === "dispatch-reply-event",
+    );
+    expect(dispatchReplyCalls).toHaveLength(1);
     expect(sendEventSpy).toHaveBeenCalledWith("dispatch-reply-event", {
       name: "medere/sms.reply.send-requested",
       data: {
@@ -911,7 +918,9 @@ describe("Step 7 — branch-by-intent", () => {
       }),
     });
 
-    // S9.4.3 — Step 8d dispatch-reply-event sur branche OBJECTION
+    // S9.4.3 — Step 8d dispatch-reply-event sur branche OBJECTION.
+    // S9.9-PR4 — sur OBJECTION, step 8e `dispatch-handoff-event` N'EST PAS
+    // émis (hand-off réservé à INTERESSE). Donc 1 seul sendEvent total ici.
     const sendEventSpyO = ctx.step.sendEvent as ReturnType<typeof vi.fn>;
     expect(sendEventSpyO).toHaveBeenCalledTimes(1);
     expect(sendEventSpyO).toHaveBeenCalledWith("dispatch-reply-event", {
@@ -923,6 +932,9 @@ describe("Step 7 — branch-by-intent", () => {
       },
       id: expect.stringMatching(/^reply\.send\.[A-Za-z0-9]+$/),
     });
+    // Sentinelle négative S9.9-PR4 : dispatch-handoff-event JAMAIS émis
+    // sur OBJECTION.
+    expect(sendEventSpyO).not.toHaveBeenCalledWith("dispatch-handoff-event", expect.anything());
   });
 
   it("NEUTRE → setConversationIntent('NEUTRE', in_dialogue) + classified", async () => {
@@ -971,7 +983,9 @@ describe("Step 7 — branch-by-intent", () => {
       }),
     });
 
-    // S9.4.3 — Step 8d dispatch-reply-event sur branche NEUTRE
+    // S9.4.3 — Step 8d dispatch-reply-event sur branche NEUTRE.
+    // S9.9-PR4 — sur NEUTRE, step 8e `dispatch-handoff-event` N'EST PAS
+    // émis (hand-off réservé à INTERESSE). Donc 1 seul sendEvent total ici.
     const sendEventSpyN = ctx.step.sendEvent as ReturnType<typeof vi.fn>;
     expect(sendEventSpyN).toHaveBeenCalledTimes(1);
     expect(sendEventSpyN).toHaveBeenCalledWith("dispatch-reply-event", {
@@ -983,6 +997,9 @@ describe("Step 7 — branch-by-intent", () => {
       },
       id: expect.stringMatching(/^reply\.send\.[A-Za-z0-9]+$/),
     });
+    // Sentinelle négative S9.9-PR4 : dispatch-handoff-event JAMAIS émis
+    // sur NEUTRE.
+    expect(sendEventSpyN).not.toHaveBeenCalledWith("dispatch-handoff-event", expect.anything());
   });
 
   it("STOP via classifier → markOptedOut ÉTENDU + status opt_out via=classifier_long_form", async () => {
@@ -1880,10 +1897,14 @@ describe("S9.4.3 — sentinelles anti-PII dispatch-reply-event", () => {
 
     await processReplyHandler(ctx, deps);
 
+    // S9.9-PR4 — sur INTERESSE, sendEvent est appelé 2× (dispatch-reply
+    // step 8d + dispatch-handoff step 8e). On filtre par stepName pour
+    // isoler la sentinelle S9.4.3 (reply.send).
     const sendEventSpy = ctx.step.sendEvent as ReturnType<typeof vi.fn>;
-    expect(sendEventSpy).toHaveBeenCalledTimes(1);
+    const replyCalls = sendEventSpy.mock.calls.filter(([name]) => name === "dispatch-reply-event");
+    expect(replyCalls).toHaveLength(1);
 
-    const callArgs = sendEventSpy.mock.calls[0];
+    const callArgs = replyCalls[0];
     expect(callArgs).toBeDefined();
     // callArgs[1] = payload { name, data, id }
     const payload = callArgs![1] as { name: string; data: unknown; id: string };
@@ -1996,8 +2017,351 @@ describe("S9.4.3 — sentinelles anti-PII dispatch-reply-event", () => {
 
     await processReplyHandler(ctx, deps);
 
+    // S9.9-PR4 — sur INTERESSE, 2 sendEvent (reply + handoff). Le step 8d
+    // (dispatch-reply-event) doit être le 1er appel (ordre : SMS auto AVANT
+    // hand-off, garantit par le code source). L'ordre est également
+    // verrouillé par le test dédié "ordre 8d avant 8e" du describe PR4.
     const sendEventSpy = ctx.step.sendEvent as ReturnType<typeof vi.fn>;
-    const stepName = sendEventSpy.mock.calls[0]![0] as string;
-    expect(stepName).toBe("dispatch-reply-event");
+    const stepNames = sendEventSpy.mock.calls.map(([name]) => name);
+    expect(stepNames[0]).toBe("dispatch-reply-event");
+    expect(stepNames).toContain("dispatch-reply-event");
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// S9.9-PR4 — dispatch-handoff-event (step 8e)
+//
+// 🔒 Verrouille les invariants du hand-off Slack event émis par
+// process-reply.ts step 8e vers la future function `slack-handoff` (PR5) :
+//   - INTERESSE UNIQUEMENT → émission
+//   - OBJECTION / NEUTRE / STOP → SKIP (pas d'émission)
+//   - Ordre : dispatch-reply-event (8d, SMS auto) AVANT dispatch-handoff-event
+//     (8e). Le SMS auto ne doit JAMAIS être bloqué par le hand-off.
+//   - event.id format strict `handoff.${draftMessageId}` — scrubber-safe
+//     par construction (draftMessageId = Firestore auto-ID `[A-Za-z0-9]{20}`)
+//   - event.data minimaliste {contactId, conversationId, draftMessageId} —
+//     pas de intent/body/phone/firstName/speciality/city
+//   - event name figé `medere/handoff.requested`
+//   - step name figé `dispatch-handoff-event`
+// ─────────────────────────────────────────────────────────────────────────────
+
+describe("S9.9-PR4 — dispatch-handoff-event (step 8e)", () => {
+  it("INTERESSE → émet handoff.requested avec {contactId, conversationId, draftMessageId} + eventId déterministe", async () => {
+    const ctx = makeFakeCtx({ body: "Oui ça m'intéresse, pouvez-vous me rappeler ?" });
+    const deps = makeDeps({
+      getContactByPhone: vi.fn().mockResolvedValue(makeFakeContact("hs-ho-int")),
+      getActiveConversationByContactId: vi.fn().mockResolvedValue({
+        conversationId: "hs-ho-int_camp-ho",
+        conversation: makeFakeConversation("hs-ho-int", "camp-ho"),
+      }),
+      addInbound: vi.fn().mockResolvedValue("msgid-ho-int"),
+      addOutboundDraft: vi.fn().mockResolvedValue("draftidho01aaaaaaaaa"),
+      classifyReply: vi.fn().mockResolvedValue({
+        intent: "INTERESSE",
+        confidence: 0.9,
+        reasoning: "demande rappel",
+        fallback: false,
+      }),
+    });
+
+    await processReplyHandler(ctx, deps);
+
+    const sendEventSpy = ctx.step.sendEvent as ReturnType<typeof vi.fn>;
+
+    // 2 sendEvent au total sur INTERESSE : dispatch-reply-event (8d) puis
+    // dispatch-handoff-event (8e).
+    expect(sendEventSpy).toHaveBeenCalledTimes(2);
+
+    // Le step 8e passe la payload attendue.
+    expect(sendEventSpy).toHaveBeenCalledWith("dispatch-handoff-event", {
+      name: "medere/handoff.requested",
+      data: {
+        contactId: "hs-ho-int",
+        conversationId: "hs-ho-int_camp-ho",
+        draftMessageId: "draftidho01aaaaaaaaa",
+      },
+      // eventId déterministe miroir `reply.send.${draftMessageId}` (8d).
+      id: "handoff.draftidho01aaaaaaaaa",
+    });
+  });
+
+  it("OBJECTION → PAS d'émission dispatch-handoff-event (hand-off réservé INTERESSE)", async () => {
+    const ctx = makeFakeCtx({ body: "Pas dispo pour l'instant" });
+    const deps = makeDeps({
+      getContactByPhone: vi.fn().mockResolvedValue(makeFakeContact("hs-ho-obj")),
+      getActiveConversationByContactId: vi.fn().mockResolvedValue({
+        conversationId: "hs-ho-obj_camp-ho",
+        conversation: makeFakeConversation("hs-ho-obj", "camp-ho"),
+      }),
+      addInbound: vi.fn().mockResolvedValue("msgid-ho-obj"),
+      classifyReply: vi.fn().mockResolvedValue({
+        intent: "OBJECTION",
+        confidence: 0.85,
+        reasoning: "refus poli",
+        fallback: false,
+      }),
+    });
+
+    await processReplyHandler(ctx, deps);
+
+    const sendEventSpy = ctx.step.sendEvent as ReturnType<typeof vi.fn>;
+    // Le SMS auto (step 8d) part quand même. C'est step 8e qui est skip.
+    const handoffCalls = sendEventSpy.mock.calls.filter(
+      ([name]) => name === "dispatch-handoff-event",
+    );
+    expect(handoffCalls).toHaveLength(0);
+    // Sanity : dispatch-reply-event a bien été émis (SMS auto sur OBJECTION).
+    const replyCalls = sendEventSpy.mock.calls.filter(([name]) => name === "dispatch-reply-event");
+    expect(replyCalls).toHaveLength(1);
+  });
+
+  it("NEUTRE → PAS d'émission dispatch-handoff-event (hand-off réservé INTERESSE)", async () => {
+    const ctx = makeFakeCtx({ body: "OK bien reçu" });
+    const deps = makeDeps({
+      getContactByPhone: vi.fn().mockResolvedValue(makeFakeContact("hs-ho-neu")),
+      getActiveConversationByContactId: vi.fn().mockResolvedValue({
+        conversationId: "hs-ho-neu_camp-ho",
+        conversation: makeFakeConversation("hs-ho-neu", "camp-ho"),
+      }),
+      addInbound: vi.fn().mockResolvedValue("msgid-ho-neu"),
+      classifyReply: vi.fn().mockResolvedValue({
+        intent: "NEUTRE",
+        confidence: 0.6,
+        reasoning: "accusé réception",
+        fallback: false,
+      }),
+    });
+
+    await processReplyHandler(ctx, deps);
+
+    const sendEventSpy = ctx.step.sendEvent as ReturnType<typeof vi.fn>;
+    const handoffCalls = sendEventSpy.mock.calls.filter(
+      ([name]) => name === "dispatch-handoff-event",
+    );
+    expect(handoffCalls).toHaveLength(0);
+    const replyCalls = sendEventSpy.mock.calls.filter(([name]) => name === "dispatch-reply-event");
+    expect(replyCalls).toHaveLength(1);
+  });
+
+  it("STOP short_form → PAS d'émission dispatch-handoff-event (court-circuit step 5)", async () => {
+    // Sur STOP short_form, le pipeline court-circuite dès le step 5 :
+    // aucun step 8 n'est atteint. Sentinelle négative : ni reply, ni handoff.
+    const ctx = makeFakeCtx({ body: "STOP" });
+    const deps = makeDeps({
+      getContactByPhone: vi.fn().mockResolvedValue(makeFakeContact("hs-ho-stop-sf")),
+      getActiveConversationByContactId: vi.fn().mockResolvedValue({
+        conversationId: "hs-ho-stop-sf_camp-ho",
+        conversation: makeFakeConversation("hs-ho-stop-sf", "camp-ho"),
+      }),
+      addInbound: vi.fn().mockResolvedValue("msgid-ho-stop-sf"),
+      isOptOut: vi.fn().mockReturnValue(true),
+    });
+
+    await processReplyHandler(ctx, deps);
+
+    expect(ctx.step.sendEvent).not.toHaveBeenCalled();
+  });
+
+  it("STOP classifier_long_form → PAS d'émission dispatch-handoff-event (branche STOP step 7)", async () => {
+    // Sur STOP long_form (rattrapé par Claude), branche STOP en step 7
+    // early return AVANT step 8. Ni reply, ni handoff.
+    const ctx = makeFakeCtx({
+      body: "Merci de me retirer de votre liste, je ne souhaite plus être contacté.",
+    });
+    const deps = makeDeps({
+      getContactByPhone: vi.fn().mockResolvedValue(makeFakeContact("hs-ho-stop-lf")),
+      getActiveConversationByContactId: vi.fn().mockResolvedValue({
+        conversationId: "hs-ho-stop-lf_camp-ho",
+        conversation: makeFakeConversation("hs-ho-stop-lf", "camp-ho"),
+      }),
+      addInbound: vi.fn().mockResolvedValue("msgid-ho-stop-lf"),
+      isOptOut: vi.fn().mockReturnValue(false), // short-form ne détecte pas
+      classifyReply: vi.fn().mockResolvedValue({
+        intent: "STOP",
+        confidence: 0.9,
+        reasoning: "demande retrait explicite",
+        fallback: false,
+      }),
+    });
+
+    await processReplyHandler(ctx, deps);
+
+    expect(ctx.step.sendEvent).not.toHaveBeenCalled();
+  });
+
+  it("ordre 8d avant 8e — le SMS auto (reply) est émis AVANT le hand-off", async () => {
+    // 🔒 SENTINELLE CRITIQUE — invariant "SMS auto ne peut jamais être
+    // bloqué par le hand-off". Si quelqu'un inverse l'ordre dans le code
+    // source (step 8e avant 8d), ce test casse. Empêche qu'une panne du
+    // step 8e retarde la réponse au PS.
+    const ctx = makeFakeCtx({ body: "Oui intéressé" });
+    const deps = makeDeps({
+      getContactByPhone: vi.fn().mockResolvedValue(makeFakeContact("hs-ho-order")),
+      getActiveConversationByContactId: vi.fn().mockResolvedValue({
+        conversationId: "hs-ho-order_camp-ho",
+        conversation: makeFakeConversation("hs-ho-order", "camp-ho"),
+      }),
+      addInbound: vi.fn().mockResolvedValue("msgid-ho-order"),
+      classifyReply: vi.fn().mockResolvedValue({
+        intent: "INTERESSE",
+        confidence: 0.9,
+        reasoning: "oui explicite",
+        fallback: false,
+      }),
+    });
+
+    await processReplyHandler(ctx, deps);
+
+    const sendEventSpy = ctx.step.sendEvent as ReturnType<typeof vi.fn>;
+    const orderedStepNames = sendEventSpy.mock.calls.map(([name]) => name);
+    // dispatch-reply-event AVANT dispatch-handoff-event dans le call order.
+    const replyIdx = orderedStepNames.indexOf("dispatch-reply-event");
+    const handoffIdx = orderedStepNames.indexOf("dispatch-handoff-event");
+    expect(replyIdx).toBeGreaterThanOrEqual(0);
+    expect(handoffIdx).toBeGreaterThan(replyIdx);
+  });
+
+  it("event name figé 'medere/handoff.requested' (sentinelle anti-drift)", async () => {
+    // Si quelqu'un renomme l'event côté events.ts SANS amender ce test,
+    // le test casse. Force la cohérence émetteur (process-reply.ts step
+    // 8e) ↔ schema (events.ts) ↔ handler (slack-handoff.ts S9.9-PR5).
+    const ctx = makeFakeCtx({ body: "je suis intéressé merci" });
+    const deps = makeDeps({
+      getContactByPhone: vi.fn().mockResolvedValue(makeFakeContact("hs-ho-name")),
+      getActiveConversationByContactId: vi.fn().mockResolvedValue({
+        conversationId: "hs-ho-name_camp-ho",
+        conversation: makeFakeConversation("hs-ho-name", "camp-ho"),
+      }),
+      addInbound: vi.fn().mockResolvedValue("msgid-ho-name"),
+      classifyReply: vi.fn().mockResolvedValue({
+        intent: "INTERESSE",
+        confidence: 0.9,
+        reasoning: "oui explicite",
+        fallback: false,
+      }),
+    });
+
+    await processReplyHandler(ctx, deps);
+
+    const sendEventSpy = ctx.step.sendEvent as ReturnType<typeof vi.fn>;
+    const handoffCall = sendEventSpy.mock.calls.find(([name]) => name === "dispatch-handoff-event");
+    expect(handoffCall).toBeDefined();
+    const payload = handoffCall![1] as { name: string };
+    expect(payload.name).toBe("medere/handoff.requested");
+  });
+
+  it("step nommé 'dispatch-handoff-event' (sentinelle anti-drift step name)", async () => {
+    // Force la stabilité du nom du step (utilisé pour la memoization
+    // Inngest par (eventId, stepName) et par la sentinelle memoization
+    // Test 4/9).
+    const ctx = makeFakeCtx({ body: "oui je veux" });
+    const deps = makeDeps({
+      getContactByPhone: vi.fn().mockResolvedValue(makeFakeContact("hs-ho-sname")),
+      getActiveConversationByContactId: vi.fn().mockResolvedValue({
+        conversationId: "hs-ho-sname_camp-ho",
+        conversation: makeFakeConversation("hs-ho-sname", "camp-ho"),
+      }),
+      addInbound: vi.fn().mockResolvedValue("msgid-ho-sname"),
+      classifyReply: vi.fn().mockResolvedValue({
+        intent: "INTERESSE",
+        confidence: 0.9,
+        reasoning: "confirmation nette",
+        fallback: false,
+      }),
+    });
+
+    await processReplyHandler(ctx, deps);
+
+    const sendEventSpy = ctx.step.sendEvent as ReturnType<typeof vi.fn>;
+    const stepNames = sendEventSpy.mock.calls.map(([name]) => name);
+    expect(stepNames).toContain("dispatch-handoff-event");
+  });
+
+  it("event.data minimaliste : uniquement {contactId, conversationId, draftMessageId} (anti-PII)", async () => {
+    // Sentinelle strictObject côté events.ts déjà, mais on double-verrouille
+    // côté site d'émission — anti-bypass compile-time (cast forcé) + drift
+    // futur du code source.
+    const ctx = makeFakeCtx({ body: "oui c'est intéressant" });
+    const deps = makeDeps({
+      getContactByPhone: vi.fn().mockResolvedValue(makeFakeContact("hs-ho-data")),
+      getActiveConversationByContactId: vi.fn().mockResolvedValue({
+        conversationId: "hs-ho-data_camp-ho",
+        conversation: makeFakeConversation("hs-ho-data", "camp-ho"),
+      }),
+      addInbound: vi.fn().mockResolvedValue("msgid-ho-data"),
+      classifyReply: vi.fn().mockResolvedValue({
+        intent: "INTERESSE",
+        confidence: 0.9,
+        reasoning: "confirmation",
+        fallback: false,
+      }),
+    });
+
+    await processReplyHandler(ctx, deps);
+
+    const sendEventSpy = ctx.step.sendEvent as ReturnType<typeof vi.fn>;
+    const handoffCall = sendEventSpy.mock.calls.find(([name]) => name === "dispatch-handoff-event");
+    const payload = handoffCall![1] as {
+      name: string;
+      data: Record<string, unknown>;
+      id: string;
+    };
+
+    // Exactement 3 clés dans data (anti-bypass : pas de champ en plus).
+    expect(Object.keys(payload.data).sort()).toEqual([
+      "contactId",
+      "conversationId",
+      "draftMessageId",
+    ]);
+
+    // Aucun champ PII attendu.
+    expect(payload.data).not.toHaveProperty("phone");
+    expect(payload.data).not.toHaveProperty("body");
+    expect(payload.data).not.toHaveProperty("email");
+    expect(payload.data).not.toHaveProperty("firstName");
+    expect(payload.data).not.toHaveProperty("speciality");
+    expect(payload.data).not.toHaveProperty("city");
+    expect(payload.data).not.toHaveProperty("intent");
+    expect(payload.data).not.toHaveProperty("ovhMessageId");
+
+    // Sérialisation : pas de PII brute.
+    const serializedData = JSON.stringify(payload.data);
+    expect(serializedData).not.toMatch(/\+33\d{9}/);
+    expect(serializedData).not.toMatch(/0[1-9]\d{8}/);
+    expect(serializedData).not.toMatch(/\S+@\S+\.\S+/);
+  });
+
+  it("event.id format strict /^handoff\\.[A-Za-z0-9]+$/ + absence PII", async () => {
+    const ctx = makeFakeCtx({ body: "oui je vous écoute" });
+    const deps = makeDeps({
+      getContactByPhone: vi.fn().mockResolvedValue(makeFakeContact("hs-ho-id")),
+      getActiveConversationByContactId: vi.fn().mockResolvedValue({
+        conversationId: "hs-ho-id_camp-ho",
+        conversation: makeFakeConversation("hs-ho-id", "camp-ho"),
+      }),
+      addInbound: vi.fn().mockResolvedValue("msgid-ho-id"),
+      classifyReply: vi.fn().mockResolvedValue({
+        intent: "INTERESSE",
+        confidence: 0.9,
+        reasoning: "curieux",
+        fallback: false,
+      }),
+    });
+
+    await processReplyHandler(ctx, deps);
+
+    const sendEventSpy = ctx.step.sendEvent as ReturnType<typeof vi.fn>;
+    const handoffCall = sendEventSpy.mock.calls.find(([name]) => name === "dispatch-handoff-event");
+    const payload = handoffCall![1] as { id: string };
+
+    // Format strict scrubber-safe.
+    expect(payload.id).toMatch(/^handoff\.[A-Za-z0-9]+$/);
+
+    // Aucune PII dans event.id (defense-in-depth contre fuite Inngest cloud).
+    expect(payload.id).not.toMatch(/\+33\d{9}/);
+    expect(payload.id).not.toMatch(/0[1-9]\d{8}/);
+    expect(payload.id).not.toMatch(/\S+@\S+\.\S+/);
+    // ovhMessageId NE DOIT PAS apparaître (semi-sensible).
+    expect(payload.id).not.toContain("ovh-msg-789");
   });
 });

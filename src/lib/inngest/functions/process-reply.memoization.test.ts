@@ -310,6 +310,9 @@ describe("MED-1 — Memoization Inngest sur retry (S9.2.3.2)", () => {
     expect(cache.has("evt-mem-1::store-draft")).toBe(true);
     expect(cache.has("evt-mem-1::audit-reply-generated")).toBe(true);
     expect(cache.has("evt-mem-1::dispatch-reply-event")).toBe(true);
+    // S9.9-PR4 — step 8e commit AVANT le throw step 9. Sur INTERESSE, il
+    // est cached comme dispatch-reply-event.
+    expect(cache.has("evt-mem-1::dispatch-handoff-event")).toBe(true);
     expect(cache.has("evt-mem-1::store-inbound")).toBe(true);
 
     // Run 2 — retry, MÊME step memoizé partagé. Doit succeed.
@@ -358,10 +361,21 @@ describe("MED-1 — Memoization Inngest sur retry (S9.2.3.2)", () => {
     // Memoization Inngest court-circuite la ré-émission au Run 2. C'est le
     // contrat anti-double-dispatch OVH critique : si memoization était
     // perdue, on aurait 2 events → 2 dispatch SMS → faute compliance.
-    expect(sendEventCalls.length).toBe(1);
-    expect(sendEventCalls[0]?.stepName).toBe("dispatch-reply-event");
-    expect(sendEventCalls[0]?.payload.name).toBe("medere/sms.reply.send-requested");
-    expect(sendEventCalls[0]?.payload.id).toMatch(/^reply\.send\.[A-Za-z0-9]+$/);
+    // S9.9-PR4 — sur INTERESSE (default deps), step 8e dispatch-handoff-event
+    // s'ajoute → 2 sendEventCalls totaux. On filtre par stepName pour
+    // isoler la sentinelle S9.4.3 sur dispatch-reply-event.
+    const replyEventCalls = sendEventCalls.filter((c) => c.stepName === "dispatch-reply-event");
+    expect(replyEventCalls.length).toBe(1);
+    expect(replyEventCalls[0]?.payload.name).toBe("medere/sms.reply.send-requested");
+    expect(replyEventCalls[0]?.payload.id).toMatch(/^reply\.send\.[A-Za-z0-9]+$/);
+
+    // 🔒 S9.9-PR4 — dispatch-handoff-event émis EXACTEMENT 1× sur les 2
+    // runs. Même contrat anti-doublon que pour dispatch-reply-event (via
+    // memoization Inngest). Empêche un double post Slack au commercial.
+    const handoffEventCalls = sendEventCalls.filter((c) => c.stepName === "dispatch-handoff-event");
+    expect(handoffEventCalls.length).toBe(1);
+    expect(handoffEventCalls[0]?.payload.name).toBe("medere/handoff.requested");
+    expect(handoffEventCalls[0]?.payload.id).toMatch(/^handoff\.[A-Za-z0-9]+$/);
 
     // Step 9 maintenant cached après succès Run 2
     expect(cache.has("evt-mem-1::audit-reply-processed")).toBe(true);
@@ -555,8 +569,8 @@ describe("MED-1 — Memoization Inngest sur retry (S9.2.3.2)", () => {
       .sort();
     expect(auditActions).toEqual(["intent_classified", "reply_generated", "reply_processed"]);
 
-    // Cache : 13 steps présents (S9.4.3 — câblage gen IA + draft + audit +
-    // dispatch-reply-event)
+    // Cache : 14 steps présents (S9.9-PR4 — câblage gen IA + draft + audit +
+    // dispatch-reply-event + dispatch-handoff-event)
     const expectedSteps = [
       "resolve-contact",
       "resolve-conversation",
@@ -572,6 +586,8 @@ describe("MED-1 — Memoization Inngest sur retry (S9.2.3.2)", () => {
       "audit-reply-generated",
       // S9.4.3 sub-step 8d
       "dispatch-reply-event",
+      // S9.9-PR4 sub-step 8e (INTERESSE only)
+      "dispatch-handoff-event",
       "audit-reply-processed",
     ];
     for (const stepName of expectedSteps) {
@@ -929,15 +945,34 @@ describe("MED-1 — Memoization Inngest sur retry (S9.2.3.2)", () => {
     );
 
     // Vérification intermédiaire : step 8d dispatch-reply-event commit
-    // AVANT le throw step 9. Cache présent + 1 appel sendEventCalls.
+    // AVANT le throw step 9. Cache présent + 1 appel filtré sendEventCalls.
+    // S9.9-PR4 — step 8e dispatch-handoff-event commit AUSSI avant step 9
+    // sur INTERESSE (branche default). On filtre par stepName pour isoler
+    // les assertions S9.4.3 (dispatch-reply-event).
     expect(cache.has("evt-mem-8::dispatch-reply-event")).toBe(true);
-    expect(sendEventCalls.length).toBe(1);
-    expect(sendEventCalls[0]?.stepName).toBe("dispatch-reply-event");
-    expect(sendEventCalls[0]?.payload.name).toBe("medere/sms.reply.send-requested");
+    expect(cache.has("evt-mem-8::dispatch-handoff-event")).toBe(true);
+
+    const replyEventCallsMid = sendEventCalls.filter((c) => c.stepName === "dispatch-reply-event");
+    expect(replyEventCallsMid.length).toBe(1);
+    expect(replyEventCallsMid[0]?.payload.name).toBe("medere/sms.reply.send-requested");
     // event.id déterministe construit depuis draftMessageId.
-    expect(sendEventCalls[0]?.payload.id).toBe("reply.send.draftidmem8aaaaaaaaa");
+    expect(replyEventCallsMid[0]?.payload.id).toBe("reply.send.draftidmem8aaaaaaaaa");
     // event.data minimaliste (anti-PII + anti-drift).
-    expect(sendEventCalls[0]?.payload.data).toEqual({
+    expect(replyEventCallsMid[0]?.payload.data).toEqual({
+      contactId: "hs-mem-8",
+      conversationId: "hs-mem-8_camp-8",
+      draftMessageId: "draftidmem8aaaaaaaaa",
+    });
+
+    // S9.9-PR4 — sentinelle miroir pour dispatch-handoff-event (branche
+    // INTERESSE) : payload strict + eventId déterministe.
+    const handoffEventCallsMid = sendEventCalls.filter(
+      (c) => c.stepName === "dispatch-handoff-event",
+    );
+    expect(handoffEventCallsMid.length).toBe(1);
+    expect(handoffEventCallsMid[0]?.payload.name).toBe("medere/handoff.requested");
+    expect(handoffEventCallsMid[0]?.payload.id).toBe("handoff.draftidmem8aaaaaaaaa");
+    expect(handoffEventCallsMid[0]?.payload.data).toEqual({
       contactId: "hs-mem-8",
       conversationId: "hs-mem-8_camp-8",
       draftMessageId: "draftidmem8aaaaaaaaa",
@@ -950,8 +985,9 @@ describe("MED-1 — Memoization Inngest sur retry (S9.2.3.2)", () => {
 
     // 🔒 GARANTIE CRITIQUE — dispatch-reply-event TOUJOURS 1× au total
     // après le retry. Memoization native Inngest court-circuite la
-    // ré-émission au Run 2.
-    expect(sendEventCalls.length).toBe(1);
+    // ré-émission au Run 2. Idem pour dispatch-handoff-event (S9.9-PR4).
+    expect(sendEventCalls.filter((c) => c.stepName === "dispatch-reply-event").length).toBe(1);
+    expect(sendEventCalls.filter((c) => c.stepName === "dispatch-handoff-event").length).toBe(1);
 
     // Steps 1-8d tous appelés 1× chacun (memoization)
     expect(deps.getContactByPhone).toHaveBeenCalledTimes(1);
@@ -970,5 +1006,155 @@ describe("MED-1 — Memoization Inngest sur retry (S9.2.3.2)", () => {
     ).length;
     expect(replyGeneratedCount).toBe(1);
     expect(replyProcessedCount).toBe(2);
+  });
+
+  // ───────────────────────────────────────────────────────────────────────────
+  // Test 9 — Idempotence dispatch-handoff-event post-câblage S9.9-PR4
+  // ───────────────────────────────────────────────────────────────────────────
+
+  /**
+   * Test 9 — Idempotence pleine step 8e après échec transient.
+   *
+   * Verrouille le contrat CRITIQUE : si le step 8e `dispatch-handoff-event`
+   * échoue (Inngest cloud transient ou consumer downstream vide en PR4 →
+   * pas d'erreur en réalité, mais on simule un throw pour couvrir le futur
+   * cas PR5 où `slack-handoff` pourra retry), la memoization Inngest sert
+   *   - claude-classify (step 6a) depuis le cache → 0 ré-appel Haiku
+   *   - claude-generate-interesse (step 8a) depuis le cache → 0 ré-appel Sonnet
+   *   - dispatch-reply-event (step 8d) depuis le cache → 0 double-dispatch OVH
+   *   - store-draft (step 8b) depuis le cache → 0 double-doc Firestore
+   *
+   * Ferme le contrat "SMS auto part TOUJOURS avant hand-off, retry hand-off
+   * ne rejoue ni Claude ni SMS auto" — l'invariant que le brief S9.9-PR4
+   * demande explicitement de sentineller.
+   *
+   * Scénario :
+   *   - Run 1 : steps 1-8d commit, step 8e `dispatch-handoff-event` throw
+   *     une fois → toute la pile remonte AVANT step 9.
+   *   - Run 2 (retry, MÊME cache) : steps 1-8d servis depuis cache, step 8e
+   *     ré-exécuté → succeed → step 9 commit.
+   *   - Assertions :
+   *     * `classifyReply` TOTAL : **1×** (memoization step 6a).
+   *     * `generateReply` TOTAL : **1×** (memoization step 8a).
+   *     * `addOutboundDraft` TOTAL : **1×** (memoization step 8b).
+   *     * dispatch-reply-event (SMS auto) TOTAL : **1×** (memoization 8d).
+   *     * dispatch-handoff-event : 2× (1 fail + 1 success), sendEventCalls
+   *       trace 2 entrées mais l'appel Slack downstream PR5 s'exécutera
+   *       1× seule fois grâce à l'eventId déterministe
+   *       `handoff.${draftMessageId}` (déduplication 60s Inngest).
+   */
+  it("Test 9 — retry après échec step 8e (dispatch-handoff-event) : SMS auto + Claude intacts", async () => {
+    const { step, cache, sendEventCalls } = makeMemoizedStepRun("evt-mem-9");
+
+    // Compteur d'appels step 8e — le fake step.sendEvent memoizé n'expose
+    // pas de mock, on gère la throw via un wrap manuel dans le fake step.
+    // Approche : on redéfinit step.sendEvent pour throw sur le 1er
+    // dispatch-handoff-event, puis succeed. Le reste (dispatch-reply-event)
+    // passe normalement.
+    let handoffAttempt = 0;
+    const originalSendEvent = step.sendEvent;
+    step.sendEvent = async (
+      stepName: string,
+      payload: { name: string; data: Record<string, unknown>; id?: string },
+    ) => {
+      // dispatch-reply-event (step 8d) : jamais throw dans ce scénario.
+      // dispatch-handoff-event (step 8e) : throw 1×, puis succeed via le
+      // memoized wrapper.
+      if (stepName === "dispatch-handoff-event") {
+        handoffAttempt++;
+        if (handoffAttempt === 1) {
+          throw new Error("Inngest transient on dispatch-handoff-event");
+        }
+      }
+      return originalSendEvent(stepName, payload);
+    };
+
+    const deps = makeDeps({
+      getContactByPhone: vi.fn().mockResolvedValue(makeFakeContact("hs-mem-9")),
+      getActiveConversationByContactId: vi.fn().mockResolvedValue({
+        conversationId: "hs-mem-9_camp-9",
+        conversation: makeFakeConversation("hs-mem-9", "camp-9"),
+      }),
+      addInbound: vi.fn().mockResolvedValue("msgid-mem-9"),
+      addOutboundDraft: vi.fn().mockResolvedValue("draftidmem9aaaaaaaaa"),
+      // classifyReply default = INTERESSE (branche qui déclenche step 8e).
+    });
+
+    // Run 1 — doit throw au step 8e
+    await expect(processReplyHandler(makeFakeCtx("evt-mem-9", step), deps)).rejects.toThrow(
+      "Inngest transient on dispatch-handoff-event",
+    );
+
+    // 🔒 Vérification intermédiaire : le SMS auto (step 8d) EST commit
+    // AVANT le throw. C'est le contrat "SMS auto ne peut jamais être
+    // bloqué par le hand-off".
+    expect(cache.has("evt-mem-9::dispatch-reply-event")).toBe(true);
+    expect(cache.has("evt-mem-9::dispatch-handoff-event")).toBe(false);
+    // Steps 6a + 8a + 8b tous cached (Claude + Firestore commit).
+    expect(cache.has("evt-mem-9::claude-classify")).toBe(true);
+    expect(cache.has("evt-mem-9::claude-generate-interesse")).toBe(true);
+    expect(cache.has("evt-mem-9::store-draft")).toBe(true);
+    // Step 9 audit-reply-processed pas atteint (throw avant).
+    expect(cache.has("evt-mem-9::audit-reply-processed")).toBe(false);
+
+    // Run 2 — retry, MÊME cache memoization partagé.
+    const result = await processReplyHandler(makeFakeCtx("evt-mem-9", step), deps);
+
+    expect(result.status).toBe("classified");
+    if (result.status === "classified") {
+      expect(result.draftMessageId).toBe("draftidmem9aaaaaaaaa");
+    }
+
+    // ✅ IDEMPOTENCE PLEINE CLAUDE HAIKU (classify) :
+    // classifyReply appelé EXACTEMENT 1× au TOTAL — step 6a servi depuis
+    // le cache au Run 2. Anti-double-facturation.
+    expect(deps.classifyReply).toHaveBeenCalledTimes(1);
+
+    // ✅ IDEMPOTENCE PLEINE CLAUDE SONNET (generate) :
+    // generateReply appelé EXACTEMENT 1× au TOTAL — step 8a servi depuis
+    // le cache au Run 2. Anti-double-facturation. C'est LA garantie
+    // demandée par le brief S9.9-PR4.
+    expect(deps.generateReply).toHaveBeenCalledTimes(1);
+
+    // ✅ IDEMPOTENCE PLEINE FIRESTORE (store-draft) :
+    // addOutboundDraft appelé EXACTEMENT 1× — pas de double-doc draft.
+    expect(deps.addOutboundDraft).toHaveBeenCalledTimes(1);
+
+    // ✅ IDEMPOTENCE PLEINE SMS AUTO (dispatch-reply-event = SMS OVH) :
+    // Le SMS auto est envoyé EXACTEMENT 1× au TOTAL. C'est LA garantie
+    // compliance critique : un retry hand-off ne doit JAMAIS re-déclencher
+    // l'envoi SMS au PS (double message = faute L.34-5 CPCE).
+    const replyEventCalls = sendEventCalls.filter((c) => c.stepName === "dispatch-reply-event");
+    expect(replyEventCalls.length).toBe(1);
+    expect(replyEventCalls[0]?.payload.name).toBe("medere/sms.reply.send-requested");
+
+    // dispatch-handoff-event : 1× (Run 2 seulement, Run 1 a throw AVANT le
+    // push dans sendEventCalls car le fake wrap throw en amont du
+    // originalSendEvent — pas de trace du fail dans sendEventCalls).
+    const handoffEventCallsFinal = sendEventCalls.filter(
+      (c) => c.stepName === "dispatch-handoff-event",
+    );
+    expect(handoffEventCallsFinal.length).toBe(1);
+    expect(handoffEventCallsFinal[0]?.payload.name).toBe("medere/handoff.requested");
+    expect(handoffEventCallsFinal[0]?.payload.id).toBe("handoff.draftidmem9aaaaaaaaa");
+    expect(handoffEventCallsFinal[0]?.payload.data).toEqual({
+      contactId: "hs-mem-9",
+      conversationId: "hs-mem-9_camp-9",
+      draftMessageId: "draftidmem9aaaaaaaaa",
+    });
+
+    // handoffAttempt : 2× total au niveau du wrap (1 fail Run 1 + 1
+    // success Run 2). Prouve que step 8e est bien retenté.
+    expect(handoffAttempt).toBe(2);
+
+    // Step 9 audit-reply-processed : 1× total (succès Run 2).
+    const replyProcessedCount = (deps.appendAuditLog as ReturnType<typeof vi.fn>).mock.calls.filter(
+      (c) => (c[0] as { action: string }).action === "reply_processed",
+    ).length;
+    expect(replyProcessedCount).toBe(1);
+
+    // Steps 8e + 9 cached après succès Run 2.
+    expect(cache.has("evt-mem-9::dispatch-handoff-event")).toBe(true);
+    expect(cache.has("evt-mem-9::audit-reply-processed")).toBe(true);
   });
 });

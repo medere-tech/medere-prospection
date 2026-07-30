@@ -87,6 +87,19 @@ import { type Timestamp } from "firebase-admin/firestore";
  *     blockedContext (discriminated union FERMÉE de `pre-send-check.ts`
  *     qui exclut les PII par typage compile-time).
  *
+ * Extensions S9.9-PR5a (hand-off Slack — branche orphelins) :
+ *   - `handoff_unassigned` — lead INTERESSE non routé vers un commercial :
+ *     owner HubSpot absent, sans ligne Airtable, inactif, ou service
+ *     HubSpot/Airtable indisponible. Posé par la function Inngest
+ *     `slack-handoff` (S9.9-PR5b) sur la branche orphelins (canal partagé
+ *     `SLACK_ORPHAN_LEADS_CHANNEL_ID`). `targetType: "conversation"`,
+ *     `targetId: conversationId`. Payload = `HandoffUnassignedPayload`
+ *     (cf. interface ci-dessous). La conv reste `status="in_dialogue"`
+ *     avec `intent="INTERESSE"` — réassignable manuellement via UI
+ *     dashboard future S10+. 🚨 INVARIANT ANTI-PII : pas de firstName,
+ *     speciality, city, body, phone — uniquement IDs opaques + reason
+ *     (enum fermé) + Slack IDs (ts + channel).
+ *
  * ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
  * ORGANISATION VISUELLE (S9.1) — sections par cycle de vie
  *
@@ -123,6 +136,13 @@ export type AuditAction =
   | "opt_out"
   | "handoff"
   | "handoff_accepted"
+  // S9.9-PR5a — lead INTERESSE non routé vers un commercial (owner
+  // manquant/inactif ou service HubSpot/Airtable indisponible). Posé par
+  // la function Inngest `slack-handoff` (S9.9-PR5b) sur la branche
+  // orphelins. `targetType: "conversation"`, `targetId: conversationId`.
+  // Payload = `HandoffUnassignedPayload` (cf. interface ci-dessous) avec
+  // `reason` discriminant l'origine du fallback.
+  | "handoff_unassigned"
   // ── CAMPAIGN / ADMIN ───────────────────────────────────────────────────
   | "manual_override"
   | "prompt_changed"
@@ -296,6 +316,103 @@ export interface ReplyDraftDroppedPayload {
   blockedContext: Record<string, unknown>;
   // Index signature pour assignation `AuditLogInput.payload` (cf. pattern
   // miroir `ReplyGeneratedPayload` + JSDoc ci-dessus).
+  readonly [k: string]: unknown;
+}
+
+/**
+ * Raisons discriminantes pour `handoff_unassigned` (S9.9-PR5a).
+ *
+ * Enum FERMÉ — toute nouvelle cause de fallback orphelins DOIT étendre
+ * cette union explicitement (compile-time safety). Aligné avec la
+ * discrimination du step `decide-route` de la function Inngest
+ * `slack-handoff` (S9.9-PR5b) :
+ *
+ *   - `"no_owner"`               : contact HubSpot sans `hubspot_owner_id`
+ *                                  assigné (rare mais possible sur import).
+ *   - `"commercial_not_found"`   : owner_id présent mais aucune ligne
+ *                                  correspondante dans Airtable Commerciaux
+ *                                  (owner parti, table pas encore mise à jour).
+ *   - `"commercial_inactive"`    : ligne Airtable trouvée mais `Statut ≠ "Actif"`
+ *                                  (commercial en congé, quitté, etc.).
+ *   - `"hubspot_unavailable"`    : appel HubSpot a throw (5xx / network /
+ *                                  timeout). Fallback immédiat orphelins pour
+ *                                  ne pas retenir un lead chaud.
+ *   - `"airtable_unavailable"`   : appel Airtable a throw (5xx / network /
+ *                                  timeout). Idem — orphelins immédiat.
+ */
+export type HandoffUnassignedReason =
+  | "no_owner"
+  | "commercial_not_found"
+  | "commercial_inactive"
+  | "hubspot_unavailable"
+  | "airtable_unavailable";
+
+/**
+ * Payload type pour action `handoff_unassigned` (S9.9-PR5a).
+ *
+ * **Cible** : `targetType: "conversation"`, `targetId: conversationId`
+ * (la conv est l'entité qui aurait dû transitionner en `handed_off` — sur
+ * la branche orphelins elle reste `in_dialogue` avec `intent: "INTERESSE"`,
+ * réassignable manuellement par le commercial team).
+ *
+ * ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ * 🚨 INVARIANT ANTI-PII — INTERDITS EN PAYLOAD
+ *
+ * Interdits (compile-time via cette signature stricte + defense-in-depth
+ * scrubber runtime `detectPiiInPayload`) :
+ *   - `firstName`, `lastName`, `civilite` — prénom/nom du PS
+ *   - `speciality`, `city`, `postalCode` — contexte métier du PS
+ *   - `body`, `lastInboundBody` — contenu SMS
+ *   - `phone`, `email`, `hubspotOwnerId` — coordonnées / identifiants CRM
+ *
+ * Ces champs vivent dans le doc `contacts/{contactId}` (accessible via
+ * dashboard Clerk-protected) et dans les blocks Slack de la notification
+ * elle-même (fenêtre courte, pas persistée en audit). Le forensic
+ * L.34-5 CPCE est complet par cohabitation :
+ *   - contenu notifié → dashboard + logs Slack workspace
+ *   - événement audité → doc `audit_log/{id}` sans contenu
+ *
+ * ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ * Champs scrubber-safe par construction
+ *
+ *   - `contactId`/`conversationId`/`draftMessageId` : IDs opaques internes.
+ *   - `reason`                                     : enum FERMÉ (5 valeurs),
+ *                                                    pas PII.
+ *   - `slackTs`                                    : timestamp Slack (`"1234.5678"`),
+ *                                                    identifiant technique.
+ *   - `slackChannel`                               : Slack channel ID (`C…`) OU
+ *                                                    DM channel ID (`D…`), ID
+ *                                                    opaque interne workspace.
+ */
+export interface HandoffUnassignedPayload {
+  /** hubspotId opaque. */
+  contactId: string;
+  /** docId composite `${contactId}_${campaignId}`. */
+  conversationId: string;
+  /**
+   * Firestore auto-ID `[A-Za-z0-9]{20}` du draft SMS auto envoyé au PS
+   * (step 8d process-reply S9.4.3). Permet la corrélation forensique
+   * `handoff_unassigned → reply_generated → sms_provider_dispatched`.
+   */
+  draftMessageId: string;
+  /** Cause discriminante du fallback orphelins. Cf. `HandoffUnassignedReason`. */
+  reason: HandoffUnassignedReason;
+  /**
+   * Timestamp Slack du message posté dans le canal orphelins par
+   * `chat.postMessage` (format `"1234567890.123456"`). Permet de rebondir
+   * en thread depuis le dashboard ou de retrouver la notif dans l'historique
+   * Slack. Pas PII (identifiant technique).
+   */
+  slackTs: string;
+  /**
+   * Slack channel ID retourné par `chat.postMessage`. Pour la branche
+   * orphelins, c'est le channel ID du canal partagé
+   * (`SLACK_ORPHAN_LEADS_CHANNEL_ID`). Pas PII (ID interne workspace).
+   */
+  slackChannel: string;
+  // Index signature explicite : permet l'assignation à
+  // `AuditLogInput.payload: Record<string, unknown>` sans cast (cf. pattern
+  // miroir `ReplyGeneratedPayload` — TS-level uniquement, no-op runtime).
   readonly [k: string]: unknown;
 }
 
