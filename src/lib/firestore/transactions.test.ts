@@ -554,7 +554,7 @@ describe("transactions.ts — sendOutboundWithLock (DEBT-001.3)", () => {
     expect(await countAuditByAction("sms_provider_dispatched")).toBe(1);
   });
 
-  it("audit sms_provider_dispatched payload contient les 8 champs forensiques exacts", async () => {
+  it("audit sms_provider_dispatched payload contient les 9 champs forensiques exacts (FIX-SENDER-PII)", async () => {
     const contactId = "hs_payload";
     const campaignId = "camp_payload";
     const convId = "conv_payload";
@@ -571,8 +571,10 @@ describe("transactions.ts — sendOutboundWithLock (DEBT-001.3)", () => {
     expect(audit?.targetType).toBe("message");
     expect(audit?.targetId).toBe(result.messageId);
 
-    // Sentinelle : payload exactement les 8 champs attendus, rien de plus,
+    // Sentinelle : payload exactement les 9 champs attendus, rien de plus,
     // rien de moins.
+    // FIX-SENDER-PII (dette S9.7 Time2Chat) : `sender` en clair remplacé
+    // par `senderType` + `senderFingerprint` (scrubber-safe).
     const payload = audit?.payload as Record<string, unknown>;
     expect(Object.keys(payload).sort()).toEqual(
       [
@@ -583,14 +585,67 @@ describe("transactions.ts — sendOutboundWithLock (DEBT-001.3)", () => {
         "creditsRemoved",
         "dryRun",
         "ovhMessageId",
-        "sender",
+        "senderFingerprint",
+        "senderType",
       ].sort(),
     );
     expect(payload.ovhMessageId).toBe("ovh-msg-12345");
-    expect(payload.sender).toBe("MEDERE");
+    // Sentinelle NEGATIVE : le champ `sender` en clair n'existe PLUS.
+    expect(payload).not.toHaveProperty("sender");
+    // Classification correcte : "MEDERE" ne matche pas E164_REGEX (`^\+…`).
+    expect(payload.senderType).toBe("alpha");
+    expect(payload.senderFingerprint).toMatch(/^[0-9a-f]{8}$/);
     expect(payload.contactId).toBe(contactId);
     expect(payload.conversationId).toBe(convId);
     expect(payload.campaignId).toBe(campaignId);
+  });
+
+  it("REGRESSION FIX-SENDER-PII : sender E.164 Time2Chat commit sans AuditPiiError + payload scrubber-safe", async () => {
+    // 🔒 SENTINELLE ANTI-RÉGRESSION du bug déjà survenu en prod post-S9.7.
+    //
+    // Bug initial (juillet 2026) : depuis que `OVH_SMS_SENDER` accepte
+    // E.164 (`+33939070545` Time2Chat), le sender en clair matchait
+    // `RE_E164` du scrubber `detectPiiInPayload` → `AuditPiiError` →
+    // tx rollback → SMS envoyé côté OVH mais aucune trace Firestore
+    // (trou L.34-5 CPCE + rate-limit faussé sur envois futurs).
+    //
+    // Fix : le payload NE contient PLUS `sender` en clair. Split en
+    // `senderType` (enum) + `senderFingerprint` (djb2 8 hex).
+    //
+    // Ce test échouait sur le code pré-fix (AuditPiiError levée à
+    // l'appel `sendOutboundWithLock`). Il DOIT passer post-fix.
+    const contactId = "hs_time2chat";
+    const campaignId = "camp_time2chat";
+    const convId = "conv_time2chat";
+    await seedTrio({ contactId, convId, campaignId, outboundsAgo: [] });
+
+    // Le vrai sender Time2Chat prod depuis S9.7.
+    const time2chatSender = "+33939070545";
+    const args = buildArgs({ contactId, convId, campaignId });
+    args.dispatch.sender = time2chatSender;
+
+    // Ne throw PAS (le bug pré-fix lèverait AuditPiiError ici).
+    const result = await sendOutboundWithLock(args);
+    expect(result.messageId).toMatch(/^[A-Za-z0-9]{20}$/);
+    expect(result.auditId).toMatch(/^[A-Za-z0-9]{20}$/);
+
+    // Vérif payload : NI le champ `sender`, NI la string E.164 en clair.
+    const auditSnap = await getAdminDb()
+      .collection(__AUDIT_COLLECTION_FOR_TESTS)
+      .doc(result.auditId)
+      .get();
+    const payload = auditSnap.data()?.payload as Record<string, unknown>;
+
+    expect(payload).not.toHaveProperty("sender");
+    expect(JSON.stringify(payload)).not.toContain(time2chatSender);
+    expect(payload.senderType).toBe("e164");
+    expect(payload.senderFingerprint).toMatch(/^[0-9a-f]{8}$/);
+
+    // Vérif tx commit atomique : le message + l'audit sms_sent doivent
+    // aussi être présents (avant fix, le rollback les faisait sauter).
+    expect(await countOutboundMessages(convId)).toBe(1);
+    expect(await countAuditByAction("sms_sent")).toBeGreaterThanOrEqual(1);
+    expect(await countAuditByAction("sms_provider_dispatched")).toBe(1);
   });
 
   // ───────────────────────────────────────────────────────────────────────

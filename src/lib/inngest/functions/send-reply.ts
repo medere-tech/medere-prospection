@@ -99,11 +99,16 @@
  *         - body / phoneE164 jamais loggés (uniquement IDs opaques)
  *         - body / phoneE164 LU INLINE dans step 2 (pas via step retour)
  *         - payload audit sms_provider_dispatched = bodyLength (number),
- *           ovhMessageId, dryRun, creditsRemoved, sender, IDs opaques
+ *           ovhMessageId, dryRun, creditsRemoved, senderType (enum
+ *           "e164"|"alpha"), senderFingerprint (djb2 8 hex), IDs opaques.
+ *           FIX-SENDER-PII : depuis S9.7 Time2Chat OVH_SMS_SENDER = E.164,
+ *           on NE persiste PLUS `sender` en clair (match scrubber RE_E164
+ *           → AuditPiiError → tx rollback → SMS envoyé sans trace forensic).
  *
  *   [GF4] DRY_RUN_SMS env-driven via `getCoreEnv().DRY_RUN_SMS` (cohérent
- *         send-first-sms.ts S8.4). Pattern audit en dry-run : sender =
- *         "DRY_RUN_SENDER", ovhMessageId = "DRY_RUN_OVH_MESSAGE_ID".
+ *         send-first-sms.ts S8.4). Pattern audit en dry-run : le sender
+ *         source vaut "DRY_RUN_SENDER" (senderType="alpha"), ovhMessageId
+ *         source = "DRY_RUN_OVH_MESSAGE_ID".
  *
  * ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
  * RETOURS DU HANDLER (discriminés)
@@ -144,6 +149,8 @@ import { smsReplySendRequested } from "@/lib/inngest/events";
 import { sendSms } from "@/lib/ovh/send-sms";
 import { getCoreEnv, getOvhEnv } from "@/lib/security/env";
 import { ConfigError, ValidationError } from "@/lib/utils/errors";
+import { E164_REGEX } from "@/lib/utils/phone";
+import { shortFingerprint } from "@/lib/utils/short-fingerprint";
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Constantes
@@ -457,11 +464,20 @@ export async function sendReplyHandler(ctx: SendReplyHandlerContext): Promise<Se
       targetId: draftMessageId,
       // Payload anti-PII strict : bodyLength (number) + IDs opaques +
       // marqueurs scrubber-safe. JAMAIS le body, JAMAIS le phone.
+      //
+      // 🔒 FIX-SENDER-PII (dette S9.7 Time2Chat) : miroir strict
+      // transactions.ts:sendOutboundWithLock. Depuis que OVH_SMS_SENDER
+      // accepte E.164, écrire le sender en clair matchait `RE_E164` du
+      // scrubber → AuditPiiError → step failed → SMS envoyé mais aucune
+      // trace forensic. On split désormais en 2 champs scrubber-safe :
+      //   - senderType        : enum "e164" | "alpha"
+      //   - senderFingerprint : djb2 8 hex
       payload: {
         direction: "outbound",
         messageId: draftMessageId,
         ovhMessageId: auditOvhMessageId,
-        sender,
+        senderType: E164_REGEX.test(sender) ? "e164" : "alpha",
+        senderFingerprint: shortFingerprint(sender),
         bodyLength: dispatch.bodyLength,
         dryRun: dispatch.dryRun,
         creditsRemoved: dispatch.creditsRemoved,

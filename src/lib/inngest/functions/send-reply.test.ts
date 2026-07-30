@@ -352,7 +352,7 @@ describe("sendReplyHandler — S9.4.2", () => {
       expect(getOvhEnv).not.toHaveBeenCalled();
     });
 
-    it("DRY_RUN=true → audit dispatched avec sender + ovhMessageId markers + bodyLength", async () => {
+    it("DRY_RUN=true → audit dispatched avec senderType='alpha' + senderFingerprint + ovhMessageId markers + bodyLength (FIX-SENDER-PII)", async () => {
       vi.mocked(commitDraftToQueued).mockResolvedValue({
         ok: true,
         messageId: DRAFT_MSG_ID,
@@ -377,7 +377,14 @@ describe("sendReplyHandler — S9.4.2", () => {
       expect(auditCall?.targetId).toBe(DRAFT_MSG_ID);
 
       const payload = auditCall?.payload as Record<string, unknown>;
-      expect(payload.sender).toBe(__AUDIT_SENDER_DRY_RUN_FOR_TESTS);
+      // FIX-SENDER-PII : `sender` en clair remplacé par `senderType` +
+      // `senderFingerprint`. En dry-run, le sender source vaut
+      // `__AUDIT_SENDER_DRY_RUN_FOR_TESTS` ("DRY_RUN_SENDER") → alpha.
+      expect(payload).not.toHaveProperty("sender");
+      expect(payload.senderType).toBe("alpha");
+      expect(payload.senderFingerprint).toMatch(/^[0-9a-f]{8}$/);
+      // La string source ne doit pas non plus fuiter en clair.
+      expect(JSON.stringify(payload)).not.toContain(__AUDIT_SENDER_DRY_RUN_FOR_TESTS);
       expect(payload.ovhMessageId).toBe(__AUDIT_OVH_MESSAGE_ID_DRY_RUN_FOR_TESTS);
       expect(payload.dryRun).toBe(true);
       expect(payload.creditsRemoved).toBe(0);
@@ -431,7 +438,7 @@ describe("sendReplyHandler — S9.4.2", () => {
       });
     });
 
-    it("audit dispatched en mode réel → sender env, ovhMessageId réel, bodyLength scrubber-safe", async () => {
+    it("audit dispatched en mode réel → senderType='alpha' + senderFingerprint, ovhMessageId réel, bodyLength scrubber-safe (FIX-SENDER-PII)", async () => {
       vi.mocked(commitDraftToQueued).mockResolvedValue({
         ok: true,
         messageId: DRAFT_MSG_ID,
@@ -454,7 +461,12 @@ describe("sendReplyHandler — S9.4.2", () => {
 
       const auditCall = vi.mocked(appendAuditLog).mock.calls[0]?.[0];
       const payload = auditCall?.payload as Record<string, unknown>;
-      expect(payload.sender).toBe("Medere"); // env-driven, pas dry-run
+      // FIX-SENDER-PII : `sender` en clair remplacé. En mode réel avec
+      // OVH_SMS_SENDER = "Medere" (alpha, cf. beforeEach), senderType=alpha.
+      expect(payload).not.toHaveProperty("sender");
+      expect(payload.senderType).toBe("alpha");
+      expect(payload.senderFingerprint).toMatch(/^[0-9a-f]{8}$/);
+      expect(JSON.stringify(payload)).not.toContain("Medere");
       expect(payload.ovhMessageId).toBe("ovh-real-msg-9876");
       expect(payload.dryRun).toBe(false);
       expect(payload.creditsRemoved).toBe(1);
@@ -464,6 +476,57 @@ describe("sendReplyHandler — S9.4.2", () => {
       const serialized = JSON.stringify(payload);
       expect(serialized).not.toContain(BODY);
       expect(serialized).not.toContain("+33612345678");
+    });
+
+    it("REGRESSION FIX-SENDER-PII : OVH_SMS_SENDER = E.164 Time2Chat → payload scrubber-safe, PAS d'AuditPiiError", async () => {
+      // 🔒 SENTINELLE ANTI-RÉGRESSION du bug survenu en prod post-S9.7.
+      //
+      // Bug initial : depuis que `OVH_SMS_SENDER` accepte E.164 Time2Chat
+      // (`+33939070545`), le sender en clair matchait `RE_E164` du
+      // scrubber → `AuditPiiError` → step failed → SMS envoyé côté OVH
+      // mais aucune trace forensic Firestore.
+      //
+      // Fix : payload split en `senderType` (enum) + `senderFingerprint`
+      // (djb2 8 hex). Aucune string E.164 ne fuit en clair.
+      //
+      // Ce test échouait sur le code pré-fix (`payload.sender = "+33..."`
+      // → `appendAuditLog` throw `AuditPiiError` détecté par le module
+      // audit-log en aval). Il DOIT passer post-fix.
+      vi.mocked(commitDraftToQueued).mockResolvedValue({
+        ok: true,
+        messageId: DRAFT_MSG_ID,
+        conversationId: CONV_ID,
+        contactId: CONTACT_ID,
+        auditId: "audit-sms-sent-1",
+      });
+      setupAdminDbReadMessage(makeFakeMessage());
+      vi.mocked(getContact).mockResolvedValue(
+        makeFakeContact() as ReturnType<typeof getContact> extends Promise<infer T> ? T : never,
+      );
+      vi.mocked(sendSms).mockResolvedValue({
+        messageIds: ["ovh-real-msg-time2chat"],
+        creditsRemoved: 1,
+      });
+      // Override le beforeEach : simule prod post-S9.7 (Time2Chat).
+      const time2chatSender = "+33939070545";
+      vi.mocked(getOvhEnv).mockReturnValue({
+        OVH_SMS_SENDER: time2chatSender,
+      } as ReturnType<typeof getOvhEnv>);
+      vi.mocked(appendAuditLog).mockResolvedValue("audit-dispatched-1");
+
+      const ctx = makeContext();
+      await sendReplyHandler(ctx);
+
+      const auditCall = vi.mocked(appendAuditLog).mock.calls[0]?.[0];
+      const payload = auditCall?.payload as Record<string, unknown>;
+
+      // Payload NE contient PAS `sender` ni la string E.164.
+      expect(payload).not.toHaveProperty("sender");
+      expect(JSON.stringify(payload)).not.toContain(time2chatSender);
+
+      // Classification correcte : "+33939070545" matche E164_REGEX.
+      expect(payload.senderType).toBe("e164");
+      expect(payload.senderFingerprint).toMatch(/^[0-9a-f]{8}$/);
     });
   });
 
