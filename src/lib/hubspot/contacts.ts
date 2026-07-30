@@ -397,3 +397,98 @@ export async function getContact(hubspotId: string): Promise<HubspotContactRaw> 
 
   return { id: raw.id, properties: raw.properties };
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// getContactOwnerId (S9.9-PR5b — hand-off Slack)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * Fetch un contact HubSpot et retourne UNIQUEMENT son `hubspot_owner_id`
+ * ACTUEL.
+ *
+ * ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ * Utilité — hand-off Slack (S9.9-PR5b)
+ *
+ * La function Inngest `slack-handoff` route un lead INTERESSE vers le DM du
+ * commercial propriétaire du contact HubSpot. Or **l'owner peut avoir changé**
+ * depuis l'import initial (contact déplacé d'un AE à un autre côté HubSpot).
+ * On lit donc à la volée à chaque hand-off — PAS de cache, PAS de lecture
+ * depuis Firestore (contact.hubspotOwnerId n'existe pas encore, et même si
+ * ajouté serait potentiellement stale).
+ *
+ * ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ * Data minimization vs `getContact`
+ *
+ * Contrairement à `getContact()` qui charge TOUTES les properties Médéré
+ * (firstname/lastname/email/phone/mobilephone/city/zip/civilite/profession +
+ * opt-out flags → PII massive), ce helper ne demande QUE `hubspot_owner_id`
+ * à HubSpot :
+ *   - Moins de PII en transit (le token HubSpot pourrait fuiter le body)
+ *   - Moins de rate quota consommé (payload plus petit)
+ *   - Surface d'attaque réduite (un log accidentel du raw ne fuite pas
+ *     l'email/téléphone/nom du PS)
+ *
+ * ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ * Retour discriminant
+ *
+ *   - `string` non vide : owner_id présent (numérique HubSpot, ex `"477507801"`).
+ *      Le caller (slack-handoff PR5b) le passe à `resolveCommercialByOwnerId`
+ *      (PR2 Airtable).
+ *   - `null`             : contact HubSpot SANS owner assigné. Cas rare mais
+ *      possible sur un import manuel ou une sync incomplète. Le caller route
+ *      en orphelins avec `reason: "no_owner"`.
+ *
+ * ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ * Contrat d'erreur (miroir strict `getContact`)
+ *
+ * @throws ValidationError si `hubspotId` vide.
+ * @throws ExternalServiceError si l'appel SDK échoue (401/404/5xx/network) OU
+ *                              si le retour est mal formé. **PAS de `cause`**
+ *                              (S10.1.7-SECURITY-CAUSE-LEAK-001 — le SDK
+ *                              HubSpot peut embarquer le Bearer token dans
+ *                              `err.message`). Forensic via `context.
+ *                              hubspotIdFingerprint` + Sentry.
+ */
+export async function getContactOwnerId(hubspotId: string): Promise<string | null> {
+  if (typeof hubspotId !== "string" || hubspotId.trim() === "") {
+    throw new ValidationError({
+      message: "getContactOwnerId: hubspotId must be a non-empty string",
+      context: { op: "getContactOwnerId" },
+    });
+  }
+
+  const client = getHubspotClient();
+
+  let raw: unknown;
+  try {
+    raw = await client.crm.contacts.basicApi.getById(hubspotId, ["hubspot_owner_id"]);
+  } catch {
+    // Miroir strict `getContact` : PAS de `cause: err` (SECURITY-CAUSE-LEAK-001).
+    throw new ExternalServiceError({
+      message: "getContactOwnerId: HubSpot contacts.basicApi.getById failed",
+      context: {
+        service: "hubspot",
+        op: "getContactOwnerId.basic",
+        hubspotIdFingerprint: shortFingerprint(hubspotId),
+      },
+    });
+  }
+
+  if (!isSimplePublicObject(raw)) {
+    throw new ExternalServiceError({
+      message: "getContactOwnerId: malformed contact response",
+      context: {
+        service: "hubspot",
+        op: "getContactOwnerId.basic.parse",
+        hubspotIdFingerprint: shortFingerprint(hubspotId),
+      },
+    });
+  }
+
+  // HubSpot retourne `null` pour un property vide, ou omet le champ. On
+  // normalise les 2 cas + les string "vides" post-trim en `null`.
+  const rawOwner = raw.properties.hubspot_owner_id;
+  if (typeof rawOwner !== "string") return null;
+  const trimmed = rawOwner.trim();
+  return trimmed === "" ? null : trimmed;
+}

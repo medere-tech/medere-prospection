@@ -14,6 +14,7 @@ import {
   GET_CONTACTS_IN_LIST_DEFAULT_LIMIT,
   GET_CONTACTS_IN_LIST_MAX_LIMIT,
   getContact,
+  getContactOwnerId,
   getContactsInList,
   HUBSPOT_CONTACT_PROPERTIES,
 } from "./contacts";
@@ -303,6 +304,139 @@ describe("getContact — validation + erreurs", () => {
     __setHubspotClientForTests(makeFakeClient({ basicGetById }));
 
     await expect(getContact("999")).rejects.toBeInstanceOf(ExternalServiceError);
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// getContactOwnerId (S9.9-PR5b — hand-off Slack)
+// ─────────────────────────────────────────────────────────────────────────────
+
+describe("getContactOwnerId — happy path", () => {
+  it("owner_id présent (string non vide) → retourne la string trimmée", async () => {
+    const basicGetById = vi.fn().mockResolvedValue({
+      id: "999",
+      properties: { hubspot_owner_id: "477507801" },
+    });
+    __setHubspotClientForTests(makeFakeClient({ basicGetById }));
+
+    const res = await getContactOwnerId("999");
+    expect(res).toBe("477507801");
+  });
+
+  it("owner_id présent avec espaces → trimmé", async () => {
+    const basicGetById = vi.fn().mockResolvedValue({
+      id: "999",
+      properties: { hubspot_owner_id: "  461430496  " },
+    });
+    __setHubspotClientForTests(makeFakeClient({ basicGetById }));
+
+    const res = await getContactOwnerId("999");
+    expect(res).toBe("461430496");
+  });
+
+  it("appelle basicApi.getById avec UNIQUEMENT ['hubspot_owner_id'] (data minimization)", async () => {
+    // Sentinelle data minimization : NE PAS demander les autres properties
+    // Médéré (firstname/lastname/email/phone/mobilephone/city/zip/civilite/
+    // profession + opt-out flags) — inutiles pour le hand-off routing et
+    // porteuses de PII massive. Cf. JSDoc getContactOwnerId section
+    // "Data minimization vs getContact".
+    const basicGetById = vi.fn().mockResolvedValue({
+      id: "999",
+      properties: { hubspot_owner_id: "1" },
+    });
+    __setHubspotClientForTests(makeFakeClient({ basicGetById }));
+
+    await getContactOwnerId("999");
+    expect(basicGetById).toHaveBeenCalledWith("999", ["hubspot_owner_id"]);
+    // Contre-sentinelle : PAS d'autres properties dans l'appel.
+    const [, propertiesArg] = basicGetById.mock.calls[0]!;
+    expect(propertiesArg).toHaveLength(1);
+    expect(propertiesArg).not.toContain("firstname");
+    expect(propertiesArg).not.toContain("email");
+    expect(propertiesArg).not.toContain("phone");
+  });
+});
+
+describe("getContactOwnerId — owner absent → null", () => {
+  it("property `hubspot_owner_id` absente → null", async () => {
+    const basicGetById = vi.fn().mockResolvedValue({
+      id: "999",
+      properties: {},
+    });
+    __setHubspotClientForTests(makeFakeClient({ basicGetById }));
+
+    const res = await getContactOwnerId("999");
+    expect(res).toBeNull();
+  });
+
+  it("property `hubspot_owner_id` = null → null", async () => {
+    const basicGetById = vi.fn().mockResolvedValue({
+      id: "999",
+      properties: { hubspot_owner_id: null },
+    });
+    __setHubspotClientForTests(makeFakeClient({ basicGetById }));
+
+    const res = await getContactOwnerId("999");
+    expect(res).toBeNull();
+  });
+
+  it("property `hubspot_owner_id` = string vide (whitespace only) → null", async () => {
+    const basicGetById = vi.fn().mockResolvedValue({
+      id: "999",
+      properties: { hubspot_owner_id: "   " },
+    });
+    __setHubspotClientForTests(makeFakeClient({ basicGetById }));
+
+    const res = await getContactOwnerId("999");
+    expect(res).toBeNull();
+  });
+});
+
+describe("getContactOwnerId — validation + erreurs", () => {
+  it("hubspotId vide → ValidationError", async () => {
+    await expect(getContactOwnerId("")).rejects.toBeInstanceOf(ValidationError);
+    await expect(getContactOwnerId("   ")).rejects.toBeInstanceOf(ValidationError);
+  });
+
+  it("SDK throw (network / 5xx / 401) → ExternalServiceError", async () => {
+    const basicGetById = vi.fn().mockRejectedValue(new Error("ECONNRESET"));
+    __setHubspotClientForTests(makeFakeClient({ basicGetById }));
+
+    await expect(getContactOwnerId("999")).rejects.toBeInstanceOf(ExternalServiceError);
+  });
+
+  it("SDK throw 404 → ExternalServiceError (miroir getContact)", async () => {
+    const basicGetById = vi.fn().mockRejectedValue(new Error("404 Not Found"));
+    __setHubspotClientForTests(makeFakeClient({ basicGetById }));
+
+    await expect(getContactOwnerId("999")).rejects.toBeInstanceOf(ExternalServiceError);
+  });
+
+  it("retour mal formé → ExternalServiceError", async () => {
+    const basicGetById = vi.fn().mockResolvedValue({ wrong: "shape" });
+    __setHubspotClientForTests(makeFakeClient({ basicGetById }));
+
+    await expect(getContactOwnerId("999")).rejects.toBeInstanceOf(ExternalServiceError);
+  });
+
+  it("ExternalServiceError SANS `cause` (SECURITY-CAUSE-LEAK-001 — pas de leak du Bearer)", async () => {
+    // Sentinelle : le Bearer token HubSpot peut apparaître dans err.message
+    // du SDK (dépendant de la version). On NE PROPAGE JAMAIS `cause: err`.
+    // Le forensic passe par context.hubspotIdFingerprint + Sentry.
+    const basicGetById = vi.fn().mockRejectedValue(new Error("Bearer pat-na1-xxxxx-secret-token"));
+    __setHubspotClientForTests(makeFakeClient({ basicGetById }));
+
+    try {
+      await getContactOwnerId("999");
+      throw new Error("expected throw");
+    } catch (err) {
+      expect(err).toBeInstanceOf(ExternalServiceError);
+      expect((err as Error).cause).toBeUndefined();
+      // Le message ne doit pas contenir le token (custom message, pas
+      // le raw err.message).
+      expect((err as Error).message).not.toContain("Bearer");
+      expect((err as Error).message).not.toContain("pat-na1");
+    }
   });
 });
 

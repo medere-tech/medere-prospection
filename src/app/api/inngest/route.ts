@@ -47,9 +47,10 @@ import {
   processReply,
   sendFirstSms,
   sendReply,
+  slackHandoff,
 } from "@/lib/inngest/functions";
 
 export const { GET, POST, PUT } = serve({
   client: getInngestClient(),
-  functions: [sendFirstSms, processReply, sendReply, monitorOrphanMessages],
+  functions: [sendFirstSms, processReply, sendReply, monitorOrphanMessages, slackHandoff],
 });
