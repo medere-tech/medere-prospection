@@ -40,10 +40,22 @@ import { type Timestamp } from "firebase-admin/firestore";
  *     `addOutbound` lors de l'enqueue Firestore status="queued") pour
  *     permettre un forensic distinct enqueue-vs-dispatch + corréler
  *     `messageId` Firestore ↔ `ovhMessageId` provider. Payload =
- *     `{ ovhMessageId, conversationId, contactId, campaignId, sender,
- *        bodyLength, dryRun, creditsRemoved? }`. Tous scrubber-safe.
- *     Posé par `lib/inngest/functions/send-first-sms` (S8.4, voie
- *     minimaliste Voie 2 — cf. Notion INFRA-DETTE-001).
+ *     `{ ovhMessageId, conversationId, contactId, campaignId, senderType,
+ *        senderFingerprint, bodyLength, dryRun, creditsRemoved? }`. Tous
+ *     scrubber-safe. Posé par `lib/inngest/functions/send-first-sms` (S8.4,
+ *     voie minimaliste Voie 2 — cf. Notion INFRA-DETTE-001) ET
+ *     `lib/inngest/functions/send-reply` (S9.4.2).
+ *
+ *     🔒 FIX-SENDER-PII (dette S9.7 Time2Chat) : depuis que
+ *     `OVH_SMS_SENDER` accepte l'E.164 (`+33939070545` Time2Chat), on NE
+ *     persiste PLUS `sender` en clair. `RE_E164` du scrubber
+ *     `detectPiiInPayload` matcherait la valeur → `AuditPiiError` →
+ *     tx rollback → SMS envoyé côté OVH mais aucune trace Firestore (trou
+ *     L.34-5 CPCE + rate-limit faussé). On split désormais en :
+ *       - `senderType`        : enum fermé `"e164" | "alpha"` (pas PII)
+ *       - `senderFingerprint` : djb2 8 hex (pas PII, forensic par
+ *                               corrélation avec archive env config à la
+ *                               date de l'audit)
  *
  * Extensions S9.1 (pipeline process-reply) :
  *   - `intent_classified` — décision du classifier Claude après chaque

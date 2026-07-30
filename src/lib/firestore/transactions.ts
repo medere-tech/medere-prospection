@@ -96,6 +96,8 @@ import {
   listRecentOutboundInTx,
 } from "@/lib/firestore/messages";
 import { ComplianceConcurrencyError, NotFoundError, ValidationError } from "@/lib/utils/errors";
+import { E164_REGEX } from "@/lib/utils/phone";
+import { shortFingerprint } from "@/lib/utils/short-fingerprint";
 import type { Contact } from "@/types/contact";
 
 import { appendAuditLogTx } from "./audit-log";
@@ -528,6 +530,16 @@ export async function sendOutboundWithLock(
       // duplication avec args.dispatch (qui ne contient QUE les facts OVH
       // OVHcloud-spécifiques). Sentinelle action = "sms_provider_dispatched"
       // verbatim (test anti-régression dans `transactions.test.ts`).
+      //
+      // 🔒 FIX-SENDER-PII (dette S9.7 Time2Chat) : depuis que
+      // OVH_SMS_SENDER accepte E.164 (ex "+33939070545"), écrire le sender
+      // en clair matchait `RE_E164` du scrubber `detectPiiInPayload` →
+      // AuditPiiError → tx rollback → SMS envoyé côté OVH mais aucune
+      // trace Firestore (trou L.34-5 CPCE + rate-limit faussé). On split
+      // désormais en 2 champs scrubber-safe :
+      //   - senderType        : enum fermé "e164" | "alpha" (pas PII)
+      //   - senderFingerprint : djb2 8 hex (pas PII, forensic via
+      //                         corrélation avec archive env config)
       const auditId = appendAuditLogTx(tx, {
         actorId: "system",
         actorType: "system",
@@ -536,7 +548,8 @@ export async function sendOutboundWithLock(
         targetId: messageId,
         payload: {
           ovhMessageId: args.dispatch.ovhMessageId,
-          sender: args.dispatch.sender,
+          senderType: E164_REGEX.test(args.dispatch.sender) ? "e164" : "alpha",
+          senderFingerprint: shortFingerprint(args.dispatch.sender),
           bodyLength: args.dispatch.bodyLength,
           creditsRemoved: args.dispatch.creditsRemoved,
           dryRun: args.dispatch.dryRun,
