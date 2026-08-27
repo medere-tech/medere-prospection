@@ -5,6 +5,7 @@ import {
   AuditPiiError,
   ComplianceConcurrencyError,
   ComplianceError,
+  ComplianceFailureError,
   ConfigError,
   ConflictError,
   ExternalServiceError,
@@ -349,5 +350,195 @@ describe("toAppError", () => {
   it("enveloppe une valeur inconnue avec un message par défaut", () => {
     expect(toAppError({ weird: true }).message).toBe("Unknown error");
     expect(toAppError(null).message).toBe("Unknown error");
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// FIX-ERROR-CONTEXT-SWC — régression bug SWC field declaration prod
+//
+// 🚨 CONTEXTE HISTORIQUE (juillet 2026, S9.9-FIX)
+//
+// En prod, un run send-reply échouait sur :
+//   TypeError: Cannot destructure property 'rule' of 'e.context' as it is
+//   undefined.
+//
+// Origine : les 2 sous-classes de ComplianceError (Concurrency + Failure)
+// déclaraient `override readonly context!: XxxContext;` (SANS initializer,
+// avec `!` definite-assignment). En TS pur target ES2017, cette
+// déclaration est effacée au build → OK. En SWC (transpiler Next.js prod),
+// elle est émise en tant que field declaration ECMAScript avec default
+// `undefined` qui écrase la valeur assignée par AppError.constructor via
+// super() → `err.context === undefined` en prod, tandis que Vitest+esbuild
+// n'avait pas le bug (esbuild n'émet pas la field decl comme SWC).
+//
+// Fix Option B : retirer le `!`, garder le typage narrow via `override
+// readonly context: XxxContext;`, ET réassigner `this.context =
+// options.context;` dans le corps du constructeur — cette dernière
+// écriture s'exécute APRÈS les field initializers (spec ECMAScript) donc
+// gagne contre le default `undefined` de SWC.
+//
+// ⚠️ LIMITE DE CE TEST (honnêteté)
+//
+// Ces tests passeraient EN LOCAL Vitest MÊME sur le code buggé pré-fix
+// (parce que esbuild ne reproduit pas le bug SWC). Ils ne "reproduisent"
+// PAS le bug prod. Leur valeur est de **verrouiller le CONTRAT** :
+//
+//   - `err.context` DOIT être défini après construction
+//   - Les champs typés (rule, code, ruleName, etc.) DOIVENT être présents
+//
+// Si un futur dev "nettoie" la ligne `this.context = options.context;` en
+// la croyant redondante avec `super({context})`, ces tests continuent à
+// passer en Vitest local — le bug ne revient qu'en prod SWC. C'est
+// pourquoi le commentaire au-dessus de la réassignation dans errors.ts
+// est verbose et explicite.
+// ─────────────────────────────────────────────────────────────────────────────
+
+describe("FIX-ERROR-CONTEXT-SWC — context persistence contract", () => {
+  describe("ComplianceFailureError", () => {
+    it("err.context PERSISTE après construction (rule/code/failureContext définis)", () => {
+      const err = new ComplianceFailureError({
+        message: "blocked: rate_limit exceeded",
+        context: {
+          rule: "rate_limit",
+          code: "rate_limit_exceeded",
+          failureContext: { count: 3, maxAllowed: 3, windowDays: 30 },
+        },
+      });
+      // Le crash prod venait de `err.context === undefined` → destructure fail.
+      expect(err.context).toBeDefined();
+      expect(err.context).not.toBeUndefined();
+      // Les 3 champs typés doivent être accessibles sans cast (narrowing préservé).
+      expect(err.context.rule).toBe("rate_limit");
+      expect(err.context.code).toBe("rate_limit_exceeded");
+      expect(err.context.failureContext).toEqual({
+        count: 3,
+        maxAllowed: 3,
+        windowDays: 30,
+      });
+    });
+
+    it("destructure `{rule, code, failureContext}` fonctionne sans crash (miroir send-reply.ts:427)", () => {
+      // Verrou strict : ceci est LE pattern qui crashait en prod.
+      const err = new ComplianceFailureError({
+        message: "blocked",
+        context: {
+          rule: "opt_out",
+          code: "opted_out",
+          failureContext: {},
+        },
+      });
+      expect(() => {
+        const { rule, code, failureContext } = err.context;
+        // Utilisation locale pour prouver que les 3 vars sont bien assignées
+        // (pas juste "ne throw pas").
+        expect(rule).toBe("opt_out");
+        expect(code).toBe("opted_out");
+        expect(failureContext).toEqual({});
+      }).not.toThrow();
+    });
+
+    it("err.context reste défini APRÈS JSON.stringify + JSON.parse cycle (defense-in-depth)", () => {
+      // Un logger qui serialize/désérialise (Pino, Sentry) ne doit pas
+      // perdre le champ. Non exhaustif : Error n'a pas de toJSON par
+      // défaut, mais on vérifie au moins que .context est enumerable sur
+      // l'instance (donc récupérable via `Object.entries` par exemple).
+      const err = new ComplianceFailureError({
+        message: "blocked",
+        context: { rule: "hours", code: "outside_hours", failureContext: { hour: 22 } },
+      });
+      const entries = Object.entries(err);
+      const contextEntry = entries.find(([k]) => k === "context");
+      expect(contextEntry).toBeDefined();
+      expect(contextEntry?.[1]).toEqual({
+        rule: "hours",
+        code: "outside_hours",
+        failureContext: { hour: 22 },
+      });
+    });
+  });
+
+  describe("ComplianceConcurrencyError", () => {
+    it("err.context PERSISTE après construction (5 champs contract)", () => {
+      const attemptedAt = new Date("2026-07-30T12:00:00Z");
+      const err = new ComplianceConcurrencyError({
+        message: "race detected",
+        context: {
+          contactId: "hubspot_12345",
+          ruleName: "rate_limit_30d",
+          attemptedAt,
+          expectedRemainingQuota: 1,
+          observedRemainingQuota: 0,
+        },
+      });
+      expect(err.context).toBeDefined();
+      expect(err.context).not.toBeUndefined();
+      // Les 5 champs typés doivent être accessibles (narrowing préservé).
+      expect(err.context.contactId).toBe("hubspot_12345");
+      expect(err.context.ruleName).toBe("rate_limit_30d");
+      expect(err.context.attemptedAt).toBe(attemptedAt);
+      expect(err.context.expectedRemainingQuota).toBe(1);
+      expect(err.context.observedRemainingQuota).toBe(0);
+    });
+
+    it("accès `err.context.ruleName` fonctionne sans crash (miroir send-first-sms.ts:384)", () => {
+      // Verrou strict : ceci est LE pattern utilisé dans send-first-sms
+      // pour logger la race rate-limit. Si err.context est undefined, le
+      // log crash → pipeline noRetry perdu → SMS potentiellement envoyé
+      // sans forensic.
+      const err = new ComplianceConcurrencyError({
+        message: "race",
+        context: {
+          contactId: "hs_race",
+          ruleName: "rate_limit_30d",
+          attemptedAt: new Date(),
+          expectedRemainingQuota: 0,
+          observedRemainingQuota: 0,
+        },
+      });
+      expect(() => {
+        const ruleName = err.context.ruleName;
+        const contactId = err.context.contactId;
+        const attemptedAt = err.context.attemptedAt.toISOString();
+        expect(ruleName).toBe("rate_limit_30d");
+        expect(contactId).toBe("hs_race");
+        expect(attemptedAt).toMatch(/^20\d{2}-\d{2}-\d{2}T/);
+      }).not.toThrow();
+    });
+  });
+
+  describe("Régression sentinelles — les 2 classes NE doivent PLUS utiliser `context!:` sans initializer", () => {
+    // Cette sentinelle est structurelle par observation de comportement :
+    // on ne peut pas facilement inspecter le source TS à la volée depuis
+    // un test Vitest, mais on peut prouver empiriquement que le contrat
+    // "context toujours défini" tient sur des inputs variés.
+    it("ComplianceFailureError sur 3 rules distinctes → context défini à chaque fois", () => {
+      const rules = ["opt_out", "hours", "rate_limit"] as const;
+      for (const rule of rules) {
+        const err = new ComplianceFailureError({
+          message: `blocked: ${rule}`,
+          context: { rule, code: `${rule}_code`, failureContext: {} },
+        });
+        expect(err.context, `context undefined pour rule=${rule}`).toBeDefined();
+        expect(err.context.rule).toBe(rule);
+      }
+    });
+
+    it("ComplianceConcurrencyError sur 3 constructions distinctes → context défini à chaque fois", () => {
+      for (let i = 0; i < 3; i++) {
+        const err = new ComplianceConcurrencyError({
+          message: `race ${i}`,
+          context: {
+            contactId: `hs_${i}`,
+            ruleName: "rate_limit_30d",
+            attemptedAt: new Date(2026, 6, 30, 12, i),
+            expectedRemainingQuota: i,
+            observedRemainingQuota: 0,
+          },
+        });
+        expect(err.context, `context undefined à l'iter ${i}`).toBeDefined();
+        expect(err.context.contactId).toBe(`hs_${i}`);
+        expect(err.context.expectedRemainingQuota).toBe(i);
+      }
+    });
   });
 });

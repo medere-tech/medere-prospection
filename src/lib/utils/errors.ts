@@ -283,11 +283,11 @@ export interface ComplianceConcurrencyErrorOptions extends Omit<AppErrorOptions,
  */
 export class ComplianceConcurrencyError extends ComplianceError {
   override readonly code = "COMPLIANCE_CONCURRENCY" as const;
-  // Narrowed type pour les callers (compile-time). Le runtime value est
-  // posé par le constructeur parent `AppError` via `super({...context})`
-  // — pas besoin de réassigner ici. `!` informe TS qu'on assume la
-  // définite assignment via super().
-  override readonly context!: ComplianceConcurrencyContext;
+  // Narrowed type pour les callers (compile-time). La valeur runtime est
+  // posée par `AppError.constructor` via `super({context})` (l.66
+  // `this.context = options.context;`) PUIS ré-assignée explicitement dans
+  // le corps de CE constructeur ci-dessous — voir bug FIX-ERROR-CONTEXT-SWC.
+  override readonly context: ComplianceConcurrencyContext;
   constructor(options: ComplianceConcurrencyErrorOptions) {
     super({
       clientMessage: "Envoi non autorisé.",
@@ -295,6 +295,24 @@ export class ComplianceConcurrencyError extends ComplianceError {
       cause: options.cause,
       context: options.context,
     });
+    // 🔒 FIX-ERROR-CONTEXT-SWC — NE PAS supprimer cette ligne "redondante".
+    //
+    // La déclaration `override readonly context: XxxContext;` ci-dessus
+    // est purement TypeScript (narrow le type). Sans initializer explicite,
+    // TS-pur target ES2017 l'efface au build. MAIS SWC (transpiler
+    // Next.js prod) l'émet en tant que field declaration ECMAScript qui,
+    // par spec, exécute son "default value" (undefined) APRÈS super() et
+    // AVANT le corps du constructeur → écrase le `this.context` posé par
+    // AppError.constructor → `err.context === undefined` en runtime prod.
+    //
+    // La spec ECMAScript garantit que le body du constructor s'exécute
+    // APRÈS toutes les field initializations. Réassigner ICI est donc
+    // le dernier write et gagne contre le defineProperty(undefined) de SWC.
+    //
+    // `readonly` autorise l'assignation dans le constructeur de la classe
+    // qui la déclare (TS spec). Le tsc noEmit build est OK, le runtime
+    // aussi. Verrouillé par test régression dans errors.test.ts.
+    this.context = options.context;
   }
 }
 
@@ -387,7 +405,10 @@ export class ComplianceFailureError extends ComplianceError {
    * (`commitDraftToQueued`), pas un retry.
    */
   override readonly noRetry = true;
-  override readonly context!: ComplianceFailureContext;
+  // Narrow le type — la valeur runtime est ré-assignée dans le body ci-dessous
+  // (bug FIX-ERROR-CONTEXT-SWC, cf. commentaire miroir dans
+  // ComplianceConcurrencyError).
+  override readonly context: ComplianceFailureContext;
   constructor(options: ComplianceFailureErrorOptions) {
     super({
       clientMessage: "Envoi non autorisé.",
@@ -395,6 +416,15 @@ export class ComplianceFailureError extends ComplianceError {
       cause: options.cause,
       context: options.context,
     });
+    // 🔒 FIX-ERROR-CONTEXT-SWC — NE PAS supprimer cette ligne "redondante".
+    // Cf. commentaire complet dans `ComplianceConcurrencyError` ci-dessus.
+    // TL;DR : SWC (Next.js prod) émet la field declaration `override
+    // readonly context: XxxContext;` en un default-init `undefined` qui
+    // écrase le `this.context = options.context;` posé par
+    // `AppError.constructor`. Réassigner ICI, après super() et après les
+    // field initializations, est la dernière écriture — gagne toujours.
+    // Verrouillé par test régression dans errors.test.ts.
+    this.context = options.context;
   }
 }
 
