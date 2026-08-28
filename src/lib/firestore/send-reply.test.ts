@@ -44,6 +44,7 @@ import { deleteApp } from "firebase-admin/app";
 import { Timestamp } from "firebase-admin/firestore";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
+import { RATE_LIMIT_WINDOW_DAYS } from "@/lib/compliance/rate-limits";
 import { __resetEnvCacheForTests } from "@/lib/security/env";
 import { NotFoundError, ValidationError } from "@/lib/utils/errors";
 import type { Contact } from "@/types/contact";
@@ -194,6 +195,9 @@ async function seedOutboundMessage(daysAgo: number, bodyTag: string): Promise<vo
     status: "sent",
     channel: "sms",
     generatedBy: "ai",
+    // 🔒 Explicite : ces seeds sont des SOLLICITATIONS, elles comptent
+    // contre le plafond (PR-FILTRE-SOLLICITATION).
+    outboundKind: "solicitation",
     createdAt,
     sentAt: createdAt,
   };
@@ -282,8 +286,12 @@ describe("commitDraftToQueued — S9.4.1", () => {
       );
     });
 
-    it("RATE_LIMIT_WINDOW_DAYS = 30 (aligné S4)", () => {
-      expect(__SEND_REPLY_RATE_LIMIT_WINDOW_DAYS_FOR_TESTS).toBe(30);
+    it("🔒 sentinel anti-drift : la fenêtre in-tx EST celle de lib/compliance", () => {
+      // Cf. jumelle dans `transactions.test.ts` : comparer à un littéral
+      // 30 ne sentinellait rien. On verrouille l'égalité avec la source de
+      // vérité (chemin fail-open fermé par PR-FILTRE-SOLLICITATION).
+      expect(__SEND_REPLY_RATE_LIMIT_WINDOW_DAYS_FOR_TESTS).toBe(RATE_LIMIT_WINDOW_DAYS);
+      expect(RATE_LIMIT_WINDOW_DAYS).toBe(30);
     });
   });
 
@@ -466,14 +474,15 @@ describe("commitDraftToQueued — S9.4.1", () => {
     });
   });
 
-  describe("branche blocked — rate_limit (3 outbound récents)", () => {
-    it("3 outbound dans la fenêtre 30j → blocked rate_limit + audits HORS tx", async () => {
+  describe("branche blocked — rate_limit (4 sollicitations récentes)", () => {
+    it("4 sollicitations dans la fenêtre 30j → blocked rate_limit + audits HORS tx", async () => {
       await seedContact();
       await seedConversation();
-      // Seed 3 outbound dans la fenêtre rate-limit
+      // Seed 4 sollicitations dans la fenêtre rate-limit (plafond = 4)
       await seedOutboundMessage(1, "rl1");
       await seedOutboundMessage(2, "rl2");
       await seedOutboundMessage(3, "rl3");
+      await seedOutboundMessage(4, "rl4");
       const draftId = await seedDraft();
 
       const result = await commitDraftToQueued({
@@ -487,12 +496,14 @@ describe("commitDraftToQueued — S9.4.1", () => {
       expect(result.failure.rule).toBe("rate_limit");
       expect(result.failure.code).toBe("rate_limit_exceeded");
       const ctx = result.failure.context as {
-        count: number;
+        solicitationCount: number;
+        totalOutboundCount: number;
         maxAllowed: number;
         windowDays: number;
       };
-      expect(ctx.count).toBe(3);
-      expect(ctx.maxAllowed).toBe(3);
+      expect(ctx.solicitationCount).toBe(4);
+      expect(ctx.totalOutboundCount).toBe(4);
+      expect(ctx.maxAllowed).toBe(4);
       expect(ctx.windowDays).toBe(30);
 
       // Draft reste draft.
@@ -505,15 +516,15 @@ describe("commitDraftToQueued — S9.4.1", () => {
       expect(await countAuditByAction("sms_sent")).toBe(0);
     });
 
-    it("🔒 SCOPE PER-CONTACT : 3 outbound répartis sur 2 conversations du même PS → blocked rate_limit", async () => {
+    it("🔒 SCOPE PER-CONTACT : 4 sollicitations réparties sur 2 conversations du même PS → blocked rate_limit", async () => {
       // Sentinelle PR-PER-CONTACT sur le 3e call site du comptage
       // (`commitDraftToQueued`). Aucune des 2 conversations n'atteint seule
-      // le plafond (2 + 1), mais le CONTACT est à 3/3 : le plafond L.34-5
+      // le plafond (3 + 1), mais le CONTACT est à 4/4 : le plafond L.34-5
       // CPCE vise la personne, pas la campagne.
       //
       // Si quelqu'un re-scope `send-reply.ts` sur `conversationId`, la
-      // conversation courante ne montre qu'1 outbound → le draft passerait
-      // → 4e SMS au PS. Ce test casse alors.
+      // conversation courante ne montre qu'1 sollicitation → le draft
+      // passerait → 5e SMS au PS. Ce test casse alors.
       const OTHER_CONV_ID = `${CONTACT_ID}_camp_autre`;
 
       await seedContact();
@@ -525,8 +536,8 @@ describe("commitDraftToQueued — S9.4.1", () => {
         .doc(OTHER_CONV_ID)
         .set(buildValidConversation({ campaignId: "camp_autre", status: "closed" }));
 
-      // 2 sollicitations dans l'autre conversation…
-      for (const [i, tag] of ["other1", "other2"].entries()) {
+      // 3 sollicitations dans l'autre conversation…
+      for (const [i, tag] of ["other1", "other2", "other3"].entries()) {
         const createdAt = Timestamp.fromDate(new Date(FIXED_NOW.getTime() - (i + 1) * 86400_000));
         await getAdminDb()
           .collection(__MESSAGES_PARENT_COLLECTION_FOR_TESTS)
@@ -538,12 +549,13 @@ describe("commitDraftToQueued — S9.4.1", () => {
             status: "sent",
             channel: "sms",
             generatedBy: "ai",
+            outboundKind: "solicitation",
             createdAt,
             sentAt: createdAt,
           } satisfies Message);
       }
-      // …+ 1 seule dans la conversation courante = 3 pour le CONTACT.
-      await seedOutboundMessage(3, "current1");
+      // …+ 1 seule dans la conversation courante = 4 pour le CONTACT.
+      await seedOutboundMessage(4, "current1");
 
       const draftId = await seedDraft();
 
@@ -557,9 +569,9 @@ describe("commitDraftToQueued — S9.4.1", () => {
       if (result.ok) throw new Error("unreachable");
       expect(result.failure.rule).toBe("rate_limit");
       expect(result.failure.code).toBe("rate_limit_exceeded");
-      // `count` reflète bien le total PER-CONTACT (3), pas le total de la
-      // conversation courante (1).
-      expect((result.failure.context as { count: number }).count).toBe(3);
+      // `solicitationCount` reflète bien le total PER-CONTACT (4), pas le
+      // total de la conversation courante (1).
+      expect((result.failure.context as { solicitationCount: number }).solicitationCount).toBe(4);
 
       // Draft intact, aucun envoi.
       expect((await readMessage(draftId))?.status).toBe("draft");

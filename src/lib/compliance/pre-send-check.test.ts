@@ -10,7 +10,11 @@ import {
   preSendCheck,
   type PreSendCheckArgs,
 } from "./pre-send-check";
-import type { OutboundMessageRecord } from "./rate-limits";
+import {
+  type OutboundMessageRecord,
+  RATE_LIMIT_MAX_MESSAGES,
+  RATE_LIMIT_WINDOW_DAYS,
+} from "./rate-limits";
 
 /** Cast Date → Timestamp pour les tests. Runtime : bloctel/rate-limits/contact
  * acceptent Date OU Timestamp via `instanceof Date`. Type-side : cast nécessaire. */
@@ -66,8 +70,14 @@ function makeArgs(overrides: Partial<PreSendCheckArgs> = {}): PreSendCheckArgs {
   };
 }
 
+/** Sortant COMPTÉ (sollicitation) — cas par défaut de ces tests. */
 function outbound(sentAt: Date): OutboundMessageRecord {
-  return { direction: "outbound", sentAt };
+  return { direction: "outbound", sentAt, outboundKind: "solicitation" };
+}
+
+/** Sortant NON compté (réponse à un PS qui a écrit en premier). */
+function reply(sentAt: Date): OutboundMessageRecord {
+  return { direction: "outbound", sentAt, outboundKind: "reply" };
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -149,11 +159,12 @@ describe("preSendCheck — un test par code de failure", () => {
     }
   });
 
-  it("rate_limit_exceeded : 3 envois dans la fenêtre 30j", () => {
+  it("rate_limit_exceeded : 4 sollicitations dans la fenêtre 30j", () => {
     const r = preSendCheck(
       makeArgs({
         recentOutboundMessages: [
           outbound(daysAgo(1)),
+          outbound(daysAgo(10)),
           outbound(daysAgo(15)),
           outbound(daysAgo(25)),
         ],
@@ -164,11 +175,69 @@ describe("preSendCheck — un test par code de failure", () => {
       expect(r.failure.code).toBe("rate_limit_exceeded");
       // Vérif context typé
       if (r.failure.code === "rate_limit_exceeded") {
-        expect(r.failure.context.count).toBe(3);
-        expect(r.failure.context.maxAllowed).toBe(3);
+        expect(r.failure.context.solicitationCount).toBe(4);
+        expect(r.failure.context.totalOutboundCount).toBe(4);
+        expect(r.failure.context.maxAllowed).toBe(4);
         expect(r.failure.context.windowDays).toBe(30);
       }
     }
+  });
+
+  it("🔒 PREUVE L.34-5 : le contexte distingue sollicitations et total sortants", () => {
+    // L'écart entre les deux compteurs est ce qu'on oppose à un contrôle :
+    // « 4 sollicitations sur 9 messages sortants ». Sans
+    // `totalOutboundCount`, impossible de distinguer un plafond respecté
+    // d'un sous-comptage.
+    const r = preSendCheck(
+      makeArgs({
+        recentOutboundMessages: [
+          outbound(daysAgo(1)),
+          outbound(daysAgo(4)),
+          outbound(daysAgo(8)),
+          outbound(daysAgo(12)),
+          reply(daysAgo(2)),
+          reply(daysAgo(3)),
+          reply(daysAgo(5)),
+          reply(daysAgo(6)),
+          reply(daysAgo(7)),
+        ],
+      }),
+    );
+    expect(r.ok).toBe(false);
+    if (!r.ok && r.failure.code === "rate_limit_exceeded") {
+      expect(r.failure.context.solicitationCount).toBe(4);
+      expect(r.failure.context.totalOutboundCount).toBe(9);
+    }
+  });
+
+  it("🔒 SENTINELLE : HUMAN_REASONS.rate_limit_exceeded est cohérent avec les constantes", () => {
+    // `HUMAN_REASONS` doit rester un littéral figé (invariant anti-PII :
+    // aucune interpolation runtime). Le revers : le texte peut driver
+    // silencieusement de `RATE_LIMIT_MAX_MESSAGES` / `RATE_LIMIT_WINDOW_DAYS`.
+    // Cette sentinelle relie les deux sans introduire de template string
+    // dans le code de prod.
+    expect(HUMAN_REASONS.rate_limit_exceeded).toContain(String(RATE_LIMIT_MAX_MESSAGES));
+    expect(HUMAN_REASONS.rate_limit_exceeded).toContain(String(RATE_LIMIT_WINDOW_DAYS));
+    // Le vocabulaire compte : on plafonne des SOLLICITATIONS, pas des SMS.
+    expect(HUMAN_REASONS.rate_limit_exceeded).toContain("sollicitations");
+  });
+
+  it("🔒 les réponses ne déclenchent PAS le rate-limit (6 replies + 0 sollicitation)", () => {
+    // Une conversation vivante : le PS écrit, l'IA répond. Aucun de ces
+    // sortants n'est une sollicitation → le plafond n'est jamais approché.
+    const r = preSendCheck(
+      makeArgs({
+        recentOutboundMessages: [
+          reply(daysAgo(1)),
+          reply(daysAgo(2)),
+          reply(daysAgo(3)),
+          reply(daysAgo(4)),
+          reply(daysAgo(5)),
+          reply(daysAgo(6)),
+        ],
+      }),
+    );
+    expect(r.ok).toBe(true);
   });
 
   it("outside_hours : mardi 13h30 Paris (= 11h30 UTC été)", () => {
@@ -384,7 +453,12 @@ describe("preSendCheck — ordre des règles et court-circuit", () => {
     const r = preSendCheck(
       makeArgs({
         message: "Bonjour Dr X, je suis Léa, assistante IA Médéré.", // pas de STOP
-        recentOutboundMessages: [outbound(daysAgo(1)), outbound(daysAgo(2)), outbound(daysAgo(3))],
+        recentOutboundMessages: [
+          outbound(daysAgo(1)),
+          outbound(daysAgo(2)),
+          outbound(daysAgo(3)),
+          outbound(daysAgo(4)),
+        ],
       }),
     );
     expect(r.ok).toBe(false);
@@ -395,7 +469,12 @@ describe("preSendCheck — ordre des règles et court-circuit", () => {
     const r = preSendCheck(
       makeArgs({
         message: "Bonjour Dr X, je suis Léa, assistante IA. STOP", // STOP mais pas de "Médéré"
-        recentOutboundMessages: [outbound(daysAgo(1)), outbound(daysAgo(2)), outbound(daysAgo(3))],
+        recentOutboundMessages: [
+          outbound(daysAgo(1)),
+          outbound(daysAgo(2)),
+          outbound(daysAgo(3)),
+          outbound(daysAgo(4)),
+        ],
       }),
     );
     expect(r.ok).toBe(false);
@@ -560,6 +639,7 @@ describe("preSendCheck — humanReason est CONSTANT par code (anti-PII)", () => 
             outbound(daysAgo(1)),
             outbound(daysAgo(2)),
             outbound(daysAgo(3)),
+            outbound(daysAgo(4)),
           ],
         }),
       b: () =>
@@ -714,14 +794,21 @@ describe("preSendCheck — context schéma fermé (discriminated union)", () => 
   it("type-level : context ne peut PAS contenir de clés arbitraires (compile-time)", () => {
     const r = preSendCheck(
       makeArgs({
-        recentOutboundMessages: [outbound(daysAgo(1)), outbound(daysAgo(2)), outbound(daysAgo(3))],
+        recentOutboundMessages: [
+          outbound(daysAgo(1)),
+          outbound(daysAgo(2)),
+          outbound(daysAgo(3)),
+          outbound(daysAgo(4)),
+        ],
       }),
     );
     expect(r.ok).toBe(false);
     if (!r.ok && r.failure.code === "rate_limit_exceeded") {
-      // Les seules clés autorisées sont count, maxAllowed, windowDays.
+      // Les seules clés autorisées : solicitationCount, totalOutboundCount,
+      // maxAllowed, windowDays. Toutes des entiers — aucune PII possible.
       const allowed: ReadonlyArray<keyof typeof r.failure.context> = [
-        "count",
+        "solicitationCount",
+        "totalOutboundCount",
         "maxAllowed",
         "windowDays",
       ];
@@ -749,7 +836,12 @@ describe("preSendCheck — context schéma fermé (discriminated union)", () => 
       makeArgs({ now: new Date("2026-05-12T11:00:00Z") }), // outside_hours
       makeArgs({ now: new Date("2026-05-01T09:00:00Z") }), // holiday
       makeArgs({
-        recentOutboundMessages: [outbound(daysAgo(1)), outbound(daysAgo(2)), outbound(daysAgo(3))],
+        recentOutboundMessages: [
+          outbound(daysAgo(1)),
+          outbound(daysAgo(2)),
+          outbound(daysAgo(3)),
+          outbound(daysAgo(4)),
+        ],
       }), // rate_limit
     ];
 

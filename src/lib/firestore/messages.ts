@@ -456,10 +456,19 @@ function validateBodyOrThrow(body: string, conversationId: string): void {
  * CPCE. Le sens inverse (`"solicitation"` posé à tort) sur-compte, donc
  * fail-closed, donc bénin. On ne garde donc que le sens dangereux.
  *
- * ⚠️ La garde ne vaut RIEN pour le comptage tant que la PR suivante n'a
- * pas branché le filtre : à ce stade le champ est écrit mais pas encore lu.
- * Elle est posée MAINTENANT pour qu'aucun doc incohérent n'entre en base
- * avant que le filtre n'arrive.
+ * ⚠️ Depuis PR-FILTRE-SOLLICITATION, cette garde protège un comptage
+ * ACTIF : un doc estampillé `"reply"` à tort sort réellement du plafond.
+ * Elle n'est plus préventive, elle est en première ligne.
+ *
+ * 🔴 LIMITE CONNUE — `inboundCount` est un compteur de VIE ENTIÈRE, sans
+ * borne de récence. Un PS ayant répondu une seule fois rend éligible à
+ * l'estampille `"reply"` tout sortant ultérieur de cette conversation,
+ * indéfiniment. Aujourd'hui inexploitable : le seul écrivain de `"reply"`
+ * est `addOutboundDraftInTx`, appelé uniquement par `process-reply` sur
+ * réception d'un entrant. La sûreté vient donc du PIPELINE, pas de cette
+ * garde. À renforcer (fenêtre sur `conversation.lastInboundAt`) AVANT la
+ * première PR de relance `schedule-followup`, qui réutiliserait ce chemin
+ * et ferait échapper ses relances au plafond.
  *
  * @throws ValidationError si `kind === "reply"` et `conv.inboundCount === 0`.
  */
@@ -857,6 +866,11 @@ export async function listRecentOutbound(
       {
         direction: "outbound" as const,
         sentAt,
+        // 🔒 PR-FILTRE-SOLLICITATION — transporté VERBATIM (pas de défaut
+        // appliqué ici) : `countsAgainstCap()` est le seul point de
+        // décision. `undefined` = doc legacy, il y sera traité comme une
+        // sollicitation (fail-closed).
+        outboundKind: msg.outboundKind,
       },
     ];
   });
@@ -1092,6 +1106,11 @@ export async function listRecentOutboundInTx(
       {
         direction: "outbound" as const,
         sentAt,
+        // 🔒 PR-FILTRE-SOLLICITATION — transporté VERBATIM (pas de défaut
+        // appliqué ici) : `countsAgainstCap()` est le seul point de
+        // décision. `undefined` = doc legacy, il y sera traité comme une
+        // sollicitation (fail-closed).
+        outboundKind: msg.outboundKind,
       },
     ];
   });

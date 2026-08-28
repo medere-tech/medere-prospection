@@ -24,9 +24,9 @@
  * CE QUE CE TEST PROUVE
  *
  *   `sendOutboundWithLock` ferme la race condition N=2 jobs Inngest
- *   concurrents au plafond rate-limit 3/30j by-construction Firestore :
+ *   concurrents au plafond rate-limit 4/30j by-construction Firestore :
  *
- *     - Pré-condition : 1 contact + 1 conversation + 2 outbound récents
+ *     - Pré-condition : 1 contact + 1 conversation + 3 outbound récents
  *       (état "à 1 SMS du plafond").
  *     - 2 appels simultanés (`Promise.allSettled`) tentent chacun l'envoi
  *       du 3e SMS via `sendOutboundWithLock`.
@@ -200,7 +200,7 @@ describe("sendOutboundWithLock — race resilience 10 iterations (DEBT-001.6)", 
     await fullReset();
   });
 
-  it("2 appels simultanés au plafond rate-limit 3/30j → exactement 1 succès + 1 ComplianceConcurrencyError (10 itérations, ZERO flaky)", async () => {
+  it("2 appels simultanés au plafond rate-limit 4/30j → exactement 1 succès + 1 ComplianceConcurrencyError (10 itérations, ZERO flaky)", async () => {
     const ITERATIONS = 10;
 
     // Note design : on n'a PAS de helper `clearFirestore` (la base
@@ -215,18 +215,20 @@ describe("sendOutboundWithLock — race resilience 10 iterations (DEBT-001.6)", 
       const campaignId = `camp_iter${i}`;
       const conversationId = `${contactId}_${campaignId}`;
 
-      // Pré-condition : contact + conv + 2 outbound récents (état
-      // "à 1 SMS du plafond"). conv.contactId/campaignId DOIVENT matcher
-      // car sendOutboundWithLock vérifie en défense en profondeur.
+      // Pré-condition : contact + conv + 3 outbound récents (état
+      // "à 1 SMS du plafond" — plafond = 4 sollicitations).
+      // conv.contactId/campaignId DOIVENT matcher car sendOutboundWithLock
+      // vérifie en défense en profondeur.
       await seedContact(contactId);
       await seedConversation(conversationId, {
         contactId,
         campaignId,
-        messageCount: 2,
-        outboundCount: 2,
+        messageCount: 3,
+        outboundCount: 3,
       });
       await seedOutboundMessage(conversationId, 5, `iter${i}_m1`);
       await seedOutboundMessage(conversationId, 3, `iter${i}_m2`);
+      await seedOutboundMessage(conversationId, 2, `iter${i}_m3`);
 
       // Snapshot audits cumulés AVANT (assertion différentielle).
       const auditsBefore = {
@@ -254,7 +256,7 @@ describe("sendOutboundWithLock — race resilience 10 iterations (DEBT-001.6)", 
           creditsRemoved: 1,
           dryRun: false,
         },
-        // Pre-check HORS tx aurait dit "1 place dispo" (3 - 2 outbounds).
+        // Pre-check HORS tx aurait dit "1 place dispo" (4 - 3 sollicitations).
         expectedRemainingQuota: 1,
       });
 
@@ -289,7 +291,7 @@ describe("sendOutboundWithLock — race resilience 10 iterations (DEBT-001.6)", 
       // ── État Firestore final : 3 outbound (pas 4), pas plus ───────────
       // 2 seeds + 1 créé par le gagnant. Le perdant a rollback intégralement.
       const totalOutbound = await countOutboundMessages(conversationId);
-      expect(totalOutbound, `iteration ${i}: 3 outbound attendus (2 seeds + 1 winner)`).toBe(3);
+      expect(totalOutbound, `iteration ${i}: 4 outbound attendus (3 seeds + 1 winner)`).toBe(4);
 
       // Compteurs conversation bumpés exactement de 1 (de 2 à 3).
       const convAfter = await getAdminDb()
@@ -297,8 +299,8 @@ describe("sendOutboundWithLock — race resilience 10 iterations (DEBT-001.6)", 
         .doc(conversationId)
         .get();
       const conv = convAfter.data() as Conversation;
-      expect(conv.outboundCount, `iteration ${i}: outboundCount === 3`).toBe(3);
-      expect(conv.messageCount, `iteration ${i}: messageCount === 3`).toBe(3);
+      expect(conv.outboundCount, `iteration ${i}: outboundCount === 4`).toBe(4);
+      expect(conv.messageCount, `iteration ${i}: messageCount === 4`).toBe(4);
 
       // ── Audits cumulés : +1 sms_sent + 1 sms_provider_dispatched ──────
       // Tous deux posés par le gagnant DANS la tx atomique (DETTE-004
@@ -356,16 +358,16 @@ describe("sendOutboundWithLock — race resilience 10 iterations (DEBT-001.6)", 
       const convX = `${contactId}_${campaignX}`;
       const convY = `${contactId}_${campaignY}`;
 
-      // Pré-condition : 1 contact, 2 conversations, 1 outbound récent dans
-      // CHACUNE → 2 sollicitations au total pour ce PS = "à 1 SMS du
-      // plafond" à l'échelle de la PERSONNE (invisible si on compte par
-      // conversation : chacune n'en montre qu'1).
+      // Pré-condition : 1 contact, 2 conversations, 3 sollicitations
+      // réparties (2 dans X, 1 dans Y) → "à 1 SMS du plafond" à l'échelle
+      // de la PERSONNE (plafond = 4). Invisible si on compte par
+      // conversation : X n'en montre que 2, Y que 1.
       await seedContact(contactId);
       await seedConversation(convX, {
         contactId,
         campaignId: campaignX,
-        messageCount: 1,
-        outboundCount: 1,
+        messageCount: 2,
+        outboundCount: 2,
       });
       await seedConversation(convY, {
         contactId,
@@ -374,6 +376,7 @@ describe("sendOutboundWithLock — race resilience 10 iterations (DEBT-001.6)", 
         outboundCount: 1,
       });
       await seedOutboundMessage(convX, 5, `iter${i}_x1`);
+      await seedOutboundMessage(convX, 4, `iter${i}_x2`);
       await seedOutboundMessage(convY, 3, `iter${i}_y1`);
 
       const buildArgs = (campaignId: string, conversationId: string, bodyTag: string) => ({
@@ -393,7 +396,7 @@ describe("sendOutboundWithLock — race resilience 10 iterations (DEBT-001.6)", 
           creditsRemoved: 1,
           dryRun: false,
         },
-        // Pre-check per-contact HORS tx aurait dit "1 place dispo" (3 - 2).
+        // Pre-check per-contact HORS tx aurait dit "1 place dispo" (4 - 3).
         expectedRemainingQuota: 1,
       });
 
@@ -428,15 +431,15 @@ describe("sendOutboundWithLock — race resilience 10 iterations (DEBT-001.6)", 
         (await countOutboundMessages(convX)) + (await countOutboundMessages(convY));
       expect(
         totalForContact,
-        `iteration ${i}: 3 outbound attendus pour le CONTACT (toutes campagnes)`,
-      ).toBe(3);
+        `iteration ${i}: 4 outbound attendus pour le CONTACT (toutes campagnes)`,
+      ).toBe(4);
     }
   }, 60_000);
 
-  it("🔒 PLAFOND PER-CONTACT : 3 outbounds répartis sur 2 conversations → le 4e (3e conversation) est refusé", async () => {
+  it("🔒 PLAFOND PER-CONTACT : 4 sollicitations réparties sur 2 conversations → la 5e (3e conversation) est refusée", async () => {
     // Preuve directe (sans course) que le comptage est bien per-personne :
     // aucune des 3 conversations ne dépasse individuellement le plafond,
-    // mais le CONTACT est déjà à 3/3. Un 4e envoi, même sur une campagne
+    // mais le CONTACT est déjà à 4/4. Un 5e envoi, même sur une campagne
     // toute neuve, doit être refusé.
     const contactId = "c_percontact_cap";
     const convA = `${contactId}_campA`;
@@ -453,8 +456,8 @@ describe("sendOutboundWithLock — race resilience 10 iterations (DEBT-001.6)", 
     await seedConversation(convB, {
       contactId,
       campaignId: "campB",
-      messageCount: 1,
-      outboundCount: 1,
+      messageCount: 2,
+      outboundCount: 2,
     });
     await seedConversation(convC, {
       contactId,
@@ -463,11 +466,12 @@ describe("sendOutboundWithLock — race resilience 10 iterations (DEBT-001.6)", 
       outboundCount: 0,
     });
 
-    // 2 sollicitations dans A + 1 dans B = 3 pour le PS. Aucune conv seule
+    // 2 sollicitations dans A + 2 dans B = 4 pour le PS. Aucune conv seule
     // n'atteint le plafond → per-conversation, l'envoi passerait.
     await seedOutboundMessage(convA, 10, "a1");
     await seedOutboundMessage(convA, 6, "a2");
     await seedOutboundMessage(convB, 2, "b1");
+    await seedOutboundMessage(convB, 1, "b2");
 
     await expect(
       sendOutboundWithLock({
@@ -475,7 +479,7 @@ describe("sendOutboundWithLock — race resilience 10 iterations (DEBT-001.6)", 
         campaignId: "campC",
         conversationId: convC,
         input: {
-          body: "4e SMS — STOP pour refuser. Léa IA Médéré.",
+          body: "5e SMS — STOP pour refuser. Léa IA Médéré.",
           channel: "sms",
           generatedBy: "ai",
           outboundKind: "solicitation" as const,
@@ -487,7 +491,7 @@ describe("sendOutboundWithLock — race resilience 10 iterations (DEBT-001.6)", 
           creditsRemoved: 1,
           dryRun: false,
         },
-        // Le pré-check per-contact HORS tx aurait déjà vu 3/3 → 0 place.
+        // Le pré-check per-contact HORS tx aurait déjà vu 4/4 → 0 place.
         expectedRemainingQuota: 0,
       }),
     ).rejects.toBeInstanceOf(ComplianceConcurrencyError);
@@ -496,6 +500,6 @@ describe("sendOutboundWithLock — race resilience 10 iterations (DEBT-001.6)", 
     expect(await countOutboundMessages(convC)).toBe(0);
     // Et les conversations sources sont intactes.
     expect(await countOutboundMessages(convA)).toBe(2);
-    expect(await countOutboundMessages(convB)).toBe(1);
+    expect(await countOutboundMessages(convB)).toBe(2);
   });
 });

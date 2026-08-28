@@ -142,9 +142,32 @@ describe("preSendCheckWithAudit", () => {
       const { args, deps } = buildPassingArgs();
       // Bloque sur rate_limit (3 outbound récents)
       args.recentOutboundMessages = [
-        { direction: "outbound", sentAt: new Date(FIXED_NOW.getTime() - 1 * 86400_000) },
-        { direction: "outbound", sentAt: new Date(FIXED_NOW.getTime() - 2 * 86400_000) },
-        { direction: "outbound", sentAt: new Date(FIXED_NOW.getTime() - 3 * 86400_000) },
+        // 4 sollicitations + 1 reply : le contexte doit distinguer les deux.
+        {
+          direction: "outbound",
+          sentAt: new Date(FIXED_NOW.getTime() - 1 * 86400_000),
+          outboundKind: "solicitation",
+        },
+        {
+          direction: "outbound",
+          sentAt: new Date(FIXED_NOW.getTime() - 2 * 86400_000),
+          outboundKind: "solicitation",
+        },
+        {
+          direction: "outbound",
+          sentAt: new Date(FIXED_NOW.getTime() - 3 * 86400_000),
+          outboundKind: "solicitation",
+        },
+        {
+          direction: "outbound",
+          sentAt: new Date(FIXED_NOW.getTime() - 4 * 86400_000),
+          outboundKind: "solicitation",
+        },
+        {
+          direction: "outbound",
+          sentAt: new Date(FIXED_NOW.getTime() - 5 * 86400_000),
+          outboundKind: "reply",
+        },
       ];
       deps.canSendMessage = vi.fn(() => ({
         allowed: false,
@@ -294,14 +317,37 @@ describe("preSendCheckWithAudit", () => {
       });
     });
 
-    it("rate_limit_exceeded → payload context: { count, maxAllowed, windowDays }", async () => {
+    it("rate_limit_exceeded → payload context: { solicitationCount, totalOutboundCount, maxAllowed, windowDays }", async () => {
       const { args, deps } = buildPassingArgs();
       args.recentOutboundMessages = [
-        { direction: "outbound", sentAt: new Date(FIXED_NOW.getTime() - 1 * 86400_000) },
-        { direction: "outbound", sentAt: new Date(FIXED_NOW.getTime() - 2 * 86400_000) },
-        { direction: "outbound", sentAt: new Date(FIXED_NOW.getTime() - 3 * 86400_000) },
+        // 4 sollicitations + 1 reply : le contexte doit distinguer les deux.
+        {
+          direction: "outbound",
+          sentAt: new Date(FIXED_NOW.getTime() - 1 * 86400_000),
+          outboundKind: "solicitation",
+        },
+        {
+          direction: "outbound",
+          sentAt: new Date(FIXED_NOW.getTime() - 2 * 86400_000),
+          outboundKind: "solicitation",
+        },
+        {
+          direction: "outbound",
+          sentAt: new Date(FIXED_NOW.getTime() - 3 * 86400_000),
+          outboundKind: "solicitation",
+        },
+        {
+          direction: "outbound",
+          sentAt: new Date(FIXED_NOW.getTime() - 4 * 86400_000),
+          outboundKind: "solicitation",
+        },
+        {
+          direction: "outbound",
+          sentAt: new Date(FIXED_NOW.getTime() - 5 * 86400_000),
+          outboundKind: "reply",
+        },
       ];
-      deps.canSendMessage = vi.fn(() => ({ allowed: false, reason: "Plafond 3/30j" }));
+      deps.canSendMessage = vi.fn(() => ({ allowed: false, reason: "Plafond 4/30j" }));
 
       await preSendCheckWithAudit(args, deps);
 
@@ -310,7 +356,7 @@ describe("preSendCheckWithAudit", () => {
         result: "blocked",
         code: "rate_limit_exceeded",
         rule: "rate_limit",
-        context: { count: 3, maxAllowed: 3, windowDays: 30 },
+        context: { solicitationCount: 4, totalOutboundCount: 5, maxAllowed: 4, windowDays: 30 },
       });
     });
 

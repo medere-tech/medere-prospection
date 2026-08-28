@@ -26,6 +26,7 @@ import { deleteApp } from "firebase-admin/app";
 import { Timestamp } from "firebase-admin/firestore";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
+import { RATE_LIMIT_WINDOW_DAYS } from "@/lib/compliance/rate-limits";
 import { __resetEnvCacheForTests } from "@/lib/security/env";
 import {
   AuditPiiError,
@@ -501,17 +502,22 @@ describe("transactions.ts — sendOutboundWithLock (DEBT-001.3)", () => {
     );
   });
 
-  it("sentinel Q-S6.3 (DEBT-001.6) : RATE_LIMIT_WINDOW_DAYS === 30 hardcodé — anti-drift CNIL", () => {
+  it("🔒 sentinel anti-drift CNIL : la fenêtre in-tx EST celle de lib/compliance", () => {
     // Cible CNIL B2B = 30 jours (L.34-5 CPCE, contrainte LÉGALE stable).
-    // Si vous changez cette valeur, vérifier l'alignement avec
-    // lib/compliance/rate-limits.ts (window également hardcodé en const
-    // privée, non exportée — décision DEBT-001.3 Q-S2 : pas d'export pour
-    // éviter un point de tentation de modification programmatique).
     //
-    // Justification du double hardcoding vs export : la valeur 30 est
-    // figée par la loi, ne devrait jamais bouger. Hardcoder + sentinel
-    // anti-drift est plus sain qu'un export qui invite à paramétrer.
-    expect(__TRANSACTIONS_RATE_LIMIT_WINDOW_DAYS_FOR_TESTS).toBe(30);
+    // 🚨 PR-FILTRE-SOLLICITATION — cette sentinelle comparait auparavant à
+    // un LITTÉRAL 30, ce qui ne sentinellait rien : une divergence entre
+    // la fenêtre compliance et la copie locale serait passée au vert.
+    // C'était le seul chemin FAIL-OPEN du dispositif — fenêtre compliance
+    // élargie à 45j, historique chargé toujours à 30j → comptage tronqué
+    // → sous-comptage → dépassement silencieux du plafond légal.
+    //
+    // La copie locale a été supprimée (ré-export direct). On verrouille
+    // l'égalité avec la source de vérité, pas avec une valeur écrite en
+    // dur ici.
+    expect(__TRANSACTIONS_RATE_LIMIT_WINDOW_DAYS_FOR_TESTS).toBe(RATE_LIMIT_WINDOW_DAYS);
+    // Valeur attendue aujourd'hui, en second rideau.
+    expect(RATE_LIMIT_WINDOW_DAYS).toBe(30);
   });
 
   // ───────────────────────────────────────────────────────────────────────
@@ -798,7 +804,7 @@ describe("transactions.ts — sendOutboundWithLock (DEBT-001.3)", () => {
     const contactId = "hs_race";
     const campaignId = "camp_race";
     const convId = "conv_race";
-    await seedTrio({ contactId, convId, campaignId, outboundsAgo: [10, 7, 3] });
+    await seedTrio({ contactId, convId, campaignId, outboundsAgo: [10, 7, 5, 3] });
 
     const auditsBefore = {
       smsSent: await countAuditByAction("sms_sent"),
@@ -810,7 +816,7 @@ describe("transactions.ts — sendOutboundWithLock (DEBT-001.3)", () => {
     ).rejects.toBeInstanceOf(ComplianceConcurrencyError);
 
     // Aucun nouveau message créé (compteur outbound reste à 3, le seed).
-    expect(await countOutboundMessages(convId)).toBe(3);
+    expect(await countOutboundMessages(convId)).toBe(4);
 
     // Aucun nouvel audit posé.
     expect(await countAuditByAction("sms_sent")).toBe(auditsBefore.smsSent);
@@ -821,7 +827,7 @@ describe("transactions.ts — sendOutboundWithLock (DEBT-001.3)", () => {
     const contactId = "hs_ctx";
     const campaignId = "camp_ctx";
     const convId = "conv_ctx";
-    await seedTrio({ contactId, convId, campaignId, outboundsAgo: [10, 7, 3] });
+    await seedTrio({ contactId, convId, campaignId, outboundsAgo: [10, 7, 5, 3] });
 
     try {
       await sendOutboundWithLock(

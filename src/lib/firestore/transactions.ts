@@ -87,7 +87,10 @@
  */
 import { type Transaction } from "firebase-admin/firestore";
 
-import { canSendMessage } from "@/lib/compliance/rate-limits";
+import {
+  canSendMessage,
+  RATE_LIMIT_WINDOW_DAYS as COMPLIANCE_RATE_LIMIT_WINDOW_DAYS,
+} from "@/lib/compliance/rate-limits";
 import { getAdminDb } from "@/lib/firestore/admin";
 import { _parseContactOrThrow } from "@/lib/firestore/contacts";
 import { _parseConversationOrThrow } from "@/lib/firestore/conversations";
@@ -122,12 +125,20 @@ const CONTACTS_COLLECTION = "contacts";
 const CONVERSATIONS_COLLECTION = "conversations";
 
 /**
- * Largeur de la fenêtre rate-limit (jours). Aligné sur la constante
- * privée `RATE_LIMIT_WINDOW_DAYS` de `lib/compliance/rate-limits.ts`.
- * Définie localement pour ne pas exporter la constante de S4 (couplage).
- * Test sentinel pourrait être ajouté en DEBT-001.6 si dérive constatée.
+ * 🔒 Largeur de la fenêtre rate-limit — RÉ-EXPORTÉE depuis
+ * `lib/compliance/rate-limits.ts`, plus JAMAIS redéfinie localement
+ * (PR-FILTRE-SOLLICITATION).
+ *
+ * Historique : une copie `const RATE_LIMIT_WINDOW_DAYS = 30` vivait ici,
+ * justifiée par « ne pas exporter la constante de S4 (couplage) ». La
+ * justification était caduque (ce module importe déjà `canSendMessage` du
+ * même fichier) et le risque était FAIL-OPEN, le seul du dispositif : si
+ * la fenêtre passait à 45 jours côté compliance, ce re-check in-tx aurait
+ * continué à ne charger que 30 jours d'historique → comptage sur un
+ * historique tronqué → sous-comptage → dépassement silencieux du plafond
+ * légal, sans aucun test rouge.
  */
-const RATE_LIMIT_WINDOW_DAYS = 30;
+const RATE_LIMIT_WINDOW_DAYS = COMPLIANCE_RATE_LIMIT_WINDOW_DAYS;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // S10.1.4.c-FIX-FLAKY-001 — détection erreurs Firestore SDK de concurrence

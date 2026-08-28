@@ -256,7 +256,43 @@ describe("sendFirstSmsHandler — happy path DRY_RUN", () => {
           dryRun: true,
           creditsRemoved: 0,
         },
-        // recentOutboundMessages mock = [] → expectedRemaining = 3 - 0 = 3.
+        // recentOutboundMessages mock = [] → expectedRemaining = 4 - 0 = 4
+        // (plafond porté à 4 sollicitations par PR-FILTRE-SOLLICITATION).
+        expectedRemainingQuota: 4,
+      }),
+    );
+  });
+
+  it("🔒 expectedRemainingQuota décompte les SOLLICITATIONS, pas les sortants", async () => {
+    // ─────────────────────────────────────────────────────────────────
+    // MAJEUR-1 (audit PR-FILTRE-SOLLICITATION) — sans ce test, remplacer
+    // `countSolicitationsInWindow(...).solicitationCount` par
+    // `recentOutboundMessages.length` faisait passer 100 % de la suite :
+    // le mock global est `mockResolvedValue([])` et aucun test ne
+    // l'override, donc le calcul n'était jamais exercé sur un historique
+    // réel.
+    //
+    // Ce qui est en jeu : `expectedRemainingQuota` hydrate le contexte
+    // forensique de `ComplianceConcurrencyError`. Avec la longueur brute,
+    // une conversation vivante (beaucoup de réponses) produirait un quota
+    // restant NÉGATIF — exactement la pièce qu'on opposerait à la CNIL
+    // pour prouver qu'on a bien compté.
+    // ─────────────────────────────────────────────────────────────────
+    const now = new Date();
+    const daysAgo = (n: number) => new Date(now.getTime() - n * 86400_000);
+
+    (listRecentOutboundByContact as ReturnType<typeof vi.fn>).mockResolvedValue([
+      { direction: "outbound", sentAt: daysAgo(1), outboundKind: "solicitation" },
+      { direction: "outbound", sentAt: daysAgo(2), outboundKind: "reply" },
+      { direction: "outbound", sentAt: daysAgo(3), outboundKind: "reply" },
+    ]);
+
+    await sendFirstSmsHandler(makeFakeCtx({ body: "Hello body" }));
+
+    expect(sendOutboundWithLock).toHaveBeenCalledWith(
+      expect.objectContaining({
+        // 4 (plafond) − 1 SOLLICITATION = 3.
+        // Avec la longueur brute on aurait eu 4 − 3 = 1. ← ce que ce test tue.
         expectedRemainingQuota: 3,
       }),
     );

@@ -140,7 +140,7 @@ src/
 
 1. **Annonce IA dans le premier SMS** ("Bonjour, Léa, assistante IA de Médéré").
 2. **"STOP" présent dans chaque SMS** et fonctionnel.
-3. **Plafond strict 3 SMS / 30 jours** par contact, enforced en code.
+3. **Plafond strict 4 SOLLICITATIONS / 30 jours** par contact (pas par campagne), enforced en code. Les **réponses** à un PS qui a écrit en premier ne comptent pas : seuls les messages où l'on prend l'initiative de le déranger comptent (`outboundKind === "solicitation"`). Une conversation engagée peut donc avoir 10+ réponses sans jamais bloquer.
 4. **Plages horaires** : 10h-13h / 14h-20h en semaine, jamais le dimanche, jamais les jours fériés.
 5. **Vérification Bloctel** des numéros mobiles persos avant envoi.
 6. **Audit log** de chaque envoi, hand-off, opt-out.
@@ -219,7 +219,8 @@ Toutes définies dans `.env.example`. Au boot, validation stricte via `src/lib/s
 | Logger un téléphone en clair | Hash ou tronquer dans le logger |
 | Envoyer SMS sans Inngest | TOUT envoi passe par une Inngest function (retry auto) |
 | SMS un dimanche | `compliance/hours.ts` bloque, ne jamais bypass |
-| 4ème SMS dans 30j | `compliance/rate-limits.ts` bloque, ne jamais bypass |
+| 5ème sollicitation dans 30j | `compliance/rate-limits.ts` bloque, ne jamais bypass |
+| Tester la nature d'un sortant à la main (`outboundKind !== "solicitation"`) | INTERDIT — passer par `countsAgainstCap()` (`lib/compliance/outbound-kind.ts`). La forme `!==` exclurait les docs legacy du comptage = sous-comptage = infraction |
 | Pas d'annonce IA dans 1er SMS | Validation post-génération obligatoire |
 | Stocker données de santé | INTERDIT — uniquement coordonnées professionnelles |
 | Husky v9 : `core.hooksPath = .husky/_` | Normal (wrappers générés). Ne PAS forcer `.husky` |
