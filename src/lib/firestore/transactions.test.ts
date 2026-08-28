@@ -652,7 +652,7 @@ describe("transactions.ts — sendOutboundWithLock (DEBT-001.3)", () => {
   // Mock-based : ordre exact des appels
   // ───────────────────────────────────────────────────────────────────────
 
-  it("ORDRE EXACT (mock) : listRecentOutboundInTx → canSendMessage (interne) → addOutboundInTx → appendAuditLogTx", async () => {
+  it("ORDRE EXACT (mock) : listRecentOutboundByContactInTx → canSendMessage (interne) → addOutboundInTx → appendAuditLogTx", async () => {
     // Verrouille l'ordre des appels via spies. Si quelqu'un réordonne
     // (ex: addOutboundInTx AVANT le re-check rate-limit), le test casse.
     const contactId = "hs_order";
@@ -662,9 +662,9 @@ describe("transactions.ts — sendOutboundWithLock (DEBT-001.3)", () => {
 
     const callOrder: string[] = [];
     const listSpy = vi
-      .spyOn(messagesModule, "listRecentOutboundInTx")
+      .spyOn(messagesModule, "listRecentOutboundByContactInTx")
       .mockImplementation(async () => {
-        callOrder.push("listRecentOutboundInTx");
+        callOrder.push("listRecentOutboundByContactInTx");
         return [];
       });
     const addSpy = vi.spyOn(messagesModule, "addOutboundInTx").mockImplementation(async () => {
@@ -678,7 +678,11 @@ describe("transactions.ts — sendOutboundWithLock (DEBT-001.3)", () => {
 
     await sendOutboundWithLock(buildArgs({ contactId, convId, campaignId }));
 
-    expect(callOrder).toEqual(["listRecentOutboundInTx", "addOutboundInTx", "appendAuditLogTx"]);
+    expect(callOrder).toEqual([
+      "listRecentOutboundByContactInTx",
+      "addOutboundInTx",
+      "appendAuditLogTx",
+    ]);
     expect(listSpy).toHaveBeenCalledTimes(1);
     expect(addSpy).toHaveBeenCalledTimes(1);
     expect(auditSpy).toHaveBeenCalledTimes(1);
@@ -688,24 +692,33 @@ describe("transactions.ts — sendOutboundWithLock (DEBT-001.3)", () => {
     auditSpy.mockRestore();
   });
 
-  it("ORDRE (mock) : listRecentOutboundInTx appelée AVEC RATE_LIMIT_WINDOW_DAYS (30j)", async () => {
-    // Sentinelle anti-régression : si quelqu'un passe 7 ou 60 jours par
-    // erreur, la fenêtre rate-limit devient incohérente avec S4.
+  it("ORDRE (mock) : listRecentOutboundByContactInTx appelée AVEC contactId + RATE_LIMIT_WINDOW_DAYS (30j)", async () => {
+    // Double sentinelle anti-régression :
+    //   1. fenêtre — si quelqu'un passe 7 ou 60 jours par erreur, le
+    //      rate-limit devient incohérent avec S4.
+    //   2. 🔒 SCOPE (PR-PER-CONTACT) — le 2e argument DOIT être le
+    //      `contactId`, JAMAIS le `conversationId`. Si quelqu'un re-scope
+    //      le comptage sur la conversation, un PS enrôlé dans 2 campagnes
+    //      peut recevoir 2× le plafond L.34-5 CPCE. Ce test casse alors.
     const contactId = "hs_window";
     const campaignId = "camp_window";
     const convId = "conv_window";
     await seedTrio({ contactId, convId, campaignId, outboundsAgo: [] });
 
-    const listSpy = vi.spyOn(messagesModule, "listRecentOutboundInTx").mockResolvedValue([]);
+    const listSpy = vi
+      .spyOn(messagesModule, "listRecentOutboundByContactInTx")
+      .mockResolvedValue([]);
 
     await sendOutboundWithLock(buildArgs({ contactId, convId, campaignId }));
 
-    // Signature attendue : (tx, conversationId, 30)
+    // Signature attendue : (tx, contactId, 30)
     expect(listSpy).toHaveBeenCalledWith(
       expect.anything(), // tx
-      convId,
+      contactId,
       __TRANSACTIONS_RATE_LIMIT_WINDOW_DAYS_FOR_TESTS, // 30
     );
+    // Defense-in-depth explicite : ce n'est PAS le convId qui est passé.
+    expect(listSpy).not.toHaveBeenCalledWith(expect.anything(), convId, expect.anything());
     listSpy.mockRestore();
   });
 

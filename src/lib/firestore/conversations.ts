@@ -7,6 +7,12 @@
  *   - `conversationDocId(contactId, campaignId)`
  *         → helper pur, retourne `${contactId}_${campaignId}` (cf. skill
  *           `medere-firestore-schema` l.328).
+ *   - `listConversationIdsByContact(contactId)`          (PR-PER-CONTACT)
+ *   - `listConversationIdsByContactInTx(tx, contactId)`  (PR-PER-CONTACT)
+ *         → docIds de TOUTES les conversations d'un contact (tous statuts,
+ *           sans limit) — étage 1 du fan-out qui rend le plafond rate-limit
+ *           per-CONTACT au lieu de per-conversation. Cf. leur JSDoc pour
+ *           les 3 différences délibérées vs `getActiveConversationByContactId`.
  *   - `getConversation(id)`
  *         → lecture validée (Zod strict, throw ValidationError si corrompu).
  *   - `incrementMessageCount(id, direction)`
@@ -53,12 +59,19 @@
  *      `notes` brut (commercial peut écrire "Dr Dupont 06...") même si
  *      le scrubber S6.2 le détecterait. Défense en profondeur.
  */
-import { type DocumentReference, Timestamp, type Transaction } from "firebase-admin/firestore";
+import {
+  type DocumentReference,
+  type QuerySnapshot,
+  Timestamp,
+  type Transaction,
+} from "firebase-admin/firestore";
 import { z } from "zod";
 
 import { getAdminDb } from "@/lib/firestore/admin";
 import { appendAuditLogTx } from "@/lib/firestore/audit-log";
 import { ConflictError, InternalError, NotFoundError, ValidationError } from "@/lib/utils/errors";
+import { logger } from "@/lib/utils/logger";
+import { shortFingerprint } from "@/lib/utils/short-fingerprint";
 import type { Conversation, ConversationStatus, Intent } from "@/types/conversation";
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -68,6 +81,27 @@ import type { Conversation, ConversationStatus, Intent } from "@/types/conversat
 const CONVERSATIONS_COLLECTION = "conversations";
 
 const HANDOFF_NOTES_MIN_LENGTH = 10;
+
+/**
+ * 🔒 Seuil d'ALERTE (pas de troncature) du fan-out conversations d'un
+ * contact — `listConversationIdsByContact{,InTx}` (PR-PER-CONTACT).
+ *
+ * Au-delà de ce nombre de conversations pour un même contact, on log un
+ * `warn` : soit le PS a été enrôlé dans un nombre anormal de campagnes,
+ * soit un bug d'orchestration crée des conversations en boucle. Dans les
+ * deux cas ça mérite un œil humain.
+ *
+ * ⚠️ CE SEUIL NE TRONQUE RIEN — et ne doit JAMAIS le faire. Un `limit()`
+ * sur le fan-out produirait un SOUS-COMPTAGE du plafond L.34-5 CPCE
+ * (des sollicitations réelles invisibles au rate-limit) — c'est-à-dire
+ * une infraction silencieuse, exactement le contraire de ce que la
+ * fonction protège. Le coût d'un fan-out large (quelques queries de plus)
+ * est sans commune mesure avec celui d'un 4e SMS non détecté.
+ *
+ * Sentinelle test : `conversations.test.ts` vérifie qu'à N > seuil les
+ * N conversations sont TOUTES retournées ET que le warn est émis.
+ */
+const CONVERSATION_FANOUT_WARN_THRESHOLD = 10;
 
 /**
  * 🔒 Status conversation considérés "terminaux" — refusent toute mutation
@@ -605,6 +639,239 @@ export async function getActiveConversationByContactId(
   return { conversationId: doc.id, conversation };
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// listConversationIdsByContact{,InTx} (PR-PER-CONTACT) — fan-out rate-limit
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * Extrait `lastOutboundAt` d'un doc conversation BRUT (non validé Zod) en
+ * millisecondes, ou `null` si absent/inexploitable.
+ *
+ * Volontairement tolérant : cette valeur ne sert QU'À ORDONNER la liste
+ * (confort de lecture + déterminisme des tests). Elle n'entre dans AUCUNE
+ * décision compliance. Un doc dont le champ serait corrompu est donc
+ * simplement rangé en fin de liste — jamais exclu.
+ */
+function conversationLastOutboundMillis(value: unknown): number | null {
+  if (value instanceof Timestamp) return value.toMillis();
+  if (value instanceof Date) return value.getTime();
+  return null;
+}
+
+/**
+ * Mappe un `QuerySnapshot` de conversations en liste ordonnée de docIds.
+ * Factorisé entre la version HORS tx et la version tx-aware pour garantir
+ * une sémantique STRICTEMENT identique (sentinelle test d'alignement).
+ *
+ * ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ * 🚨 PAS DE VALIDATION ZOD ICI — dérogation ASSUMÉE à l'invariant maison
+ *
+ * Toutes les autres lectures de ce module parsent le doc via
+ * `parseConversationOrThrow`. Pas ici, et c'est délibéré :
+ *
+ *   1. On ne consomme AUCUN champ du doc pour une décision métier. Le
+ *      `docId` vient de la métadonnée Firestore (`doc.id`), pas du
+ *      contenu — il est valide par construction quelle que soit la
+ *      santé du document.
+ *
+ *   2. Parser introduirait un mode de défaillance NET NÉGATIF pour la
+ *      compliance : une conversation corrompue ferait throw → l'envoi
+ *      entier serait bloqué, alors même que les messages de cette
+ *      conversation doivent être COMPTÉS. On perdrait la disponibilité
+ *      sans rien gagner en correction.
+ *
+ *   3. Le filet Zod reste posé là où il compte : `listRecentOutbound{,InTx}`
+ *      parse CHAQUE doc message et throw `ValidationError` si corrompu.
+ *      Un message illisible fait donc toujours échouer le comptage
+ *      (fail-closed) — c'est le bon endroit pour cette garde.
+ *
+ * 🚨 CONDITION DE CADUCITÉ DE CETTE DÉROGATION — À LIRE AVANT DE MODIFIER
+ *
+ * Ce qui rend la dérogation sûre, c'est que cette fonction **ne peut
+ * structurellement pas RETIRER une conversation du comptage** : le seul
+ * champ du payload qu'elle consomme est `lastOutboundAt`, via
+ * `conversationLastOutboundMillis` qui retombe sur `null` pour toute
+ * valeur inattendue → la conversation est reléguée en fin de liste,
+ * JAMAIS exclue. Une donnée corrompue, absente ou hostile ne peut donc
+ * pas produire de sous-comptage.
+ *
+ * Cette garantie tombe à la SECONDE où quelqu'un ajoute ici le moindre
+ * filtre, `limit()`, ou déduplication dérivé du CONTENU du doc. Dans ce
+ * cas la dérogation devient caduque : remets `parseConversationOrThrow`,
+ * ou déplace le filtre dans une fonction qui, elle, parse.
+ *
+ * ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ * ORDRE — tri EN MÉMOIRE, pas `orderBy` Firestore
+ *
+ * `where("contactId","==",x).orderBy("lastOutboundAt","desc")` exigerait
+ * un index composite `(contactId ASC, lastOutboundAt DESC)` à déployer
+ * AVANT le code, sous peine de `FAILED_PRECONDITION` en prod. Or l'égalité
+ * seule sur `contactId` est servie par l'index mono-champ AUTOMATIQUE de
+ * Firestore — zéro index à déclarer, zéro délai de build, zéro fenêtre de
+ * déploiement risquée. Comme on ne tronque JAMAIS, trier côté serveur
+ * n'apporte rien : on trie les quelques docs en mémoire.
+ *
+ * Tri : `lastOutboundAt` DESC, conversations sans `lastOutboundAt` en
+ * dernier, départage par `docId` croissant (déterminisme des tests).
+ */
+function orderConversationIdsForFanout(
+  snap: QuerySnapshot,
+  contactId: string,
+  op: string,
+): string[] {
+  const entries = snap.docs.map((doc) => ({
+    id: doc.id,
+    lastOutboundMs: conversationLastOutboundMillis(doc.get("lastOutboundAt")),
+  }));
+
+  entries.sort((a, b) => {
+    if (a.lastOutboundMs !== b.lastOutboundMs) {
+      if (a.lastOutboundMs === null) return 1;
+      if (b.lastOutboundMs === null) return -1;
+      return b.lastOutboundMs - a.lastOutboundMs;
+    }
+    return a.id < b.id ? -1 : a.id > b.id ? 1 : 0;
+  });
+
+  if (entries.length > CONVERSATION_FANOUT_WARN_THRESHOLD) {
+    // Signal d'anomalie, PAS une troncature (cf. JSDoc du seuil).
+    //
+    // 🔒 FINGERPRINT et NON `contactId` brut — deux raisons cumulées :
+    //   1. Convention maison semi-PII : le hubspotId identifie UN PS
+    //      précis côté CRM (cf. `hubspot/contacts.ts` qui logge déjà
+    //      `hubspotIdFingerprint`). Le forensic se fait par corrélation
+    //      timestamp + fingerprint côté admin.
+    //   2. Le hubspotId de prod est une chaîne NUMÉRIQUE : `PHONE_REGEX`
+    //      du scrubber Pino (`utils/logger.ts`, ≥ 8 chiffres) le
+    //      remplacerait par `[PHONE]` — l'alerte perdrait son
+    //      identifiant et deviendrait inexploitable. Vérifié.
+    //
+    // ⚠️ Ce warn est émis DANS la transaction pour la variante `…InTx`.
+    // Le SDK Admin retry jusqu'à 5×, donc un contact en course peut le
+    // faire apparaître plusieurs fois. C'est du bruit de log bénin (pas
+    // un effet de bord non-rollbackable) — mais si tu branches une alerte
+    // monitoring dessus, dédupliquer par `contactIdFingerprint`.
+    logger.warn(
+      {
+        op,
+        contactIdFingerprint: shortFingerprint(contactId),
+        conversationCount: entries.length,
+        threshold: CONVERSATION_FANOUT_WARN_THRESHOLD,
+      },
+      "[conversations] fan-out rate-limit inhabituellement large (aucune troncature appliquée)",
+    );
+  }
+
+  return entries.map((e) => e.id);
+}
+
+/**
+ * Retourne les docIds de TOUTES les conversations d'un contact, tous
+ * statuts confondus, ordonnées `lastOutboundAt` DESC.
+ *
+ * ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ * RAISON D'ÊTRE (PR-PER-CONTACT)
+ *
+ * Le plafond L.34-5 CPCE vise la PERSONNE, pas la campagne. Or le docId
+ * conversation est composite `${contactId}_${campaignId}` : un contact
+ * enrôlé dans 2 campagnes possède 2 conversations, donc 2 sous-collections
+ * `messages` distinctes. Compter le rate-limit sur UNE conversation laissait
+ * un PS recevoir 2× le plafond.
+ *
+ * Cette fonction fournit l'étage 1 du fan-out (contact → conversations) ;
+ * l'étage 2 (conversation → messages) reste `listRecentOutbound` inchangé.
+ * Composé par `listRecentOutboundByContact` (`messages.ts`).
+ *
+ * ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ * ⚠️ DIFFÉRENCES DÉLIBÉRÉES vs `getActiveConversationByContactId`
+ *
+ *   1. **TOUS LES STATUTS** — surtout PAS `ACTIVE_CONVERSATION_STATUSES`.
+ *      Une conversation `closed`, `opted_out`, `handed_off` ou `blocked`
+ *      porte des sollicitations RÉELLEMENT ENVOYÉES : elles dérangent le
+ *      PS au sens L.34-5 CPCE et comptent donc dans la fenêtre 30j. Filtrer
+ *      sur les statuts actifs rouvrirait exactement le trou qu'on ferme.
+ *
+ *   2. **N > 1 EST NORMAL, on ne throw PAS.** `getActiveConversationByContactId`
+ *      throw `InternalError` si >1 car son invariant métier est "1 seule
+ *      conversation ACTIVE à la fois". Ici on veut au contraire l'historique
+ *      complet multi-campagnes — plusieurs docs sont le cas nominal.
+ *
+ *   3. **AUCUN `limit()`.** Cf. JSDoc `CONVERSATION_FANOUT_WARN_THRESHOLD` :
+ *      tronquer = sous-compter = infraction silencieuse.
+ *
+ * ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ * INDEX FIRESTORE : AUCUN à déclarer. La query n'a qu'une égalité sur un
+ * seul champ (`contactId`) et aucun `orderBy` — servie par l'index
+ * mono-champ automatique. Rien à ajouter dans `firestore.indexes.json`,
+ * rien à déployer avant le code.
+ *
+ * @param contactId  ID Firestore du contact (= hubspotId). NON vide.
+ * @returns docIds ordonnés. Contact sans aucune conversation → `[]`.
+ * @throws ValidationError si `contactId` est vide.
+ */
+export async function listConversationIdsByContact(contactId: string): Promise<string[]> {
+  if (contactId.length === 0) {
+    throw new ValidationError({
+      message: "listConversationIdsByContact: contactId is empty",
+      context: { op: "listConversationIdsByContact", inputLength: 0 },
+    });
+  }
+
+  const snap = await getAdminDb()
+    .collection(CONVERSATIONS_COLLECTION)
+    .where("contactId", "==", contactId)
+    .get();
+
+  return orderConversationIdsForFanout(snap, contactId, "listConversationIdsByContact");
+}
+
+/**
+ * Version tx-aware de `listConversationIdsByContact` — utilise
+ * `tx.get(query)` au lieu de `.get()`.
+ *
+ * ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ * 🔒 POURQUOI `tx.get` EST INDISPENSABLE ICI
+ *
+ * `tx.get(query)` verrouille le READ SET dans la tx parente. Conséquence
+ * directe : si une AUTRE transaction crée une nouvelle conversation pour
+ * ce contact (nouvelle campagne) entre notre lecture et notre commit,
+ * Firestore détecte le conflit et retry notre tx — qui relit alors la
+ * liste complète. Sans ça, une conversation créée en course serait
+ * invisible au comptage.
+ *
+ * C'est exactement la propriété sur laquelle repose déjà
+ * `listRecentOutboundInTx` (cf. sa JSDoc). Même mécanique, un étage plus haut.
+ *
+ * ⚠️ Si quelqu'un refactorait `tx.get(query)` en `.get()` direct ici, la
+ * race "nouvelle campagne pendant l'envoi" redeviendrait exploitable.
+ *
+ * @param tx         Transaction ouverte par le caller (typiquement
+ *                   `withContactLock`).
+ * @param contactId  ID Firestore du contact (= hubspotId). NON vide.
+ * @returns Identique à `listConversationIdsByContact` côté shape ET ordre.
+ * @throws ValidationError si `contactId` est vide.
+ */
+export async function listConversationIdsByContactInTx(
+  tx: Transaction,
+  contactId: string,
+): Promise<string[]> {
+  if (contactId.length === 0) {
+    throw new ValidationError({
+      message: "listConversationIdsByContactInTx: contactId is empty",
+      context: { op: "listConversationIdsByContactInTx", inputLength: 0 },
+    });
+  }
+
+  const query = getAdminDb()
+    .collection(CONVERSATIONS_COLLECTION)
+    .where("contactId", "==", contactId);
+
+  // ⚠️ `tx.get(query)` — verrouille le READ SET. Cf. JSDoc ci-dessus.
+  const snap = await tx.get(query);
+
+  return orderConversationIdsForFanout(snap, contactId, "listConversationIdsByContactInTx");
+}
+
 /**
  * Incrémente atomiquement les compteurs de messages d'une conversation et
  * pose les timestamps de cadence pour `lib/compliance/rate-limits` et
@@ -873,6 +1140,9 @@ export const __CONVERSATIONS_COLLECTION_FOR_TESTS = CONVERSATIONS_COLLECTION;
 
 /** @internal */
 export const __HANDOFF_NOTES_MIN_LENGTH_FOR_TESTS = HANDOFF_NOTES_MIN_LENGTH;
+
+/** @internal */
+export const __CONVERSATION_FANOUT_WARN_THRESHOLD_FOR_TESTS = CONVERSATION_FANOUT_WARN_THRESHOLD;
 
 /** @internal */
 export const __ACTIVE_CONVERSATION_STATUSES_FOR_TESTS = ACTIVE_CONVERSATION_STATUSES;

@@ -38,6 +38,16 @@
  *           parente. Permet le re-check rate-limit DANS la tx (fix
  *           DETTE-001 race condition rate-limit 3 SMS / 30j).
  *
+ *   - `listRecentOutboundByContact(contactId, days?, now?)` (PR-PER-CONTACT)
+ *   - `listRecentOutboundByContactInTx(tx, contactId, days?, now?)`
+ *         → 🚨 SCOPE DE COMPTAGE RATE-LIMIT. Fan-out contact →
+ *           conversations → messages. Ce sont ELLES que les callers
+ *           compliance doivent utiliser : le plafond L.34-5 CPCE vise la
+ *           PERSONNE, et un contact peut avoir plusieurs conversations
+ *           (une par campagne). Les versions scopées `conversationId`
+ *           ci-dessus restent exposées pour les usages non-compliance
+ *           (dashboard, debug d'une conversation précise).
+ *
  * Hors périmètre S6.5 (reportés explicitement) :
  *   - `updateMessageStatus` (queued→sending→sent→delivered, failed,
  *      pose `sentAt`/`deliveredAt`, `cost`, `error`) → S7 sur réception
@@ -104,6 +114,8 @@ import { appendAuditLogTx } from "@/lib/firestore/audit-log";
 import {
   _bumpConversationCountersTx,
   _parseConversationOrThrow,
+  listConversationIdsByContact,
+  listConversationIdsByContactInTx,
 } from "@/lib/firestore/conversations";
 import { NotFoundError, ValidationError } from "@/lib/utils/errors";
 import type { Conversation } from "@/types/conversation";
@@ -984,6 +996,150 @@ export async function listRecentOutboundInTx(
       },
     ];
   });
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// listRecentOutboundByContact{,InTx} (PR-PER-CONTACT) — fan-out rate-limit
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * Millisecondes d'un `OutboundMessageRecord.sentAt` (`Timestamp | Date`).
+ * Les deux formes proviennent de notre propre mapping — pas de narrowing
+ * défensif nécessaire au-delà de l'`instanceof`.
+ */
+function outboundRecordMillis(record: OutboundMessageRecord): number {
+  return record.sentAt instanceof Date ? record.sentAt.getTime() : record.sentAt.toMillis();
+}
+
+/**
+ * Trie DESC par `sentAt` la concaténation multi-conversations, pour que le
+ * contrat "liste ordonnée DESC" reste vrai à l'échelle du CONTACT (et pas
+ * seulement à l'intérieur de chaque conversation).
+ *
+ * `Array.prototype.sort` est stable (V8) : à `sentAt` égal l'ordre du
+ * fan-out est préservé — donc la version HORS tx et la version tx-aware
+ * produisent le MÊME tableau, ce que verrouille la sentinelle d'alignement.
+ */
+function sortOutboundRecordsDesc(records: OutboundMessageRecord[]): OutboundMessageRecord[] {
+  return [...records].sort((a, b) => outboundRecordMillis(b) - outboundRecordMillis(a));
+}
+
+/**
+ * Retourne les messages outbound d'un CONTACT — **toutes conversations
+ * confondues** — dans la fenêtre temporelle, mappés en
+ * `OutboundMessageRecord[]` consommable par `canSendMessage` (S4).
+ *
+ * ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ * 🚨 RAISON D'ÊTRE (PR-PER-CONTACT) — corrige un SOUS-COMPTAGE légal
+ *
+ * `listRecentOutbound` est scopée à UNE conversation. Or le docId
+ * conversation est `${contactId}_${campaignId}` : un PS enrôlé dans 2
+ * campagnes a 2 conversations, donc 2 compteurs indépendants — il pouvait
+ * recevoir 2× le plafond. **L.34-5 CPCE vise la personne, pas la campagne.**
+ *
+ * Cette fonction compose les 2 étages :
+ *   1. `listConversationIdsByContact(contactId)` — toutes les conversations
+ *      du contact, TOUS statuts (une conv `closed` porte des sollicitations
+ *      déjà envoyées), sans `limit()`.
+ *   2. `listRecentOutbound(convId, days, now)` — INCHANGÉE, réutilisée telle
+ *      quelle pour chacune. Tous ses invariants (filtre status
+ *      `RATE_LIMIT_COUNTED_STATUSES`, mapping `sentAt ?? createdAt`, parse
+ *      Zod strict, conversation absente → `[]`) restent en vigueur.
+ *
+ * ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ * COÛT
+ *
+ * N+1 queries (N = nombre de conversations du contact). En MVP N vaut 1
+ * (mono-campagne, invariant "1 conversation active par contact"). Le
+ * fan-out HORS tx est parallélisé (`Promise.all`) — aucun verrou à
+ * ordonner ici, contrairement à la version tx-aware.
+ *
+ * **Aucun index Firestore supplémentaire** n'est requis (cf. JSDoc de
+ * `listConversationIdsByContact`).
+ *
+ * @param contactId  ID Firestore du contact (= hubspotId). NON vide.
+ * @param days       Largeur de fenêtre en jours. Défaut 30 (S4).
+ * @param now        Référence temporelle. Défaut `new Date()`.
+ *
+ * @returns Liste ordonnée DESC par `sentAt`, toutes conversations fusionnées.
+ *          Contact sans conversation → `[]`.
+ *
+ * @throws ValidationError si `contactId` est vide, ou si un doc message
+ *         est corrompu (propagé par `listRecentOutbound` — fail-closed).
+ */
+export async function listRecentOutboundByContact(
+  contactId: string,
+  days: number = DEFAULT_LIST_DAYS,
+  now: Date = new Date(),
+): Promise<OutboundMessageRecord[]> {
+  const conversationIds = await listConversationIdsByContact(contactId);
+
+  const perConversation = await Promise.all(
+    conversationIds.map((conversationId) => listRecentOutbound(conversationId, days, now)),
+  );
+
+  return sortOutboundRecordsDesc(perConversation.flat());
+}
+
+/**
+ * Version tx-aware de `listRecentOutboundByContact`.
+ *
+ * ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ * 🔒 DOUBLE VERROU DE READ SET — ce qui rend la race cross-campagne impossible
+ *
+ *   1. `listConversationIdsByContactInTx` — `tx.get(query)` sur la
+ *      collection `conversations` filtrée par `contactId`. Une NOUVELLE
+ *      conversation créée en course (nouvelle campagne) entre en conflit
+ *      au commit → retry → relecture complète.
+ *
+ *   2. `listRecentOutboundInTx` pour CHAQUE conversation — `tx.get(query)`
+ *      sur chaque sous-collection `messages`. Un nouveau message outbound
+ *      commit en course dans N'IMPORTE LAQUELLE des conversations du
+ *      contact entre en conflit → retry.
+ *
+ * Combiné au lock pessimiste `contacts/{contactId}` déjà posé par
+ * `withContactLock` (qui sérialise DÉJÀ deux envois au même PS, y compris
+ * via 2 campagnes différentes), le plafond devient inviolable par course.
+ * Prouvé en emulator par `concurrency.test.ts` (cas cross-conversation).
+ *
+ * ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ * ORDRE DES OPÉRATIONS — tous les READS avant tout WRITE
+ *
+ * Firestore impose que les lectures d'une transaction précèdent ses
+ * écritures. Ce fan-out est intégralement composé de lectures et est
+ * appelé AVANT toute écriture par ses deux callers (`sendOutboundWithLock`
+ * étape 3, `commitDraftToQueued` étape 4). Ne JAMAIS le déplacer après un
+ * `tx.create`/`tx.update`.
+ *
+ * Le fan-out est SÉQUENTIEL (et non `Promise.all` comme la version HORS
+ * tx) : les lectures transactionnelles posent des verrous, on les acquiert
+ * dans un ordre déterministe plutôt qu'en rafale concurrente. Le coût est
+ * nul à l'échelle réelle (N ≈ 1).
+ *
+ * @param tx         Transaction ouverte par le caller (`withContactLock`).
+ * @param contactId  ID Firestore du contact (= hubspotId). NON vide.
+ * @param days       Largeur de fenêtre en jours. Défaut 30 (S4).
+ * @param now        Référence temporelle. Défaut `new Date()`.
+ *
+ * @returns Identique à `listRecentOutboundByContact` côté shape ET ordre.
+ *
+ * @throws ValidationError si `contactId` est vide, ou si un doc message
+ *         est corrompu. La tx rollback.
+ */
+export async function listRecentOutboundByContactInTx(
+  tx: Transaction,
+  contactId: string,
+  days: number = DEFAULT_LIST_DAYS,
+  now: Date = new Date(),
+): Promise<OutboundMessageRecord[]> {
+  const conversationIds = await listConversationIdsByContactInTx(tx, contactId);
+
+  const all: OutboundMessageRecord[] = [];
+  for (const conversationId of conversationIds) {
+    all.push(...(await listRecentOutboundInTx(tx, conversationId, days, now)));
+  }
+
+  return sortOutboundRecordsDesc(all);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

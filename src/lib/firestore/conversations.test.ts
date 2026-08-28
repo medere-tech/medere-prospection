@@ -22,7 +22,9 @@ import {
   NotFoundError,
   ValidationError,
 } from "@/lib/utils/errors";
-import type { Conversation } from "@/types/conversation";
+import { logger } from "@/lib/utils/logger";
+import { shortFingerprint } from "@/lib/utils/short-fingerprint";
+import type { Conversation, ConversationStatus } from "@/types/conversation";
 
 import {
   __APP_NAME_FOR_TESTS,
@@ -34,6 +36,7 @@ import * as auditLogModule from "./audit-log";
 import { __AUDIT_COLLECTION_FOR_TESTS } from "./audit-log";
 import {
   __ACTIVE_CONVERSATION_STATUSES_FOR_TESTS,
+  __CONVERSATION_FANOUT_WARN_THRESHOLD_FOR_TESTS,
   __CONVERSATIONS_COLLECTION_FOR_TESTS,
   __HANDOFF_NOTES_MIN_LENGTH_FOR_TESTS,
   __NON_STOP_INTENTS_FOR_TESTS,
@@ -44,6 +47,8 @@ import {
   getConversation,
   getOrCreateInitialConversation,
   incrementMessageCount,
+  listConversationIdsByContact,
+  listConversationIdsByContactInTx,
   setConversationIntent,
   setHandoff,
 } from "./conversations";
@@ -920,6 +925,154 @@ describe("conversations.ts", () => {
       // 2ᵉ appel idempotent — toujours pas d'audit
       await getOrCreateInitialConversation("hs_abc", "hubspot-list-200");
       expect(await countAuditDocs()).toBe(0);
+    });
+  });
+
+  // ───────────────────────────────────────────────────────────────────────
+  // listConversationIdsByContact{,InTx} (PR-PER-CONTACT)
+  // ───────────────────────────────────────────────────────────────────────
+
+  describe("listConversationIdsByContact{,InTx} (PR-PER-CONTACT)", () => {
+    /** Les 8 statuts de `ConversationStatus`, y compris les terminaux. */
+    const ALL_STATUSES: ConversationStatus[] = [
+      "active",
+      "awaiting_reply",
+      "in_dialogue",
+      "qualified",
+      "handed_off",
+      "closed",
+      "opted_out",
+      "blocked",
+    ];
+
+    it("🔒 TOUS LES STATUTS comptent — closed/opted_out/handed_off/blocked INCLUS", async () => {
+      // Sentinelle compliance : une conversation terminée porte des
+      // sollicitations RÉELLEMENT envoyées, qui dérangent le PS au sens
+      // L.34-5 CPCE et comptent donc dans la fenêtre 30j. Si quelqu'un
+      // ajoutait un filtre `ACTIVE_CONVERSATION_STATUSES` ici, ce test
+      // casse — et il DOIT casser : ce filtre rouvrirait le sous-comptage.
+      const contactId = "hs_allstatus";
+      for (const status of ALL_STATUSES) {
+        await seedConversation(`${contactId}_camp_${status}`, { contactId, status });
+      }
+
+      const ids = await listConversationIdsByContact(contactId);
+
+      expect(ids).toHaveLength(ALL_STATUSES.length);
+      for (const status of ALL_STATUSES) {
+        expect(ids).toContain(`${contactId}_camp_${status}`);
+      }
+    });
+
+    it("n'inclut PAS les conversations d'un autre contact", async () => {
+      await seedConversation("hs_mine_camp_a", { contactId: "hs_mine" });
+      await seedConversation("hs_mine_camp_b", { contactId: "hs_mine" });
+      await seedConversation("hs_other_camp_a", { contactId: "hs_other" });
+
+      const ids = await listConversationIdsByContact("hs_mine");
+
+      expect(ids).toHaveLength(2);
+      expect(ids).not.toContain("hs_other_camp_a");
+    });
+
+    it("contact sans aucune conversation → [] (pas d'erreur)", async () => {
+      expect(await listConversationIdsByContact("hs_nothing")).toEqual([]);
+    });
+
+    it("contactId vide → ValidationError", async () => {
+      await expect(listConversationIdsByContact("")).rejects.toBeInstanceOf(ValidationError);
+      await expect(
+        getAdminDb().runTransaction((tx) => listConversationIdsByContactInTx(tx, "")),
+      ).rejects.toBeInstanceOf(ValidationError);
+    });
+
+    it("ordre : lastOutboundAt DESC, conversations sans lastOutboundAt en dernier", async () => {
+      const contactId = "hs_order_fanout";
+      const older = Timestamp.fromDate(new Date("2026-05-01T10:00:00Z"));
+      const newer = Timestamp.fromDate(new Date("2026-05-20T10:00:00Z"));
+
+      await seedConversation(`${contactId}_camp_old`, { contactId, lastOutboundAt: older });
+      await seedConversation(`${contactId}_camp_new`, { contactId, lastOutboundAt: newer });
+      // Pas de lastOutboundAt du tout (conversation créée, rien envoyé).
+      await seedConversation(`${contactId}_camp_none`, { contactId });
+
+      const ids = await listConversationIdsByContact(contactId);
+
+      expect(ids).toEqual([
+        `${contactId}_camp_new`,
+        `${contactId}_camp_old`,
+        `${contactId}_camp_none`,
+      ]);
+    });
+
+    it("🔒 ANTI-TRONCATURE : N > seuil → les N conversations sont TOUTES retournées + warn loggé", async () => {
+      // Sentinelle compliance la plus importante de ce describe : tronquer
+      // le fan-out (un `limit()`, un slice défensif) produirait un
+      // SOUS-COMPTAGE silencieux du plafond L.34-5 CPCE. Le seuil ne sert
+      // qu'à ALERTER — jamais à couper.
+      const contactId = "hs_many";
+      const count = __CONVERSATION_FANOUT_WARN_THRESHOLD_FOR_TESTS + 2;
+      for (let i = 0; i < count; i++) {
+        await seedConversation(`${contactId}_camp_${String(i).padStart(2, "0")}`, { contactId });
+      }
+
+      const warnSpy = vi.spyOn(logger, "warn").mockImplementation(() => undefined as never);
+
+      const ids = await listConversationIdsByContact(contactId);
+
+      expect(ids).toHaveLength(count);
+      expect(new Set(ids).size).toBe(count); // aucun doublon, aucune perte
+
+      expect(warnSpy).toHaveBeenCalledTimes(1);
+      const [payload] = warnSpy.mock.calls[0] as [Record<string, unknown>, string];
+      expect(payload.conversationCount).toBe(count);
+      expect(payload.threshold).toBe(__CONVERSATION_FANOUT_WARN_THRESHOLD_FOR_TESTS);
+
+      // 🔒 ANTI-PII : fingerprint, jamais le hubspotId brut. Deux raisons
+      // (cf. commentaire dans `orderConversationIdsForFanout`) : convention
+      // semi-PII maison, et un hubspotId numérique de prod serait de toute
+      // façon remplacé par `[PHONE]` par le scrubber Pino.
+      expect(payload.contactId).toBeUndefined();
+      expect(payload.contactIdFingerprint).toBe(shortFingerprint(contactId));
+      expect(payload.contactIdFingerprint).toMatch(/^[0-9a-f]{8}$/);
+
+      warnSpy.mockRestore();
+    });
+
+    it("N === seuil exactement → AUCUN warn (borne non stricte)", async () => {
+      const contactId = "hs_at_threshold";
+      const count = __CONVERSATION_FANOUT_WARN_THRESHOLD_FOR_TESTS;
+      for (let i = 0; i < count; i++) {
+        await seedConversation(`${contactId}_camp_${String(i).padStart(2, "0")}`, { contactId });
+      }
+
+      const warnSpy = vi.spyOn(logger, "warn").mockImplementation(() => undefined as never);
+
+      const ids = await listConversationIdsByContact(contactId);
+
+      expect(ids).toHaveLength(count);
+      expect(warnSpy).not.toHaveBeenCalled();
+
+      warnSpy.mockRestore();
+    });
+
+    it("SENTINELLE alignement : listConversationIdsByContactInTx === listConversationIdsByContact", async () => {
+      // Si les 2 versions divergent (filtre, tri, seuil), le comptage
+      // rate-limit devient incohérent entre le pré-check HORS tx et le
+      // re-check autoritaire DANS la tx.
+      const contactId = "hs_align";
+      const ts = Timestamp.fromDate(new Date("2026-05-10T10:00:00Z"));
+      await seedConversation(`${contactId}_camp_a`, { contactId, lastOutboundAt: ts });
+      await seedConversation(`${contactId}_camp_b`, { contactId, status: "closed" });
+      await seedConversation(`${contactId}_camp_c`, { contactId, status: "opted_out" });
+
+      const nonTx = await listConversationIdsByContact(contactId);
+      const inTx = await getAdminDb().runTransaction((tx) =>
+        listConversationIdsByContactInTx(tx, contactId),
+      );
+
+      expect(inTx).toEqual(nonTx);
+      expect(inTx).toHaveLength(3);
     });
   });
 });

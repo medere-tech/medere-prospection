@@ -83,11 +83,19 @@
  *        caller bug — refuse pour faire surface le double-commit)
  *      - `generatedBy === "ai"` (S9.4 ne traite QUE les drafts IA — humain
  *        sera S10+)
- *   5. `tx.get(convRef)` + parse Zod via `_parseConversationOrThrow`.
- *   6. `listRecentOutboundInTx(tx, convId, 30)` — re-read avec lock READ
- *      SET (anti-race `rate_limit`).
+ *   5. `tx.get(convRef)` + parse Zod via `_parseConversationOrThrow`, puis
+ *      sentinelle `convInTx.contactId === contactId` (défense en profondeur,
+ *      miroir `sendOutboundWithLock` — le `contactId` pilote le lock ET le
+ *      scope de comptage).
+ *   6. `listRecentOutboundByContactInTx(tx, contactId, 30)` — re-read avec
+ *      lock READ SET (anti-race `rate_limit`), scope CONTACT toutes
+ *      conversations confondues (PR-PER-CONTACT).
  *   7. `preSendCheckWithAuditTx(tx, args)` — re-validation 9 rules. Si
  *      throw `ComplianceFailureError` → tx rollback automatique.
+ *      ⚠️ Cette fonction ÉCRIT (audit `compliance_check` via
+ *      `appendAuditLogTx`) malgré son nom en "check" : c'est le PREMIER
+ *      write de la tx. Firestore impose reads-before-writes → ne JAMAIS
+ *      insérer un `tx.get` après cette ligne.
  *   8. `tx.update(messageRef, {status: "queued", queuedAt: now})`.
  *   9. `_bumpConversationCountersTx(tx, convRef, conv, "outbound", now)`.
  *  10. `appendAuditLogTx(tx, "sms_sent", {direction: "outbound",
@@ -162,7 +170,7 @@ import {
   _parseConversationOrThrow,
   getConversation,
 } from "@/lib/firestore/conversations";
-import { _parseMessageOrThrow, listRecentOutboundInTx } from "@/lib/firestore/messages";
+import { _parseMessageOrThrow, listRecentOutboundByContactInTx } from "@/lib/firestore/messages";
 import { withContactLock } from "@/lib/firestore/transactions";
 import { ComplianceFailureError, NotFoundError, ValidationError } from "@/lib/utils/errors";
 import { logger } from "@/lib/utils/logger";
@@ -362,15 +370,46 @@ export async function commitDraftToQueued(
       }
       const convInTx = _parseConversationOrThrow(convDocInTx.data(), conversationId);
 
+      // ── 3bis. Sentinelle convInTx.contactId === contactId ───────────────
+      // Défense en profondeur, miroir de `transactions.ts` (sendOutboundWithLock
+      // étape 2). Le `contactId` utilisé ici vient du pré-flight HORS tx ; il
+      // pilote À LA FOIS le lock `withContactLock` ET — depuis PR-PER-CONTACT
+      // — le SCOPE DU COMPTAGE rate-limit.
+      //
+      // 🚨 C'est précisément ce qui rend cette garde nécessaire maintenant :
+      // avant, une divergence pré-flight/in-tx donnait "mauvais lock, bon
+      // comptage" (le comptage était scopé sur `conversationId`, fourni
+      // directement). Désormais elle donnerait "mauvais lock ET comptage sur
+      // le mauvais contact" → quota d'un autre PS appliqué au destinataire
+      // réel → sur-envoi possible. Aucun chemin ne mute `conversation.contactId`
+      // aujourd'hui, donc le cas est théorique — on refuse quand même.
+      if (convInTx.contactId !== contactId) {
+        throw new ValidationError({
+          message: `Conversation ${conversationId} belongs to contact ${convInTx.contactId}, not ${contactId}`,
+          context: {
+            conversationId,
+            draftMessageId,
+            expectedContactId: contactId,
+            actualContactId: convInTx.contactId,
+          },
+        });
+      }
+
       // ── 4. Re-lecture historique outbound DANS tx (lock READ SET) ───────
-      // `listRecentOutboundInTx` utilise `tx.get(query)` → verrouille le
-      // READ SET dans la tx parente. Si une autre tx commit un nouveau
+      // `listRecentOutboundByContactInTx` utilise `tx.get(query)` → verrouille
+      // le READ SET dans la tx parente. Si une autre tx commit un nouveau
       // message outbound dans la fenêtre 30j entre notre lecture et notre
       // commit, Firestore détectera le conflit et retry la tx (jusqu'à 5×
       // par défaut côté Admin SDK).
-      const recentOutbound = await listRecentOutboundInTx(
+      //
+      // 🚨 SCOPE = CONTACT, pas conversation (PR-PER-CONTACT). On lit
+      // l'historique de TOUTES les conversations de ce PS (une par
+      // campagne), car le plafond L.34-5 CPCE vise la personne. Le
+      // `contactId` vient du pré-flight HORS tx (l. ~298) — cohérent avec
+      // `withContactLock(contactId)` qui verrouille ce même contact.
+      const recentOutbound = await listRecentOutboundByContactInTx(
         tx,
-        conversationId,
+        contactId,
         RATE_LIMIT_WINDOW_DAYS,
         args.now,
       );

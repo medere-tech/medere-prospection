@@ -18,7 +18,9 @@ vi.mock("@/lib/firestore/conversations", () => ({
   conversationDocId: vi.fn((contactId: string, campaignId: string) => `${contactId}_${campaignId}`),
 }));
 vi.mock("@/lib/firestore/messages", () => ({
-  listRecentOutbound: vi.fn(),
+  // PR-PER-CONTACT : le step 1 lit désormais l'historique du CONTACT
+  // (toutes conversations) et non plus d'une seule conversation.
+  listRecentOutboundByContact: vi.fn(),
 }));
 vi.mock("@/lib/firestore/transactions", () => ({
   sendOutboundWithLock: vi.fn(),
@@ -44,7 +46,7 @@ import { preSendCheckWithAudit } from "@/lib/compliance/pre-send-check-with-audi
 import { __ACTIONS_FOR_TESTS as ACTIONS_ACTUAL, appendAuditLog } from "@/lib/firestore/audit-log";
 import { getContact } from "@/lib/firestore/contacts";
 import { getConversation } from "@/lib/firestore/conversations";
-import { listRecentOutbound } from "@/lib/firestore/messages";
+import { listRecentOutboundByContact } from "@/lib/firestore/messages";
 import { sendOutboundWithLock } from "@/lib/firestore/transactions";
 import { sendSms } from "@/lib/ovh/send-sms";
 import { getCoreEnv, getOvhEnv } from "@/lib/security/env";
@@ -139,7 +141,7 @@ beforeEach(() => {
   });
   (getContact as ReturnType<typeof vi.fn>).mockResolvedValue(makeFakeContact());
   (getConversation as ReturnType<typeof vi.fn>).mockResolvedValue(makeFakeConversation());
-  (listRecentOutbound as ReturnType<typeof vi.fn>).mockResolvedValue([]);
+  (listRecentOutboundByContact as ReturnType<typeof vi.fn>).mockResolvedValue([]);
   (preSendCheckWithAudit as ReturnType<typeof vi.fn>).mockResolvedValue({ ok: true });
   // DEBT-001.5 : sendOutboundWithLock remplace addOutbound + appendAuditLog.
   // Retourne le shape attendu { messageId, auditId } (compose les 2 audits
@@ -257,6 +259,21 @@ describe("sendFirstSmsHandler — happy path DRY_RUN", () => {
         // recentOutboundMessages mock = [] → expectedRemaining = 3 - 0 = 3.
         expectedRemainingQuota: 3,
       }),
+    );
+  });
+
+  it("🔒 SCOPE PER-CONTACT : le pré-check lit l'historique du CONTACT, jamais d'une conversation", async () => {
+    // Sentinelle PR-PER-CONTACT sur le call site hors tx. `contactId` et
+    // `conversationId` sont tous deux des strings : sans cette assertion,
+    // un re-scope sur `cid` passerait toute la suite au vert. Le pré-check
+    // est indicatif (le re-check in-tx fait autorité), mais un désalignement
+    // rendrait `expectedRemainingQuota` faux dans le forensic des
+    // ComplianceConcurrencyError.
+    await sendFirstSmsHandler(makeFakeCtx({ body: "Hello body" }));
+
+    expect(listRecentOutboundByContact).toHaveBeenCalledWith("contact-123");
+    expect(listRecentOutboundByContact).not.toHaveBeenCalledWith(
+      expect.stringContaining("contact-123_"),
     );
   });
 

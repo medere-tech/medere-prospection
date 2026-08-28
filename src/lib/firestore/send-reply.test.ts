@@ -504,6 +504,67 @@ describe("commitDraftToQueued — S9.4.1", () => {
       expect(await countAuditByAction("reply_draft_dropped")).toBe(1);
       expect(await countAuditByAction("sms_sent")).toBe(0);
     });
+
+    it("🔒 SCOPE PER-CONTACT : 3 outbound répartis sur 2 conversations du même PS → blocked rate_limit", async () => {
+      // Sentinelle PR-PER-CONTACT sur le 3e call site du comptage
+      // (`commitDraftToQueued`). Aucune des 2 conversations n'atteint seule
+      // le plafond (2 + 1), mais le CONTACT est à 3/3 : le plafond L.34-5
+      // CPCE vise la personne, pas la campagne.
+      //
+      // Si quelqu'un re-scope `send-reply.ts` sur `conversationId`, la
+      // conversation courante ne montre qu'1 outbound → le draft passerait
+      // → 4e SMS au PS. Ce test casse alors.
+      const OTHER_CONV_ID = `${CONTACT_ID}_camp_autre`;
+
+      await seedContact();
+      await seedConversation();
+
+      // 2e conversation du MÊME contact (autre campagne).
+      await getAdminDb()
+        .collection(__CONVERSATIONS_COLLECTION_FOR_TESTS)
+        .doc(OTHER_CONV_ID)
+        .set(buildValidConversation({ campaignId: "camp_autre", status: "closed" }));
+
+      // 2 sollicitations dans l'autre conversation…
+      for (const [i, tag] of ["other1", "other2"].entries()) {
+        const createdAt = Timestamp.fromDate(new Date(FIXED_NOW.getTime() - (i + 1) * 86400_000));
+        await getAdminDb()
+          .collection(__MESSAGES_PARENT_COLLECTION_FOR_TESTS)
+          .doc(OTHER_CONV_ID)
+          .collection(__MESSAGES_SUBCOLLECTION_FOR_TESTS)
+          .add({
+            direction: "outbound",
+            body: `seed_${tag}`,
+            status: "sent",
+            channel: "sms",
+            generatedBy: "ai",
+            createdAt,
+            sentAt: createdAt,
+          } satisfies Message);
+      }
+      // …+ 1 seule dans la conversation courante = 3 pour le CONTACT.
+      await seedOutboundMessage(3, "current1");
+
+      const draftId = await seedDraft();
+
+      const result = await commitDraftToQueued({
+        conversationId: CONV_ID,
+        draftMessageId: draftId,
+        now: FIXED_NOW,
+      });
+
+      expect(result.ok).toBe(false);
+      if (result.ok) throw new Error("unreachable");
+      expect(result.failure.rule).toBe("rate_limit");
+      expect(result.failure.code).toBe("rate_limit_exceeded");
+      // `count` reflète bien le total PER-CONTACT (3), pas le total de la
+      // conversation courante (1).
+      expect((result.failure.context as { count: number }).count).toBe(3);
+
+      // Draft intact, aucun envoi.
+      expect((await readMessage(draftId))?.status).toBe("draft");
+      expect(await countAuditByAction("sms_sent")).toBe(0);
+    });
   });
 
   describe("branche blocked — hours (dimanche)", () => {

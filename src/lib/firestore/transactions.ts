@@ -15,8 +15,9 @@
  *   - `sendOutboundWithLock(args)`                        (DEBT-001.3)
  *         → composition tx unique qui ferme DETTE-001 (race rate-limit
  *           3/30j) + DETTE-004 (atomicité audit). Acquiert lock contact,
- *           re-check rate-limit DANS la tx via `listRecentOutboundInTx`
- *           (lock READ SET), throw `ComplianceConcurrencyError` si race,
+ *           re-check rate-limit DANS la tx via
+ *           `listRecentOutboundByContactInTx` (scope CONTACT, lock READ
+ *           SET), throw `ComplianceConcurrencyError` si race,
  *           sinon `addOutboundInTx` + `appendAuditLogTx("sms_provider_
  *           dispatched")` DANS la même tx → tout commit ou tout rollback.
  *
@@ -93,7 +94,7 @@ import { _parseConversationOrThrow } from "@/lib/firestore/conversations";
 import {
   type AddOutboundInput,
   addOutboundInTx,
-  listRecentOutboundInTx,
+  listRecentOutboundByContactInTx,
 } from "@/lib/firestore/messages";
 import { ComplianceConcurrencyError, NotFoundError, ValidationError } from "@/lib/utils/errors";
 import { E164_REGEX } from "@/lib/utils/phone";
@@ -333,9 +334,18 @@ export interface SendOutboundWithLockResult {
  *     passent tous les deux, et créent CHACUN un 3e SMS → 4 SMS total →
  *     sanction CNIL jusqu'à 20 M€ ou 4 % CA. Cette fonction re-check
  *     `canSendMessage` DANS la tx avec l'historique relu via
- *     `listRecentOutboundInTx` (`tx.get`, lock READ SET) — Firestore
- *     optimistic concurrency détecte le conflit au commit et retry
- *     automatiquement (jusqu'à 5x, cf. transactions.ts JSDoc).
+ *     `listRecentOutboundByContactInTx` (`tx.get`, lock READ SET) —
+ *     Firestore optimistic concurrency détecte le conflit au commit et
+ *     retry automatiquement (jusqu'à 5x, cf. transactions.ts JSDoc).
+ *
+ *   - **PR-PER-CONTACT — scope de comptage = la PERSONNE** : le re-check
+ *     lit désormais l'historique de TOUTES les conversations du contact,
+ *     pas seulement `args.conversationId`. Le docId conversation étant
+ *     `${contactId}_${campaignId}`, compter par conversation laissait un
+ *     PS enrôlé dans 2 campagnes recevoir 2× le plafond — or L.34-5 CPCE
+ *     vise la personne. Le lock `contacts/{contactId}` posé par
+ *     `withContactLock` sérialisait DÉJÀ correctement ces deux envois :
+ *     seul le périmètre de LECTURE était trop étroit.
  *
  *   - **DETTE-004 — atomicité audit `sms_provider_dispatched`** :
  *     l'implémentation Phase 1 S8 posait l'audit HORS tx via
@@ -355,8 +365,9 @@ export interface SendOutboundWithLockResult {
  *   3. **Sentinelle conv.contactId === args.contactId**     — défense en
  *      profondeur. Si le caller passe un convId qui n'appartient PAS au
  *      contact locké, le lock est inutile → throw `ValidationError`.
- *   4. `listRecentOutboundInTx(tx, conversationId, 30)`     — re-read
- *      historique outbound DANS la tx (lock READ SET)
+ *   4. `listRecentOutboundByContactInTx(tx, contactId, 30)` — re-read
+ *      historique outbound DANS la tx (lock READ SET), scope CONTACT :
+ *      fan-out sur TOUTES les conversations du contact
  *   5. `canSendMessage(recentOutbound)`                     — re-check
  *      rate-limit 3/30j sur l'historique relu
  *   6. **Si `!allowed`** → throw `ComplianceConcurrencyError`             ←
@@ -496,9 +507,15 @@ export async function sendOutboundWithLock(
       }
 
       // ── 3. Lecture historique outbound DANS la tx (lock READ SET) ─────────
-      const recentOutbound = await listRecentOutboundInTx(
+      // 🚨 SCOPE = CONTACT, pas conversation (PR-PER-CONTACT). Le plafond
+      // L.34-5 CPCE vise la personne : un PS enrôlé dans 2 campagnes a 2
+      // conversations, et compter sur une seule le laissait recevoir 2× le
+      // plafond. Le fan-out verrouille le READ SET des conversations ET de
+      // chaque sous-collection messages — cf. JSDoc
+      // `listRecentOutboundByContactInTx`.
+      const recentOutbound = await listRecentOutboundByContactInTx(
         tx,
-        args.conversationId,
+        args.contactId,
         RATE_LIMIT_WINDOW_DAYS,
       );
 
