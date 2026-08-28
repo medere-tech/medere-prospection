@@ -183,6 +183,10 @@ export async function POST(req: NextRequest): Promise<NextResponse> {
       message: result.body,
       conversation: { messageCount: 0 },
       recentOutboundMessages: [],
+      // Preview d'un PREMIER SMS → sollicitation. Sans effet réel ici
+      // (`recentOutboundMessages: []` → aucun plafond ne peut tirer),
+      // mais le champ est requis et doit refléter la vérité métier.
+      outboundKind: "solicitation",
     });
 
     // ── 7. Response ───────────────────────────────────────────────────────

@@ -1,6 +1,7 @@
 import type { Timestamp } from "firebase-admin/firestore";
 import { describe, expect, it, vi } from "vitest";
 
+import type { ReplyDraftDroppedPayload } from "@/types/audit-log";
 import type { Contact } from "@/types/contact";
 
 import {
@@ -15,6 +16,7 @@ import {
   RATE_LIMIT_MAX_MESSAGES,
   RATE_LIMIT_WINDOW_DAYS,
 } from "./rate-limits";
+import { REPLY_VOLUME_MAX, REPLY_VOLUME_WINDOW_HOURS } from "./reply-volume";
 
 /** Cast Date → Timestamp pour les tests. Runtime : bloctel/rate-limits/contact
  * acceptent Date OU Timestamp via `instanceof Date`. Type-side : cast nécessaire. */
@@ -65,6 +67,10 @@ function makeArgs(overrides: Partial<PreSendCheckArgs> = {}): PreSendCheckArgs {
     message: COMPLIANT_MESSAGE,
     conversation: { messageCount: 1 }, // pas premier SMS par défaut
     recentOutboundMessages: [],
+    // Défaut historique des tests : une SOLLICITATION. C'est le régime
+    // sous lequel toutes les assertions pré-PR-BARRIERE-2 ont été écrites
+    // — les garder telles quelles prouve la non-régression de la règle 5.
+    outboundKind: "solicitation",
     now: NOW,
     ...overrides,
   };
@@ -78,6 +84,11 @@ function outbound(sentAt: Date): OutboundMessageRecord {
 /** Sortant NON compté (réponse à un PS qui a écrit en premier). */
 function reply(sentAt: Date): OutboundMessageRecord {
   return { direction: "outbound", sentAt, outboundKind: "reply" };
+}
+
+/** Décalage en HEURES — pour la fenêtre 24h du plafond de volume. */
+function hoursAgo(n: number, ref: Date = NOW): Date {
+  return new Date(ref.getTime() - n * 3600 * 1000);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -220,6 +231,106 @@ describe("preSendCheck — un test par code de failure", () => {
     expect(HUMAN_REASONS.rate_limit_exceeded).toContain(String(RATE_LIMIT_WINDOW_DAYS));
     // Le vocabulaire compte : on plafonne des SOLLICITATIONS, pas des SMS.
     expect(HUMAN_REASONS.rate_limit_exceeded).toContain("sollicitations");
+  });
+
+  it("🔴 (d) un PS à 4 SOLLICITATIONS qui RÉPOND → la réponse PASSE", () => {
+    // Le changement de comportement le plus sensible de PR-BARRIERE-2.
+    //
+    // AVANT : `canSendMessage` comptait les 4 sollicitations et refusait
+    // TOUT envoi — y compris la réponse au PS qui venait d'écrire. La
+    // promesse « une conversation engagée peut avoir 10+ réponses » était
+    // donc fausse dès que le quota de sollicitations était saturé.
+    //
+    // APRÈS : la règle 5 ne s'applique qu'aux sollicitations. L.34-5 CPCE
+    // encadre la prospection, pas le fait de répondre à quelqu'un.
+    const quatreSollicitations = [
+      outbound(daysAgo(1)),
+      outbound(daysAgo(5)),
+      outbound(daysAgo(10)),
+      outbound(daysAgo(20)),
+    ];
+
+    const laReponse = preSendCheck(
+      makeArgs({ recentOutboundMessages: quatreSollicitations, outboundKind: "reply" }),
+    );
+    expect(laReponse.ok).toBe(true);
+  });
+
+  it("🔒 (d) …mais une 5e SOLLICITATION reste BLOQUÉE (plafond légal intact)", () => {
+    // Le pendant du test précédent : assouplir pour les réponses ne doit
+    // RIEN assouplir pour la prospection. Zéro régression légale.
+    const quatreSollicitations = [
+      outbound(daysAgo(1)),
+      outbound(daysAgo(5)),
+      outbound(daysAgo(10)),
+      outbound(daysAgo(20)),
+    ];
+
+    const r = preSendCheck(
+      makeArgs({ recentOutboundMessages: quatreSollicitations, outboundKind: "solicitation" }),
+    );
+    expect(r.ok).toBe(false);
+    if (!r.ok) expect(r.failure.code).toBe("rate_limit_exceeded");
+  });
+
+  it("🔒 reply_volume : 10 réponses/24h → la 11e est bloquée", () => {
+    const dixReponses = Array.from({ length: 10 }, (_, i) => reply(hoursAgo(i + 1)));
+
+    const r = preSendCheck(
+      makeArgs({ recentOutboundMessages: dixReponses, outboundKind: "reply" }),
+    );
+    expect(r.ok).toBe(false);
+    if (!r.ok && r.failure.code === "reply_volume_exceeded") {
+      expect(r.failure.rule).toBe("reply_volume");
+      expect(r.failure.context.replyCount).toBe(10);
+      expect(r.failure.context.totalOutboundCount).toBe(10);
+      expect(r.failure.context.maxAllowed).toBe(10);
+      expect(r.failure.context.windowHours).toBe(24);
+    }
+  });
+
+  it("🔒 reply_volume ne bloque JAMAIS une sollicitation (même à 10 réponses/24h)", () => {
+    // Les deux régimes sont étanches : un emballement de réponses ne doit
+    // pas empêcher une campagne légitime de démarrer sur ce contact.
+    const dixReponses = Array.from({ length: 10 }, (_, i) => reply(hoursAgo(i + 1)));
+
+    const r = preSendCheck(
+      makeArgs({ recentOutboundMessages: dixReponses, outboundKind: "solicitation" }),
+    );
+    expect(r.ok).toBe(true);
+  });
+
+  it("🔒 PRIORITÉ : les 2 plafonds saturés → chaque nature reporte SA règle", () => {
+    // 4 sollicitations (plafond légal saturé) + 10 réponses en 24h
+    // (plafond de volume saturé). Les deux règles pourraient tirer — mais
+    // elles sont mutuellement exclusives par `outboundKind`.
+    const lesDeux = [
+      ...Array.from({ length: 4 }, (_, i) => outbound(daysAgo(i + 1))),
+      ...Array.from({ length: 10 }, (_, i) => reply(hoursAgo(i + 1))),
+    ];
+
+    const surUneSollicitation = preSendCheck(
+      makeArgs({ recentOutboundMessages: lesDeux, outboundKind: "solicitation" }),
+    );
+    expect(surUneSollicitation.ok).toBe(false);
+    if (!surUneSollicitation.ok) {
+      expect(surUneSollicitation.failure.rule).toBe("rate_limit");
+    }
+
+    const surUneReponse = preSendCheck(
+      makeArgs({ recentOutboundMessages: lesDeux, outboundKind: "reply" }),
+    );
+    expect(surUneReponse.ok).toBe(false);
+    if (!surUneReponse.ok) {
+      expect(surUneReponse.failure.rule).toBe("reply_volume");
+    }
+  });
+
+  it("🔒 SENTINELLE : HUMAN_REASONS.reply_volume_exceeded cohérent avec les constantes", () => {
+    expect(HUMAN_REASONS.reply_volume_exceeded).toContain(String(REPLY_VOLUME_MAX));
+    expect(HUMAN_REASONS.reply_volume_exceeded).toContain(String(REPLY_VOLUME_WINDOW_HOURS));
+    // Le vocabulaire distingue ce plafond du plafond légal.
+    expect(HUMAN_REASONS.reply_volume_exceeded).toContain("réponses");
   });
 
   it("🔒 les réponses ne déclenchent PAS le rate-limit (6 replies + 0 sollicitation)", () => {
@@ -864,6 +975,7 @@ describe("preSendCheck — failure.rule mappé correctement à failure.code", ()
     stop_optout_missing: "stop_present",
     advertiser_identification_missing: "advertiser_identification",
     rate_limit_exceeded: "rate_limit",
+    reply_volume_exceeded: "reply_volume",
     outside_hours: "hours",
     saturday_out_of_range: "hours",
     sunday: "hours",
@@ -877,8 +989,8 @@ describe("preSendCheck — failure.rule mappé correctement à failure.code", ()
     phone_voip: "phone_validity",
   };
 
-  it("le mapping est documenté pour tous les 16 codes", () => {
-    expect(Object.keys(CODE_TO_RULE)).toHaveLength(16);
+  it("le mapping est documenté pour tous les 17 codes", () => {
+    expect(Object.keys(CODE_TO_RULE)).toHaveLength(17);
   });
 });
 
@@ -896,6 +1008,7 @@ describe("preSendCheck — branches défensives", () => {
         message: COMPLIANT_MESSAGE,
         conversation: { messageCount: 1 },
         recentOutboundMessages: [],
+        outboundKind: "solicitation",
         // now: VOLONTAIREMENT absent
       },
       {
@@ -955,4 +1068,50 @@ describe("preSendCheck — branches défensives", () => {
       expect.fail("expected bloctel_check_expired with toDate() path");
     }
   });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Type-level (compile-time only, jamais exécuté)
+// ─────────────────────────────────────────────────────────────────────────────
+
+describe("preSendCheck — type-level (PR-BARRIERE-2)", () => {
+  it("placeholder runtime : les vrais checks sont les @ts-expect-error ci-dessous", () => {
+    expect(true).toBe(true);
+  });
+
+  // eslint-disable-next-line @typescript-eslint/no-unused-vars
+  function _typeCheckOutboundKindRequired() {
+    // 🔒 `outboundKind` est REQUIS. L'omettre est une erreur de compilation,
+    // pas un défaut silencieux : deux règles de plafond en dépendent, et un
+    // défaut implicite ferait qu'un futur chemin d'envoi hériterait d'un
+    // régime qu'il n'a pas choisi.
+    // @ts-expect-error - outboundKind manquant (champ REQUIS)
+    preSendCheck({
+      contact: makeContact(),
+      message: COMPLIANT_MESSAGE,
+      conversation: { messageCount: 1 },
+      recentOutboundMessages: [],
+    });
+
+    // Et seules les 2 valeurs de l'enum fermé sont acceptées.
+    preSendCheck({
+      contact: makeContact(),
+      message: COMPLIANT_MESSAGE,
+      conversation: { messageCount: 1 },
+      recentOutboundMessages: [],
+      // @ts-expect-error - "followup" n'existe pas : une relance est une
+      // sollicitation, pas une troisième catégorie.
+      outboundKind: "followup",
+    });
+  }
+
+  // eslint-disable-next-line @typescript-eslint/no-unused-vars
+  function _typeCheckBlockedRuleAcceptsReplyVolume() {
+    // 🔒 `ReplyDraftDroppedPayload.blockedRule` est un enum FERMÉ. Si
+    // `reply_volume` n'y avait pas été ajouté, `commitDraftToQueued` ne
+    // compilerait plus au moment d'écrire l'audit du blocage — garde
+    // intentionnelle documentée dans `send-reply.ts`.
+    const rule: ReplyDraftDroppedPayload["blockedRule"] = "reply_volume";
+    return rule;
+  }
 });

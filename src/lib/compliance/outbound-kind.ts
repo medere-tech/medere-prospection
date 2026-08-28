@@ -80,3 +80,80 @@ export const DEFAULT_OUTBOUND_KIND: MessageOutboundKind = "solicitation";
 export function countsAgainstCap(message: { outboundKind?: MessageOutboundKind }): boolean {
   return (message.outboundKind ?? DEFAULT_OUTBOUND_KIND) === "solicitation";
 }
+
+/**
+ * Vrai si ce message sortant est une RÉPONSE avérée — donc s'il compte
+ * contre le plafond de VOLUME `lib/compliance/reply-volume.ts`
+ * (10 réponses / 24h, disjoncteur de sécurité).
+ *
+ * ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ * 🚨 STRICT COMPLÉMENT DE `countsAgainstCap` — c'est délibéré
+ *
+ * Défini comme la négation exacte, et non par un test `=== "reply"` écrit
+ * à la main, pour que `outboundKind` reste interprété en UN SEUL endroit.
+ * Les deux plafonds partitionnent donc rigoureusement les sortants : tout
+ * message compte soit contre le plafond légal, soit contre le plafond de
+ * volume, jamais les deux, jamais aucun.
+ *
+ * ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ * ⚠️ POLARITÉ INVERSÉE PAR RAPPORT AU PLAFOND LÉGAL — et c'est correct
+ *
+ * Un doc LEGACY (sans `outboundKind`) est traité par `countsAgainstCap`
+ * comme une sollicitation ; il n'est donc PAS une réponse ici, et ne
+ * compte PAS contre le plafond de volume.
+ *
+ * Pour le plafond LÉGAL, le fail-safe est de SUR-compter (bloquer un
+ * envoi de trop plutôt que d'en laisser passer un). Pour ce plafond-ci,
+ * c'est l'inverse : sur-bloquer ferait TAIRE un PS en conversation
+ * réelle — le même dommage silencieux qu'un faux positif AUTO_REPLY. Le
+ * défaut penche donc vers « ne pas bloquer ».
+ *
+ * En pratique la question est vide : la fenêtre est de 24 HEURES, or les
+ * docs legacy sont antérieurs à PR-OUTBOUNDKIND (#42) et donc vieux de
+ * plusieurs semaines. Ils ne peuvent structurellement pas y entrer.
+ *
+ * @param message  N'importe quel objet portant (ou non) `outboundKind`.
+ * @returns `true` UNIQUEMENT pour une réponse avérée (`"reply"` explicite).
+ */
+export function countsAsReply(message: { outboundKind?: MessageOutboundKind }): boolean {
+  return !countsAgainstCap(message);
+}
+
+/**
+ * 🔒 SENTINELLE D'EXHAUSTIVITÉ — ajouter une valeur à `MessageOutboundKind`
+ * fait échouer la COMPILATION ici.
+ *
+ * ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ * POURQUOI CETTE SENTINELLE EXISTE
+ *
+ * Les deux plafonds partitionnent les sortants via `countsAgainstCap` /
+ * `countsAsReply`, qui sont des BOOLÉENS. Cette partition n'est exhaustive
+ * que tant que l'enum a exactement 2 valeurs. Avec une 3e — `"followup"`,
+ * `"reactivation"`… — la valeur :
+ *
+ *   - ne serait PAS une sollicitation → règle 5 ne s'applique pas,
+ *     et elle ne compterait pas contre le plafond légal ;
+ *   - SERAIT une réponse au sens de `countsAsReply` (complément strict),
+ *     donc bornée à 10/24h — un régime probablement faux pour une relance.
+ *
+ * Autrement dit : une 3e nature hériterait silencieusement du régime des
+ * réponses, alors qu'une relance est juridiquement une SOLLICITATION et
+ * doit compter contre le plafond L.34-5. C'est la reproduction exacte du
+ * MAJEUR-1 de PR-OUTBOUNDKIND, un cran plus haut dans la pile.
+ *
+ * Cette table force donc le développeur qui étend l'enum à trancher
+ * explicitement le régime de plafond de la nouvelle valeur, et à
+ * revisiter les règles 5 et 6 de `pre-send-check.ts` — au lieu de
+ * découvrir le trou six mois plus tard.
+ *
+ * ⚠️ Ne PAS « réparer » un échec de compilation ici en ajoutant
+ * mécaniquement une entrée : le passage par compliance-auditor est
+ * obligatoire (les deux plafonds sont concernés).
+ */
+const OUTBOUND_KIND_CAP_REGIME: Record<MessageOutboundKind, "legal_cap" | "volume_cap"> = {
+  solicitation: "legal_cap",
+  reply: "volume_cap",
+};
+
+/** @internal Exposé pour la sentinelle de cardinalité (`outbound-kind.test.ts`). */
+export const __OUTBOUND_KIND_CAP_REGIME_FOR_TESTS = OUTBOUND_KIND_CAP_REGIME;

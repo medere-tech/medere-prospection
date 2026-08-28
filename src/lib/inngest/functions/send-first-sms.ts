@@ -246,6 +246,10 @@ export async function sendFirstSmsHandler(ctx: InngestHandlerContext): Promise<S
       message: body,
       conversation: loaded.conversation,
       recentOutboundMessages: loaded.recentOutboundMessages,
+      // 🔒 Premier SMS de campagne : on prend l'initiative de déranger le
+      // PS. Régime de plafond = LÉGAL (règle 5, 4/30j). Le plafond de
+      // volume des réponses (règle 6) ne s'applique donc jamais ici.
+      outboundKind: "solicitation",
     }),
   );
   if (!check.ok) {

@@ -162,6 +162,7 @@
  */
 import { Timestamp } from "firebase-admin/firestore";
 
+import { DEFAULT_OUTBOUND_KIND } from "@/lib/compliance/outbound-kind";
 import { preSendCheckWithAuditTx } from "@/lib/compliance/pre-send-check-with-audit-tx";
 import { RATE_LIMIT_WINDOW_DAYS as COMPLIANCE_RATE_LIMIT_WINDOW_DAYS } from "@/lib/compliance/rate-limits";
 import { getAdminDb } from "@/lib/firestore/admin";
@@ -426,6 +427,12 @@ export async function commitDraftToQueued(
         message: draft.body,
         conversation: convInTx,
         recentOutboundMessages: recentOutbound,
+        // 🔒 La nature vient du DRAFT lui-même, pas d'une supposition du
+        // pipeline : `addOutboundDraftInTx` fige `outboundKind: "reply"`
+        // à la création (#42), et le doc a été relu + parsé DANS cette tx
+        // (étape 1). C'est donc l'état réel en base qui pilote le régime
+        // de plafond, pas une valeur reconstruite ici.
+        outboundKind: draft.outboundKind ?? DEFAULT_OUTBOUND_KIND,
         now: args.now ?? new Date(),
       });
 

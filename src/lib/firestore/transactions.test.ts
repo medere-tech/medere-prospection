@@ -734,6 +734,62 @@ describe("transactions.ts — sendOutboundWithLock (DEBT-001.3)", () => {
   // Erreurs : rollback + ComplianceConcurrencyError
   // ───────────────────────────────────────────────────────────────────────
 
+  it("🔒 MINEUR-4 (compile-time) : router une RÉPONSE ici NE COMPILE PAS", () => {
+    // ─────────────────────────────────────────────────────────────────
+    // C'est CE test qui protège réellement, pas celui d'après.
+    //
+    // Ce chemin ne re-vérifie que `canSendMessage` (plafond légal), PAS
+    // les 10 règles de `preSendCheck` : le plafond de VOLUME (règle 6)
+    // n'y est jamais appliqué. Or la précondition 4 impose que `sendSms()`
+    // ait DÉJÀ tourné quand on entre ici — une assertion runtime tire donc
+    // APRÈS que le SMS soit parti chez OVH, et son rollback laisse le PS
+    // avec un message reçu mais AUCUNE trace en base : invisible aux deux
+    // plafonds pour tous les envois futurs, introuvable en forensic L.34-5.
+    //
+    // `SendOutboundWithLockArgs["input"]["outboundKind"]` est donc narrowé
+    // au littéral `"solicitation"` : l'erreur remonte à l'écriture de la
+    // ligne, pas à l'exécution.
+    // ─────────────────────────────────────────────────────────────────
+    // eslint-disable-next-line @typescript-eslint/no-unused-vars
+    function _typeCheckRejectsReply() {
+      const base = buildArgs({ contactId: "x", convId: "y", campaignId: "z" });
+      return sendOutboundWithLock({
+        ...base,
+        input: {
+          ...base.input,
+          // @ts-expect-error - ce chemin n'accepte QUE "solicitation".
+          // Une réponse doit passer par `commitDraftToQueued`, qui applique
+          // les 10 règles (dont le plafond de volume) dans sa transaction.
+          outboundKind: "reply",
+        },
+      });
+    }
+    expect(true).toBe(true);
+  });
+
+  it("🔒 MINEUR-4 (runtime, defense-in-depth) : bypass du typage → ValidationError, RIEN écrit", async () => {
+    // Filet pour un caller qui contournerait le narrowing via `as` / `any`
+    // / du JS non typé. Le `as` ci-dessous SIMULE exactement ce bypass —
+    // il n'est pas une commodité de test, c'est le seul moyen d'atteindre
+    // cette branche, ce qui est précisément la preuve que le type protège.
+    const contactId = "hs_kind_guard";
+    const campaignId = "camp_kind_guard";
+    const convId = "conv_kind_guard";
+    await seedTrio({ contactId, convId, campaignId, outboundsAgo: [] });
+
+    const args = buildArgs({ contactId, convId, campaignId });
+    const bypassed = {
+      ...args,
+      input: { ...args.input, outboundKind: "reply" },
+    } as Parameters<typeof sendOutboundWithLock>[0];
+
+    await expect(sendOutboundWithLock(bypassed)).rejects.toBeInstanceOf(ValidationError);
+
+    // Rollback intégral : aucun message, aucun audit.
+    expect(await countOutboundMessages(convId)).toBe(0);
+    expect(await countAuditByAction("sms_provider_dispatched")).toBe(0);
+  });
+
   it("contact absent → NotFoundError, RIEN écrit", async () => {
     // Pas de seedContact — withContactLock fail au tx.get(contacts/{id}).
     await seedConversation("conv_orphan", {

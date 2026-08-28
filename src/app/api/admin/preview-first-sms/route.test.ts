@@ -350,6 +350,11 @@ describe("POST /api/admin/preview-first-sms", () => {
         message: FAKE_GENERATION_OK.body,
         conversation: { messageCount: 0 },
         recentOutboundMessages: [],
+        // PR-BARRIERE-2 : la preview simule un PREMIER SMS, donc une
+        // sollicitation. Sans effet ici (`recentOutboundMessages: []` →
+        // aucun plafond ne peut tirer), mais le champ est requis et doit
+        // refléter la vérité métier.
+        outboundKind: "solicitation",
       });
     });
 

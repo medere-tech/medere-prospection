@@ -305,6 +305,7 @@ export interface ReplyDraftDroppedPayload {
     | "stop_present"
     | "advertiser_identification"
     | "rate_limit"
+    | "reply_volume"
     | "hours"
     | "bloctel"
     | "legitimate_interest"
@@ -321,7 +322,8 @@ export interface ReplyDraftDroppedPayload {
   /**
    * Contexte structuré du failure tel que renvoyé par `preSendCheck`.
    * Anti-PII par typage S5 (discriminated union FERMÉE, clés autorisées :
-   * count, maxAllowed, windowDays, hour, minute, weekday, isoDate, year,
+   * solicitationCount, totalOutboundCount, replyCount, maxAllowed,
+   * windowDays, windowHours, hour, minute, weekday, isoDate, year,
    * maxVerified, daysSinceCheck, documentedLength, minLength). Aucune
    * de ces clés n'est PII par construction.
    */

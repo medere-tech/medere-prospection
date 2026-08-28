@@ -95,6 +95,7 @@ function buildPassingArgs(): {
       message: "Bonjour, Léa de Médéré. Une question rapide à vous poser. STOP pour refuser.",
       conversation: { messageCount: 0 },
       recentOutboundMessages: [],
+      outboundKind: "solicitation",
       now: FIXED_NOW,
     },
     deps: {
@@ -102,6 +103,7 @@ function buildPassingArgs(): {
       hasOptOut: vi.fn(() => true),
       hasAdvertiserIdentification: vi.fn(() => true),
       canSendMessage: vi.fn(() => ({ allowed: true })),
+      canSendReplyVolume: vi.fn(() => ({ allowed: true })),
       isAllowedSendTime: vi.fn(() => ({ allowed: true })),
       canSendB2C: vi.fn(() => ({ allowed: true })),
     },

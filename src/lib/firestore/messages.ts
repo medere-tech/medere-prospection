@@ -104,6 +104,7 @@
  *      la fuite via les audits. `firestore.rules` protège l'accès
  *      client (commercial only, lecture seule).
  */
+import { differenceInHours } from "date-fns";
 import { type DocumentReference, Timestamp, type Transaction } from "firebase-admin/firestore";
 import { z } from "zod";
 
@@ -154,6 +155,18 @@ const BODY_MAX_LENGTH = 1600;
 
 /** Largeur par défaut de la fenêtre `listRecentOutbound` (alignement S4). */
 const DEFAULT_LIST_DAYS = 30;
+
+/**
+ * 🔒 Ancienneté maximale de l'entrant pour qu'un sortant puisse être
+ * estampillé `"reply"` (PR-BARRIERE-2, MAJEUR-1).
+ *
+ * Au-delà, le message n'est plus une réponse mais une RELANCE — donc une
+ * sollicitation, qui doit compter contre le plafond L.34-5 CPCE.
+ *
+ * Cf. `assertOutboundKindCoherentOrThrow` pour le raisonnement complet et
+ * le choix de 48 h. Toute modification passe par compliance-auditor.
+ */
+const REPLY_INBOUND_RECENCY_HOURS = 48;
 
 const MS_PER_DAY = 24 * 60 * 60 * 1000;
 
@@ -460,30 +473,88 @@ function validateBodyOrThrow(body: string, conversationId: string): void {
  * ACTIF : un doc estampillé `"reply"` à tort sort réellement du plafond.
  * Elle n'est plus préventive, elle est en première ligne.
  *
- * 🔴 LIMITE CONNUE — `inboundCount` est un compteur de VIE ENTIÈRE, sans
- * borne de récence. Un PS ayant répondu une seule fois rend éligible à
- * l'estampille `"reply"` tout sortant ultérieur de cette conversation,
- * indéfiniment. Aujourd'hui inexploitable : le seul écrivain de `"reply"`
- * est `addOutboundDraftInTx`, appelé uniquement par `process-reply` sur
- * réception d'un entrant. La sûreté vient donc du PIPELINE, pas de cette
- * garde. À renforcer (fenêtre sur `conversation.lastInboundAt`) AVANT la
- * première PR de relance `schedule-followup`, qui réutiliserait ce chemin
- * et ferait échapper ses relances au plafond.
+ * 🔴 DEPUIS PR-BARRIERE-2, CETTE GARDE EST LA **SEULE** PROTECTION
  *
- * @throws ValidationError si `kind === "reply"` et `conv.inboundCount === 0`.
+ * Avant PR-BARRIERE-2 il y avait DEUX couches contre un mauvais
+ * estampillage `"reply"` :
+ *   1. cette garde, à l'écriture ;
+ *   2. le verdict `rate_limit` (règle 5), appliqué à TOUT sortant — donc
+ *      un faux `"reply"` restait bloqué dès 4 sollicitations.
+ *
+ * La décision (d) de PR-BARRIERE-2 a conditionné la règle 5 à
+ * `outboundKind === "solicitation"` : **la couche 2 a disparu**. Un doc
+ * estampillé `"reply"` à tort n'est désormais bloqué par RIEN côté
+ * plafond légal — seul le plafond de volume (10/24h) le borne encore, ce
+ * qui n'a aucune valeur juridique.
+ *
+ * ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ * FENÊTRE DE RÉCENCE — ce que `inboundCount` seul ne pouvait pas faire
+ *
+ * `inboundCount` est un compteur de VIE ENTIÈRE : un PS ayant répondu une
+ * seule fois en janvier rendait éligible à l'estampille `"reply"` tout
+ * sortant ultérieur, indéfiniment. Le jour où `schedule-followup`
+ * réutiliserait `addOutboundDraftInTx` (le chemin naturel : mêmes besoins
+ * que `process-reply`), ses relances après des semaines de silence
+ * seraient estampillées `"reply"` et échapperaient au plafond L.34-5 —
+ * infraction non détectable en review.
+ *
+ * On exige donc AUSSI que l'entrant soit RÉCENT
+ * (`REPLY_INBOUND_RECENCY_HOURS`). Une réponse suit un message du PS de
+ * quelques secondes à quelques minutes ; une relance après silence, de
+ * plusieurs jours. La fenêtre discrimine les deux.
+ *
+ * Pourquoi 48 h et pas 24 : `process-reply` stocke l'entrant (step 4)
+ * avant de générer le draft (step 8b), donc `lastInboundAt ≈ now` en
+ * régime nominal. La marge absorbe les retries Inngest et un éventuel
+ * rattrapage de file sans jamais bloquer une vraie réponse.
+ *
+ * `lastInboundAt` absent alors que `inboundCount > 0` → REFUS. Cas
+ * vacant en pratique (`_bumpConversationCountersTx` pose toujours les
+ * deux ensemble depuis S6.4), mais on ne présume pas d'une récence qu'on
+ * ne peut pas vérifier : c'est le sens fail-closed pour le plafond légal.
+ *
+ * @throws ValidationError si `kind === "reply"` et que la conversation ne
+ *         porte aucun entrant, ou aucun entrant RÉCENT.
  */
 function assertOutboundKindCoherentOrThrow(
   kind: MessageOutboundKind,
   conv: Conversation,
   conversationId: string,
+  now: Date = new Date(),
 ): void {
-  if (kind === "reply" && conv.inboundCount === 0) {
+  if (kind !== "reply") return;
+
+  if (conv.inboundCount === 0) {
     throw new ValidationError({
       message: `Cannot write outboundKind="reply" on conversation ${conversationId} with inboundCount=0 (a reply implies the PS wrote first)`,
       context: {
         conversationId,
         outboundKind: kind,
         inboundCount: conv.inboundCount,
+      },
+    });
+  }
+
+  const lastInboundAt = conv.lastInboundAt;
+  const lastInboundDate =
+    lastInboundAt instanceof Date ? lastInboundAt : (lastInboundAt?.toDate() ?? null);
+
+  if (lastInboundDate === null) {
+    throw new ValidationError({
+      message: `Cannot write outboundKind="reply" on conversation ${conversationId}: inboundCount>0 but lastInboundAt is missing (cannot verify recency)`,
+      context: { conversationId, outboundKind: kind, inboundCount: conv.inboundCount },
+    });
+  }
+
+  const hoursSinceInbound = differenceInHours(now, lastInboundDate);
+  if (hoursSinceInbound > REPLY_INBOUND_RECENCY_HOURS) {
+    throw new ValidationError({
+      message: `Cannot write outboundKind="reply" on conversation ${conversationId}: last inbound is ${hoursSinceInbound}h old (max ${REPLY_INBOUND_RECENCY_HOURS}h). A message sent long after the PS wrote is a SOLICITATION, not a reply — it must count against the L.34-5 cap.`,
+      context: {
+        conversationId,
+        outboundKind: kind,
+        hoursSinceInbound,
+        maxHours: REPLY_INBOUND_RECENCY_HOURS,
       },
     });
   }
@@ -1394,7 +1465,7 @@ export function addOutboundDraftInTx(
   validateBodyOrThrow(input.body, input.conversationId);
   // 🔒 PR-OUTBOUNDKIND — un draft est TOUJOURS une réponse : la conversation
   // doit donc porter au moins un inbound. Sinon incohérence → crash.
-  assertOutboundKindCoherentOrThrow("reply", conv, input.conversationId);
+  assertOutboundKindCoherentOrThrow("reply", conv, input.conversationId, input.now);
 
   const messageRef = messagesSubcollectionRef(input.conversationId).doc(); // auto-ID
   const now = input.now !== undefined ? Timestamp.fromDate(input.now) : Timestamp.now();
@@ -2077,6 +2148,9 @@ export const __BODY_MAX_LENGTH_FOR_TESTS = BODY_MAX_LENGTH;
 
 /** @internal */
 export const __DEFAULT_LIST_DAYS_FOR_TESTS = DEFAULT_LIST_DAYS;
+
+/** @internal */
+export const __REPLY_INBOUND_RECENCY_HOURS_FOR_TESTS = REPLY_INBOUND_RECENCY_HOURS;
 
 /** @internal */
 export const __DEFAULT_HISTORY_LIMIT_FOR_TESTS = DEFAULT_HISTORY_LIMIT;
