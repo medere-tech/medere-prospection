@@ -354,6 +354,11 @@ export async function sendFirstSmsHandler(ctx: InngestHandlerContext): Promise<S
           body,
           channel: "sms",
           generatedBy: "ai",
+          // 🔒 PR-OUTBOUNDKIND — c'est NOUS qui prenons l'initiative de
+          // déranger le PS : premier contact d'une campagne, non sollicité.
+          // C'est la définition même d'une sollicitation au sens L.34-5
+          // CPCE, donc ce SMS compte contre le plafond.
+          outboundKind: "solicitation",
           externalReceiver: loaded.contact.phone.e164,
         },
         dispatch: {

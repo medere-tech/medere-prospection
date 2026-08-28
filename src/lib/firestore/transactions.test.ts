@@ -148,6 +148,7 @@ async function seedOutboundMessage(
     status: "sent",
     channel: "sms",
     generatedBy: "ai",
+    outboundKind: "solicitation" as const,
     createdAt,
     sentAt: createdAt,
   };
@@ -476,6 +477,7 @@ describe("transactions.ts — sendOutboundWithLock (DEBT-001.3)", () => {
         body: overrides.inputBody ?? "Bonjour, Léa de Médéré. STOP pour refuser.",
         channel: "sms" as const,
         generatedBy: "ai" as const,
+        outboundKind: "solicitation" as const,
         aiModel: "claude-sonnet-4-6",
       },
       dispatch: {

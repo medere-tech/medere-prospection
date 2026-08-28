@@ -39,9 +39,10 @@
  *                            `receivedAt`
  */
 import { deleteApp } from "firebase-admin/app";
-import { Timestamp } from "firebase-admin/firestore";
+import { Timestamp, type Transaction } from "firebase-admin/firestore";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
+import { countsAgainstCap, DEFAULT_OUTBOUND_KIND } from "@/lib/compliance/outbound-kind";
 import { __resetEnvCacheForTests } from "@/lib/security/env";
 import { AuditPiiError, NotFoundError, ValidationError } from "@/lib/utils/errors";
 import { logger } from "@/lib/utils/logger";
@@ -69,8 +70,10 @@ import {
   __MESSAGES_PARENT_COLLECTION_FOR_TESTS,
   __MESSAGES_SUBCOLLECTION_FOR_TESTS,
   __STALE_MESSAGES_DEFAULT_LIMIT_FOR_TESTS,
+  _parseMessageOrThrow,
   addInbound,
   addOutbound,
+  addOutboundDraft,
   addOutboundDraftInTx,
   addOutboundInTx,
   findInboundByExternalId,
@@ -120,6 +123,18 @@ async function seedConversation(
   return conv;
 }
 
+/**
+ * Lit + parse la conversation DANS une tx. PR-OUTBOUNDKIND :
+ * `addOutboundDraftInTx` exige désormais la conversation parente (pour la
+ * garde `"reply"` ⇒ `inboundCount > 0`), au même titre qu'`addOutboundInTx`.
+ */
+async function readConvInTx(tx: Transaction, conversationId: string): Promise<Conversation> {
+  const snap = await tx.get(
+    getAdminDb().collection(__CONVERSATIONS_COLLECTION_FOR_TESTS).doc(conversationId),
+  );
+  return _parseConversationOrThrow(snap.data(), conversationId);
+}
+
 /** Écrit un doc message DIRECTEMENT dans la sous-collection, sans passer
  *  par addOutbound/addInbound. Utilisé pour les tests `listRecentOutbound`
  *  qui ont besoin de poser un `sentAt` distinct du `createdAt` (impossible
@@ -131,6 +146,7 @@ async function seedMessage(conversationId: string, overrides: Partial<Message>):
     status: "sent",
     channel: "sms",
     generatedBy: "ai",
+    outboundKind: "solicitation",
     createdAt: Timestamp.now(),
   };
   const docRef = await getAdminDb()
@@ -139,6 +155,17 @@ async function seedMessage(conversationId: string, overrides: Partial<Message>):
     .collection(__MESSAGES_SUBCOLLECTION_FOR_TESTS)
     .add({ ...base, ...overrides });
   return docRef.id;
+}
+
+/** Relit un doc message brut depuis Firestore (typé `Message`). */
+async function readMessageDoc(conversationId: string, messageId: string): Promise<Message> {
+  const snap = await getAdminDb()
+    .collection(__MESSAGES_PARENT_COLLECTION_FOR_TESTS)
+    .doc(conversationId)
+    .collection(__MESSAGES_SUBCOLLECTION_FOR_TESTS)
+    .doc(messageId)
+    .get();
+  return snap.data() as Message;
 }
 
 async function countMessages(conversationId: string): Promise<number> {
@@ -217,6 +244,7 @@ describe("messages.ts", () => {
         body: "Bonjour, Léa de Médéré. Une question rapide à vous poser. STOP pour refuser.",
         channel: "sms",
         generatedBy: "ai",
+        outboundKind: "solicitation",
         aiModel: "claude-sonnet-4-6",
         aiPromptVersion: "first-sms-v1.0.0",
       });
@@ -280,6 +308,7 @@ describe("messages.ts", () => {
         body: "Suite à mon dernier message...",
         channel: "sms",
         generatedBy: "ai",
+        outboundKind: "solicitation",
       });
 
       const convSnap = await getAdminDb()
@@ -303,6 +332,7 @@ describe("messages.ts", () => {
         body: "Bonjour, Léa de Médéré.",
         channel: "sms",
         generatedBy: "ai",
+        outboundKind: "solicitation",
         externalReceiver: "+33612345678",
         aiModel: "claude-sonnet-4-6",
         aiPromptVersion: "first-sms-v1.0.0",
@@ -330,7 +360,8 @@ describe("messages.ts", () => {
       const messageId = await addOutbound("conv_out_3", {
         body: "Message minimal",
         channel: "sms",
-        generatedBy: "human", // commercial qui répond manuellement
+        generatedBy: "human",
+        outboundKind: "solicitation", // commercial qui répond manuellement
       });
 
       const msgSnap = await getAdminDb()
@@ -355,7 +386,12 @@ describe("messages.ts", () => {
       const messagesBefore = await countMessages("conv_out_4");
 
       await expect(
-        addOutbound("conv_out_4", { body: "", channel: "sms", generatedBy: "ai" }),
+        addOutbound("conv_out_4", {
+          body: "",
+          channel: "sms",
+          generatedBy: "ai",
+          outboundKind: "solicitation",
+        }),
       ).rejects.toBeInstanceOf(ValidationError);
 
       expect(await countAuditDocs()).toBe(auditsBefore);
@@ -372,7 +408,12 @@ describe("messages.ts", () => {
       const body = "x".repeat(__BODY_MAX_LENGTH_FOR_TESTS + 1);
 
       await expect(
-        addOutbound("conv_out_5", { body, channel: "sms", generatedBy: "ai" }),
+        addOutbound("conv_out_5", {
+          body,
+          channel: "sms",
+          generatedBy: "ai",
+          outboundKind: "solicitation",
+        }),
       ).rejects.toBeInstanceOf(ValidationError);
 
       expect(await countMessages("conv_out_5")).toBe(0);
@@ -387,13 +428,19 @@ describe("messages.ts", () => {
         body,
         channel: "sms",
         generatedBy: "ai",
+        outboundKind: "solicitation",
       });
       expect(messageId).toMatch(FIRESTORE_AUTO_ID_PATTERN);
     });
 
     it("conversation inexistante → throw NotFoundError", async () => {
       await expect(
-        addOutbound("conv_ghost", { body: "hello", channel: "sms", generatedBy: "ai" }),
+        addOutbound("conv_ghost", {
+          body: "hello",
+          channel: "sms",
+          generatedBy: "ai",
+          outboundKind: "solicitation",
+        }),
       ).rejects.toBeInstanceOf(NotFoundError);
     });
 
@@ -404,7 +451,12 @@ describe("messages.ts", () => {
         .set({ contactId: "x" }); // pas messageCount, etc.
 
       await expect(
-        addOutbound("conv_broken", { body: "hello", channel: "sms", generatedBy: "ai" }),
+        addOutbound("conv_broken", {
+          body: "hello",
+          channel: "sms",
+          generatedBy: "ai",
+          outboundKind: "solicitation",
+        }),
       ).rejects.toBeInstanceOf(ValidationError);
 
       expect(await countMessages("conv_broken")).toBe(0);
@@ -417,7 +469,12 @@ describe("messages.ts", () => {
       });
 
       await expect(
-        addOutbound("conv_out_atomic", { body: "hello", channel: "sms", generatedBy: "ai" }),
+        addOutbound("conv_out_atomic", {
+          body: "hello",
+          channel: "sms",
+          generatedBy: "ai",
+          outboundKind: "solicitation",
+        }),
       ).rejects.toBeInstanceOf(AuditPiiError);
 
       // Rollback total : pas de message, pas de compteur bumpé, pas d'audit.
@@ -442,6 +499,7 @@ describe("messages.ts", () => {
         body: bodyWithFakePii,
         channel: "sms",
         generatedBy: "ai",
+        outboundKind: "solicitation",
       });
 
       const audits = await getAdminDb().collection(__AUDIT_COLLECTION_FOR_TESTS).get();
@@ -484,6 +542,7 @@ describe("messages.ts", () => {
           body: "Bonjour, Léa de Médéré — STOP pour refuser.",
           channel: "sms",
           generatedBy: "ai",
+          outboundKind: "solicitation",
           aiModel: "claude-sonnet-4-6",
         });
       });
@@ -531,6 +590,7 @@ describe("messages.ts", () => {
           body: "Hello",
           channel: "sms",
           generatedBy: "ai",
+          outboundKind: "solicitation",
         });
       });
 
@@ -558,6 +618,7 @@ describe("messages.ts", () => {
           body: "Hello",
           channel: "sms",
           generatedBy: "ai",
+          outboundKind: "solicitation",
         });
       });
 
@@ -583,6 +644,7 @@ describe("messages.ts", () => {
             body: "",
             channel: "sms",
             generatedBy: "ai",
+            outboundKind: "solicitation",
           });
         }),
       ).rejects.toBeInstanceOf(ValidationError);
@@ -614,6 +676,7 @@ describe("messages.ts", () => {
             body: huge,
             channel: "sms",
             generatedBy: "ai",
+            outboundKind: "solicitation",
           });
         }),
       ).rejects.toBeInstanceOf(ValidationError);
@@ -635,6 +698,7 @@ describe("messages.ts", () => {
             body: "Hello",
             channel: "sms",
             generatedBy: "ai",
+            outboundKind: "solicitation",
           });
         }),
       ).rejects.toBeInstanceOf(AuditPiiError);
@@ -671,6 +735,7 @@ describe("messages.ts", () => {
           body: "Hello",
           channel: "sms",
           generatedBy: "ai",
+          outboundKind: "solicitation",
         });
       });
 
@@ -695,6 +760,7 @@ describe("messages.ts", () => {
           body: "PII risk: 0612345678 should not appear in audit",
           channel: "sms",
           generatedBy: "ai",
+          outboundKind: "solicitation",
         });
       });
 
@@ -728,6 +794,7 @@ describe("messages.ts", () => {
           body: "Hello",
           channel: "sms",
           generatedBy: "ai",
+          outboundKind: "solicitation",
         });
       });
 
@@ -1023,11 +1090,26 @@ describe("messages.ts", () => {
   describe("listRecentOutbound", () => {
     it("3 outbound créés → 3 retournés, ordre DESC par createdAt", async () => {
       await seedConversation("conv_list_1");
-      await addOutbound("conv_list_1", { body: "msg 1", channel: "sms", generatedBy: "ai" });
+      await addOutbound("conv_list_1", {
+        body: "msg 1",
+        channel: "sms",
+        generatedBy: "ai",
+        outboundKind: "solicitation",
+      });
       await new Promise((r) => setTimeout(r, 10)); // garantir createdAt distinct
-      await addOutbound("conv_list_1", { body: "msg 2", channel: "sms", generatedBy: "ai" });
+      await addOutbound("conv_list_1", {
+        body: "msg 2",
+        channel: "sms",
+        generatedBy: "ai",
+        outboundKind: "solicitation",
+      });
       await new Promise((r) => setTimeout(r, 10));
-      await addOutbound("conv_list_1", { body: "msg 3", channel: "sms", generatedBy: "ai" });
+      await addOutbound("conv_list_1", {
+        body: "msg 3",
+        channel: "sms",
+        generatedBy: "ai",
+        outboundKind: "solicitation",
+      });
 
       const result = await listRecentOutbound("conv_list_1");
       expect(result).toHaveLength(3);
@@ -1043,14 +1125,24 @@ describe("messages.ts", () => {
 
     it("mix outbound + inbound → ne retourne QUE les outbound", async () => {
       await seedConversation("conv_list_2");
-      await addOutbound("conv_list_2", { body: "out 1", channel: "sms", generatedBy: "ai" });
+      await addOutbound("conv_list_2", {
+        body: "out 1",
+        channel: "sms",
+        generatedBy: "ai",
+        outboundKind: "solicitation",
+      });
       await addInbound("conv_list_2", {
         body: "in 1",
         channel: "sms",
         externalId: "ovh-1",
         externalReceiver: "+33611111111",
       });
-      await addOutbound("conv_list_2", { body: "out 2", channel: "sms", generatedBy: "ai" });
+      await addOutbound("conv_list_2", {
+        body: "out 2",
+        channel: "sms",
+        generatedBy: "ai",
+        outboundKind: "solicitation",
+      });
 
       const result = await listRecentOutbound("conv_list_2");
       expect(result).toHaveLength(2);
@@ -1459,6 +1551,239 @@ describe("messages.ts", () => {
   // PASSE alors qu'il devrait FAIL, tsc throw "Unused @ts-expect-error".
   // ───────────────────────────────────────────────────────────────────────
 
+  // ───────────────────────────────────────────────────────────────────────
+  // outboundKind (PR-OUTBOUNDKIND) — estampillage à l'écriture
+  // ───────────────────────────────────────────────────────────────────────
+
+  describe("outboundKind (PR-OUTBOUNDKIND)", () => {
+    it("addOutbound écrit la valeur tranchée par le caller ('solicitation')", async () => {
+      const convId = "conv_kind_solicitation";
+      await seedConversation(convId);
+
+      const messageId = await addOutbound(convId, {
+        body: "Bonjour Docteur, Léa de Médéré. STOP pour refuser.",
+        channel: "sms",
+        generatedBy: "ai",
+        outboundKind: "solicitation",
+      });
+
+      const msg = await readMessageDoc(convId, messageId);
+      expect(msg.outboundKind).toBe("solicitation");
+    });
+
+    it("addOutbound accepte aussi 'reply' quand la conv porte un inbound", async () => {
+      // Cas d'usage futur : un commercial humain qui répond via le
+      // dashboard. La garde ne se déclenche pas puisque le PS a écrit.
+      const convId = "conv_kind_reply_ok";
+      await seedConversation(convId, { inboundCount: 1, messageCount: 1 });
+
+      const messageId = await addOutbound(convId, {
+        body: "Bonjour Docteur, Léa de Médéré. STOP pour refuser.",
+        channel: "sms",
+        generatedBy: "human",
+        outboundKind: "reply",
+      });
+
+      const msg = await readMessageDoc(convId, messageId);
+      expect(msg.outboundKind).toBe("reply");
+    });
+
+    it("🔒 GARDE symétrique : addOutbound refuse 'reply' si inboundCount === 0", async () => {
+      const convId = "conv_kind_reply_ko";
+      await seedConversation(convId, { inboundCount: 0 });
+
+      await expect(
+        addOutbound(convId, {
+          body: "Bonjour Docteur, Léa de Médéré. STOP pour refuser.",
+          channel: "sms",
+          generatedBy: "human",
+          outboundKind: "reply",
+        }),
+      ).rejects.toBeInstanceOf(ValidationError);
+
+      expect(await countMessages(convId)).toBe(0);
+    });
+
+    it("🔒 FAIL-CLOSED : doc LEGACY sans outboundKind → parse OK, défaut 'solicitation'", async () => {
+      // Les docs écrits avant cette PR n'ont pas le champ. Ils DOIVENT
+      // rester lisibles (pas de ValidationError, sinon on bloque tous les
+      // envois) ET compter comme sollicitations (au pire on sur-compte et
+      // on bloque un envoi de trop — jamais l'inverse).
+      //
+      // C'est ce qui permet de se passer de backfill : la fenêtre
+      // rate-limit étant glissante sur 30j, 30 jours après le déploiement
+      // plus aucun doc comptabilisé n'est legacy.
+      const convId = "conv_kind_legacy";
+      await seedConversation(convId);
+
+      // Écriture BRUTE sans outboundKind (simulation d'un doc pré-PR).
+      const ref = await getAdminDb()
+        .collection(__MESSAGES_PARENT_COLLECTION_FOR_TESTS)
+        .doc(convId)
+        .collection(__MESSAGES_SUBCOLLECTION_FOR_TESTS)
+        .add({
+          direction: "outbound",
+          body: "SMS legacy sans outboundKind",
+          status: "sent",
+          channel: "sms",
+          generatedBy: "ai",
+          createdAt: Timestamp.now(),
+        });
+
+      const snap = await getAdminDb()
+        .collection(__MESSAGES_PARENT_COLLECTION_FOR_TESTS)
+        .doc(convId)
+        .collection(__MESSAGES_SUBCOLLECTION_FOR_TESTS)
+        .doc(ref.id)
+        .get();
+
+      // Le champ est bien ABSENT du doc Firestore…
+      expect(snap.data()?.outboundKind).toBeUndefined();
+
+      // …mais le parse le matérialise à "solicitation" (fail-closed).
+      const parsed = _parseMessageOrThrow(snap.data(), convId, ref.id);
+      expect(parsed.outboundKind).toBe("solicitation");
+
+      // 🔒 SENTINELLE ANTI-DRIFT — le défaut appliqué par MessageSchema
+      // DOIT être celui de `lib/compliance/outbound-kind.ts`, qui est la
+      // source de vérité consommée à la lecture par `countsAgainstCap`.
+      // Si les deux divergeaient, un doc legacy serait écrit/lu comme
+      // sollicitation d'un côté et exclu du comptage de l'autre.
+      expect(parsed.outboundKind).toBe(DEFAULT_OUTBOUND_KIND);
+      expect(countsAgainstCap(parsed)).toBe(true);
+    });
+
+    it("SENTINELLE enum fermé : une valeur inconnue en base → ValidationError (fail-closed)", async () => {
+      // Un doc portant une valeur hors enum n'est PAS silencieusement
+      // ramené au défaut : il fait échouer le parse, donc l'envoi.
+      const convId = "conv_kind_bogus";
+      await seedConversation(convId);
+
+      const ref = await getAdminDb()
+        .collection(__MESSAGES_PARENT_COLLECTION_FOR_TESTS)
+        .doc(convId)
+        .collection(__MESSAGES_SUBCOLLECTION_FOR_TESTS)
+        .add({
+          direction: "outbound",
+          body: "SMS avec kind inconnu",
+          status: "sent",
+          channel: "sms",
+          generatedBy: "ai",
+          outboundKind: "followup",
+          createdAt: Timestamp.now(),
+        });
+
+      const snap = await getAdminDb()
+        .collection(__MESSAGES_PARENT_COLLECTION_FOR_TESTS)
+        .doc(convId)
+        .collection(__MESSAGES_SUBCOLLECTION_FOR_TESTS)
+        .doc(ref.id)
+        .get();
+
+      expect(() => _parseMessageOrThrow(snap.data(), convId, ref.id)).toThrow(ValidationError);
+    });
+
+    it("🔒 SENTINELLE `null` : outboundKind=null en base → ValidationError, PAS le défaut", async () => {
+      // ─────────────────────────────────────────────────────────────────
+      // POURQUOI CE TEST EXISTE
+      //
+      // `z.enum([...]).default(x)` ne se déclenche QUE sur `undefined`.
+      // Une valeur `null` produit un `invalid_type`, donc un throw. C'est
+      // le bon comportement (fail-closed : on bloque l'envoi plutôt que de
+      // deviner la nature du message), MAIS c'est une subtilité de Zod que
+      // rien ne garantit dans le temps :
+      //
+      //   - une future migration Zod pourrait aligner `null` sur
+      //     `undefined` (comportement de `.nullish()`), ou
+      //   - quelqu'un pourrait "corriger" le schéma en `.nullable()` ou
+      //     `.catch(DEFAULT_OUTBOUND_KIND)` en croyant fiabiliser la
+      //     lecture.
+      //
+      // Dans les deux cas, un doc à `null` deviendrait silencieusement une
+      // "solicitation"… ou pire, si le `.catch()` était mal orienté, un
+      // "reply" — donc exclu du comptage. Ce test verrouille le
+      // comportement RÉEL observé, il ne le suppose pas.
+      //
+      // Firestore stocke `null` nativement (pas de coercition en
+      // `undefined`), ce cas est donc atteignable en base : import
+      // manuel, console Firebase, script de migration bâclé.
+      // ─────────────────────────────────────────────────────────────────
+      const convId = "conv_kind_null";
+      await seedConversation(convId);
+
+      const ref = await getAdminDb()
+        .collection(__MESSAGES_PARENT_COLLECTION_FOR_TESTS)
+        .doc(convId)
+        .collection(__MESSAGES_SUBCOLLECTION_FOR_TESTS)
+        .add({
+          direction: "outbound",
+          body: "SMS avec outboundKind null",
+          status: "sent",
+          channel: "sms",
+          generatedBy: "ai",
+          outboundKind: null,
+          createdAt: Timestamp.now(),
+        });
+
+      const snap = await getAdminDb()
+        .collection(__MESSAGES_PARENT_COLLECTION_FOR_TESTS)
+        .doc(convId)
+        .collection(__MESSAGES_SUBCOLLECTION_FOR_TESTS)
+        .doc(ref.id)
+        .get();
+
+      // 1. Firestore a bien stocké `null` — et NON `undefined`. Sans cette
+      //    assertion, le test pourrait passer pour la mauvaise raison (un
+      //    champ absent, qui lui prend le défaut).
+      expect(snap.data()?.outboundKind).toBeNull();
+
+      // 2. Le parse REFUSE — il ne ramène PAS au défaut.
+      expect(() => _parseMessageOrThrow(snap.data(), convId, ref.id)).toThrow(ValidationError);
+
+      // 3. Contraste explicite : le MÊME doc sans le champ prend le défaut
+      //    `"solicitation"`. C'est ce qui prouve que le refus de `null` est
+      //    un comportement distinct et volontaire, pas un effet de bord du
+      //    cas "champ absent".
+      const { outboundKind: _dropped, ...sansLeChamp } = snap.data() as Record<string, unknown>;
+      expect(_parseMessageOrThrow(sansLeChamp, convId, ref.id).outboundKind).toBe(
+        DEFAULT_OUTBOUND_KIND,
+      );
+
+      // 4. 🔒 LE POINT QUI COMPTE — le refus se propage jusqu'au chemin de
+      //    comptage. `listRecentOutbound` parse chaque doc : un `null` en
+      //    base fait donc échouer le pré-check compliance, donc l'envoi.
+      //    Fail-closed vérifié de bout en bout, pas seulement au parse.
+      await expect(listRecentOutbound(convId)).rejects.toBeInstanceOf(ValidationError);
+    });
+
+    it("⚠️ CETTE PR N'UTILISE PAS ENCORE outboundKind pour compter", async () => {
+      // Sentinelle de périmètre. `listRecentOutbound` compte TOUS les
+      // outbounds quelle que soit leur nature — le filtre arrive dans la PR
+      // suivante. Si ce test casse, c'est que le filtre a été branché : il
+      // faudra alors le remplacer par les tests de comptage correspondants
+      // (et repasser compliance-auditor).
+      const convId = "conv_kind_not_counted_yet";
+      await seedConversation(convId, { inboundCount: 1, messageCount: 1 });
+      const now = new Date();
+
+      await addOutbound(convId, {
+        body: "Sollicitation. STOP pour refuser. Médéré.",
+        channel: "sms",
+        generatedBy: "ai",
+        outboundKind: "solicitation",
+      });
+      await addOutbound(convId, {
+        body: "Réponse. STOP pour refuser. Médéré.",
+        channel: "sms",
+        generatedBy: "ai",
+        outboundKind: "reply",
+      });
+
+      // 2 comptés : le "reply" n'est PAS encore exclu.
+      expect(await listRecentOutbound(convId, 30, now)).toHaveLength(2);
+    });
+  });
+
   describe("type-level (compile-time)", () => {
     it("placeholder runtime : les vrais checks sont les @ts-expect-error ci-dessous", () => {
       expect(true).toBe(true);
@@ -1473,6 +1798,7 @@ describe("messages.ts", () => {
         body: "x",
         channel: "sms",
         generatedBy: "ai",
+        outboundKind: "solicitation",
       });
       await addOutbound(convId, {
         // @ts-expect-error - status est FIGÉ par addOutbound (="queued")
@@ -1480,6 +1806,7 @@ describe("messages.ts", () => {
         body: "x",
         channel: "sms",
         generatedBy: "ai",
+        outboundKind: "solicitation",
       });
       await addOutbound(convId, {
         // @ts-expect-error - createdAt est FIGÉ (timestamp serveur)
@@ -1487,6 +1814,7 @@ describe("messages.ts", () => {
         body: "x",
         channel: "sms",
         generatedBy: "ai",
+        outboundKind: "solicitation",
       });
       await addOutbound(convId, {
         // @ts-expect-error - sentAt est posé par updateMessageStatus en S7
@@ -1494,6 +1822,48 @@ describe("messages.ts", () => {
         body: "x",
         channel: "sms",
         generatedBy: "ai",
+        outboundKind: "solicitation",
+      });
+
+      // 🔒 PR-OUTBOUNDKIND — `outboundKind` est REQUIS : le caller DOIT
+      // trancher la nature de l'envoi au compile-time. L'omettre est une
+      // erreur de compilation, pas un défaut silencieux.
+      // @ts-expect-error - outboundKind manquant (champ REQUIS)
+      await addOutbound(convId, {
+        body: "x",
+        channel: "sms",
+        generatedBy: "ai",
+      });
+
+      // Et seules les 2 valeurs de l'enum fermé sont acceptées.
+      await addOutbound(convId, {
+        body: "x",
+        channel: "sms",
+        generatedBy: "ai",
+        // @ts-expect-error - "followup" n'existe pas : une relance est une
+        // sollicitation, pas une troisième catégorie.
+        outboundKind: "followup",
+      });
+    }
+
+    // eslint-disable-next-line @typescript-eslint/no-unused-vars
+    async function _typeCheckAddOutboundDraft(tx: Transaction, conv: Conversation, convId: string) {
+      // 🔒 PR-OUTBOUNDKIND — `outboundKind` est FIGÉ à "reply" par
+      // `addOutboundDraftInTx` (un draft naît toujours en réaction à un
+      // inbound). Le caller ne peut PAS le fournir, au même titre que
+      // `direction` / `status` / `generatedBy`.
+      addOutboundDraftInTx(tx, conv, {
+        // @ts-expect-error - outboundKind est FIGÉ par addOutboundDraftInTx (="reply")
+        outboundKind: "solicitation",
+        contactId: "contact_abc",
+        conversationId: convId,
+        body: "x",
+        aiModel: "claude-sonnet-4-6",
+        aiPromptVersion: "1.0.0",
+        aiTemperature: 0.5,
+        aiTokensInput: 1,
+        aiTokensOutput: 1,
+        aiGenerationDurationMs: 1,
       });
     }
 
@@ -1665,10 +2035,10 @@ describe("messages.ts", () => {
   describe("addOutboundDraftInTx (S9.3.3a)", () => {
     it("happy path : crée un doc Message status='draft' avec tous les champs IA", async () => {
       const convId = "conv_draft_happy";
-      await seedConversation(convId);
+      await seedConversation(convId, { inboundCount: 1, messageCount: 1 });
 
       const draftId = await getAdminDb().runTransaction(async (tx) =>
-        addOutboundDraftInTx(tx, {
+        addOutboundDraftInTx(tx, await readConvInTx(tx, convId), {
           contactId: "contact_abc",
           conversationId: convId,
           body: "Bonjour Docteur, quelle formation vous intéresse chez Médéré ?",
@@ -1695,6 +2065,8 @@ describe("messages.ts", () => {
       expect(msg.status).toBe("draft");
       expect(msg.channel).toBe("sms");
       expect(msg.generatedBy).toBe("ai");
+      // 🔒 PR-OUTBOUNDKIND — figé à "reply" par la fonction.
+      expect(msg.outboundKind).toBe("reply");
       expect(msg.aiModel).toBe("claude-sonnet-4-6");
       expect(msg.aiPromptVersion).toBe("1.0.0");
       expect(msg.aiTemperature).toBe(0.5);
@@ -1705,23 +2077,95 @@ describe("messages.ts", () => {
       expect(msg.deliveredAt).toBeUndefined();
     });
 
+    it("🔒 GARDE : outboundKind='reply' sur une conv sans inbound → ValidationError, aucun doc créé", async () => {
+      // Un draft affirme que le PS a écrit en premier. Si la conversation
+      // ne porte AUCUN inbound, l'affirmation est fausse : soit le caller
+      // s'est trompé, soit les compteurs sont désynchronisés. On refuse.
+      //
+      // C'est le SEUL mode de défaillance de `outboundKind` qui élargit le
+      // quota (un sortant qui devait compter ne compterait plus) — donc le
+      // seul qui produise une infraction L.34-5 CPCE.
+      const convId = "conv_draft_no_inbound";
+      await seedConversation(convId, { inboundCount: 0 });
+
+      await expect(
+        getAdminDb().runTransaction(async (tx) =>
+          addOutboundDraftInTx(tx, await readConvInTx(tx, convId), {
+            contactId: "contact_abc",
+            conversationId: convId,
+            body: "Bonjour Médéré, réponse sans question préalable.",
+            aiModel: "claude-sonnet-4-6",
+            aiPromptVersion: "1.0.0",
+            aiTemperature: 0.5,
+            aiTokensInput: 100,
+            aiTokensOutput: 10,
+            aiGenerationDurationMs: 500,
+          }),
+        ),
+      ).rejects.toBeInstanceOf(ValidationError);
+
+      expect(await countMessages(convId)).toBe(0);
+    });
+
+    it("🔒 GARDE : le wrapper addOutboundDraft applique la même garde (conv sans inbound)", async () => {
+      const convId = "conv_draft_wrapper_no_inbound";
+      await seedConversation(convId, { inboundCount: 0 });
+
+      await expect(
+        addOutboundDraft({
+          contactId: "contact_abc",
+          conversationId: convId,
+          body: "Bonjour Médéré, réponse sans question préalable.",
+          aiModel: "claude-sonnet-4-6",
+          aiPromptVersion: "1.0.0",
+          aiTemperature: 0.5,
+          aiTokensInput: 100,
+          aiTokensOutput: 10,
+          aiGenerationDurationMs: 500,
+        }),
+      ).rejects.toBeInstanceOf(ValidationError);
+
+      expect(await countMessages(convId)).toBe(0);
+    });
+
+    it("le wrapper addOutboundDraft refuse une conversation inexistante → NotFoundError", async () => {
+      // Effet de bord bienvenu de la lecture conv ajoutée en PR-OUTBOUNDKIND :
+      // avant, un draft était créé sans broncher dans la sous-collection
+      // d'une conversation supprimée (Firestore autorise les sous-collections
+      // orphelines).
+      await expect(
+        addOutboundDraft({
+          contactId: "contact_abc",
+          conversationId: "conv_draft_ghost",
+          body: "Bonjour Médéré.",
+          aiModel: "claude-sonnet-4-6",
+          aiPromptVersion: "1.0.0",
+          aiTemperature: 0.5,
+          aiTokensInput: 100,
+          aiTokensOutput: 10,
+          aiGenerationDurationMs: 500,
+        }),
+      ).rejects.toBeInstanceOf(NotFoundError);
+    });
+
     it("🔒 NE BUMP PAS conversation.outboundCount / messageCount / lastOutboundAt", async () => {
       // Invariant critique S9.3.3a — un draft n'est pas un envoi tenté.
       // Si retiré, race en S9.4 quand commitDraftToQueued bumpera à son
       // tour → double-comptage côté analytics et rate-limit.
       const convId = "conv_draft_no_bump";
-      await seedConversation(convId);
+      await seedConversation(convId, { inboundCount: 1, messageCount: 1 });
 
       const before = await getAdminDb()
         .collection(__CONVERSATIONS_COLLECTION_FOR_TESTS)
         .doc(convId)
         .get();
       const beforeConv = before.data() as Conversation;
-      expect(beforeConv.messageCount).toBe(0);
+      // La conv porte 1 inbound (pré-requis PR-OUTBOUNDKIND : un draft est
+      // une réponse). Les compteurs OUTBOUND, eux, sont bien à zéro.
       expect(beforeConv.outboundCount).toBe(0);
 
       await getAdminDb().runTransaction(async (tx) =>
-        addOutboundDraftInTx(tx, {
+        addOutboundDraftInTx(tx, await readConvInTx(tx, convId), {
           contactId: "contact_abc",
           conversationId: convId,
           body: "Bonjour Docteur, Médéré propose des formations DPC. Une question ?",
@@ -1739,8 +2183,11 @@ describe("messages.ts", () => {
         .doc(convId)
         .get();
       const afterConv = after.data() as Conversation;
-      expect(afterConv.messageCount).toBe(0);
-      expect(afterConv.outboundCount).toBe(0);
+      // Assertion différentielle (plus robuste qu'une valeur absolue) :
+      // AUCUN compteur n'a bougé.
+      expect(afterConv.messageCount).toBe(beforeConv.messageCount);
+      expect(afterConv.outboundCount).toBe(beforeConv.outboundCount);
+      expect(afterConv.inboundCount).toBe(beforeConv.inboundCount);
       expect(afterConv.lastOutboundAt).toBeUndefined();
       expect(afterConv.firstMessageAt).toBeUndefined();
     });
@@ -1750,12 +2197,12 @@ describe("messages.ts", () => {
       // l'envoi OVH est acté (S9.4). Le caller (process-reply step 8
       // S9.3.3b) posera reply_generated à la place, distinct.
       const convId = "conv_draft_no_audit";
-      await seedConversation(convId);
+      await seedConversation(convId, { inboundCount: 1, messageCount: 1 });
 
       const beforeAudit = await countAuditDocs();
 
       await getAdminDb().runTransaction(async (tx) =>
-        addOutboundDraftInTx(tx, {
+        addOutboundDraftInTx(tx, await readConvInTx(tx, convId), {
           contactId: "contact_abc",
           conversationId: convId,
           body: "Bonjour Médéré, formations DPC.",
@@ -1775,11 +2222,11 @@ describe("messages.ts", () => {
 
     it("body vide → ValidationError (pas de doc créé)", async () => {
       const convId = "conv_draft_empty_body";
-      await seedConversation(convId);
+      await seedConversation(convId, { inboundCount: 1, messageCount: 1 });
 
       await expect(
         getAdminDb().runTransaction(async (tx) =>
-          addOutboundDraftInTx(tx, {
+          addOutboundDraftInTx(tx, await readConvInTx(tx, convId), {
             contactId: "contact_abc",
             conversationId: convId,
             body: "",
@@ -1798,12 +2245,12 @@ describe("messages.ts", () => {
 
     it("body > BODY_MAX_LENGTH (1600) → ValidationError", async () => {
       const convId = "conv_draft_too_long";
-      await seedConversation(convId);
+      await seedConversation(convId, { inboundCount: 1, messageCount: 1 });
 
       const tooLong = "a".repeat(__BODY_MAX_LENGTH_FOR_TESTS + 1);
       await expect(
         getAdminDb().runTransaction(async (tx) =>
-          addOutboundDraftInTx(tx, {
+          addOutboundDraftInTx(tx, await readConvInTx(tx, convId), {
             contactId: "contact_abc",
             conversationId: convId,
             body: tooLong,
@@ -1823,10 +2270,10 @@ describe("messages.ts", () => {
       // tient ENSEMBLE pour les deux modules : addOutboundDraftInTx crée
       // un doc status='draft', listRecentOutbound le filtre.
       const convId = "conv_draft_e2e_rate_limit";
-      await seedConversation(convId);
+      await seedConversation(convId, { inboundCount: 1, messageCount: 1 });
 
       await getAdminDb().runTransaction(async (tx) =>
-        addOutboundDraftInTx(tx, {
+        addOutboundDraftInTx(tx, await readConvInTx(tx, convId), {
           contactId: "contact_abc",
           conversationId: convId,
           body: "Bonjour Médéré, draft test.",
@@ -2020,6 +2467,7 @@ describe("messages.ts", () => {
         status: "queued",
         body: "Bonjour, c'est Léa de Médéré. Test. STOP pour refuser.",
         generatedBy: "ai",
+        outboundKind: "solicitation",
         createdAt: Timestamp.now(),
         queuedAt: Timestamp.now(),
       });
@@ -2132,6 +2580,7 @@ describe("messages.ts", () => {
         status: "sent",
         body: "sent prior",
         generatedBy: "ai",
+        outboundKind: "solicitation",
         createdAt: Timestamp.now(),
         sentAt: Timestamp.now(),
       });
@@ -2155,6 +2604,7 @@ describe("messages.ts", () => {
         status: "sent",
         body: "sent prior",
         generatedBy: "ai",
+        outboundKind: "solicitation",
         createdAt: Timestamp.now(),
         sentAt: Timestamp.now(),
       });
@@ -2186,6 +2636,7 @@ describe("messages.ts", () => {
         status: "failed",
         body: "already failed",
         generatedBy: "ai",
+        outboundKind: "solicitation",
         createdAt: Timestamp.now(),
         error: { code: "config_error", message: "prior", retryCount: 1 },
       });
@@ -2214,6 +2665,7 @@ describe("messages.ts", () => {
         status: "sent",
         body: "sent prior",
         generatedBy: "ai",
+        outboundKind: "solicitation",
         createdAt: Timestamp.fromMillis(Date.now() - 120_000),
         sentAt: originalSentAt,
       });
@@ -2242,6 +2694,7 @@ describe("messages.ts", () => {
         status: "delivered",
         body: "already delivered",
         generatedBy: "ai",
+        outboundKind: "solicitation",
         createdAt: Timestamp.now(),
         deliveredAt: Timestamp.now(),
       });
@@ -2263,6 +2716,7 @@ describe("messages.ts", () => {
         status: "failed",
         body: "failed prior",
         generatedBy: "ai",
+        outboundKind: "solicitation",
         createdAt: Timestamp.now(),
         error: { code: "config_error", message: "prior", retryCount: 0 },
       });
@@ -2283,6 +2737,7 @@ describe("messages.ts", () => {
         status: "draft",
         body: "Bonjour, c'est Léa de Médéré. STOP.",
         generatedBy: "ai",
+        outboundKind: "solicitation",
         createdAt: Timestamp.now(),
       });
 
@@ -2302,6 +2757,7 @@ describe("messages.ts", () => {
         status: "received",
         body: "Inbound test",
         generatedBy: "human",
+        outboundKind: "solicitation",
         externalId: "ovh-inbound-1",
         externalReceiver: "+33612345678",
         createdAt: Timestamp.now(),
@@ -2393,6 +2849,7 @@ describe("messages.ts", () => {
         status: "draft",
         channel: "sms",
         generatedBy: "ai",
+        outboundKind: "solicitation",
         createdAt,
       };
       const ref = await getAdminDb()
