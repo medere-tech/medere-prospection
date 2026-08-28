@@ -108,6 +108,7 @@ import { type DocumentReference, Timestamp, type Transaction } from "firebase-ad
 import { z } from "zod";
 
 import type { ClaudeModel } from "@/lib/claude/types";
+import { DEFAULT_OUTBOUND_KIND } from "@/lib/compliance/outbound-kind";
 import { type OutboundMessageRecord } from "@/lib/compliance/rate-limits";
 import { getAdminDb } from "@/lib/firestore/admin";
 import { appendAuditLogTx } from "@/lib/firestore/audit-log";
@@ -119,7 +120,13 @@ import {
 } from "@/lib/firestore/conversations";
 import { NotFoundError, ValidationError } from "@/lib/utils/errors";
 import type { Conversation } from "@/types/conversation";
-import type { Message, MessageAITokens, MessageChannel, MessageGeneratedBy } from "@/types/message";
+import type {
+  Message,
+  MessageAITokens,
+  MessageChannel,
+  MessageGeneratedBy,
+  MessageOutboundKind,
+} from "@/types/message";
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Constantes
@@ -241,6 +248,34 @@ export const MessageSchema = z.object({
   channel: z.enum(["sms", "whatsapp"]),
   externalId: z.string().optional(),
   externalReceiver: z.string().optional(),
+  /**
+   * 🔒 PR-OUTBOUNDKIND — nature du sortant au regard du plafond L.34-5.
+   *
+   * `.default(DEFAULT_OUTBOUND_KIND)` et NON `.optional()` : l'entrée est
+   * facultative (les docs LEGACY antérieurs à cette PR n'ont pas le champ
+   * et doivent rester lisibles), mais la SORTIE du parse est toujours
+   * définie. Un doc sans le champ est donc traité comme une
+   * **sollicitation** — le choix FAIL-CLOSED : au pire on sur-compte et
+   * on bloque un envoi de trop, jamais l'inverse.
+   *
+   * ⚠️ **La garantie est sur la DONNÉE, pas sur le TYPE.**
+   * `_parseMessageOrThrow` renvoie `result.data as Message`, et
+   * `Message.outboundKind` est optionnel — le cast efface donc la
+   * garantie côté lecteur, qui verra `MessageOutboundKind | undefined`.
+   * NE PAS écrire son propre test de nature : utiliser
+   * `countsAgainstCap()` de `lib/compliance/outbound-kind.ts`, qui est le
+   * seul endroit où le défaut est appliqué à la lecture.
+   *
+   * ⚠️ Ne JAMAIS basculer ce `.default()` en `.optional()` nu, et ne
+   * jamais changer `DEFAULT_OUTBOUND_KIND` pour `"reply"` : un doc legacy
+   * deviendrait invisible au comptage → sous-comptage silencieux du
+   * plafond → infraction. Toute modification passe par compliance-auditor.
+   *
+   * Note : le défaut s'applique aussi aux docs `inbound`, où le champ n'a
+   * aucun sens. Sans effet : toutes les lectures rate-limit filtrent
+   * `direction == "outbound"` en amont.
+   */
+  outboundKind: z.enum(["solicitation", "reply"]).default(DEFAULT_OUTBOUND_KIND),
   generatedBy: z.enum(["ai", "human", "system"]),
   aiModel: z.string().optional(),
   aiPromptVersion: z.string().optional(),
@@ -283,6 +318,23 @@ export interface AddOutboundInput {
   body: string;
   channel: MessageChannel;
   generatedBy: MessageGeneratedBy;
+  /**
+   * 🔒 REQUIS (PR-OUTBOUNDKIND) — le caller DOIT trancher explicitement.
+   *
+   * Volontairement NON optionnel et SANS valeur par défaut : c'est le code
+   * appelant qui sait s'il prend l'initiative de déranger le PS
+   * (`"solicitation"` — 1er SMS, relance) ou s'il répond à un message
+   * entrant (`"reply"`). Un défaut implicite ferait qu'un futur chemin
+   * d'envoi hériterait silencieusement d'une nature qu'il n'a pas choisie.
+   *
+   * Le compilateur force donc la décision : `send-first-sms` pose
+   * `"solicitation"`, et le futur `schedule-followup` devra trancher
+   * (réponse attendue : `"solicitation"` — une relance après silence n'est
+   * PAS demandée par le PS).
+   *
+   * Cf. `MessageOutboundKind` pour la sémantique complète.
+   */
+  outboundKind: MessageOutboundKind;
   /** E.164 du destinataire (PS). Recommandé pour traçabilité OVH. */
   externalReceiver?: string;
   aiModel?: string;
@@ -380,6 +432,49 @@ function validateBodyOrThrow(body: string, conversationId: string): void {
         conversationId,
         bodyLength: body.length,
         maxLength: BODY_MAX_LENGTH,
+      },
+    });
+  }
+}
+
+/**
+ * 🔒 GARDE DEFENSE-IN-DEPTH (PR-OUTBOUNDKIND) — cohérence
+ * `outboundKind: "reply"` ⇒ `conv.inboundCount > 0`.
+ *
+ * Un message estampillé `"reply"` affirme que le PS a écrit en premier.
+ * Si la conversation ne porte AUCUN inbound, l'affirmation est fausse :
+ * soit le caller s'est trompé, soit les compteurs conversation sont
+ * désynchronisés. Dans les deux cas c'est une incohérence, et on la fait
+ * CRASHER plutôt que de l'écrire.
+ *
+ * ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ * POURQUOI CETTE GARDE MÉRITE D'EXISTER
+ *
+ * Un mauvais estampillage `"reply"` est le SEUL mode de défaillance de
+ * `outboundKind` qui ÉLARGIT le quota (un sortant qui devait compter ne
+ * compte plus) — c'est-à-dire le seul qui produise une infraction L.34-5
+ * CPCE. Le sens inverse (`"solicitation"` posé à tort) sur-compte, donc
+ * fail-closed, donc bénin. On ne garde donc que le sens dangereux.
+ *
+ * ⚠️ La garde ne vaut RIEN pour le comptage tant que la PR suivante n'a
+ * pas branché le filtre : à ce stade le champ est écrit mais pas encore lu.
+ * Elle est posée MAINTENANT pour qu'aucun doc incohérent n'entre en base
+ * avant que le filtre n'arrive.
+ *
+ * @throws ValidationError si `kind === "reply"` et `conv.inboundCount === 0`.
+ */
+function assertOutboundKindCoherentOrThrow(
+  kind: MessageOutboundKind,
+  conv: Conversation,
+  conversationId: string,
+): void {
+  if (kind === "reply" && conv.inboundCount === 0) {
+    throw new ValidationError({
+      message: `Cannot write outboundKind="reply" on conversation ${conversationId} with inboundCount=0 (a reply implies the PS wrote first)`,
+      context: {
+        conversationId,
+        outboundKind: kind,
+        inboundCount: conv.inboundCount,
       },
     });
   }
@@ -509,6 +604,8 @@ export async function addOutboundInTx(
   input: AddOutboundInput,
 ): Promise<string> {
   validateBodyOrThrow(input.body, conversationId);
+  // 🔒 PR-OUTBOUNDKIND — refuse un "reply" sur une conversation sans inbound.
+  assertOutboundKindCoherentOrThrow(input.outboundKind, conv, conversationId);
 
   const convRef = getAdminDb().collection(CONVERSATIONS_COLLECTION).doc(conversationId);
   const messageRef = messagesSubcollectionRef(conversationId).doc(); // auto-ID
@@ -523,6 +620,8 @@ export async function addOutboundInTx(
     body: input.body,
     status: "queued",
     channel: input.channel,
+    // Tranché par le caller (champ REQUIS de `AddOutboundInput`).
+    outboundKind: input.outboundKind,
     generatedBy: input.generatedBy,
     createdAt: now,
     ...(input.externalReceiver !== undefined && {
@@ -1238,16 +1337,45 @@ export interface AddOutboundDraftInput {
  * draft + audit reply_generated est portée par la step.run Inngest +
  * la tx Firestore parente.
  *
+ * ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ * 🔒 `outboundKind` FIGÉ À `"reply"` (PR-OUTBOUNDKIND)
+ *
+ * Non fournissable par le caller — au même titre que `direction`,
+ * `status` et `generatedBy`. Justification : cette fonction n'a qu'UN
+ * appelant en production, `process-reply` (via le wrapper
+ * `addOutboundDraft`), et ce pipeline ne se déclenche QUE sur réception
+ * d'un SMS entrant du PS. Un draft est donc, par construction du flux,
+ * toujours une réponse.
+ *
+ * Le paramètre `conv` sert à deux choses : la garde de cohérence
+ * `"reply"` ⇒ `inboundCount > 0` (cf.
+ * `assertOutboundKindCoherentOrThrow`), et — effet de bord bienvenu — il
+ * force le caller à prouver que la conversation EXISTE. Avant
+ * PR-OUTBOUNDKIND, cette fonction créait sans broncher un message dans la
+ * sous-collection d'une conversation supprimée (Firestore autorise les
+ * sous-collections orphelines).
+ *
  * @param tx     Transaction Firestore ouverte par le caller.
+ * @param conv   `Conversation` déjà lue + parsée DANS `tx` (pattern miroir
+ *               `addOutboundInTx`). Fournit `inboundCount` pour la garde.
  * @param input  Voir `AddOutboundDraftInput` pour le périmètre.
  *
  * @returns L'ID Firestore (auto-généré, 20 chars `[A-Za-z0-9]`) du
  *          draft créé. À propager au caller pour audit + retour S9.3.3b.
  *
- * @throws ValidationError si `body` vide ou > `BODY_MAX_LENGTH`.
+ * @throws ValidationError si `body` vide ou > `BODY_MAX_LENGTH`, ou si
+ *                         `conv.inboundCount === 0` (draft = réponse, donc
+ *                         un inbound antérieur est obligatoire).
  */
-export function addOutboundDraftInTx(tx: Transaction, input: AddOutboundDraftInput): string {
+export function addOutboundDraftInTx(
+  tx: Transaction,
+  conv: Conversation,
+  input: AddOutboundDraftInput,
+): string {
   validateBodyOrThrow(input.body, input.conversationId);
+  // 🔒 PR-OUTBOUNDKIND — un draft est TOUJOURS une réponse : la conversation
+  // doit donc porter au moins un inbound. Sinon incohérence → crash.
+  assertOutboundKindCoherentOrThrow("reply", conv, input.conversationId);
 
   const messageRef = messagesSubcollectionRef(input.conversationId).doc(); // auto-ID
   const now = input.now !== undefined ? Timestamp.fromDate(input.now) : Timestamp.now();
@@ -1259,6 +1387,8 @@ export function addOutboundDraftInTx(tx: Transaction, input: AddOutboundDraftInp
     body: input.body,
     status: "draft",
     channel: "sms",
+    // FIGÉ — cf. JSDoc. `AddOutboundDraftInput` n'expose PAS ce champ.
+    outboundKind: "reply",
     generatedBy: "ai",
     aiModel: input.aiModel,
     aiPromptVersion: input.aiPromptVersion,
@@ -1283,18 +1413,31 @@ export function addOutboundDraftInTx(tx: Transaction, input: AddOutboundDraftInp
  * propre `runTransaction` et délègue à la version tx-aware. Pour callers
  * SANS tx ouverte (pipeline `process-reply` step 8b).
  *
- * Pattern miroir `addOutbound` (S6.5) qui wrap `addOutboundInTx`. Tous
- * les invariants de `addOutboundDraftInTx` s'appliquent (no counter
- * bump, no audit sms_sent, body validation).
+ * Pattern miroir `addOutbound` (S6.5) qui wrap `addOutboundInTx` : lit +
+ * parse la conversation DANS la tx, puis délègue. Tous les invariants de
+ * `addOutboundDraftInTx` s'appliquent (no counter bump, no audit sms_sent,
+ * body validation, `outboundKind` figé à `"reply"`).
  *
- * @throws ValidationError si `body` vide ou > `BODY_MAX_LENGTH`.
+ * PR-OUTBOUNDKIND — la lecture de la conversation est NOUVELLE ici : elle
+ * alimente la garde `"reply"` ⇒ `inboundCount > 0` et ferme au passage le
+ * cas "conversation supprimée" qui produisait silencieusement un message
+ * orphelin.
+ *
+ * @throws ValidationError si `body` vide ou > `BODY_MAX_LENGTH`, si la
+ *                         conversation est corrompue, ou si
+ *                         `inboundCount === 0`.
+ * @throws NotFoundError   si la conversation n'existe pas.
  */
 export async function addOutboundDraft(input: AddOutboundDraftInput): Promise<string> {
   // Pre-flight validation HORS tx → fail-fast sans ouvrir de tx si body
   // invalide. `addOutboundDraftInTx` re-valide en défense en profondeur.
   validateBodyOrThrow(input.body, input.conversationId);
 
-  return await getAdminDb().runTransaction(async (tx) => addOutboundDraftInTx(tx, input));
+  return await getAdminDb().runTransaction(async (tx) => {
+    const convRef = getAdminDb().collection(CONVERSATIONS_COLLECTION).doc(input.conversationId);
+    const conv = await readConversationInTxOrThrow(tx, convRef, input.conversationId);
+    return addOutboundDraftInTx(tx, conv, input);
+  });
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

@@ -45,6 +45,51 @@ export type MessageChannel = "sms" | "whatsapp";
 /** Auteur du contenu du message. */
 export type MessageGeneratedBy = "ai" | "human" | "system";
 
+/**
+ * 🔒 Nature d'un message SORTANT au regard du plafond L.34-5 CPCE
+ * (PR-OUTBOUNDKIND).
+ *
+ * ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ * SÉMANTIQUE
+ *
+ *   - `"solicitation"` : on prend l'initiative de déranger le PS. Premier
+ *     SMS de campagne, relance après silence. **Compte** contre le plafond.
+ *
+ *   - `"reply"` : réponse à un message que le PS vient de nous envoyer.
+ *     Le PS a engagé l'échange, on ne le dérange pas — on lui répond.
+ *
+ * ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ * 🚨 ESTAMPILLÉ À L'ÉCRITURE, JAMAIS DÉRIVÉ À LA LECTURE
+ *
+ * La valeur est FIGÉE par la fonction d'écriture, qui est la seule à
+ * SAVOIR ce qu'elle écrit :
+ *   - `addOutboundDraftInTx` → toujours `"reply"` (appelée uniquement par
+ *     `process-reply`, donc toujours en réaction à un inbound).
+ *   - `addOutboundInTx`      → le caller DOIT trancher (champ requis dans
+ *     `AddOutboundInput`) : `send-first-sms` pose `"solicitation"`.
+ *
+ * Deux alternatives ont été explicitement REJETÉES :
+ *
+ *   1. **Dériver d'un booléen conversation** (`inboundCount > 0`) :
+ *      rétroactif. 3 sollicitations envoyées puis le PS répond → les 3
+ *      passeraient "réponses" a posteriori → quota entier rendu. N'importe
+ *      quelle réponse du PS effacerait l'historique de sollicitation.
+ *
+ *   2. **Dériver d'un point de coupure** (`firstInboundAt`) : non
+ *      rétroactif, mais troué sur la RELANCE APRÈS SILENCE. Un PS qui
+ *      répond une fois puis se tait rendrait toutes les relances
+ *      ultérieures "réponses" → relances illimitées.
+ *
+ * L'estampillage à l'écriture est immunisé contre les deux.
+ *
+ * ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ * ⚠️ NE CONCERNE QUE LES SORTANTS. Un message `direction: "inbound"` n'a
+ * pas de `outboundKind` (le PS ne nous "sollicite" pas au sens L.34-5).
+ * Les lectures rate-limit filtrent `direction == "outbound"` en amont, le
+ * champ n'est donc jamais consulté sur un inbound.
+ */
+export type MessageOutboundKind = "solicitation" | "reply";
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Sous-objets
 // ─────────────────────────────────────────────────────────────────────────────
@@ -75,6 +120,31 @@ export interface Message {
   externalId?: string;
   /** E.164 destinataire (outbound) ou expéditeur (inbound). */
   externalReceiver?: string;
+
+  /**
+   * Nature de la sollicitation (SORTANTS uniquement) — cf.
+   * `MessageOutboundKind` pour la sémantique et les alternatives rejetées.
+   *
+   * **Optionnel, et il le reste À LA LECTURE.** Deux raisons distinctes :
+   *   1. les docs LEGACY écrits avant PR-OUTBOUNDKIND n'ont pas le champ ;
+   *   2. les messages `inbound` ne le portent pas du tout.
+   *
+   * 🚨 `MessageSchema` applique bien un défaut `"solicitation"` au parse,
+   * mais `_parseMessageOrThrow` fait `result.data as Message` : le cast
+   * **efface cette garantie au niveau du type**. Côté lecteur, la valeur
+   * est donc bel et bien `MessageOutboundKind | undefined`.
+   *
+   * ⚠️ NE PAS écrire son propre test de nature — la forme
+   * `!== "solicitation"` exclurait tous les docs legacy du comptage, soit
+   * un sous-comptage silencieux du plafond L.34-5 CPCE. Utiliser
+   * `countsAgainstCap()` de `lib/compliance/outbound-kind.ts`, seul
+   * endroit où le défaut fail-closed est appliqué à la lecture.
+   *
+   * Aucun backfill n'est nécessaire : la fenêtre rate-limit étant glissante
+   * sur 30 jours, 30 jours après le déploiement plus aucun doc comptabilisé
+   * n'est legacy.
+   */
+  outboundKind?: MessageOutboundKind;
 
   // Génération IA
   generatedBy: MessageGeneratedBy;

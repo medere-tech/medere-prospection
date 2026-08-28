@@ -262,6 +262,23 @@ describe("sendFirstSmsHandler — happy path DRY_RUN", () => {
     );
   });
 
+  it("🔒 PR-OUTBOUNDKIND : le 1er SMS est estampillé 'solicitation'", async () => {
+    // Le premier SMS d'une campagne est non sollicité par définition :
+    // c'est NOUS qui prenons l'initiative de déranger le PS. C'est la
+    // définition même d'une sollicitation au sens L.34-5 CPCE, donc il
+    // devra compter contre le plafond quand le filtre sera branché.
+    //
+    // Si quelqu'un le passait à "reply", ce SMS sortirait du comptage →
+    // sollicitations invisibles → infraction. Ce test casse alors.
+    await sendFirstSmsHandler(makeFakeCtx({ body: "Hello body" }));
+
+    expect(sendOutboundWithLock).toHaveBeenCalledWith(
+      expect.objectContaining({
+        input: expect.objectContaining({ outboundKind: "solicitation" }),
+      }),
+    );
+  });
+
   it("🔒 SCOPE PER-CONTACT : le pré-check lit l'historique du CONTACT, jamais d'une conversation", async () => {
     // Sentinelle PR-PER-CONTACT sur le call site hors tx. `contactId` et
     // `conversationId` sont tous deux des strings : sans cette assertion,
