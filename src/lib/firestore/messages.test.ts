@@ -70,6 +70,7 @@ import {
   __DEFAULT_LIST_DAYS_FOR_TESTS,
   __MESSAGES_PARENT_COLLECTION_FOR_TESTS,
   __MESSAGES_SUBCOLLECTION_FOR_TESTS,
+  __REPLY_INBOUND_RECENCY_HOURS_FOR_TESTS,
   __STALE_MESSAGES_DEFAULT_LIMIT_FOR_TESTS,
   _parseMessageOrThrow,
   addInbound,
@@ -1576,7 +1577,11 @@ describe("messages.ts", () => {
       // Cas d'usage futur : un commercial humain qui répond via le
       // dashboard. La garde ne se déclenche pas puisque le PS a écrit.
       const convId = "conv_kind_reply_ok";
-      await seedConversation(convId, { inboundCount: 1, messageCount: 1 });
+      await seedConversation(convId, {
+        inboundCount: 1,
+        messageCount: 1,
+        lastInboundAt: Timestamp.now(),
+      });
 
       const messageId = await addOutbound(convId, {
         body: "Bonjour Docteur, Léa de Médéré. STOP pour refuser.",
@@ -1767,7 +1772,11 @@ describe("messages.ts", () => {
       // DEUX endroits où « ce qui compte » est décidé → drift garanti, et
       // le `totalOutboundCount` du contexte d'audit deviendrait faux.
       const convId = "conv_kind_mapper_transports";
-      await seedConversation(convId, { inboundCount: 1, messageCount: 1 });
+      await seedConversation(convId, {
+        inboundCount: 1,
+        messageCount: 1,
+        lastInboundAt: Timestamp.now(),
+      });
       const now = new Date();
 
       await addOutbound(convId, {
@@ -1796,7 +1805,11 @@ describe("messages.ts", () => {
       // vraie chaîne Firestore → mapper → compliance : une conversation
       // vivante ne sature jamais le plafond.
       const convId = "conv_kind_e2e_dialogue";
-      await seedConversation(convId, { inboundCount: 1, messageCount: 1 });
+      await seedConversation(convId, {
+        inboundCount: 1,
+        messageCount: 1,
+        lastInboundAt: Timestamp.now(),
+      });
       const now = new Date();
 
       await addOutbound(convId, {
@@ -1825,7 +1838,11 @@ describe("messages.ts", () => {
 
     it("🔒 BOUT-EN-BOUT : 4 sollicitations + 10 réponses en base → canSendMessage REFUSE", async () => {
       const convId = "conv_kind_e2e_cap";
-      await seedConversation(convId, { inboundCount: 1, messageCount: 1 });
+      await seedConversation(convId, {
+        inboundCount: 1,
+        messageCount: 1,
+        lastInboundAt: Timestamp.now(),
+      });
       const now = new Date();
 
       for (let i = 0; i < 4; i++) {
@@ -2104,7 +2121,11 @@ describe("messages.ts", () => {
   describe("addOutboundDraftInTx (S9.3.3a)", () => {
     it("happy path : crée un doc Message status='draft' avec tous les champs IA", async () => {
       const convId = "conv_draft_happy";
-      await seedConversation(convId, { inboundCount: 1, messageCount: 1 });
+      await seedConversation(convId, {
+        inboundCount: 1,
+        messageCount: 1,
+        lastInboundAt: Timestamp.now(),
+      });
 
       const draftId = await getAdminDb().runTransaction(async (tx) =>
         addOutboundDraftInTx(tx, await readConvInTx(tx, convId), {
@@ -2176,6 +2197,93 @@ describe("messages.ts", () => {
       expect(await countMessages(convId)).toBe(0);
     });
 
+    it("🔒 RÉCENCE (MAJEUR-1) : inbound vieux de 3 SEMAINES → ValidationError", async () => {
+      // Le scénario que cette garde existe pour empêcher : `schedule-followup`
+      // réutilisant `addOutboundDraftInTx` (chemin naturel, mêmes besoins que
+      // `process-reply`) pour une RELANCE après silence. `inboundCount > 0`
+      // reste vrai éternellement — sans borne de récence, la relance serait
+      // estampillée "reply", donc HORS du plafond L.34-5.
+      //
+      // Depuis PR-BARRIERE-2 (décision d), la règle 5 ne bloque plus les
+      // "reply" : cette garde est la SEULE protection restante.
+      const convId = "conv_draft_stale_inbound";
+      const troisSemaines = Timestamp.fromDate(new Date(Date.now() - 21 * 86400_000));
+      await seedConversation(convId, {
+        inboundCount: 1,
+        messageCount: 1,
+        lastInboundAt: troisSemaines,
+      });
+
+      await expect(
+        addOutboundDraft({
+          contactId: "contact_abc",
+          conversationId: convId,
+          body: "Relance déguisée en réponse. STOP pour refuser. Médéré.",
+          aiModel: "claude-sonnet-4-6",
+          aiPromptVersion: "1.0.0",
+          aiTemperature: 0.5,
+          aiTokensInput: 100,
+          aiTokensOutput: 10,
+          aiGenerationDurationMs: 500,
+        }),
+      ).rejects.toBeInstanceOf(ValidationError);
+
+      expect(await countMessages(convId)).toBe(0);
+    });
+
+    it("RÉCENCE : inbound d'il y a 2h → accepté (cas nominal process-reply)", async () => {
+      // En régime nominal, `process-reply` stocke l'entrant (step 4) avant
+      // de générer le draft (step 8b) : `lastInboundAt ≈ now`. La fenêtre
+      // de 48h absorbe largement les retries Inngest.
+      const convId = "conv_draft_fresh_inbound";
+      await seedConversation(convId, {
+        inboundCount: 1,
+        messageCount: 1,
+        lastInboundAt: Timestamp.fromDate(new Date(Date.now() - 2 * 3600_000)),
+      });
+
+      const draftId = await addOutboundDraft({
+        contactId: "contact_abc",
+        conversationId: convId,
+        body: "Vraie réponse. STOP pour refuser. Médéré.",
+        aiModel: "claude-sonnet-4-6",
+        aiPromptVersion: "1.0.0",
+        aiTemperature: 0.5,
+        aiTokensInput: 100,
+        aiTokensOutput: 10,
+        aiGenerationDurationMs: 500,
+      });
+
+      expect(draftId).toMatch(FIRESTORE_AUTO_ID_PATTERN);
+      expect((await readMessageDoc(convId, draftId)).outboundKind).toBe("reply");
+    });
+
+    it("🔒 RÉCENCE : inboundCount>0 mais lastInboundAt ABSENT → refus (récence invérifiable)", async () => {
+      // Cas vacant en pratique (`_bumpConversationCountersTx` pose toujours
+      // les deux ensemble), mais on ne présume pas d'une récence qu'on ne
+      // peut pas vérifier : sens fail-closed pour le plafond légal.
+      const convId = "conv_draft_no_lastinbound";
+      await seedConversation(convId, { inboundCount: 1, messageCount: 1 });
+
+      await expect(
+        addOutboundDraft({
+          contactId: "contact_abc",
+          conversationId: convId,
+          body: "Réponse sans lastInboundAt. STOP. Médéré.",
+          aiModel: "claude-sonnet-4-6",
+          aiPromptVersion: "1.0.0",
+          aiTemperature: 0.5,
+          aiTokensInput: 100,
+          aiTokensOutput: 10,
+          aiGenerationDurationMs: 500,
+        }),
+      ).rejects.toBeInstanceOf(ValidationError);
+    });
+
+    it("SENTINELLE : fenêtre de récence = 48h", () => {
+      expect(__REPLY_INBOUND_RECENCY_HOURS_FOR_TESTS).toBe(48);
+    });
+
     it("🔒 GARDE : le wrapper addOutboundDraft applique la même garde (conv sans inbound)", async () => {
       const convId = "conv_draft_wrapper_no_inbound";
       await seedConversation(convId, { inboundCount: 0 });
@@ -2222,7 +2330,11 @@ describe("messages.ts", () => {
       // Si retiré, race en S9.4 quand commitDraftToQueued bumpera à son
       // tour → double-comptage côté analytics et rate-limit.
       const convId = "conv_draft_no_bump";
-      await seedConversation(convId, { inboundCount: 1, messageCount: 1 });
+      await seedConversation(convId, {
+        inboundCount: 1,
+        messageCount: 1,
+        lastInboundAt: Timestamp.now(),
+      });
 
       const before = await getAdminDb()
         .collection(__CONVERSATIONS_COLLECTION_FOR_TESTS)
@@ -2266,7 +2378,11 @@ describe("messages.ts", () => {
       // l'envoi OVH est acté (S9.4). Le caller (process-reply step 8
       // S9.3.3b) posera reply_generated à la place, distinct.
       const convId = "conv_draft_no_audit";
-      await seedConversation(convId, { inboundCount: 1, messageCount: 1 });
+      await seedConversation(convId, {
+        inboundCount: 1,
+        messageCount: 1,
+        lastInboundAt: Timestamp.now(),
+      });
 
       const beforeAudit = await countAuditDocs();
 
@@ -2291,7 +2407,11 @@ describe("messages.ts", () => {
 
     it("body vide → ValidationError (pas de doc créé)", async () => {
       const convId = "conv_draft_empty_body";
-      await seedConversation(convId, { inboundCount: 1, messageCount: 1 });
+      await seedConversation(convId, {
+        inboundCount: 1,
+        messageCount: 1,
+        lastInboundAt: Timestamp.now(),
+      });
 
       await expect(
         getAdminDb().runTransaction(async (tx) =>
@@ -2314,7 +2434,11 @@ describe("messages.ts", () => {
 
     it("body > BODY_MAX_LENGTH (1600) → ValidationError", async () => {
       const convId = "conv_draft_too_long";
-      await seedConversation(convId, { inboundCount: 1, messageCount: 1 });
+      await seedConversation(convId, {
+        inboundCount: 1,
+        messageCount: 1,
+        lastInboundAt: Timestamp.now(),
+      });
 
       const tooLong = "a".repeat(__BODY_MAX_LENGTH_FOR_TESTS + 1);
       await expect(
@@ -2339,7 +2463,11 @@ describe("messages.ts", () => {
       // tient ENSEMBLE pour les deux modules : addOutboundDraftInTx crée
       // un doc status='draft', listRecentOutbound le filtre.
       const convId = "conv_draft_e2e_rate_limit";
-      await seedConversation(convId, { inboundCount: 1, messageCount: 1 });
+      await seedConversation(convId, {
+        inboundCount: 1,
+        messageCount: 1,
+        lastInboundAt: Timestamp.now(),
+      });
 
       await getAdminDb().runTransaction(async (tx) =>
         addOutboundDraftInTx(tx, await readConvInTx(tx, convId), {

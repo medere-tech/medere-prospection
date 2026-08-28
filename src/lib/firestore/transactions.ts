@@ -302,7 +302,35 @@ export interface SendOutboundWithLockArgs {
   contactId: string;
   campaignId: string;
   conversationId: string;
-  input: AddOutboundInput;
+  /**
+   * 🔒 `outboundKind` NARROWÉ au littéral `"solicitation"` — pas
+   * `MessageOutboundKind` (PR-BARRIERE-2, MINEUR-4).
+   *
+   * ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+   * POURQUOI UN LITTÉRAL ET PAS UNE ASSERTION SEULE
+   *
+   * Ce chemin ne re-vérifie que `canSendMessage` (plafond légal), PAS les
+   * 10 règles de `preSendCheck` : le plafond de VOLUME des réponses
+   * (règle 6) n'y est jamais appliqué.
+   *
+   * Une assertion runtime existe bien plus bas — mais elle tire TROP TARD.
+   * La précondition 4 de cette fonction impose que `sendSms()` ait déjà
+   * été exécuté par le caller. La séquence réelle d'un mésusage serait
+   * donc : SMS **parti chez OVH** → assertion → `ValidationError` →
+   * rollback intégral → **aucun doc `messages/{id}`, aucun audit
+   * `sms_sent`, aucun audit `sms_provider_dispatched`**. Le PS a reçu un
+   * message invisible aux deux plafonds pour tous les envois futurs, et
+   * introuvable en forensic L.34-5. Le pire des deux mondes.
+   *
+   * Le narrowing déplace l'échec du RUNTIME (après dispatch, irréversible)
+   * vers le COMPILE (avant d'écrire la ligne). L'assertion runtime est
+   * conservée en defense-in-depth pour les callers qui bypasseraient le
+   * typage via `as` — mais elle n'est plus la première ligne.
+   *
+   * Une réponse doit passer par `commitDraftToQueued`, qui applique les
+   * 10 règles dans sa transaction.
+   */
+  input: AddOutboundInput & { outboundKind: "solicitation" };
   dispatch: {
     ovhMessageId: string;
     sender: string;
@@ -529,6 +557,45 @@ export async function sendOutboundWithLock(
         args.contactId,
         RATE_LIMIT_WINDOW_DAYS,
       );
+
+      // ── 3bis. Assertion : ce chemin n'envoie QUE des sollicitations ───────
+      //
+      // 🔒 PR-BARRIERE-2 (b) — DEFENSE-IN-DEPTH, plus la première ligne.
+      //
+      // La première ligne est désormais le TYPE : `SendOutboundWithLockArgs`
+      // narrowe `input.outboundKind` au littéral `"solicitation"`, donc un
+      // appelant qui tenterait d'y router une réponse ne compile pas (cf.
+      // JSDoc du champ + `@ts-expect-error` dans `transactions.test.ts`).
+      //
+      // Cette assertion ne peut donc être atteinte que par un bypass du
+      // typage (`as`, `any`, JS non typé). On la garde parce qu'elle
+      // couvre exactement ce cas — mais elle tire APRÈS le dispatch OVH
+      // (précondition 4), donc le SMS est déjà parti quand elle throw.
+      // C'est un filet, pas une protection.
+      //
+      // Ce chemin re-vérifie UNIQUEMENT `canSendMessage` (plafond légal),
+      // PAS les 10 règles de `preSendCheck`. Le plafond de VOLUME des
+      // réponses (10/24h, règle 6) n'y est donc pas appliqué.
+      //
+      // C'est sans conséquence aujourd'hui : le seul appelant est
+      // `send-first-sms`, qui envoie des sollicitations. Mais l'invariant
+      // est IMPLICITE, et une réponse routée ici passerait sans aucun
+      // contrôle de volume — exactement l'emballement que PR-BARRIERE-2
+      // cherche à rendre impossible.
+      //
+      // On refuse donc bruyamment plutôt que de laisser un futur appelant
+      // découvrir le trou en production. Si un jour ce chemin doit porter
+      // des réponses, il faudra d'abord y câbler `canSendReplyVolume`.
+      if (args.input.outboundKind !== "solicitation") {
+        throw new ValidationError({
+          message: `sendOutboundWithLock only handles solicitations, got outboundKind="${args.input.outboundKind}". Replies must go through commitDraftToQueued (which applies the reply_volume rule).`,
+          context: {
+            contactId: args.contactId,
+            conversationId: args.conversationId,
+            outboundKind: args.input.outboundKind,
+          },
+        });
+      }
 
       // ── 4. Re-check rate-limit DANS la tx ─────────────────────────────────
       const rateLimitCheck = canSendMessage(recentOutbound);
