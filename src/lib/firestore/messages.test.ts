@@ -44,6 +44,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { __resetEnvCacheForTests } from "@/lib/security/env";
 import { AuditPiiError, NotFoundError, ValidationError } from "@/lib/utils/errors";
+import { logger } from "@/lib/utils/logger";
 import type { Conversation } from "@/types/conversation";
 import type { Message } from "@/types/message";
 
@@ -56,6 +57,7 @@ import {
 import * as auditLogModule from "./audit-log";
 import { __AUDIT_COLLECTION_FOR_TESTS } from "./audit-log";
 import {
+  __CONVERSATION_FANOUT_WARN_THRESHOLD_FOR_TESTS,
   __CONVERSATIONS_COLLECTION_FOR_TESTS,
   _parseConversationOrThrow,
   conversationDocId,
@@ -74,6 +76,8 @@ import {
   findInboundByExternalId,
   listRecentMessages,
   listRecentOutbound,
+  listRecentOutboundByContact,
+  listRecentOutboundByContactInTx,
   listRecentOutboundInTx,
   listStaleMessages,
   RATE_LIMIT_COUNTED_STATUSES,
@@ -1291,6 +1295,159 @@ describe("messages.ts", () => {
       await seedConversation(convId);
       const result = await getAdminDb().runTransaction((tx) => listRecentOutboundInTx(tx, convId));
       expect(result).toEqual([]);
+    });
+  });
+
+  // ───────────────────────────────────────────────────────────────────────
+  // listRecentOutboundByContact{,InTx} (PR-PER-CONTACT) — fan-out
+  // ───────────────────────────────────────────────────────────────────────
+
+  describe("listRecentOutboundByContact{,InTx} (PR-PER-CONTACT)", () => {
+    it("FAN-OUT : 1 contact, 3 conversations × 1 outbound → 3 records (somme des 3)", async () => {
+      // Le cœur de la PR : le comptage agrège les conversations d'un même
+      // PS. Scopé conversation, on aurait lu 1 seul message.
+      const contactId = "hs_fanout";
+      const now = new Date("2026-05-17T12:00:00Z");
+
+      for (const camp of ["a", "b", "c"]) {
+        const convId = `${contactId}_camp_${camp}`;
+        await seedConversation(convId, { contactId, campaignId: `camp_${camp}` });
+        await seedMessage(convId, {
+          createdAt: Timestamp.fromDate(new Date("2026-05-15T10:00:00Z")),
+          status: "sent",
+          body: `msg_${camp}`,
+        });
+      }
+
+      const result = await listRecentOutboundByContact(contactId, 30, now);
+
+      expect(result).toHaveLength(3);
+      // Comparaison de contrôle : la version scopée conversation n'en voit qu'1.
+      expect(await listRecentOutbound(`${contactId}_camp_a`, 30, now)).toHaveLength(1);
+    });
+
+    it("🔒 conversation `closed` : ses outbounds comptent QUAND MÊME", async () => {
+      // Une conv terminée porte des SMS réellement reçus par le PS — ils
+      // dérangent au sens L.34-5 CPCE tant qu'ils sont dans la fenêtre 30j.
+      const contactId = "hs_closed";
+      const now = new Date("2026-05-17T12:00:00Z");
+      const recent = Timestamp.fromDate(new Date("2026-05-15T10:00:00Z"));
+
+      await seedConversation(`${contactId}_camp_closed`, { contactId, status: "closed" });
+      await seedMessage(`${contactId}_camp_closed`, { createdAt: recent, status: "delivered" });
+
+      await seedConversation(`${contactId}_camp_live`, { contactId, status: "in_dialogue" });
+      await seedMessage(`${contactId}_camp_live`, { createdAt: recent, status: "sent" });
+
+      const result = await listRecentOutboundByContact(contactId, 30, now);
+      expect(result).toHaveLength(2);
+    });
+
+    it("les invariants de listRecentOutbound survivent au fan-out (fenêtre + status + inbound)", async () => {
+      // Le fan-out RÉUTILISE listRecentOutbound : ses filtres doivent
+      // continuer de s'appliquer conversation par conversation.
+      const contactId = "hs_invariants";
+      const now = new Date("2026-05-17T12:00:00Z");
+      const inWindow = Timestamp.fromDate(new Date(now.getTime() - 5 * 86400_000));
+      const outOfWindow = Timestamp.fromDate(new Date(now.getTime() - 31 * 86400_000));
+
+      await seedConversation(`${contactId}_camp_a`, { contactId });
+      await seedMessage(`${contactId}_camp_a`, { createdAt: inWindow, status: "sent" });
+      await seedMessage(`${contactId}_camp_a`, { createdAt: outOfWindow, status: "sent" }); // hors 30j
+      await seedMessage(`${contactId}_camp_a`, { createdAt: inWindow, status: "draft" }); // exclu
+      await seedMessage(`${contactId}_camp_a`, { createdAt: inWindow, status: "failed" }); // exclu
+
+      await seedConversation(`${contactId}_camp_b`, { contactId });
+      await seedMessage(`${contactId}_camp_b`, { createdAt: inWindow, status: "queued" });
+      await seedMessage(`${contactId}_camp_b`, {
+        direction: "inbound",
+        status: "received",
+        createdAt: inWindow,
+      }); // exclu
+
+      const result = await listRecentOutboundByContact(contactId, 30, now);
+      expect(result).toHaveLength(2); // 1 `sent` (conv a) + 1 `queued` (conv b)
+    });
+
+    it("ordre DESC par sentAt à l'échelle du CONTACT (fusion inter-conversations)", async () => {
+      const contactId = "hs_merge_order";
+      const now = new Date("2026-05-17T12:00:00Z");
+      const t1 = Timestamp.fromDate(new Date("2026-05-10T10:00:00Z"));
+      const t2 = Timestamp.fromDate(new Date("2026-05-14T10:00:00Z"));
+      const t3 = Timestamp.fromDate(new Date("2026-05-16T10:00:00Z"));
+
+      await seedConversation(`${contactId}_camp_a`, { contactId });
+      await seedConversation(`${contactId}_camp_b`, { contactId });
+      // Entrelacé volontairement : t1 et t3 dans A, t2 dans B.
+      await seedMessage(`${contactId}_camp_a`, { createdAt: t1, status: "sent" });
+      await seedMessage(`${contactId}_camp_a`, { createdAt: t3, status: "sent" });
+      await seedMessage(`${contactId}_camp_b`, { createdAt: t2, status: "sent" });
+
+      const result = await listRecentOutboundByContact(contactId, 30, now);
+
+      const millis = result.map((r) => (r.sentAt as Timestamp).toMillis());
+      expect(millis).toEqual([t3.toMillis(), t2.toMillis(), t1.toMillis()]);
+    });
+
+    it("contact sans conversation → []", async () => {
+      expect(await listRecentOutboundByContact("hs_void", 30, new Date())).toEqual([]);
+    });
+
+    it("contactId vide → ValidationError (propagé par l'étage 1)", async () => {
+      await expect(listRecentOutboundByContact("")).rejects.toBeInstanceOf(ValidationError);
+    });
+
+    it("SENTINELLE alignement : listRecentOutboundByContactInTx === listRecentOutboundByContact", async () => {
+      // Extension au fan-out de la sentinelle historique
+      // (`listRecentOutboundInTx` === `listRecentOutbound`). Si les 2
+      // chemins divergent, le pré-check HORS tx et le re-check autoritaire
+      // DANS la tx ne comptent plus la même chose.
+      const contactId = "hs_align_fanout";
+      const now = new Date("2026-05-17T12:00:00Z");
+      const t1Created = Timestamp.fromDate(new Date("2026-05-15T10:00:00Z"));
+      const t1Sent = Timestamp.fromDate(new Date("2026-05-15T10:05:00Z"));
+      const t2Created = Timestamp.fromDate(new Date("2026-05-16T10:00:00Z"));
+
+      await seedConversation(`${contactId}_camp_a`, { contactId });
+      await seedConversation(`${contactId}_camp_b`, { contactId, status: "closed" });
+      await seedMessage(`${contactId}_camp_a`, {
+        createdAt: t1Created,
+        sentAt: t1Sent,
+        status: "sent",
+      });
+      await seedMessage(`${contactId}_camp_b`, { createdAt: t2Created, status: "queued" });
+
+      const nonTx = await listRecentOutboundByContact(contactId, 30, now);
+      const inTx = await getAdminDb().runTransaction((tx) =>
+        listRecentOutboundByContactInTx(tx, contactId, 30, now),
+      );
+
+      expect(inTx).toEqual(nonTx);
+      expect(inTx).toHaveLength(2);
+      // Mapping fallback `sentAt ?? createdAt` préservé à travers le fan-out.
+      expect((inTx[0]?.sentAt as Timestamp).toMillis()).toBe(t2Created.toMillis());
+      expect((inTx[1]?.sentAt as Timestamp).toMillis()).toBe(t1Sent.toMillis());
+    });
+
+    it("🔒 ANTI-TRONCATURE : N > seuil de warn → les N conversations sont lues, aucun message perdu", async () => {
+      // Miroir messages.ts du test conversations.ts : on vérifie ici que
+      // le fan-out AGRÈGE bien les N conversations (1 outbound chacune).
+      const contactId = "hs_many_msgs";
+      const now = new Date("2026-05-17T12:00:00Z");
+      const createdAt = Timestamp.fromDate(new Date("2026-05-15T10:00:00Z"));
+      const count = __CONVERSATION_FANOUT_WARN_THRESHOLD_FOR_TESTS + 2;
+
+      for (let i = 0; i < count; i++) {
+        const convId = `${contactId}_camp_${String(i).padStart(2, "0")}`;
+        await seedConversation(convId, { contactId });
+        await seedMessage(convId, { createdAt, status: "sent", body: `m${i}` });
+      }
+
+      const warnSpy = vi.spyOn(logger, "warn").mockImplementation(() => undefined as never);
+      const result = await listRecentOutboundByContact(contactId, 30, now);
+      warnSpy.mockRestore();
+
+      expect(result).toHaveLength(count);
     });
   });
 

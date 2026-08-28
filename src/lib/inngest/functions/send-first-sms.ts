@@ -53,7 +53,9 @@
  * PIPELINE 4 STEPS (Voie 2 minimaliste — Q2 arbitrée par Déthié S8)
  *
  *   1. `get-contact-and-history`  : `getContact(contactId)` + lookup
- *                                    `getConversation` + `listRecentOutbound`.
+ *                                    `getConversation` +
+ *                                    `listRecentOutboundByContact` (scope
+ *                                    CONTACT — PR-PER-CONTACT).
  *                                    Throws `NonRetriableError` si contact
  *                                    ou conversation absents (config morte).
  *
@@ -108,7 +110,7 @@ import { RATE_LIMIT_MAX_MESSAGES } from "@/lib/compliance/rate-limits";
 import { appendAuditLog } from "@/lib/firestore/audit-log";
 import { getContact } from "@/lib/firestore/contacts";
 import { conversationDocId, getConversation } from "@/lib/firestore/conversations";
-import { listRecentOutbound } from "@/lib/firestore/messages";
+import { listRecentOutboundByContact } from "@/lib/firestore/messages";
 import { sendOutboundWithLock } from "@/lib/firestore/transactions";
 import { getInngestClient } from "@/lib/inngest/client";
 import { smsSendFirstRequested } from "@/lib/inngest/events";
@@ -220,7 +222,13 @@ export async function sendFirstSmsHandler(ctx: InngestHandlerContext): Promise<S
     if (!conversation) {
       throw new NonRetriableError(`Conversation not found: ${cid}`);
     }
-    const recentOutboundMessages = await listRecentOutbound(cid);
+    // 🚨 SCOPE = CONTACT (PR-PER-CONTACT), pas `cid`. Le pré-check S5 doit
+    // voir les sollicitations de TOUTES les campagnes de ce PS, sinon un
+    // contact recontacté dans une 2e campagne repart avec un quota neuf.
+    // Le re-check autoritaire DANS la tx (`sendOutboundWithLock`) utilise
+    // le même scope — les deux doivent rester alignés, sinon
+    // `expectedRemainingQuota` (l. ~338) devient incohérent.
+    const recentOutboundMessages = await listRecentOutboundByContact(contactId);
     return {
       contact,
       conversation,
@@ -291,7 +299,7 @@ export async function sendFirstSmsHandler(ctx: InngestHandlerContext): Promise<S
   // ── Step 4 : record-outbound-message (DEBT-001.5 — sendOutboundWithLock) ──
   // Composition tx atomique unique :
   //   - withContactLock(contactId) — lock optimiste Firestore
-  //   - re-check rate-limit DANS la tx via listRecentOutboundInTx
+  //   - re-check rate-limit DANS la tx via listRecentOutboundByContactInTx
   //   - addOutboundInTx — message + audit sms_sent interne
   //   - appendAuditLogTx — audit sms_provider_dispatched
   // Tout commit OU tout rollback (DETTE-001 + DETTE-004 fermées).

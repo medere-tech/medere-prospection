@@ -315,4 +315,183 @@ describe("sendOutboundWithLock — race resilience 10 iterations (DEBT-001.6)", 
       ).toBe(1);
     }
   }, 60_000); // timeout étendu pour 10 itérations × 2 appels Firestore
+
+  // ───────────────────────────────────────────────────────────────────────
+  // PR-PER-CONTACT — race CROSS-CONVERSATION (même PS, 2 campagnes)
+  // ───────────────────────────────────────────────────────────────────────
+
+  it("🔴 CROSS-CONVERSATION : même contact, 2 conversations, 2 envois simultanés au plafond → exactement 1 succès + 1 ComplianceConcurrencyError (10 itérations, ZERO flaky)", async () => {
+    // ─────────────────────────────────────────────────────────────────────
+    // CE QUE CE TEST PROUVE — et ce qu'il aurait laissé passer AVANT
+    //
+    // Le docId conversation est composite `${contactId}_${campaignId}` :
+    // un PS enrôlé dans 2 campagnes possède 2 conversations, donc 2
+    // sous-collections `messages` DISTINCTES.
+    //
+    // AVANT (comptage scopé conversationId) : l'appel A lisait la conv X
+    // (1 outbound), l'appel B lisait la conv Y (1 outbound). Chacun voyait
+    // "1 < 3", chacun validait, et les deux écrivaient dans des
+    // sous-collections différentes — donc AUCUN conflit Firestore ne les
+    // départageait. Résultat : 4 SMS au même PS. Le test mono-conversation
+    // ci-dessus ne pouvait PAS le détecter (ses 2 appels se battaient sur
+    // la MÊME sous-collection).
+    //
+    // APRÈS (comptage scopé contactId) : les 2 tx lisent la query
+    // `conversations.where(contactId==)` ET les messages des DEUX
+    // conversations → read sets partagés → le commit du perdant est rejeté
+    // par Firestore, sa tx retry, relit 3 outbounds, et `canSendMessage`
+    // refuse → ComplianceConcurrencyError.
+    //
+    // Si quelqu'un re-scope le comptage sur la conversation, ce test
+    // produit 2 fulfilled et 4 outbounds → il DOIT casser.
+    // ─────────────────────────────────────────────────────────────────────
+    const ITERATIONS = 10;
+
+    for (let i = 0; i < ITERATIONS; i++) {
+      const contactId = `c_xconv_iter${i}`;
+      const campaignX = `campX_iter${i}`;
+      const campaignY = `campY_iter${i}`;
+      const convX = `${contactId}_${campaignX}`;
+      const convY = `${contactId}_${campaignY}`;
+
+      // Pré-condition : 1 contact, 2 conversations, 1 outbound récent dans
+      // CHACUNE → 2 sollicitations au total pour ce PS = "à 1 SMS du
+      // plafond" à l'échelle de la PERSONNE (invisible si on compte par
+      // conversation : chacune n'en montre qu'1).
+      await seedContact(contactId);
+      await seedConversation(convX, {
+        contactId,
+        campaignId: campaignX,
+        messageCount: 1,
+        outboundCount: 1,
+      });
+      await seedConversation(convY, {
+        contactId,
+        campaignId: campaignY,
+        messageCount: 1,
+        outboundCount: 1,
+      });
+      await seedOutboundMessage(convX, 5, `iter${i}_x1`);
+      await seedOutboundMessage(convY, 3, `iter${i}_y1`);
+
+      const buildArgs = (campaignId: string, conversationId: string, bodyTag: string) => ({
+        contactId,
+        campaignId,
+        conversationId,
+        input: {
+          body: `Race ${bodyTag} — STOP pour refuser. Léa IA Médéré.`,
+          channel: "sms" as const,
+          generatedBy: "ai" as const,
+        },
+        dispatch: {
+          ovhMessageId: `ovh-xconv-${i}-${bodyTag}`,
+          sender: "MEDERE",
+          bodyLength: 60,
+          creditsRemoved: 1,
+          dryRun: false,
+        },
+        // Pre-check per-contact HORS tx aurait dit "1 place dispo" (3 - 2).
+        expectedRemainingQuota: 1,
+      });
+
+      // 🚨 Les 2 appels ciblent des CONVERSATIONS DIFFÉRENTES du même contact.
+      const [a, b] = await Promise.allSettled([
+        sendOutboundWithLock(buildArgs(campaignX, convX, "X")),
+        sendOutboundWithLock(buildArgs(campaignY, convY, "Y")),
+      ]);
+
+      const fulfilled = [a, b].filter((r) => r.status === "fulfilled");
+      const rejected = [a, b].filter((r) => r.status === "rejected");
+
+      expect(fulfilled.length, `iteration ${i}: exactement 1 fulfilled attendu`).toBe(1);
+      expect(rejected.length, `iteration ${i}: exactement 1 rejected attendu`).toBe(1);
+
+      const rejection = rejected[0];
+      if (rejection?.status === "rejected") {
+        expect(
+          rejection.reason,
+          `iteration ${i}: la rejection DOIT être ComplianceConcurrencyError`,
+        ).toBeInstanceOf(ComplianceConcurrencyError);
+        const err = rejection.reason as ComplianceConcurrencyError;
+        expect(err.context.contactId).toBe(contactId);
+        expect(err.context.ruleName).toBe("rate_limit_30d");
+        expect(err.context.observedRemainingQuota).toBe(0);
+      }
+
+      // ── État final : 3 outbound POUR LE CONTACT (2 seeds + 1 winner) ──
+      // C'est l'assertion qui compte : le total est per-PERSONNE, réparti
+      // sur les 2 conversations. Avant la PR : 4.
+      const totalForContact =
+        (await countOutboundMessages(convX)) + (await countOutboundMessages(convY));
+      expect(
+        totalForContact,
+        `iteration ${i}: 3 outbound attendus pour le CONTACT (toutes campagnes)`,
+      ).toBe(3);
+    }
+  }, 60_000);
+
+  it("🔒 PLAFOND PER-CONTACT : 3 outbounds répartis sur 2 conversations → le 4e (3e conversation) est refusé", async () => {
+    // Preuve directe (sans course) que le comptage est bien per-personne :
+    // aucune des 3 conversations ne dépasse individuellement le plafond,
+    // mais le CONTACT est déjà à 3/3. Un 4e envoi, même sur une campagne
+    // toute neuve, doit être refusé.
+    const contactId = "c_percontact_cap";
+    const convA = `${contactId}_campA`;
+    const convB = `${contactId}_campB`;
+    const convC = `${contactId}_campC`;
+
+    await seedContact(contactId);
+    await seedConversation(convA, {
+      contactId,
+      campaignId: "campA",
+      messageCount: 2,
+      outboundCount: 2,
+    });
+    await seedConversation(convB, {
+      contactId,
+      campaignId: "campB",
+      messageCount: 1,
+      outboundCount: 1,
+    });
+    await seedConversation(convC, {
+      contactId,
+      campaignId: "campC",
+      messageCount: 0,
+      outboundCount: 0,
+    });
+
+    // 2 sollicitations dans A + 1 dans B = 3 pour le PS. Aucune conv seule
+    // n'atteint le plafond → per-conversation, l'envoi passerait.
+    await seedOutboundMessage(convA, 10, "a1");
+    await seedOutboundMessage(convA, 6, "a2");
+    await seedOutboundMessage(convB, 2, "b1");
+
+    await expect(
+      sendOutboundWithLock({
+        contactId,
+        campaignId: "campC",
+        conversationId: convC,
+        input: {
+          body: "4e SMS — STOP pour refuser. Léa IA Médéré.",
+          channel: "sms",
+          generatedBy: "ai",
+        },
+        dispatch: {
+          ovhMessageId: "ovh-percontact-cap",
+          sender: "MEDERE",
+          bodyLength: 60,
+          creditsRemoved: 1,
+          dryRun: false,
+        },
+        // Le pré-check per-contact HORS tx aurait déjà vu 3/3 → 0 place.
+        expectedRemainingQuota: 0,
+      }),
+    ).rejects.toBeInstanceOf(ComplianceConcurrencyError);
+
+    // Rollback intégral : aucun message créé dans la 3e conversation.
+    expect(await countOutboundMessages(convC)).toBe(0);
+    // Et les conversations sources sont intactes.
+    expect(await countOutboundMessages(convA)).toBe(2);
+    expect(await countOutboundMessages(convB)).toBe(1);
+  });
 });
