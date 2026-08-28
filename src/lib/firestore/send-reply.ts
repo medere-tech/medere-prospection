@@ -163,6 +163,7 @@
 import { Timestamp } from "firebase-admin/firestore";
 
 import { preSendCheckWithAuditTx } from "@/lib/compliance/pre-send-check-with-audit-tx";
+import { RATE_LIMIT_WINDOW_DAYS as COMPLIANCE_RATE_LIMIT_WINDOW_DAYS } from "@/lib/compliance/rate-limits";
 import { getAdminDb } from "@/lib/firestore/admin";
 import { appendAuditLog, appendAuditLogTx } from "@/lib/firestore/audit-log";
 import {
@@ -190,10 +191,12 @@ const CONVERSATIONS_COLLECTION = "conversations";
 const MESSAGES_SUBCOLLECTION = "messages";
 
 /**
- * Largeur de la fenêtre rate-limit (jours). Aligné `RATE_LIMIT_WINDOW_DAYS`
- * de `lib/compliance/rate-limits.ts` (S4) et `transactions.ts:127` (S6.6).
+ * 🔒 Largeur de la fenêtre rate-limit — RÉ-EXPORTÉE depuis
+ * `lib/compliance/rate-limits.ts`, plus JAMAIS redéfinie localement
+ * (PR-FILTRE-SOLLICITATION). Cf. JSDoc jumelle dans `transactions.ts`
+ * pour le détail du risque fail-open que cette dé-duplication ferme.
  */
-const RATE_LIMIT_WINDOW_DAYS = 30;
+const RATE_LIMIT_WINDOW_DAYS = COMPLIANCE_RATE_LIMIT_WINDOW_DAYS;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Types publics

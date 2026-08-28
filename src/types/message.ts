@@ -188,4 +188,14 @@ export interface SentMessageRecord {
   /** Le calcul du plafond se base sur `sentAt` (envois effectifs), pas
    * `createdAt` ni `queuedAt`. */
   sentAt: Timestamp | Date;
+  /**
+   * Nature du sortant — **transportée verbatim**, jamais interprétée ici.
+   *
+   * Reste `undefined` si le doc source ne portait pas le champ (legacy).
+   * C'est VOULU : le défaut fail-closed est appliqué en UN SEUL endroit,
+   * `countsAgainstCap()` (`lib/compliance/outbound-kind.ts`). Si les
+   * mappers appliquaient eux-mêmes le défaut, il existerait deux sources
+   * de vérité pour « qu'est-ce qui compte ».
+   */
+  outboundKind?: MessageOutboundKind;
 }

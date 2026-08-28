@@ -85,33 +85,44 @@ export function isOptOut(incomingMessage: string): boolean {
 3. Logger dans `audit_log`
 4. AUCUN message de confirmation envoyé (sauf si explicitement demandé)
 
-### Règle 3 — Plafond strict 3 SMS par contact sur 30 jours
+### Règle 3 — Plafond strict 4 SOLLICITATIONS par contact sur 30 jours
 
-Ne JAMAIS envoyer plus de 3 SMS au même contact dans une fenêtre glissante de 30 jours (loi française fixe la limite à 4/30j, on garde une marge de sécurité).
+Ne JAMAIS envoyer plus de 4 **sollicitations** au même **contact** (toutes campagnes confondues) dans une fenêtre glissante de 30 jours. C'est exactement la limite légale L.34-5 CPCE — **il n'y a plus de marge de sécurité**.
+
+**Ce qui compte / ce qui ne compte pas** :
+
+| Message | `outboundKind` | Compte ? |
+|---|---|---|
+| 1er SMS de campagne | `"solicitation"` | ✅ oui |
+| Relance après silence | `"solicitation"` | ✅ oui |
+| Réponse à un PS qui a écrit en premier | `"reply"` | ❌ non |
+| Doc legacy sans le champ | *(absent)* | ✅ oui — défaut fail-closed |
+
+L.34-5 encadre la **prospection** : le fait de prendre l'initiative de déranger. Répondre à quelqu'un qui vient de nous écrire n'en est pas. Une conversation vivante peut donc compter 10+ réponses sans jamais approcher le plafond.
 
 ```typescript
-import { differenceInDays } from 'date-fns';
+// src/lib/compliance/rate-limits.ts — implémentation réelle (simplifiée)
+import { countsAgainstCap } from '@/lib/compliance/outbound-kind';
 
 export function canSendMessage(
-  outboundMessages: { sentAt: Date }[]
-): { allowed: boolean; reason?: string } {
-  const now = new Date();
-  const last30Days = outboundMessages.filter(
-    m => differenceInDays(now, m.sentAt) <= 30
-  );
-  
-  if (last30Days.length >= 3) {
-    return {
-      allowed: false,
-      reason: `Plafond atteint : ${last30Days.length} SMS envoyés sur les 30 derniers jours`,
-    };
+  outboundMessages: OutboundMessageRecord[],
+  now: Date = new Date(),
+): ComplianceCheckResult {
+  const { solicitationCount, totalOutboundCount } =
+    countSolicitationsInWindow(outboundMessages, now);
+
+  if (solicitationCount >= RATE_LIMIT_MAX_MESSAGES /* = 4 */) {
+    return { allowed: false, reason: `Plafond 4/30j atteint (${solicitationCount} sollicitations sur ${totalOutboundCount} envois récents)` };
   }
-  
   return { allowed: true };
 }
 ```
 
-**À enforcer dans** : `src/inngest/functions/send-first-sms.ts`, `src/inngest/functions/schedule-followup.ts`, et tout endpoint d'envoi.
+🚨 **La discrimination passe EXCLUSIVEMENT par `countsAgainstCap()`** (`src/lib/compliance/outbound-kind.ts`). Ne JAMAIS écrire un test de nature à la main : la forme `outboundKind !== "solicitation"` exclut les docs legacy du comptage → sous-comptage silencieux → infraction.
+
+⚠️ **Périmètre = le CONTACT, pas la conversation.** Le docId conversation est `${contactId}_${campaignId}` : un PS enrôlé dans 2 campagnes a 2 conversations. Utiliser `listRecentOutboundByContact{,InTx}`, jamais les versions scopées `conversationId`.
+
+**À enforcer dans** : `src/lib/inngest/functions/send-first-sms.ts`, `src/lib/firestore/send-reply.ts` (`commitDraftToQueued`), `src/lib/firestore/transactions.ts` (`sendOutboundWithLock`), le futur `schedule-followup`, et tout endpoint d'envoi.
 
 ### Règle 4 — Plages horaires strictes
 

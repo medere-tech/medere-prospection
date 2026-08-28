@@ -43,6 +43,7 @@ import { Timestamp, type Transaction } from "firebase-admin/firestore";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { countsAgainstCap, DEFAULT_OUTBOUND_KIND } from "@/lib/compliance/outbound-kind";
+import { canSendMessage, countSolicitationsInWindow } from "@/lib/compliance/rate-limits";
 import { __resetEnvCacheForTests } from "@/lib/security/env";
 import { AuditPiiError, NotFoundError, ValidationError } from "@/lib/utils/errors";
 import { logger } from "@/lib/utils/logger";
@@ -1756,13 +1757,16 @@ describe("messages.ts", () => {
       await expect(listRecentOutbound(convId)).rejects.toBeInstanceOf(ValidationError);
     });
 
-    it("⚠️ CETTE PR N'UTILISE PAS ENCORE outboundKind pour compter", async () => {
-      // Sentinelle de périmètre. `listRecentOutbound` compte TOUS les
-      // outbounds quelle que soit leur nature — le filtre arrive dans la PR
-      // suivante. Si ce test casse, c'est que le filtre a été branché : il
-      // faudra alors le remplacer par les tests de comptage correspondants
-      // (et repasser compliance-auditor).
-      const convId = "conv_kind_not_counted_yet";
+    it("🔒 SÉPARATION DES RESPONSABILITÉS : le mapper TRANSPORTE, il ne filtre pas", async () => {
+      // `listRecentOutbound` remonte TOUS les sortants comptables au sens
+      // `RATE_LIMIT_COUNTED_STATUSES`, sollicitations ET réponses, en
+      // propageant `outboundKind` verbatim. C'est `canSendMessage` (via
+      // `countsAgainstCap`) qui décide ensuite ce qui compte.
+      //
+      // Si un jour ce mapper se mettait à filtrer lui-même, il y aurait
+      // DEUX endroits où « ce qui compte » est décidé → drift garanti, et
+      // le `totalOutboundCount` du contexte d'audit deviendrait faux.
+      const convId = "conv_kind_mapper_transports";
       await seedConversation(convId, { inboundCount: 1, messageCount: 1 });
       const now = new Date();
 
@@ -1779,8 +1783,73 @@ describe("messages.ts", () => {
         outboundKind: "reply",
       });
 
-      // 2 comptés : le "reply" n'est PAS encore exclu.
-      expect(await listRecentOutbound(convId, 30, now)).toHaveLength(2);
+      const records = await listRecentOutbound(convId, 30, now);
+      // Le mapper remonte les 2…
+      expect(records).toHaveLength(2);
+      // …avec leur nature préservée (c'est ce transport qui permet à
+      // `canSendMessage` de discriminer en aval).
+      expect(records.map((r) => r.outboundKind).sort()).toEqual(["reply", "solicitation"]);
+    });
+
+    it("🔒 BOUT-EN-BOUT : 1 sollicitation + 10 réponses en base → canSendMessage AUTORISE", async () => {
+      // Le scénario métier de PR-FILTRE-SOLLICITATION, vérifié sur la
+      // vraie chaîne Firestore → mapper → compliance : une conversation
+      // vivante ne sature jamais le plafond.
+      const convId = "conv_kind_e2e_dialogue";
+      await seedConversation(convId, { inboundCount: 1, messageCount: 1 });
+      const now = new Date();
+
+      await addOutbound(convId, {
+        body: "1er SMS. STOP pour refuser. Médéré.",
+        channel: "sms",
+        generatedBy: "ai",
+        outboundKind: "solicitation",
+      });
+      for (let i = 0; i < 10; i++) {
+        await addOutbound(convId, {
+          body: `Réponse ${i}. STOP pour refuser. Médéré.`,
+          channel: "sms",
+          generatedBy: "ai",
+          outboundKind: "reply",
+        });
+      }
+
+      const records = await listRecentOutbound(convId, 30, now);
+      expect(records).toHaveLength(11);
+
+      const counts = countSolicitationsInWindow(records, now);
+      expect(counts.solicitationCount).toBe(1);
+      expect(counts.totalOutboundCount).toBe(11);
+      expect(canSendMessage(records, now).allowed).toBe(true);
+    });
+
+    it("🔒 BOUT-EN-BOUT : 4 sollicitations + 10 réponses en base → canSendMessage REFUSE", async () => {
+      const convId = "conv_kind_e2e_cap";
+      await seedConversation(convId, { inboundCount: 1, messageCount: 1 });
+      const now = new Date();
+
+      for (let i = 0; i < 4; i++) {
+        await addOutbound(convId, {
+          body: `Sollicitation ${i}. STOP pour refuser. Médéré.`,
+          channel: "sms",
+          generatedBy: "ai",
+          outboundKind: "solicitation",
+        });
+      }
+      for (let i = 0; i < 10; i++) {
+        await addOutbound(convId, {
+          body: `Réponse ${i}. STOP pour refuser. Médéré.`,
+          channel: "sms",
+          generatedBy: "ai",
+          outboundKind: "reply",
+        });
+      }
+
+      const records = await listRecentOutbound(convId, 30, now);
+      const counts = countSolicitationsInWindow(records, now);
+      expect(counts.solicitationCount).toBe(4);
+      expect(counts.totalOutboundCount).toBe(14);
+      expect(canSendMessage(records, now).allowed).toBe(false);
     });
   });
 

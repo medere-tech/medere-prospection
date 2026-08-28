@@ -51,14 +51,26 @@ Garantir que le code Médéré respecte le cadre juridique français et europée
 
 **Verdict si manquant** : 🔴 BLOCKER. Sanction CNIL jusqu'à 20M€.
 
-## 3. Plafond 3 SMS / 30 jours par contact
+## 3. Plafond 4 sollicitations / 30 jours par contact
 
-**Exigence** : pour rester sous la limite légale (4 sollicitations/30j) avec marge.
+**Exigence** : la limite légale L.34-5 CPCE est de 4 sollicitations/30j, et c'est
+exactement la valeur retenue — **il n'y a plus de marge de sécurité** (avant :
+3 SMS, mais TOUS les sortants comptaient). Toute imprécision de comptage devient
+donc un dépassement.
+
+**Ce qui compte** : uniquement les messages dont `outboundKind === "solicitation"`
+(1er SMS, relance). Les réponses à un PS qui a écrit en premier ne comptent pas.
+Le périmètre est le **contact**, pas la conversation (un PS peut être enrôlé dans
+plusieurs campagnes).
 
 **À vérifier dans `src/lib/compliance/rate-limits.ts`** :
-- Fonction `canSendMessage()` compte les SMS sortants des 30 derniers jours
-- Refuse si ≥ 3
-- Tests unitaires couvrant : exactement 3 SMS, 3 SMS dont 1 > 30j, message à J+30 exactement
+- Fonction `canSendMessage()` compte les SOLLICITATIONS des 30 derniers jours
+- Refuse si ≥ 4 (`RATE_LIMIT_MAX_MESSAGES`)
+- La discrimination passe EXCLUSIVEMENT par `countsAgainstCap()`
+  (`lib/compliance/outbound-kind.ts`) — jamais un test de nature écrit à la main
+- Un doc sans `outboundKind` (legacy) COMPTE (défaut fail-closed)
+- Tests unitaires couvrant : exactement 4 sollicitations, 4 dont 1 > 30j, message
+  à J+30 exactement, N réponses seules → autorisé, mix sollicitations/réponses
 - Appelée dans `preSendCheck()` avant tout envoi
 
 **Verdict si manquant** : 🔴 BLOCKER.

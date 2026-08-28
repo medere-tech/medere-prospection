@@ -27,11 +27,20 @@
  * `countsAgainstCap()`, la forme dangereuse devient inécrivable.
  *
  * ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
- * ⚠️ PAS ENCORE BRANCHÉ SUR LE COMPTAGE
+ * 🚨 BRANCHÉ SUR LE COMPTAGE DEPUIS PR-FILTRE-SOLLICITATION
  *
- * PR-OUTBOUNDKIND pose la donnée et ce prédicat ; elle ne filtre RIEN.
- * `canSendMessage` compte encore TOUS les sortants. Le branchement est
- * l'objet de la PR suivante, qui devra passer compliance-auditor.
+ * Ce prédicat n'est plus inerte : `canSendMessage` l'utilise, via
+ * `countSolicitationsInWindow`, pour décider quels sortants comptent
+ * contre le plafond de 4 sollicitations / 30 jours.
+ *
+ * Concrètement, **changer une ligne de ce fichier change ce que le
+ * système considère comme légal**. Toute modification passe par
+ * compliance-auditor.
+ *
+ * Consommateurs actuels (les seuls autorisés à décider) :
+ *   - `countSolicitationsInWindow` (`lib/compliance/rate-limits.ts`) —
+ *     lui-même appelé par `canSendMessage` (la décision) ET par
+ *     `preSendCheck` (le contexte d'audit opposable).
  */
 import type { MessageOutboundKind } from "@/types/message";
 

@@ -106,7 +106,7 @@
 import { NonRetriableError } from "inngest";
 
 import { preSendCheckWithAudit } from "@/lib/compliance/pre-send-check-with-audit";
-import { RATE_LIMIT_MAX_MESSAGES } from "@/lib/compliance/rate-limits";
+import { countSolicitationsInWindow, RATE_LIMIT_MAX_MESSAGES } from "@/lib/compliance/rate-limits";
 import { appendAuditLog } from "@/lib/firestore/audit-log";
 import { getContact } from "@/lib/firestore/contacts";
 import { conversationDocId, getConversation } from "@/lib/firestore/conversations";
@@ -343,7 +343,15 @@ export async function sendFirstSmsHandler(ctx: InngestHandlerContext): Promise<S
     // la race est détectée DANS la tx. Décision Déthié Q-S5.1 DEBT-001.5 :
     // RATE_LIMIT_MAX_MESSAGES exporté de lib/compliance/rate-limits.ts —
     // single source of truth, anti-drift.
-    const expectedRemainingQuota = RATE_LIMIT_MAX_MESSAGES - loaded.recentOutboundMessages.length;
+    //
+    // 🔒 PR-FILTRE-SOLLICITATION — on décompte les SOLLICITATIONS, pas les
+    // sortants. Avec l'ancien `recentOutboundMessages.length`, une
+    // conversation riche en réponses aurait produit un quota restant
+    // négatif et un forensic `ComplianceConcurrencyError` mensonger, alors
+    // que le plafond n'était pas approché.
+    const expectedRemainingQuota =
+      RATE_LIMIT_MAX_MESSAGES -
+      countSolicitationsInWindow(loaded.recentOutboundMessages).solicitationCount;
 
     try {
       const result = await sendOutboundWithLock({

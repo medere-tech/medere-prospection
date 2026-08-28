@@ -152,13 +152,36 @@ describe("preSendCheckWithAuditTx", () => {
       const { args, deps } = buildPassingArgs();
       const tx = fakeTx();
       args.recentOutboundMessages = [
-        { direction: "outbound", sentAt: new Date(FIXED_NOW.getTime() - 1 * 86400_000) },
-        { direction: "outbound", sentAt: new Date(FIXED_NOW.getTime() - 2 * 86400_000) },
-        { direction: "outbound", sentAt: new Date(FIXED_NOW.getTime() - 3 * 86400_000) },
+        // 4 sollicitations + 1 reply : le contexte doit distinguer les deux.
+        {
+          direction: "outbound",
+          sentAt: new Date(FIXED_NOW.getTime() - 1 * 86400_000),
+          outboundKind: "solicitation",
+        },
+        {
+          direction: "outbound",
+          sentAt: new Date(FIXED_NOW.getTime() - 2 * 86400_000),
+          outboundKind: "solicitation",
+        },
+        {
+          direction: "outbound",
+          sentAt: new Date(FIXED_NOW.getTime() - 3 * 86400_000),
+          outboundKind: "solicitation",
+        },
+        {
+          direction: "outbound",
+          sentAt: new Date(FIXED_NOW.getTime() - 4 * 86400_000),
+          outboundKind: "solicitation",
+        },
+        {
+          direction: "outbound",
+          sentAt: new Date(FIXED_NOW.getTime() - 5 * 86400_000),
+          outboundKind: "reply",
+        },
       ];
       deps.canSendMessage = vi.fn(() => ({
         allowed: false,
-        reason: "Plafond 3/30j",
+        reason: "Plafond 4/30j",
       }));
 
       const pureResult = preSendCheck(args, deps);
@@ -339,15 +362,38 @@ describe("preSendCheckWithAuditTx", () => {
       expect(appendTxSpy).not.toHaveBeenCalled();
     });
 
-    it("rate_limit_exceeded → throw + failureContext { count, maxAllowed, windowDays }", () => {
+    it("rate_limit_exceeded → throw + failureContext { solicitationCount, totalOutboundCount, maxAllowed, windowDays }", () => {
       const { args, deps } = buildPassingArgs();
       const tx = fakeTx();
       args.recentOutboundMessages = [
-        { direction: "outbound", sentAt: new Date(FIXED_NOW.getTime() - 1 * 86400_000) },
-        { direction: "outbound", sentAt: new Date(FIXED_NOW.getTime() - 2 * 86400_000) },
-        { direction: "outbound", sentAt: new Date(FIXED_NOW.getTime() - 3 * 86400_000) },
+        // 4 sollicitations + 1 reply : le contexte doit distinguer les deux.
+        {
+          direction: "outbound",
+          sentAt: new Date(FIXED_NOW.getTime() - 1 * 86400_000),
+          outboundKind: "solicitation",
+        },
+        {
+          direction: "outbound",
+          sentAt: new Date(FIXED_NOW.getTime() - 2 * 86400_000),
+          outboundKind: "solicitation",
+        },
+        {
+          direction: "outbound",
+          sentAt: new Date(FIXED_NOW.getTime() - 3 * 86400_000),
+          outboundKind: "solicitation",
+        },
+        {
+          direction: "outbound",
+          sentAt: new Date(FIXED_NOW.getTime() - 4 * 86400_000),
+          outboundKind: "solicitation",
+        },
+        {
+          direction: "outbound",
+          sentAt: new Date(FIXED_NOW.getTime() - 5 * 86400_000),
+          outboundKind: "reply",
+        },
       ];
-      deps.canSendMessage = vi.fn(() => ({ allowed: false, reason: "Plafond 3/30j" }));
+      deps.canSendMessage = vi.fn(() => ({ allowed: false, reason: "Plafond 4/30j" }));
 
       try {
         preSendCheckWithAuditTx(tx, args, deps);
@@ -357,8 +403,9 @@ describe("preSendCheckWithAuditTx", () => {
         expect(err.context.rule).toBe("rate_limit");
         expect(err.context.code).toBe("rate_limit_exceeded");
         expect(err.context.failureContext).toEqual({
-          count: 3,
-          maxAllowed: 3,
+          solicitationCount: 4,
+          totalOutboundCount: 5,
+          maxAllowed: 4,
           windowDays: 30,
         });
       }
@@ -542,9 +589,32 @@ describe("preSendCheckWithAuditTx", () => {
       const { args, deps } = buildPassingArgs();
       const tx = fakeTx();
       args.recentOutboundMessages = [
-        { direction: "outbound", sentAt: new Date(FIXED_NOW.getTime() - 1 * 86400_000) },
-        { direction: "outbound", sentAt: new Date(FIXED_NOW.getTime() - 2 * 86400_000) },
-        { direction: "outbound", sentAt: new Date(FIXED_NOW.getTime() - 3 * 86400_000) },
+        // 4 sollicitations + 1 reply : le contexte doit distinguer les deux.
+        {
+          direction: "outbound",
+          sentAt: new Date(FIXED_NOW.getTime() - 1 * 86400_000),
+          outboundKind: "solicitation",
+        },
+        {
+          direction: "outbound",
+          sentAt: new Date(FIXED_NOW.getTime() - 2 * 86400_000),
+          outboundKind: "solicitation",
+        },
+        {
+          direction: "outbound",
+          sentAt: new Date(FIXED_NOW.getTime() - 3 * 86400_000),
+          outboundKind: "solicitation",
+        },
+        {
+          direction: "outbound",
+          sentAt: new Date(FIXED_NOW.getTime() - 4 * 86400_000),
+          outboundKind: "solicitation",
+        },
+        {
+          direction: "outbound",
+          sentAt: new Date(FIXED_NOW.getTime() - 5 * 86400_000),
+          outboundKind: "reply",
+        },
       ];
       deps.canSendMessage = vi.fn(() => ({ allowed: false, reason: "Plafond" }));
 

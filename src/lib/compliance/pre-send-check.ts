@@ -8,7 +8,9 @@
  *   2. `ai_disclosure`                   — annonce IA dans le 1er SMS (AI Act art. 50)
  *   3. `stop_present`                    — STOP dans le SMS sortant (L.34-5 CPCE)
  *   4. `advertiser_identification`       — mention "Médéré" dans le SMS (L.34-5 al. 5 CPCE)
- *   5. `rate_limit`                      — plafond 3 / 30 jours
+ *   5. `rate_limit`                      — plafond 4 SOLLICITATIONS / 30 jours
+ *                                          (les réponses à un PS qui a
+ *                                          écrit en premier ne comptent pas)
  *   6. `hours`                           — plages horaires L-V/sam, dimanche/fériés
  *   7. `bloctel`                         — vérif Bloctel si B2C mobile perso
  *   8. `legitimate_interest`             — intérêt légitime documenté (min 20 chars)
@@ -79,7 +81,10 @@ import { hasOptOut } from "./opt-out";
 import {
   canSendMessage,
   type ComplianceCheckResult,
+  countSolicitationsInWindow,
   type OutboundMessageRecord,
+  RATE_LIMIT_MAX_MESSAGES,
+  RATE_LIMIT_WINDOW_DAYS,
 } from "./rate-limits";
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -126,7 +131,12 @@ export const HUMAN_REASONS: Record<ComplianceFailCode, string> = {
   stop_optout_missing: "Mot-clé STOP absent du SMS sortant (L.34-5 CPCE)",
   advertiser_identification_missing:
     'Identification de l\'annonceur "Médéré" absente du SMS (L.34-5 al. 5 CPCE)',
-  rate_limit_exceeded: "Plafond 3 SMS sur 30 jours atteint",
+  // ⚠️ Littéral figé (invariant anti-PII `HUMAN_REASONS` : jamais de
+  // template string). Sa cohérence avec `RATE_LIMIT_MAX_MESSAGES` /
+  // `RATE_LIMIT_WINDOW_DAYS` est verrouillée par une sentinelle de test
+  // dans `pre-send-check.test.ts` — si tu changes la constante sans le
+  // texte, le test casse.
+  rate_limit_exceeded: "Plafond 4 sollicitations sur 30 jours atteint",
   outside_hours: "Hors plage L-V 10-13h / 14-20h (Europe/Paris)",
   saturday_out_of_range: "Hors plage samedi 10-13h (Europe/Paris)",
   sunday: "Envoi interdit le dimanche",
@@ -178,7 +188,17 @@ export type ComplianceFailure =
       code: "rate_limit_exceeded";
       rule: "rate_limit";
       humanReason: string;
-      context: { count: number; maxAllowed: number; windowDays: number };
+      /**
+       * `solicitationCount` = ce qui compte contre le plafond.
+       * `totalOutboundCount` = tous les sortants de la fenêtre, réponses
+       * comprises. L'écart est la preuve L.34-5 (cf. site de construction).
+       */
+      context: {
+        solicitationCount: number;
+        totalOutboundCount: number;
+        maxAllowed: number;
+        windowDays: number;
+      };
     }
   | {
       code: "outside_hours";
@@ -523,10 +543,18 @@ export function preSendCheck(
         code: "rate_limit_exceeded",
         rule: "rate_limit",
         humanReason: HUMAN_REASONS.rate_limit_exceeded,
+        // 🔒 PREUVE L.34-5 CPCE — l'écart entre les deux compteurs EST
+        // l'argument opposable à un contrôle : « 4 sollicitations sur 14
+        // messages sortants ». Sans `totalOutboundCount`, un auditeur
+        // externe ne peut pas distinguer un plafond respecté d'un
+        // sous-comptage. Calculé par `countSolicitationsInWindow`, la
+        // MÊME fonction que celle qui a pris la décision — pas de
+        // recalcul divergent possible.
+        // Aucun champ PII : 4 entiers.
         context: {
-          count: args.recentOutboundMessages.length,
-          maxAllowed: 3,
-          windowDays: 30,
+          ...countSolicitationsInWindow(args.recentOutboundMessages, now),
+          maxAllowed: RATE_LIMIT_MAX_MESSAGES,
+          windowDays: RATE_LIMIT_WINDOW_DAYS,
         },
       },
     };

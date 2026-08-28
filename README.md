@@ -1096,22 +1096,30 @@ import { describe, it, expect } from 'vitest';
 import { canSendMessage } from '@/lib/compliance/rate-limits';
 
 describe('Rate limits compliance', () => {
-  it('refuse l\'envoi si 3 SMS déjà envoyés sur 30 jours', () => {
+  it('refuse l\'envoi si 4 sollicitations déjà envoyées sur 30 jours', () => {
+    const solicitation = (sentAt) => ({
+      direction: 'outbound',
+      sentAt,
+      outboundKind: 'solicitation',
+    });
     const messages = [
-      { sentAt: daysAgo(5) },
-      { sentAt: daysAgo(15) },
-      { sentAt: daysAgo(25) },
+      solicitation(daysAgo(5)),
+      solicitation(daysAgo(15)),
+      solicitation(daysAgo(20)),
+      solicitation(daysAgo(25)),
     ];
-    expect(canSendMessage(messages)).toBe(false);
+    expect(canSendMessage(messages).allowed).toBe(false);
   });
 
-  it('autorise l\'envoi si le 3ème message date d\'il y a > 30 jours', () => {
-    const messages = [
-      { sentAt: daysAgo(31) },
-      { sentAt: daysAgo(20) },
-      { sentAt: daysAgo(10) },
-    ];
-    expect(canSendMessage(messages)).toBe(true);
+  it('les RÉPONSES ne comptent pas : 10 replies → autorisé', () => {
+    // L.34-5 encadre la prospection. Répondre à un PS qui vient d'écrire
+    // n'est pas une sollicitation — cf. `countsAgainstCap`.
+    const messages = Array.from({ length: 10 }, (_, i) => ({
+      direction: 'outbound',
+      sentAt: daysAgo(i + 1),
+      outboundKind: 'reply',
+    }));
+    expect(canSendMessage(messages).allowed).toBe(true);
   });
 });
 ```
@@ -1284,7 +1292,7 @@ L'ordre dans lequel Claude Code doit construire le projet. Une étape = une sess
 | Piège | Conséquence | Solution |
 |---|---|---|
 | Envoyer un SMS un dimanche | Sanction CNIL | `compliance/hours.ts` enforced |
-| Envoyer un 4ème SMS dans les 30j | Sanction CNIL | `compliance/rate-limits.ts` enforced |
+| Envoyer une 5ème sollicitation dans les 30j | Sanction CNIL | `compliance/rate-limits.ts` enforced |
 | Ne pas faire l'annonce IA dans le 1er SMS | Sanction AI Act | Prompt enforced + validation post-génération |
 | Hand-off vers un commercial absent | Lead refroidit | Routage avec statut commercial (dispo/absent) |
 | Stocker des données de santé | Catégorie spéciale RGPD | Ne JAMAIS stocker autre chose que les coordonnées pro |
