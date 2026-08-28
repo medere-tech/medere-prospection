@@ -91,7 +91,17 @@
  *                                       inchangé, l'IA répond quand même.
  *                                       Seul l'audit `intent_classified`
  *                                       (step 6b) garde la valeur brute.
- *                                       PR2 y posera l'early return.
+ *                                       La PR d'activation y posera
+ *                                       l'early return.
+ *
+ *   7bis. `observe-auto-reply`      : alerte Sentry/Pino via
+ *                                     `captureMonitoringWarning` sur
+ *                                     CHAQUE `AUTO_REPLY` détecté
+ *                                     (PR-AUTO-REPLY-OBSERVABILITE).
+ *                                     🔒 N'INTERROMPT RIEN — pure
+ *                                     observabilité. Produit l'échantillon
+ *                                     à examiner manuellement avant de
+ *                                     décider l'activation de la coupure.
  *
  *   8a. `claude-generate-{intent}`  : `generateReply({intent, rawMessage,
  *                                      history})` (S9.3.2 Sonnet 4.6).
@@ -317,6 +327,7 @@ import {
 } from "@/lib/firestore/messages";
 import { getInngestClient } from "@/lib/inngest/client";
 import { handoffRequested, smsReplyReceived, smsReplySendRequested } from "@/lib/inngest/events";
+import { captureMonitoringWarning } from "@/lib/utils/observability";
 import { hashPii, PHONE_HASH_PREFIX, safePhoneHash } from "@/lib/utils/pii-detector";
 import type { ReplyGeneratedPayload } from "@/types/audit-log";
 
@@ -415,6 +426,7 @@ export interface ProcessReplyDeps {
   addInbound?: typeof addInbound;
   markOptedOut?: typeof markOptedOut;
   isOptOut?: typeof isOptOut;
+  captureMonitoringWarning?: typeof captureMonitoringWarning;
   hashPii?: typeof hashPii;
   appendAuditLog?: typeof appendAuditLog;
   // S9.2.2 — classifier + post-classification mutation
@@ -485,6 +497,7 @@ export async function processReplyHandler(
   const _addInbound = deps.addInbound ?? addInbound;
   const _markOptedOut = deps.markOptedOut ?? markOptedOut;
   const _isOptOut = deps.isOptOut ?? isOptOut;
+  const _captureMonitoringWarning = deps.captureMonitoringWarning ?? captureMonitoringWarning;
   const _hashPii = deps.hashPii ?? hashPii;
   const _appendAuditLog = deps.appendAuditLog ?? appendAuditLog;
   const _classifyReply = deps.classifyReply ?? classifyReply;
@@ -896,6 +909,57 @@ export async function processReplyHandler(
   // INTERESSE / OBJECTION / NEUTRE / AUTO_REPLY — la conv passe en
   // in_dialogue. S9.3.3b génère + stocke le draft + audit reply_generated.
   const nonStopIntent = classification.intent;
+
+  // ── Step 7bis — OBSERVABILITÉ AUTO_REPLY (PR-AUTO-REPLY-OBSERVABILITE) ─
+  //
+  // 🔒 ZÉRO CHANGEMENT DE COMPORTEMENT. On n'interrompt rien : l'IA répond
+  // exactement comme avant. On rend seulement la détection AUDIBLE.
+  //
+  // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  // POURQUOI CETTE PR EXISTE SÉPARÉMENT DE L'ACTIVATION
+  //
+  // PR1 (#44) a posé la détection sans couper, pour mesurer le taux de
+  // faux positifs sur du trafic réel avant de cesser de répondre à de
+  // vrais PS. Mais elle n'écrivait la donnée QUE dans `audit_log`
+  // (`intent_classified`), et **aucun consommateur ne lit cette
+  // collection** : pas de vue conversations au dashboard, pas d'alerte.
+  // La phase d'observation ne pouvait donc pas produire son échantillon.
+  //
+  // Cette PR ferme ce trou et RIEN D'AUTRE. L'activation de la coupure
+  // reste subordonnée à la lecture des données produites ici.
+  //
+  // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  // ALERTE À CHAQUE DÉTECTION, PAS AU-DELÀ D'UN SEUIL
+  //
+  // À l'échelle MVP (200 dentistes IDF) le volume le permet, et c'est
+  // précisément ce qui fournit l'échantillon à examiner MANUELLEMENT :
+  // pour chaque alerte, on relit le body dans `messages/{messageId}` et on
+  // tranche « vraie machine » vs « faux positif ». Sans ce grain fin, on
+  // ne peut pas calibrer la décision d'activation.
+  // ⚠️ À reconsidérer (agrégation 24h) avant la montée à 26k contacts.
+  //
+  // Encapsulé dans un `step.run` pour l'idempotence Inngest : un retry du
+  // pipeline ne doit pas re-déclencher l'alerte (la memoization sert le
+  // résultat en cache). Les `logger.info` du pipeline, eux, vivent hors
+  // step et se répètent au retry — comportement voulu pour du log brut,
+  // pas pour une alerte.
+  //
+  // Payload scrubber-safe : IDs opaques + number + boolean. PAS de body,
+  // PAS de `reasoning` classifier (invariant anti-PII du step 6b).
+  if (nonStopIntent === "AUTO_REPLY") {
+    await step.run("observe-auto-reply", async () => {
+      _captureMonitoringWarning("process_reply.auto_reply_detected", {
+        tags: { phase: "observe_only" },
+        extra: {
+          contactId,
+          conversationId,
+          messageId,
+          confidence: classification.confidence,
+          classifierFallback: classification.fallback,
+        },
+      });
+    });
+  }
 
   // ─────────────────────────────────────────────────────────────────────
   // 🔻 COUTURE PR1 → PR2 (PR1-AUTO-REPLY-OBSERVE) — LIRE AVANT DE TOUCHER

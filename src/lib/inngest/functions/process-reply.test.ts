@@ -942,6 +942,105 @@ describe("Step 7 — branch-by-intent", () => {
     expect(sendEventSpyO).not.toHaveBeenCalledWith("dispatch-handoff-event", expect.anything());
   });
 
+  it("🔒 OBSERVABILITÉ : AUTO_REPLY détecté → alerte monitoring posée", async () => {
+    // PR1 écrivait la détection UNIQUEMENT dans `audit_log`
+    // (`intent_classified`), or aucun consommateur ne lit cette
+    // collection : pas de vue conversations au dashboard, pas d'alerte.
+    // La phase d'observation ne pouvait donc pas produire son échantillon.
+    const ctx = makeFakeCtx({ body: "Réponse automatique : absent jusqu'au 15." });
+    const captureSpy = vi.fn();
+    const deps = makeDeps({
+      getContactByPhone: vi.fn().mockResolvedValue(makeFakeContact("hs-obs")),
+      getActiveConversationByContactId: vi.fn().mockResolvedValue({
+        conversationId: "hs-obs_camp-obs",
+        conversation: makeFakeConversation("hs-obs", "camp-obs"),
+      }),
+      addInbound: vi.fn().mockResolvedValue("msgid-obs"),
+      classifyReply: vi.fn().mockResolvedValue({
+        intent: "AUTO_REPLY",
+        confidence: 0.96,
+        reasoning: "auto-descriptif + disponibilité datée",
+        fallback: false,
+      }),
+      captureMonitoringWarning: captureSpy,
+    });
+
+    await processReplyHandler(ctx, deps);
+
+    expect(captureSpy).toHaveBeenCalledTimes(1);
+    expect(captureSpy).toHaveBeenCalledWith("process_reply.auto_reply_detected", {
+      tags: { phase: "observe_only" },
+      extra: {
+        contactId: "hs-obs",
+        conversationId: "hs-obs_camp-obs",
+        messageId: "msgid-obs",
+        confidence: 0.96,
+        classifierFallback: false,
+      },
+    });
+  });
+
+  it("🔒 ZÉRO CHANGEMENT DE COMPORTEMENT : AUTO_REPLY → l'IA répond TOUJOURS", async () => {
+    // Le cœur de cette PR : on observe, on ne coupe pas. Si ce test
+    // tombe, c'est que la coupure a été activée par inadvertance — elle
+    // doit faire l'objet d'une PR dédiée, après lecture des données que
+    // l'alerte ci-dessus produit.
+    const ctx = makeFakeCtx({ body: "Message automatique du secrétariat." });
+    const deps = makeDeps({
+      getContactByPhone: vi.fn().mockResolvedValue(makeFakeContact("hs-nc")),
+      getActiveConversationByContactId: vi.fn().mockResolvedValue({
+        conversationId: "hs-nc_camp-nc",
+        conversation: makeFakeConversation("hs-nc", "camp-nc"),
+      }),
+      addInbound: vi.fn().mockResolvedValue("msgid-nc"),
+      classifyReply: vi.fn().mockResolvedValue({
+        intent: "AUTO_REPLY",
+        confidence: 0.99,
+        reasoning: "auto-descriptif",
+        fallback: false,
+      }),
+    });
+
+    const result = await processReplyHandler(ctx, deps);
+
+    // Même issue qu'avant : remappé NEUTRE, généré, envoyé.
+    expect(result.status).toBe("classified");
+    if (result.status === "classified") {
+      expect(result.intent).toBe("NEUTRE");
+    }
+    expect(deps.generateReply).toHaveBeenCalledTimes(1);
+    expect(deps.addOutboundDraft).toHaveBeenCalledTimes(1);
+    expect(deps.setConversationIntent).toHaveBeenCalledWith("hs-nc_camp-nc", "NEUTRE", {
+      nextStatus: "in_dialogue",
+    });
+    // L'event d'envoi part (1 seul : pas de hand-off sur NEUTRE).
+    expect(ctx.step.sendEvent).toHaveBeenCalledTimes(1);
+  });
+
+  it("🔒 l'alerte ne se déclenche PAS sur les intents normaux", async () => {
+    const ctx = makeFakeCtx({ body: "C'est combien ?" });
+    const captureSpy = vi.fn();
+    const deps = makeDeps({
+      getContactByPhone: vi.fn().mockResolvedValue(makeFakeContact("hs-noalert")),
+      getActiveConversationByContactId: vi.fn().mockResolvedValue({
+        conversationId: "hs-noalert_camp",
+        conversation: makeFakeConversation("hs-noalert", "camp"),
+      }),
+      addInbound: vi.fn().mockResolvedValue("msgid-noalert"),
+      classifyReply: vi.fn().mockResolvedValue({
+        intent: "INTERESSE",
+        confidence: 0.85,
+        reasoning: "question tarif",
+        fallback: false,
+      }),
+      captureMonitoringWarning: captureSpy,
+    });
+
+    await processReplyHandler(ctx, deps);
+
+    expect(captureSpy).not.toHaveBeenCalled();
+  });
+
   it("NEUTRE → setConversationIntent('NEUTRE', in_dialogue) + classified", async () => {
     const ctx = makeFakeCtx({ body: "OK" });
     const deps = makeDeps({
@@ -1677,6 +1776,45 @@ describe("Anti-PII pipeline complet (sentinelle critique L.34-5 CPCE)", () => {
     expect(serialized).not.toContain(SECRET_DRAFT_BODY);
     expect(serialized).not.toContain("+33799887766");
   }
+
+  it("branche AUTO_REPLY observée — aucune fuite (y compris dans l'alerte)", async () => {
+    // Cette suite est organisée branche par branche : sa garantie est
+    // « 100 % des branches du pipeline sont couvertes ». L'alerte
+    // monitoring est un NOUVEAU canal de sortie (Sentry) — elle doit
+    // respecter les mêmes invariants anti-PII que les logs et les audits.
+    const ctx = makeFakeCtx({
+      phone: SECRET_PHONE,
+      body: SECRET_BODY,
+      ovhMessageId: SECRET_OVH_MSGID,
+    });
+    const captureSpy = vi.fn();
+    const deps = makeDeps({
+      getContactByPhone: vi.fn().mockResolvedValue(makeFakeContact("hs-arpii")),
+      getActiveConversationByContactId: vi.fn().mockResolvedValue({
+        conversationId: "hs-arpii_camp",
+        conversation: makeFakeConversation("hs-arpii", "camp"),
+      }),
+      addInbound: vi.fn().mockResolvedValue("msgid-arpii"),
+      classifyReply: vi.fn().mockResolvedValue({
+        intent: "AUTO_REPLY",
+        confidence: 0.95,
+        reasoning: SECRET_REASONING,
+        fallback: false,
+      }),
+      captureMonitoringWarning: captureSpy,
+    });
+
+    await processReplyHandler(ctx, deps);
+
+    assertNoLeak(ctx.logger);
+
+    // Le payload de l'alerte est soumis aux mêmes interdits.
+    const alertSerialized = JSON.stringify(captureSpy.mock.calls);
+    expect(alertSerialized).not.toContain(SECRET_BODY);
+    expect(alertSerialized).not.toContain(SECRET_REASONING);
+    expect(alertSerialized).not.toContain(SECRET_OVH_MSGID);
+    expect(alertSerialized).not.toContain("0612345678");
+  });
 
   it("branche contact_unknown — aucune fuite phone/body/ovhMessageId", async () => {
     const ctx = makeFakeCtx({
