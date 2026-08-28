@@ -71,18 +71,27 @@
  *                                       step 6a est servi depuis cache
  *                                       memoization → 0 ré-appel Claude.
  *
- *   7. `branch-by-intent`           : 4 branches discriminées :
+ *   7. `branch-by-intent`           : 5 valeurs, 2 branches :
  *                                     - STOP → `markOptedOut` étendu
  *                                       (ferme GUARD-001 long-form
  *                                       opt-out >50 chars rattrapé) +
  *                                       SKIP step 8 entier + return
  *                                       `{status:"opt_out", via:
  *                                       "classifier_long_form"}`.
- *                                     - INTERESSE/OBJECTION/NEUTRE →
+ *                                     - INTERESSE/OBJECTION/NEUTRE/
+ *                                       AUTO_REPLY →
  *                                       `setConversationIntent(convId,
- *                                       intent, {nextStatus:
+ *                                       effectiveIntent, {nextStatus:
  *                                       "in_dialogue"})` puis enchaîne
  *                                       les sub-steps 8a/8b/8c.
+ *                                     - ⚠️ PR1-AUTO-REPLY-OBSERVE :
+ *                                       `AUTO_REPLY` est remappé sur
+ *                                       `NEUTRE` (`effectiveIntent`) →
+ *                                       comportement STRICTEMENT
+ *                                       inchangé, l'IA répond quand même.
+ *                                       Seul l'audit `intent_classified`
+ *                                       (step 6b) garde la valeur brute.
+ *                                       PR2 y posera l'early return.
  *
  *   8a. `claude-generate-{intent}`  : `generateReply({intent, rawMessage,
  *                                      history})` (S9.3.2 Sonnet 4.6).
@@ -291,7 +300,7 @@ import {
   CLASSIFY_INTENT_MODEL,
   CLASSIFY_INTENT_PROMPT_VERSION,
 } from "@/lib/claude/prompts/classify-intent";
-import { generateReply } from "@/lib/claude/reply-generator";
+import { generateReply, type GenerateReplyIntent } from "@/lib/claude/reply-generator";
 import type { Intent } from "@/lib/claude/types";
 import { isOptOut } from "@/lib/compliance/opt-out";
 import { appendAuditLog } from "@/lib/firestore/audit-log";
@@ -884,11 +893,43 @@ export async function processReplyHandler(
     };
   }
 
-  // INTERESSE / OBJECTION / NEUTRE — la conv passe en in_dialogue.
-  // S9.3.3b génère + stocke le draft + audit reply_generated.
+  // INTERESSE / OBJECTION / NEUTRE / AUTO_REPLY — la conv passe en
+  // in_dialogue. S9.3.3b génère + stocke le draft + audit reply_generated.
   const nonStopIntent = classification.intent;
-  await step.run(`branch-${nonStopIntent.toLowerCase()}`, async () => {
-    await _setConversationIntent(conversationId, nonStopIntent, {
+
+  // ─────────────────────────────────────────────────────────────────────
+  // 🔻 COUTURE PR1 → PR2 (PR1-AUTO-REPLY-OBSERVE) — LIRE AVANT DE TOUCHER
+  //
+  // PR1 NE COUPE RIEN. Un `AUTO_REPLY` est traité EXACTEMENT comme un
+  // `NEUTRE` : la conv passe en in_dialogue, Claude génère, le SMS part.
+  // Le comportement observable est donc STRICTEMENT identique à avant.
+  //
+  // Ce que PR1 apporte : l'audit `intent_classified` (step 6b) enregistre
+  // la classification BRUTE (`classification.intent`, donc `AUTO_REPLY`
+  // le cas échéant) AVANT ce remapping. C'est la donnée qu'on vient
+  // chercher — mesurer le taux de faux positifs sur du trafic réel avant
+  // de cesser de répondre à de vrais PS.
+  //
+  // Pourquoi observer d'abord : le coût d'un faux positif est asymétrique
+  // ET SILENCIEUX (un PS humain classé machine ne reçoit plus jamais de
+  // réponse, et personne ne s'en aperçoit). Le coût d'un faux négatif est
+  // le comportement actuel. On ne coupe pas à l'aveugle.
+  //
+  // ⚠️ PR2 remplacera CETTE ligne par un early return (pas de génération,
+  // pas d'event, pas de hand-off, audit `reply_dropped` avec
+  // `reason: "auto_reply_detected"` + garde `confidence >= 0.8`).
+  // C'est le SEUL endroit à modifier : tout l'aval consomme
+  // `effectiveIntent`.
+  //
+  // Le remapping vers "NEUTRE" est aussi ce qui garantit la décision
+  // Déthié « AUTO_REPLY n'entre jamais dans l'état conversation » :
+  // `_setConversationIntent` ne verra jamais cette valeur.
+  // ─────────────────────────────────────────────────────────────────────
+  const effectiveIntent: GenerateReplyIntent =
+    nonStopIntent === "AUTO_REPLY" ? "NEUTRE" : nonStopIntent;
+
+  await step.run(`branch-${effectiveIntent.toLowerCase()}`, async () => {
+    await _setConversationIntent(conversationId, effectiveIntent, {
       nextStatus: "in_dialogue",
     });
   });
@@ -916,11 +957,11 @@ export async function processReplyHandler(
   // contactCivility=undefined en MVP — voir S9.5-CONTACT-CIVILITY-IN-REPLY-001
   // pour étendre resolve-contact step 1.
   const generationResult = await step.run(
-    `claude-generate-${nonStopIntent.toLowerCase()}`,
+    `claude-generate-${effectiveIntent.toLowerCase()}`,
     async () => {
       const history = await _listRecentMessages(conversationId);
       return _generateReply({
-        intent: nonStopIntent,
+        intent: effectiveIntent,
         rawMessage: body,
         history,
       });
@@ -963,7 +1004,7 @@ export async function processReplyHandler(
       contactId,
       conversationId,
       draftMessageId,
-      intent: nonStopIntent,
+      intent: effectiveIntent,
       promptVersion: generationResult.promptVersion,
       model: generationResult.model,
       temperature: generationResult.temperature,
@@ -1072,6 +1113,12 @@ export async function processReplyHandler(
   // S9.9-PR4). Pas de firstName/speciality/city/body/phone — le consumer
   // PR5 les charge à la volée depuis Firestore au moment du post Slack
   // (état frais vs état stale figé T0).
+  // `nonStopIntent` (brut) et `effectiveIntent` (remappé) sont ici
+  // ÉQUIVALENTS : le remapping PR1 ne touche que `AUTO_REPLY → NEUTRE`,
+  // donc aucun des deux ne peut valoir "INTERESSE" sans que l'autre le
+  // vaille aussi. On garde le brut — le hand-off suit la classification
+  // réelle du PS, pas une projection de pipeline. Un `AUTO_REPLY` ne
+  // déclenche donc JAMAIS de hand-off (un accusé machine n'est pas un lead).
   if (nonStopIntent === "INTERESSE") {
     await step.sendEvent("dispatch-handoff-event", {
       name: handoffRequested.name,
@@ -1101,7 +1148,7 @@ export async function processReplyHandler(
     contactId,
     conversationId,
     messageId,
-    intent: nonStopIntent,
+    intent: effectiveIntent,
     draftMessageId,
   };
 }

@@ -13,6 +13,7 @@
 import type { Timestamp } from "firebase-admin/firestore";
 import { describe, expect, it, vi } from "vitest";
 
+import { CLASSIFY_INTENT_PROMPT_VERSION } from "@/lib/claude/prompts/classify-intent";
 import { ExternalServiceError } from "@/lib/utils/errors";
 import type { Contact } from "@/types/contact";
 import type { Conversation } from "@/types/conversation";
@@ -629,7 +630,11 @@ describe("Step 6 — classify-intent (Claude Haiku 4.5)", () => {
           intent: "INTERESSE",
           confidence: 0.85,
           fallback: false,
-          promptVersion: "1.0.1",
+          // Relié à la constante plutôt qu'au littéral : ce champ est un
+          // marqueur forensic (corrélation « quel prompt a pris cette
+          // décision »). Le figer en dur ici oblige à toucher ce test à
+          // chaque bump de prompt sans rien prouver de plus.
+          promptVersion: CLASSIFY_INTENT_PROMPT_VERSION,
           model: "claude-haiku-4-5-20251001",
         },
       }),

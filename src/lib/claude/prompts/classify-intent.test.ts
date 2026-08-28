@@ -27,8 +27,8 @@ describe("classify-intent — sentinelles constantes", () => {
     expect(CLASSIFY_INTENT_TEMPERATURE).toBe(0);
   });
 
-  it("[S4] Version prompt verrouillée à 1.0.1", () => {
-    expect(CLASSIFY_INTENT_PROMPT_VERSION).toBe("1.0.1");
+  it("[S4] Version prompt verrouillée à 1.1.0", () => {
+    expect(CLASSIFY_INTENT_PROMPT_VERSION).toBe("1.1.0");
   });
 
   it("Tool name verrouillé à classify_intent", () => {
@@ -50,7 +50,7 @@ describe("classify-intent — sentinelles constantes", () => {
 // ─────────────────────────────────────────────────────────────────────────────
 
 describe("classifyIntentToolInputSchema — vocabulaire et bornes", () => {
-  it("[S3] accepte les 4 INTENT_VALUES et exactement ces 4", () => {
+  it("[S3] accepte les 5 INTENT_VALUES et exactement ces 5", () => {
     for (const intent of INTENT_VALUES) {
       const result = classifyIntentToolInputSchema.safeParse({
         intent,
@@ -216,17 +216,69 @@ describe("buildClassifyIntentPrompt — structure", () => {
     expect(system).toMatch(/C['']est cher|Trop cher/);
   });
 
-  it("[v1.0.1 M1] few-shot rééquilibré : 3 STOP / 2 OBJECTION / 1 INTERESSE / 1 NEUTRE", () => {
+  it("[v1.1.0 M1] few-shot : 3 STOP / 3 OBJECTION / 2 INTERESSE / 3 NEUTRE / 2 AUTO_REPLY", () => {
     const { system } = buildClassifyIntentPrompt("x");
     // On compte les classifications dans les exemples (insensible aux retours ligne).
     // Patterns alignés sur le format des exemples : `→ {"intent":"X"`.
     const countIntent = (intent: string): number =>
       (system.match(new RegExp(`"intent":"${intent}"`, "g")) ?? []).length;
 
+    // v1.1.0 — la distribution s'élargit dans les DEUX sens du piège
+    // AUTO_REPLY : 2 exemples de machines à détecter, et 3 exemples
+    // d'humains à préserver (2 NEUTRE brefs + 1 INTERESSE / 1 OBJECTION
+    // qui mentionnent une absence mais restent humains). L'asymétrie est
+    // volontaire : on renforce le côté "ne pas sur-détecter", conforme à
+    // la règle de doute.
     expect(countIntent("STOP")).toBe(3);
-    expect(countIntent("OBJECTION")).toBe(2);
-    expect(countIntent("INTERESSE")).toBe(1);
-    expect(countIntent("NEUTRE")).toBe(1);
+    expect(countIntent("OBJECTION")).toBe(3);
+    expect(countIntent("INTERESSE")).toBe(2);
+    expect(countIntent("NEUTRE")).toBe(4);
+    expect(countIntent("AUTO_REPLY")).toBe(2);
+  });
+
+  it("🔒 [v1.1.0] NEUTRE reste la classe PAR DÉFAUT des accusés de réception", () => {
+    // Review prompt-engineer : retirer purement la couverture générique
+    // des accusés du bloc NEUTRE creusait un trou — NEUTRE n'aurait plus
+    // couvert que 5 formulations littérales, et un "Compris" / "Noté"
+    // aurait pu partir chercher un signal côté AUTO_REPLY faute de mieux.
+    //
+    // L'invariant n'est donc PAS « NEUTRE ne parle plus d'accusés », mais
+    // « NEUTRE les couvre TOUS par défaut, et AUTO_REPLY est l'exception
+    // qui doit se justifier par un signal structurel ». C'est cette
+    // clause de non-collision qu'on verrouille.
+    const { system } = buildClassifyIntentPrompt("x");
+    const neutreBlock = system.slice(
+      system.indexOf("**NEUTRE**"),
+      system.indexOf("**AUTO_REPLY**"),
+    );
+    expect(neutreBlock).toContain("classe PAR DÉFAUT des accusés de réception");
+    expect(neutreBlock).toContain("signal structurel de la liste AUTO_REPLY n'est présent");
+    // NEUTRE est explicitement qualifié d'humain (vs machine).
+    expect(neutreBlock).toContain("ÉCRITE PAR UN HUMAIN");
+  });
+
+  it("🔒 [v1.1.0] le signal 'impersonnel' ne suffit JAMAIS seul à classer AUTO_REPLY", () => {
+    // Review prompt-engineer : contrairement aux signaux 1/2/3/5 qui sont
+    // des marqueurs POSITIFS, le signal 4 est un marqueur négatif — c'est
+    // aussi la description exacte d'un refus humain générique ("merci de
+    // votre message, je ne suis pas intéressé"). Laissé autonome, il
+    // devenait un vecteur de faux positif.
+    const { system } = buildClassifyIntentPrompt("x");
+    expect(system).toContain("Ce signal seul ne suffit JAMAIS à classer AUTO_REPLY");
+    expect(system).toContain("moins un des signaux 1, 2, 3 ou 5");
+  });
+
+  it("🔒 [v1.1.0] la règle de doute tranche vers l'humain, jamais vers AUTO_REPLY", () => {
+    // Le tie-breaker qui borne le coût du faux positif. Sans lui, un
+    // "ok reçu" pourrait basculer machine et le PS ne recevrait plus
+    // jamais de réponse — panne silencieuse.
+    const { system } = buildClassifyIntentPrompt("x");
+    expect(system).toContain("choisir **l'autre valeur**, jamais");
+  });
+
+  it("🔒 [v1.1.0] le contre-signal 'brièveté ≠ machine' est présent", () => {
+    const { system } = buildClassifyIntentPrompt("x");
+    expect(system).toContain("BRIÈVETÉ N'EST PAS un signal de machine");
   });
 
   it("[v1.0.1 M1] l'exemple OBJECTION temporel est présent", () => {

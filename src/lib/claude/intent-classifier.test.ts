@@ -4,6 +4,7 @@ import { z } from "zod";
 import { isOptOut, OPT_OUT_MAX_INCOMING_LENGTH } from "@/lib/compliance/opt-out";
 import { ConfigError, ExternalServiceError, ValidationError } from "@/lib/utils/errors";
 import { logger } from "@/lib/utils/logger";
+import type { Intent as ConversationIntent } from "@/types/conversation";
 
 import * as clientModule from "./client";
 import { __setAnthropicClientForTests, type AnthropicClient } from "./client";
@@ -13,7 +14,7 @@ import {
   CLASSIFY_INTENT_TEMPERATURE,
   CLASSIFY_INTENT_TOOL_NAME,
 } from "./prompts/classify-intent";
-import { INTENT_VALUES } from "./types";
+import { type Intent as ClassifierIntent, INTENT_VALUES } from "./types";
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Helpers
@@ -105,8 +106,8 @@ describe("SENTINELLES classifier (verrouillent invariants compliance)", () => {
     expect(CLASSIFY_INTENT_TEMPERATURE).toBe(0);
   });
 
-  it("[S3] le vocabulaire INTENT_VALUES est exactement les 4 valeurs fermées", () => {
-    expect(INTENT_VALUES).toEqual(["STOP", "OBJECTION", "INTERESSE", "NEUTRE"]);
+  it("[S3] le vocabulaire INTENT_VALUES est exactement les 5 valeurs fermées", () => {
+    expect(INTENT_VALUES).toEqual(["STOP", "OBJECTION", "INTERESSE", "NEUTRE", "AUTO_REPLY"]);
   });
 
   // S5 + S6 + S10 — pour chaque fixture GUARD-001
@@ -345,6 +346,44 @@ describe("classifyReply — paramètres SDK", () => {
 // ─────────────────────────────────────────────────────────────────────────────
 // Robustesse fail-safe — variantes d'erreur
 // ─────────────────────────────────────────────────────────────────────────────
+
+describe("AUTO_REPLY — invariants PR1-AUTO-REPLY-OBSERVE", () => {
+  it("🔒 le fail-safe reste STOP, JAMAIS AUTO_REPLY", async () => {
+    // Invariant critique. Si une panne classifier basculait sur
+    // AUTO_REPLY, on cesserait silencieusement de répondre à TOUS les PS
+    // pendant l'incident — panne invisible, aucun opt-out, aucune alerte
+    // métier. Le fail-safe doit rester STOP : il est bruyant (le contact
+    // sort de la campagne), donc détectable.
+    const { client, create } = makeFakeClient();
+    create.mockRejectedValueOnce(new Error("panne SDK"));
+    __setAnthropicClientForTests(client);
+
+    const result = await classifyReply("Réponse automatique : absent jusqu'au 15");
+    expect(result.intent).toBe("STOP");
+    expect(result.intent).not.toBe("AUTO_REPLY");
+    expect(result.fallback).toBe(true);
+  });
+
+  it("🔒 AUTO_REPLY n'entre PAS dans l'enum Intent de la conversation (compile-time)", () => {
+    // Décision Déthié : `conversation.intent` exprime la position
+    // COMMERCIALE du PS. Un accusé machine n'en exprime aucune, et l'y
+    // écrire ÉCRASERAIT un INTERESSE acquis — cas réel, la branche
+    // orphelins du hand-off laisse la conv en `in_dialogue`/`INTERESSE`,
+    // donc hors protection `TERMINAL_CONV_STATUSES_FOR_INTENT_CHANGE`.
+    //
+    // @ts-expect-error - AUTO_REPLY est INTERDIT dans ConversationIntent
+    const forbidden: ConversationIntent = "AUTO_REPLY";
+    void forbidden;
+
+    // Contrôle positif : les 5 valeurs du CLASSIFIER, elles, l'acceptent.
+    const allowed: ClassifierIntent = "AUTO_REPLY";
+    expect(allowed).toBe("AUTO_REPLY");
+  });
+
+  it("🔒 AUTO_REPLY est bien dans le vocabulaire classifier ET accepté par le schéma tool", () => {
+    expect(INTENT_VALUES).toContain("AUTO_REPLY");
+  });
+});
 
 describe("classifyReply — fail-safe sur erreurs SDK variées", () => {
   it("erreur SDK générique (Error nu) → STOP fallback", async () => {
