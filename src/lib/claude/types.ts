@@ -177,15 +177,49 @@ export interface ToolUseResult<TInput> {
  * fait STRICTEMENT sur ces 4 valeurs.
  *
  * Sémantique :
- *   - `STOP`      → opt-out explicite ou implicite. Inngest (S8+) appelle
- *                   `markOptedOut()` via la voie compliance S6.
- *   - `OBJECTION` → refus poli ou différé ("pas intéressé pour
- *                   l'instant"). Pas un STOP juridique mais on coupe
- *                   gracieusement la campagne pour ce contact.
- *   - `INTERESSE` → signe d'intérêt clair (question, demande de
- *                   tarifs, RDV). Hand-off Slack vers commercial.
- *   - `NEUTRE`    → réponse non discriminante. On enchaîne avec le
- *                   prochain SMS du séquençage (sous réserve compliance).
+ *   - `STOP`       → opt-out explicite ou implicite. Inngest (S8+) appelle
+ *                    `markOptedOut()` via la voie compliance S6.
+ *   - `OBJECTION`  → refus poli ou différé ("pas intéressé pour
+ *                    l'instant"). Pas un STOP juridique mais on coupe
+ *                    gracieusement la campagne pour ce contact.
+ *   - `INTERESSE`  → signe d'intérêt clair (question, demande de
+ *                    tarifs, RDV). Hand-off Slack vers commercial.
+ *   - `NEUTRE`     → réponse HUMAINE non discriminante ("ok", "bien reçu",
+ *                    "je vais voir"). On enchaîne avec le prochain SMS du
+ *                    séquençage (sous réserve compliance).
+ *   - `AUTO_REPLY` → le message n'a PAS été écrit par un humain : accusé
+ *                    de réception automatique, réponse d'absence, message
+ *                    de standard. (PR1-AUTO-REPLY-OBSERVE)
+ *
+ * ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ * 🚨 `AUTO_REPLY` VIT ICI, ET **PAS** DANS L'ÉTAT CONVERSATION
+ *
+ * Décision Déthié (PR1-AUTO-REPLY-OBSERVE) : `AUTO_REPLY` est une valeur
+ * du vocabulaire CLASSIFIER et des audits — elle n'entre JAMAIS dans
+ * `Intent` de `@/types/conversation`, ni dans les schémas Zod
+ * conversation/message.
+ *
+ * Raison : `conversation.intent` exprime la **position commerciale du
+ * PS**. Un accusé machine n'exprime aucune position. L'y écrire
+ * ÉCRASERAIT un `INTERESSE` acquis — cas réel puisque la branche
+ * orphelins du hand-off laisse la conv en `in_dialogue` / `INTERESSE`
+ * (`slack-handoff.ts`), donc hors de la protection
+ * `TERMINAL_CONV_STATUSES_FOR_INTENT_CHANGE`.
+ *
+ * Verrouillé par un `@ts-expect-error` dans `intent-classifier.test.ts`.
+ *
+ * ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ * ⚠️ ÉTAT PR1 — LE CLASSIFIER SAIT, MAIS LE PIPELINE NE COUPE PAS ENCORE
+ *
+ * `process-reply` traite `AUTO_REPLY` EXACTEMENT comme `NEUTRE` : l'IA
+ * répond quand même. L'objectif de PR1 est de COLLECTER les
+ * classifications réelles (via l'audit `intent_classified`) pour mesurer
+ * le taux de faux positifs sur du vrai trafic AVANT de couper la parole à
+ * des PS (PR2).
+ *
+ * Le coût d'un faux positif est asymétrique et SILENCIEUX : on cesserait
+ * de répondre à un vrai PS. Le coût d'un faux négatif est le
+ * comportement actuel. D'où l'observation préalable.
  *
  * Modifier (ajout/retrait/réordo) DOIT passer par :
  *   (a) parler à Déthié,
@@ -193,11 +227,11 @@ export interface ToolUseResult<TInput> {
  *   (c) mise à jour GUARD-001 Notion,
  *   (d) re-validation prompt-engineer du prompt classifier.
  *
- * Verrouillé par un test sentinelle dans
- * `intent-classifier.test.ts` (S7a.2) qui fera échouer le build si la
+ * Verrouillé par des tests sentinelles dans `intent-classifier.test.ts`
+ * ET `prompts/classify-intent.test.ts` qui feront échouer le build si la
  * liste change.
  */
-export const INTENT_VALUES = ["STOP", "OBJECTION", "INTERESSE", "NEUTRE"] as const;
+export const INTENT_VALUES = ["STOP", "OBJECTION", "INTERESSE", "NEUTRE", "AUTO_REPLY"] as const;
 
 export type Intent = (typeof INTENT_VALUES)[number];
 
