@@ -1,0 +1,736 @@
+diff --git a/src/lib/compliance/opt-out.test.ts b/src/lib/compliance/opt-out.test.ts
+index 4cd2f69..004de25 100644
+--- a/src/lib/compliance/opt-out.test.ts
++++ b/src/lib/compliance/opt-out.test.ts
+@@ -1,6 +1,12 @@
+ import { describe, expect, it } from "vitest";
+ 
+-import { hasOptOut, isOptOut, OPT_OUT_KEYWORDS, OPT_OUT_MAX_INCOMING_LENGTH } from "./opt-out";
++import {
++  containsOptOutKeyword,
++  hasOptOut,
++  isOptOut,
++  OPT_OUT_KEYWORDS,
++  OPT_OUT_MAX_INCOMING_LENGTH,
++} from "./opt-out";
+ 
+ // ─────────────────────────────────────────────────────────────────────────────
+ // hasOptOut — validation message SORTANT
+@@ -229,3 +235,60 @@ describe("isOptOut — anti-évasion Unicode invisible", () => {
+     expect(isOptOut("DÉCONFINEMENT")).toBe(false);
+   });
+ });
++
++// ─────────────────────────────────────────────────────────────────────────────
++// containsOptOutKeyword — VETO sans borne de longueur (PR2, MAJEUR-4)
++// ─────────────────────────────────────────────────────────────────────────────
++
++describe("containsOptOutKeyword — veto anti-avalement d'opt-out", () => {
++  it("🔒 détecte un opt-out DANS un message long, là où isOptOut abandonne", () => {
++    // Le cas exact que ce prédicat existe pour couvrir : un message à la
++    // fois MACHINE et OPT-OUT. `isOptOut` le rate (> 50 chars), le
++    // classifier le range en AUTO_REPLY (2 signaux structurels francs), et
++    // sans ce veto la coupure PR2 avalerait la demande d'arrêt.
++    const machineEtOptOut =
++      "Message automatique du secrétariat : merci de ne plus adresser de sollicitations commerciales à ce cabinet. ARRET des envois demandé. Fermé le vendredi.";
++
++    expect(machineEtOptOut.length).toBeGreaterThan(OPT_OUT_MAX_INCOMING_LENGTH);
++    expect(isOptOut(machineEtOptOut)).toBe(false); // la borne 50 chars abandonne
++    expect(containsOptOutKeyword(machineEtOptOut)).toBe(true); // le veto attrape
++  });
++
++  it("couvre les 5 mots-clés, sans borne de longueur", () => {
++    const padding = "x".repeat(OPT_OUT_MAX_INCOMING_LENGTH + 20);
++    for (const kw of OPT_OUT_KEYWORDS) {
++      expect(containsOptOutKeyword(`${padding} ${kw} ${padding}`)).toBe(true);
++    }
++  });
++
++  it("même normalisation anti-évasion que isOptOut (accents + invisibles)", () => {
++    expect(containsOptOutKeyword("Merci de bien vouloir arrêter vos envois, cordialement.")).toBe(
++      true,
++    );
++    // ZWSP inséré au milieu du mot-clé (attaque S4 M1).
++    expect(containsOptOutKeyword(`${"x".repeat(60)} S​TOP`)).toBe(true);
++  });
++
++  it("message sans mot-clé → false (le veto ne bloque pas tout)", () => {
++    expect(
++      containsOptOutKeyword(
++        "Réponse automatique : je suis absent du 12 au 26 août et ne consulte pas mes messages.",
++      ),
++    ).toBe(false);
++  });
++
++  it("message vide → false", () => {
++    expect(containsOptOutKeyword("")).toBe(false);
++    expect(containsOptOutKeyword("   ")).toBe(false);
++  });
++
++  it("⚠️ NE PAS confondre avec isOptOut : ce prédicat sur-détecte par design", () => {
++    // Une phrase de conversation contenant « stop » par hasard déclenche
++    // le veto — c'est VOULU (on refuse seulement de couper), et c'est
++    // exactement pourquoi il ne doit JAMAIS servir à décider un opt-out.
++    const conversation =
++      "J'ai vu votre message, je suis en plein stop-and-go entre deux consultations, rappelez-moi jeudi.";
++    expect(isOptOut(conversation)).toBe(false);
++    expect(containsOptOutKeyword(conversation)).toBe(true);
++  });
++});
+diff --git a/src/lib/compliance/opt-out.ts b/src/lib/compliance/opt-out.ts
+index cfc86d4..c4ed447 100644
+--- a/src/lib/compliance/opt-out.ts
++++ b/src/lib/compliance/opt-out.ts
+@@ -141,3 +141,49 @@ export function isOptOut(incomingMessage: string): boolean {
+   if (normalized.length > OPT_OUT_MAX_INCOMING_LENGTH) return false;
+   return OPT_OUT_KEYWORDS.some((kw) => normalized.includes(kw));
+ }
++
++/**
++ * Vrai si le message entrant contient un mot-clé d'opt-out, **SANS la
++ * borne des 50 caractères** de `isOptOut`.
++ *
++ * ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
++ * 🚨 CE N'EST PAS UN DÉTECTEUR D'OPT-OUT — C'EST UN VETO
++ *
++ * N'utilise JAMAIS cette fonction pour DÉCIDER un opt-out : sans la borne
++ * de longueur, une phrase de conversation contenant « stop » par hasard
++ * la déclencherait, et on désabonnerait un PS qui ne l'a pas demandé.
++ * C'est exactement le faux positif que la borne des 50 chars existe pour
++ * éviter (cf. `isOptOut`). La décision d'opt-out reste : `isOptOut`
++ * (court) puis le classifier Claude (long-form, GUARD-001).
++ *
++ * Son usage légitime est INVERSE : empêcher une autre règle de couper le
++ * traitement d'un message qui pourrait être une demande d'arrêt.
++ *
++ * ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
++ * CAS D'USAGE (PR2-AUTO-REPLY-ACTIVATE, MAJEUR-4)
++ *
++ * Le classifier ne rend qu'UN seul label. Un message long à la fois
++ * MACHINE et OPT-OUT — typiquement « Message automatique du secrétariat :
++ * merci de ne plus adresser de sollicitations à ce cabinet. Fermé le
++ * vendredi. » — porte deux signaux structurels d'`AUTO_REPLY` francs et
++ * se verrait classé machine. La coupure PR2 l'avalerait : ni réponse, ni
++ * `markOptedOut`, contact toujours démarchable. **L.34-5 CPCE caractérisé.**
++ *
++ * `process-reply` conditionne donc la coupure `AUTO_REPLY` à l'absence de
++ * tout mot-clé d'opt-out dans le body brut. Un message machine qui
++ * contient « ne plus », « arrêt », « désinscription » retombe sur le
++ * traitement normal et reste examinable.
++ *
++ * Asymétrie des coûts, qui justifie l'absence de borne de longueur :
++ *   - faux positif ici (on ne coupe pas une vraie machine) → on répond à
++ *     une machine, borné par le plafond de volume. Bénin.
++ *   - faux négatif (on avale un opt-out) → infraction. Inacceptable.
++ *
++ * Même normalisation que `isOptOut` (NFKD + strip diacritiques/invisibles
++ * + uppercase) : la logique anti-évasion vit en un seul endroit.
++ */
++export function containsOptOutKeyword(incomingMessage: string): boolean {
++  const normalized = normalizeIncoming(incomingMessage);
++  if (normalized.length === 0) return false;
++  return OPT_OUT_KEYWORDS.some((kw) => normalized.includes(kw));
++}
+diff --git a/src/lib/inngest/functions/process-reply.test.ts b/src/lib/inngest/functions/process-reply.test.ts
+index 096c250..624c242 100644
+--- a/src/lib/inngest/functions/process-reply.test.ts
++++ b/src/lib/inngest/functions/process-reply.test.ts
+@@ -20,6 +20,7 @@ import type { Conversation } from "@/types/conversation";
+ import type { Message } from "@/types/message";
+ 
+ import {
++  __AUTO_REPLY_CONFIDENCE_THRESHOLD_FOR_TESTS,
+   __DROP_REASONS_FOR_TESTS,
+   __FUNCTION_ID_FOR_TESTS,
+   __PHONE_HASH_PREFIX_FOR_TESTS,
+@@ -212,16 +213,24 @@ describe("sentinelles structurelles process-reply (S9.2.1)", () => {
+     expect(opts.retries).toBe(3);
+   });
+ 
+-  it("DROP_REASONS verrouillé à ['contact_unknown', 'no_active_conversation', 'duplicate']", () => {
++  it("DROP_REASONS verrouillé à 4 raisons (dont 'auto_reply_detected', PR2)", () => {
+     // 🔒 Sentinelle anti-régression : ajouter une raison de drop sans
+     // miroir dans le pipeline (et inversement) = bug forensic / audit.
+     expect([...__DROP_REASONS_FOR_TESTS].sort()).toEqual([
++      "auto_reply_detected",
+       "contact_unknown",
+       "duplicate",
+       "no_active_conversation",
+     ]);
+   });
+ 
++  it("🔒 seuil de coupure AUTO_REPLY = 0.8", () => {
++    // Baisser ce seuil augmente le risque de faire taire de vrais PS
++    // (faux positif silencieux). Toute modification passe par
++    // compliance-auditor.
++    expect(__AUTO_REPLY_CONFIDENCE_THRESHOLD_FOR_TESTS).toBe(0.8);
++  });
++
+   it("PHONE_HASH_PREFIX === 'hph_' (fix HIGH-1 security-reviewer S9.2.1)", () => {
+     // 🔒 Sentinelle anti-régression : ce préfixe casse les frontières
+     // anti-digit du scrubber RE_FR_NATIONAL et évite les ~0.3% de
+@@ -942,6 +951,182 @@ describe("Step 7 — branch-by-intent", () => {
+     expect(sendEventSpyO).not.toHaveBeenCalledWith("dispatch-handoff-event", expect.anything());
+   });
+ 
++  it("🔒 PR2 AUTO_REPLY confidence 0.9 → COUPÉ : 0 génération, 0 draft, 0 event, 0 hand-off", async () => {
++    // Le cœur de PR2. Un accusé de réception automatique ne doit
++    // déclencher AUCUNE réponse — sinon ping-pong IA↔machine non borné.
++    const ctx = makeFakeCtx({ body: "Réponse automatique : absent jusqu'au 15." });
++    const deps = makeDeps({
++      getContactByPhone: vi.fn().mockResolvedValue(makeFakeContact("hs-ar")),
++      getActiveConversationByContactId: vi.fn().mockResolvedValue({
++        conversationId: "hs-ar_camp-ar",
++        conversation: makeFakeConversation("hs-ar", "camp-ar"),
++      }),
++      addInbound: vi.fn().mockResolvedValue("msgid-ar"),
++      classifyReply: vi.fn().mockResolvedValue({
++        intent: "AUTO_REPLY",
++        confidence: 0.9,
++        reasoning: "auto-descriptif + disponibilité datée",
++        fallback: false,
++      }),
++    });
++
++    const result = await processReplyHandler(ctx, deps);
++
++    expect(result.status).toBe("dropped");
++    if (result.status === "dropped") {
++      expect(result.reason).toBe("auto_reply_detected");
++    }
++
++    // 🔒 Aucun appel Sonnet — l'emballement ne coûte plus de tokens.
++    expect(deps.generateReply).not.toHaveBeenCalled();
++    expect(deps.addOutboundDraft).not.toHaveBeenCalled();
++
++    // 🔒 Aucun event : ni envoi (8d), ni hand-off (8e).
++    expect(ctx.step.sendEvent).not.toHaveBeenCalled();
++
++    // 🔒 L'audit de coupure est posé, scrubber-safe.
++    expect(deps.appendAuditLog).toHaveBeenCalledWith({
++      actorId: "system",
++      actorType: "system",
++      action: "reply_dropped",
++      targetType: "message",
++      targetId: "msgid-ar",
++      payload: {
++        reason: "auto_reply_detected",
++        contactId: "hs-ar",
++        conversationId: "hs-ar_camp-ar",
++        confidence: 0.9,
++      },
++    });
++
++    // Convention pipeline : pas de `reply_processed` sur un drop.
++    const actions = (deps.appendAuditLog as ReturnType<typeof vi.fn>).mock.calls.map(
++      (c) => (c[0] as { action: string }).action,
++    );
++    expect(actions).not.toContain("reply_processed");
++  });
++
++  it("🔒 PR2 AUTO_REPLY coupé → conversation.intent NON modifié (pas d'écrasement d'un INTERESSE)", async () => {
++    // La coupure intervient AVANT `setConversationIntent`. Un INTERESSE
++    // acquis — y compris via la branche orphelins du hand-off, qui laisse
++    // la conv en `in_dialogue`/`INTERESSE` hors protection des statuts
++    // terminaux — n'est PAS écrasé par un accusé machine arrivant après.
++    const ctx = makeFakeCtx({ body: "Message automatique du secrétariat." });
++    const deps = makeDeps({
++      getContactByPhone: vi.fn().mockResolvedValue(makeFakeContact("hs-ar2")),
++      getActiveConversationByContactId: vi.fn().mockResolvedValue({
++        conversationId: "hs-ar2_camp-ar2",
++        conversation: makeFakeConversation("hs-ar2", "camp-ar2"),
++      }),
++      addInbound: vi.fn().mockResolvedValue("msgid-ar2"),
++      classifyReply: vi.fn().mockResolvedValue({
++        intent: "AUTO_REPLY",
++        confidence: 0.95,
++        reasoning: "auto-descriptif",
++        fallback: false,
++      }),
++    });
++
++    await processReplyHandler(ctx, deps);
++
++    expect(deps.setConversationIntent).not.toHaveBeenCalled();
++  });
++
++  it("🔒 PR2 AUTO_REPLY confidence 0.7 → traité comme NEUTRE : l'IA RÉPOND", async () => {
++    // Sous le seuil, le doute penche vers l'humain. Le coût d'un faux
++    // positif (faire taire un vrai PS) est silencieux ; celui d'un faux
++    // négatif est le comportement d'avant, borné par le plafond de volume.
++    const ctx = makeFakeCtx({ body: "ok reçu" });
++    const deps = makeDeps({
++      getContactByPhone: vi.fn().mockResolvedValue(makeFakeContact("hs-lo")),
++      getActiveConversationByContactId: vi.fn().mockResolvedValue({
++        conversationId: "hs-lo_camp-lo",
++        conversation: makeFakeConversation("hs-lo", "camp-lo"),
++      }),
++      addInbound: vi.fn().mockResolvedValue("msgid-lo"),
++      classifyReply: vi.fn().mockResolvedValue({
++        intent: "AUTO_REPLY",
++        confidence: 0.7,
++        reasoning: "signal machine faible",
++        fallback: false,
++      }),
++    });
++
++    const result = await processReplyHandler(ctx, deps);
++
++    expect(result.status).toBe("classified");
++    if (result.status === "classified") {
++      // Remappé sur NEUTRE — AUTO_REPLY n'entre JAMAIS dans l'état conv.
++      expect(result.intent).toBe("NEUTRE");
++    }
++    expect(deps.generateReply).toHaveBeenCalledTimes(1);
++    expect(deps.setConversationIntent).toHaveBeenCalledWith("hs-lo_camp-lo", "NEUTRE", {
++      nextStatus: "in_dialogue",
++    });
++  });
++
++  it("🔴 MAJEUR-4 : AUTO_REPLY franc MAIS body contenant un opt-out → PAS coupé", async () => {
++    // Le classifier ne rend qu'UN label. Un message à la fois MACHINE et
++    // OPT-OUT porte deux signaux AUTO_REPLY francs et serait coupé — ni
++    // réponse, ni `markOptedOut`, contact toujours démarchable.
++    // L.34-5 CPCE caractérisé.
++    //
++    // Le veto `containsOptOutKeyword` (sans la borne 50 chars d'`isOptOut`)
++    // empêche la coupure. Le message retombe sur le traitement normal et
++    // reste examinable.
++    const bodyMachineEtOptOut =
++      "Message automatique du secrétariat : merci de ne plus adresser de sollicitations à ce cabinet. ARRET des envois.";
++    const ctx = makeFakeCtx({ body: bodyMachineEtOptOut });
++    const deps = makeDeps({
++      getContactByPhone: vi.fn().mockResolvedValue(makeFakeContact("hs-oo")),
++      getActiveConversationByContactId: vi.fn().mockResolvedValue({
++        conversationId: "hs-oo_camp-oo",
++        conversation: makeFakeConversation("hs-oo", "camp-oo"),
++      }),
++      addInbound: vi.fn().mockResolvedValue("msgid-oo"),
++      // `isOptOut` abandonne (> 50 chars) — c'est le trou GUARD-001.
++      isOptOut: vi.fn().mockReturnValue(false),
++      classifyReply: vi.fn().mockResolvedValue({
++        intent: "AUTO_REPLY",
++        confidence: 0.96,
++        reasoning: "auto-descriptif + redirection",
++        fallback: false,
++      }),
++    });
++
++    const result = await processReplyHandler(ctx, deps);
++
++    // PAS de drop : le veto a joué.
++    expect(result.status).not.toBe("dropped");
++    const droppedActions = (deps.appendAuditLog as ReturnType<typeof vi.fn>).mock.calls
++      .map((c) => c[0] as { action: string; payload?: { reason?: string } })
++      .filter((a) => a.payload?.reason === "auto_reply_detected");
++    expect(droppedActions).toHaveLength(0);
++  });
++
++  it("🔒 PR2 AUTO_REPLY confidence EXACTEMENT 0.8 → COUPÉ (borne >= inclusive)", async () => {
++    const ctx = makeFakeCtx({ body: "Ne pas répondre à ce message." });
++    const deps = makeDeps({
++      getContactByPhone: vi.fn().mockResolvedValue(makeFakeContact("hs-b")),
++      getActiveConversationByContactId: vi.fn().mockResolvedValue({
++        conversationId: "hs-b_camp-b",
++        conversation: makeFakeConversation("hs-b", "camp-b"),
++      }),
++      addInbound: vi.fn().mockResolvedValue("msgid-b"),
++      classifyReply: vi.fn().mockResolvedValue({
++        intent: "AUTO_REPLY",
++        confidence: __AUTO_REPLY_CONFIDENCE_THRESHOLD_FOR_TESTS,
++        reasoning: "signal machine",
++        fallback: false,
++      }),
++    });
++
++    const result = await processReplyHandler(ctx, deps);
++
++    expect(result.status).toBe("dropped");
++    expect(deps.generateReply).not.toHaveBeenCalled();
++  });
++
+   it("NEUTRE → setConversationIntent('NEUTRE', in_dialogue) + classified", async () => {
+     const ctx = makeFakeCtx({ body: "OK" });
+     const deps = makeDeps({
+@@ -1678,6 +1863,34 @@ describe("Anti-PII pipeline complet (sentinelle critique L.34-5 CPCE)", () => {
+     expect(serialized).not.toContain("+33799887766");
+   }
+ 
++  it("branche auto_reply_detected — aucune fuite (PR2)", async () => {
++    // Cette suite est organisée BRANCHE PAR BRANCHE : sa garantie est
++    // « 100 % des branches du pipeline sont couvertes ». PR2 ajoute une
++    // branche, elle doit donc y figurer — sinon la garantie devient
++    // partielle sans que rien ne le signale.
++    const ctx = makeFakeCtx({
++      phone: SECRET_PHONE,
++      body: SECRET_BODY,
++      ovhMessageId: SECRET_OVH_MSGID,
++    });
++    const deps = makeDeps({
++      getContactByPhone: vi.fn().mockResolvedValue(makeFakeContact("hs-arpii")),
++      getActiveConversationByContactId: vi.fn().mockResolvedValue({
++        conversationId: "hs-arpii_camp",
++        conversation: makeFakeConversation("hs-arpii", "camp"),
++      }),
++      addInbound: vi.fn().mockResolvedValue("msgid-arpii"),
++      classifyReply: vi.fn().mockResolvedValue({
++        intent: "AUTO_REPLY",
++        confidence: 0.95,
++        reasoning: SECRET_REASONING,
++        fallback: false,
++      }),
++    });
++    await processReplyHandler(ctx, deps);
++    assertNoLeak(ctx.logger);
++  });
++
+   it("branche contact_unknown — aucune fuite phone/body/ovhMessageId", async () => {
+     const ctx = makeFakeCtx({
+       phone: SECRET_PHONE,
+diff --git a/src/lib/inngest/functions/process-reply.ts b/src/lib/inngest/functions/process-reply.ts
+index bc363c3..3a6eb0f 100644
+--- a/src/lib/inngest/functions/process-reply.ts
++++ b/src/lib/inngest/functions/process-reply.ts
+@@ -84,14 +84,17 @@
+  *                                       effectiveIntent, {nextStatus:
+  *                                       "in_dialogue"})` puis enchaîne
+  *                                       les sub-steps 8a/8b/8c.
+- *                                     - ⚠️ PR1-AUTO-REPLY-OBSERVE :
+- *                                       `AUTO_REPLY` est remappé sur
+- *                                       `NEUTRE` (`effectiveIntent`) →
+- *                                       comportement STRICTEMENT
+- *                                       inchangé, l'IA répond quand même.
+- *                                       Seul l'audit `intent_classified`
+- *                                       (step 6b) garde la valeur brute.
+- *                                       PR2 y posera l'early return.
++ *                                     - AUTO_REPLY + confidence >= 0.8 →
++ *                                       🔒 COUPURE (PR2, step 7bis) :
++ *                                       audit `reply_dropped`
++ *                                       (`auto_reply_detected`) + early
++ *                                       return. PAS de génération, PAS
++ *                                       d'envoi, PAS de hand-off, et
++ *                                       `conversation.intent` INTACT.
++ *                                     - AUTO_REPLY + confidence < 0.8 →
++ *                                       remappé sur `NEUTRE` : le doute
++ *                                       penche vers l'humain, l'IA
++ *                                       répond.
+  *
+  *   8a. `claude-generate-{intent}`  : `generateReply({intent, rawMessage,
+  *                                      history})` (S9.3.2 Sonnet 4.6).
+@@ -273,6 +276,8 @@
+  *   |----------------------|---------------|---------------------------|--------------------------------------------------------------|
+  *   | `reply_dropped`      | `contact`     | `phoneHash` (safePhone)   | `{reason: "contact_unknown", phoneHash}`                     |
+  *   | `reply_dropped`      | `contact`     | `contactId`               | `{reason: "no_active_conversation", phoneHash}`              |
++ *   | `reply_dropped`      | `message`     | `inboundMessageId`        | `{reason: "auto_reply_detected", contactId, conversationId,  |
++ *   |                      |               |                           |    confidence}` (PR2 — message non écrit par un humain)      |
+  *   | `reply_dropped`      | `message`     | `duplicateOfMessageId`    | `{reason: "duplicate", contactId, conversationId,            |
+  *   |                      |               |                           |    duplicateOfMessageId}`                                    |
+  *   | `sms_received` (auto)| `message`     | `messageId` (nouveau)     | `{direction: "inbound", messageId}` (par `addInbound`)       |
+@@ -302,7 +307,7 @@ import {
+ } from "@/lib/claude/prompts/classify-intent";
+ import { generateReply, type GenerateReplyIntent } from "@/lib/claude/reply-generator";
+ import type { Intent } from "@/lib/claude/types";
+-import { isOptOut } from "@/lib/compliance/opt-out";
++import { containsOptOutKeyword, isOptOut } from "@/lib/compliance/opt-out";
+ import { appendAuditLog } from "@/lib/firestore/audit-log";
+ import { getContactByPhone, markOptedOut } from "@/lib/firestore/contacts";
+ import {
+@@ -317,6 +322,7 @@ import {
+ } from "@/lib/firestore/messages";
+ import { getInngestClient } from "@/lib/inngest/client";
+ import { handoffRequested, smsReplyReceived, smsReplySendRequested } from "@/lib/inngest/events";
++import { captureMonitoringWarning } from "@/lib/utils/observability";
+ import { hashPii, PHONE_HASH_PREFIX, safePhoneHash } from "@/lib/utils/pii-detector";
+ import type { ReplyGeneratedPayload } from "@/types/audit-log";
+ 
+@@ -332,11 +338,86 @@ import type { ReplyGeneratedPayload } from "@/types/audit-log";
+ const FUNCTION_ID = "process-reply";
+ 
+ /**
+- * Raisons de drop possibles en S9.2.1. Discriminant du retour
++ * 🔒 Seuil de confiance minimal pour COUPER sur un `AUTO_REPLY`
++ * (PR2-AUTO-REPLY-ACTIVATE).
++ *
++ * ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
++ * 🚨 CE SEUIL EST UNE GARDE DE DERNIER RESSORT, PAS LA PROTECTION
++ *
++ * Ne t'appuie PAS dessus pour dormir tranquille. En pratique il n'est
++ * probablement JAMAIS atteint, pour trois raisons tenant au prompt
++ * `classify-intent.ts` v1.1.0 :
++ *
++ *   1. le prompt dit explicitement au modèle que « confidence basse ne
++ *      change PAS la décision — la règle de doute prime » ;
++ *   2. la règle de doute évacue `AUTO_REPLY` AVANT que la confidence ne
++ *      soit émise (« ne réponds AUTO_REPLY que si au moins un signal
++ *      structurel est FRANCHEMENT présent ») — un AUTO_REPLY émis est
++ *      donc par construction un AUTO_REPLY jugé franc ;
++ *   3. les DEUX seuls few-shots AUTO_REPLY sont ancrés à 0.97 et 0.96.
++ *      Le modèle n'a aucun ancrage pour émettre AUTO_REPLY à 0.7.
++ *
++ * Autrement dit : `P(confidence < 0.8 | intent = AUTO_REPLY) ≈ 0`, et
++ * cette garde approxime « couper sur TOUT AUTO_REPLY ».
++ *
++ * **La protection réelle contre le faux positif vit dans le prompt**
++ * (règle de doute + contre-signal « la brièveté n'est pas un signal de
++ * machine ») — un artefact probabiliste, pas déterministe. Le second
++ * filet réel est le VETO OPT-OUT posé au site d'usage, qui lui est bien
++ * déterministe.
++ *
++ * Le seuil reste utile : il coûte une ligne, il couvre le jour où le
++ * prompt changerait, et il rend la décision explicite. Mais il ne doit
++ * pas être compté comme une barrière dans l'analyse de risque.
++ *
++ * ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
++ * POURQUOI UNE GARDE DÉTERMINISTE MALGRÉ TOUT
++ *
++ * Le coût des deux erreurs est ASYMÉTRIQUE :
++ *
++ *   - Faux POSITIF (humain classé machine) → on cesse de répondre à un
++ *     vrai PS. Silencieux : personne ne s'en aperçoit, le lead meurt.
++ *   - Faux NÉGATIF (machine classée humaine) → ping-pong, c'est-à-dire
++ *     le comportement d'avant cette PR. Borné par ailleurs par le
++ *     plafond de volume (10 réponses/24h, PR-BARRIERE-2).
++ *
++ * On n'accepte donc de couper QUE sur un signal franc. En dessous du
++ * seuil, le doute penche vers l'humain : le message est traité comme un
++ * `NEUTRE` et l'IA répond.
++ *
++ * Cette garde vit dans l'ORCHESTRATEUR, pas dans le classifier — cohérent
++ * avec la décision de design de `classify-intent.ts` : « le mapping
++ * intent → action est une décision métier de l'orchestrateur, pas du
++ * classifier sémantique. Garder le classifier pur. »
++ *
++ * Borne INCLUSIVE (`>=`) : une confiance de 0.8 pile coupe. Cohérent avec
++ * les conventions de bornes du projet (J-30 pile compté, 24h pile compté).
++ *
++ * ⚠️ Baisser ce seuil augmente le risque de faire taire de vrais PS.
++ * Toute modification passe par compliance-auditor.
++ */
++const AUTO_REPLY_CONFIDENCE_THRESHOLD = 0.8;
++
++/**
++ * Raisons de drop possibles. Discriminant du retour
+  * `ProcessReplyResult.status === "dropped"`. Sentinelle test verrouille
+  * cette union.
++ *
++ * ⚠️ Les 3 premières coupent AVANT `store-inbound` (steps 1-3) ;
++ * `auto_reply_detected` coupe APRÈS la classification (step 7). Le
++ * message entrant EST donc stocké et audité dans ce dernier cas — c'est
++ * voulu : forensic L.34-5 CPCE, on conserve la preuve de ce que le PS
++ * (ou sa machine) nous a envoyé, même si on ne répond pas.
+  */
+-const DROP_REASONS = ["contact_unknown", "no_active_conversation", "duplicate"] as const;
++const DROP_REASONS = [
++  "contact_unknown",
++  "no_active_conversation",
++  "duplicate",
++  // PR2-AUTO-REPLY-ACTIVATE — le message entrant n'a pas été écrit par un
++  // humain (accusé de réception automatique, message d'absence, standard).
++  // Répondre déclencherait un ping-pong IA↔machine non borné.
++  "auto_reply_detected",
++] as const;
+ type DropReason = (typeof DROP_REASONS)[number];
+ 
+ // ─────────────────────────────────────────────────────────────────────────────
+@@ -415,6 +496,7 @@ export interface ProcessReplyDeps {
+   addInbound?: typeof addInbound;
+   markOptedOut?: typeof markOptedOut;
+   isOptOut?: typeof isOptOut;
++  containsOptOutKeyword?: typeof containsOptOutKeyword;
+   hashPii?: typeof hashPii;
+   appendAuditLog?: typeof appendAuditLog;
+   // S9.2.2 — classifier + post-classification mutation
+@@ -485,6 +567,7 @@ export async function processReplyHandler(
+   const _addInbound = deps.addInbound ?? addInbound;
+   const _markOptedOut = deps.markOptedOut ?? markOptedOut;
+   const _isOptOut = deps.isOptOut ?? isOptOut;
++  const _containsOptOutKeyword = deps.containsOptOutKeyword ?? containsOptOutKeyword;
+   const _hashPii = deps.hashPii ?? hashPii;
+   const _appendAuditLog = deps.appendAuditLog ?? appendAuditLog;
+   const _classifyReply = deps.classifyReply ?? classifyReply;
+@@ -897,33 +980,126 @@ export async function processReplyHandler(
+   // in_dialogue. S9.3.3b génère + stocke le draft + audit reply_generated.
+   const nonStopIntent = classification.intent;
+ 
+-  // ─────────────────────────────────────────────────────────────────────
+-  // 🔻 COUTURE PR1 → PR2 (PR1-AUTO-REPLY-OBSERVE) — LIRE AVANT DE TOUCHER
++  // ── Step 7bis — COUPURE AUTO_REPLY (PR2-AUTO-REPLY-ACTIVATE) ──────────
++  //
++  // 🔒 Le message entrant n'a PAS été écrit par un humain (accusé de
++  // réception automatique, message d'absence, standard). On ne répond pas :
++  // répondre à une machine déclenche un ping-pong IA↔machine non borné.
++  //
++  // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
++  // PLACEMENT — AVANT `_setConversationIntent`, et c'est essentiel
+   //
+-  // PR1 NE COUPE RIEN. Un `AUTO_REPLY` est traité EXACTEMENT comme un
+-  // `NEUTRE` : la conv passe en in_dialogue, Claude génère, le SMS part.
+-  // Le comportement observable est donc STRICTEMENT identique à avant.
++  // Cet early return précède TOUT : la mutation de `conversation.intent`,
++  // la génération Claude, le store-draft, l'event d'envoi et le hand-off.
++  // Conséquences voulues, dans l'ordre :
+   //
+-  // Ce que PR1 apporte : l'audit `intent_classified` (step 6b) enregistre
+-  // la classification BRUTE (`classification.intent`, donc `AUTO_REPLY`
+-  // le cas échéant) AVANT ce remapping. C'est la donnée qu'on vient
+-  // chercher — mesurer le taux de faux positifs sur du trafic réel avant
+-  // de cesser de répondre à de vrais PS.
++  //   1. `conversation.intent` n'est PAS touché. Un `INTERESSE` acquis
++  //      (y compris via la branche orphelins du hand-off, qui laisse la
++  //      conv en `in_dialogue`/`INTERESSE` hors protection
++  //      `TERMINAL_CONV_STATUSES_FOR_INTENT_CHANGE`) N'EST PAS écrasé par
++  //      un accusé machine arrivant après.
++  //   2. Zéro appel Sonnet — l'emballement ne coûte plus de tokens.
++  //   3. Aucun hand-off : la condition du step 8e (`=== "INTERESSE"`) est
++  //      hors de portée par construction, en plus d'être fausse ici.
+   //
+-  // Pourquoi observer d'abord : le coût d'un faux positif est asymétrique
+-  // ET SILENCIEUX (un PS humain classé machine ne reçoit plus jamais de
+-  // réponse, et personne ne s'en aperçoit). Le coût d'un faux négatif est
+-  // le comportement actuel. On ne coupe pas à l'aveugle.
++  // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
++  // GARDE DE CONFIANCE — on ne coupe que sur un signal franc
++  //
++  // En dessous du seuil, le doute penche vers l'humain : le message
++  // retombe sur le remapping `"NEUTRE"` ci-dessous et l'IA répond. Cf.
++  // `AUTO_REPLY_CONFIDENCE_THRESHOLD` pour l'asymétrie des coûts.
++  //
++  // L'audit `intent_classified` (step 6b) a DÉJÀ enregistré la
++  // classification brute avec sa `confidence`, quelle que soit la branche
++  // prise ici — la donnée d'observation de PR1 continue d'être collectée.
++  // 🔒 VETO OPT-OUT (MAJEUR-4) — la coupure ne doit JAMAIS avaler une
++  // demande d'arrêt. Le classifier ne rend qu'UN label : un message long
++  // à la fois MACHINE et OPT-OUT (« Message automatique du secrétariat :
++  // merci de ne plus adresser de sollicitations à ce cabinet ») porte deux
++  // signaux AUTO_REPLY francs et serait coupé — ni réponse, ni
++  // `markOptedOut`, contact toujours démarchable. L.34-5 CPCE caractérisé.
++  //
++  // `containsOptOutKeyword` est délibérément SANS la borne des 50 chars de
++  // `isOptOut` : ici on ne DÉCIDE pas un opt-out, on refuse seulement de
++  // couper. Faux positif = on répond à une machine (bénin, borné par le
++  // plafond de volume). Faux négatif = infraction.
++  const bodyMayBeOptOut = _containsOptOutKeyword(body);
++
++  if (
++    nonStopIntent === "AUTO_REPLY" &&
++    classification.confidence >= AUTO_REPLY_CONFIDENCE_THRESHOLD &&
++    !bodyMayBeOptOut
++  ) {
++    await step.run("drop-auto-reply", async () => {
++      await _appendAuditLog({
++        actorId: "system",
++        actorType: "system",
++        action: "reply_dropped",
++        targetType: "message",
++        targetId: messageId,
++        // Scrubber-safe : IDs opaques + enum fermé + number. PAS de body,
++        // PAS de reasoning classifier (cf. invariant anti-PII step 6b).
++        payload: {
++          reason: "auto_reply_detected",
++          contactId,
++          conversationId,
++          confidence: classification.confidence,
++        },
++      });
++    });
++
++    logger.info("[process-reply] dropped", {
++      eventId: event.id,
++      contactId,
++      conversationId,
++      messageId,
++      step: "drop-auto-reply",
++      reason: "auto_reply_detected",
++      confidence: classification.confidence,
++      classifierFallback: classification.fallback,
++    });
++
++    // 🔒 OBSERVABILITÉ DE LA COUPURE (MAJEUR-2) — rendre le dommage
++    // silencieux AUDIBLE.
++    //
++    // Un faux positif ici fait taire un vrai PS et personne ne s'en
++    // aperçoit : l'audit `reply_dropped` est écrit mais AUCUN consommateur
++    // ne le lit (pas de vue conversations au dashboard, pas d'alerte). On
++    // remonte donc chaque coupure vers Sentry.
++    //
++    // Alerte à CHAQUE drop, pas au-delà d'un seuil : à l'échelle MVP
++    // (200 dentistes) le volume le permet, et c'est précisément ce qui
++    // fournit l'échantillon manuel nécessaire pour valider le taux de faux
++    // positifs. À reconsidérer (agrégation 24h) avant la montée à 26k.
++    //
++    // Payload scrubber-safe : IDs opaques + enum + number. Pas de body.
++    captureMonitoringWarning("process_reply.auto_reply_dropped", {
++      tags: { reason: "auto_reply_detected" },
++      extra: {
++        contactId,
++        conversationId,
++        messageId,
++        confidence: classification.confidence,
++        classifierFallback: classification.fallback,
++      },
++    });
++
++    // Pas d'audit `reply_processed` : convention du pipeline — il n'est
++    // PAS posé sur les drops, `reply_dropped` suffit.
++    return { status: "dropped", reason: "auto_reply_detected" };
++  }
++
++  // ─────────────────────────────────────────────────────────────────────
++  // 🔻 REMAPPING AUTO_REPLY BASSE CONFIANCE → NEUTRE
+   //
+-  // ⚠️ PR2 remplacera CETTE ligne par un early return (pas de génération,
+-  // pas d'event, pas de hand-off, audit `reply_dropped` avec
+-  // `reason: "auto_reply_detected"` + garde `confidence >= 0.8`).
+-  // C'est le SEUL endroit à modifier : tout l'aval consomme
+-  // `effectiveIntent`.
++  // Ne reste atteignable que pour un `AUTO_REPLY` sous le seuil : la
++  // coupure ci-dessus a déjà traité les cas francs. Le doute penche vers
++  // l'humain, donc on répond comme à un `NEUTRE`.
+   //
+-  // Le remapping vers "NEUTRE" est aussi ce qui garantit la décision
+-  // Déthié « AUTO_REPLY n'entre jamais dans l'état conversation » :
+-  // `_setConversationIntent` ne verra jamais cette valeur.
++  // Ce remapping garantit aussi la décision Déthié « AUTO_REPLY n'entre
++  // JAMAIS dans l'état conversation » : `_setConversationIntent` ne verra
++  // jamais cette valeur, ni sur la branche coupée (early return), ni sur
++  // la branche basse-confiance (remappée).
+   // ─────────────────────────────────────────────────────────────────────
+   const effectiveIntent: GenerateReplyIntent =
+     nonStopIntent === "AUTO_REPLY" ? "NEUTRE" : nonStopIntent;
+@@ -1215,5 +1391,8 @@ export const __FUNCTION_ID_FOR_TESTS = FUNCTION_ID;
+ /** @internal */
+ export const __DROP_REASONS_FOR_TESTS = DROP_REASONS;
+ 
++/** @internal */
++export const __AUTO_REPLY_CONFIDENCE_THRESHOLD_FOR_TESTS = AUTO_REPLY_CONFIDENCE_THRESHOLD;
++
+ /** @internal */
+ export const __PHONE_HASH_PREFIX_FOR_TESTS = PHONE_HASH_PREFIX;
+diff --git a/src/types/audit-log.ts b/src/types/audit-log.ts
+index f892413..3a826b3 100644
+--- a/src/types/audit-log.ts
++++ b/src/types/audit-log.ts
+@@ -84,9 +84,20 @@ import { type Timestamp } from "firebase-admin/firestore";
+  *        branche passée par classifier), pipelineDurationMs }`. Tous
+  *     scrubber-safe (IDs opaques + enums fermés + number). PAS de
+  *     body/phone/ovhMessageId/reasoning (defense-in-depth).
+- *   - `reply_dropped` — pipeline `process-reply` court-circuité (PS
+- *     inconnu, dédup webhook, body invalide). Payload = `{ reason,
+- *      ovhMessageIdHash? }`.
++ *   - `reply_dropped` — pipeline `process-reply` court-circuité. Le
++ *     payload varie selon `reason` (enum fermé `DROP_REASONS`, cf.
++ *     `process-reply.ts` pour le tableau canonique) :
++ *       - `contact_unknown`       : `{ reason, phoneHash }`
++ *       - `no_active_conversation`: `{ reason, phoneHash }`
++ *       - `duplicate`             : `{ reason, contactId, conversationId,
++ *                                    duplicateOfMessageId }`
++ *       - `auto_reply_detected`   : `{ reason, contactId, conversationId,
++ *                                    confidence }` (PR2 — message non
++ *                                    écrit par un humain ; SEULE raison
++ *                                    qui coupe APRÈS `store-inbound`,
++ *                                    donc l'entrant est conservé)
++ *     Tous scrubber-safe : IDs opaques, enum fermé, number. Jamais de
++ *     body ni de reasoning classifier.
+  *
+  * Extensions S9.4.1 (commitDraftToQueued — transition draft→queued) :
+  *   - `reply_draft_dropped` — draft rejeté par `preSendCheckWithAuditTx`
