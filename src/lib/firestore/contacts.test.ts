@@ -418,22 +418,73 @@ describe("contacts.ts", () => {
       expect(conv.status).toBe("opted_out");
     });
 
-    it("conv en handed_off → throw ValidationError, contact NON mis à jour (atomicité)", async () => {
+    it("conv en handed_off → opt-out appliqué (PR-A-INBOUND-HANDED-OFF — opted_out l'emporte)", async () => {
+      // Avant PR-A : handed_off était refusé par TERMINAL_CONV_STATUSES_FOR_OPT_OUT
+      // → le contact restait consentant → risque L.34-5 CPCE.
+      // Après PR-A : `opted_out` l'emporte sur `handed_off`. Le pipeline
+      // process-reply branche handed_off notifie en parallèle le commercial
+      // titulaire via Slack (audit `inbound_relayed_to_human` avec
+      // `wasOptOut: true`) — ce comportement est testé côté process-reply.
+      // Ici on verrouille uniquement la primitive data : la tx réussit, les
+      // deux docs transitionnent, l'audit `opt_out` est posé.
       await seedContact("contact_ext_2");
       await seedConv("conv_ext_2", {
         contactId: "contact_ext_2",
         status: "handed_off",
       });
 
+      await markOptedOut("contact_ext_2", "sms", {
+        conversationId: "conv_ext_2",
+        intent: "STOP",
+      });
+
+      const contact = await getContact("contact_ext_2");
+      expect(contact?.consent.optedOut).toBe(true);
+      expect(contact?.status).toBe("opted_out");
+
+      const convDoc = await getAdminDb().collection(CONV_COLL).doc("conv_ext_2").get();
+      const conv = convDoc.data() as { intent: string; status: string };
+      expect(conv.intent).toBe("STOP");
+      expect(conv.status).toBe("opted_out");
+    });
+
+    it("sentinelle anti-drift : conv en `closed` reste refusée (ValidationError)", async () => {
+      // PR-A a retiré `handed_off` du guard mais a laissé `closed` et
+      // `blocked`. Ce test verrouille le périmètre : si quelqu'un vide le
+      // guard par mégarde (ou le remplace), ce test casse.
+      await seedContact("contact_closed_1");
+      await seedConv("conv_closed_1", {
+        contactId: "contact_closed_1",
+        status: "closed",
+      });
+
       await expect(
-        markOptedOut("contact_ext_2", "sms", {
-          conversationId: "conv_ext_2",
+        markOptedOut("contact_closed_1", "sms", {
+          conversationId: "conv_closed_1",
           intent: "STOP",
         }),
       ).rejects.toBeInstanceOf(ValidationError);
 
-      // Atomicité : la guard transition rollback la tx → contact intact.
-      const contact = await getContact("contact_ext_2");
+      const contact = await getContact("contact_closed_1");
+      expect(contact?.consent.optedOut).toBe(false);
+      expect(contact?.status).toBe("ready");
+    });
+
+    it("sentinelle anti-drift : conv en `blocked` reste refusée (ValidationError)", async () => {
+      await seedContact("contact_blocked_1");
+      await seedConv("conv_blocked_1", {
+        contactId: "contact_blocked_1",
+        status: "blocked",
+      });
+
+      await expect(
+        markOptedOut("contact_blocked_1", "sms", {
+          conversationId: "conv_blocked_1",
+          intent: "STOP",
+        }),
+      ).rejects.toBeInstanceOf(ValidationError);
+
+      const contact = await getContact("contact_blocked_1");
       expect(contact?.consent.optedOut).toBe(false);
       expect(contact?.status).toBe("ready");
     });

@@ -305,6 +305,8 @@
  *
  * @see `processReplyHandler` ci-dessous pour le typage.
  */
+import { NonRetriableError } from "inngest";
+
 import { classifyReply } from "@/lib/claude/intent-classifier";
 import {
   CLASSIFY_INTENT_MODEL,
@@ -314,9 +316,10 @@ import { generateReply, type GenerateReplyIntent } from "@/lib/claude/reply-gene
 import type { Intent } from "@/lib/claude/types";
 import { isOptOut } from "@/lib/compliance/opt-out";
 import { appendAuditLog } from "@/lib/firestore/audit-log";
-import { getContactByPhone, markOptedOut } from "@/lib/firestore/contacts";
+import { getContact, getContactByPhone, markOptedOut } from "@/lib/firestore/contacts";
 import {
   getActiveConversationByContactId,
+  getHandedOffConversationByContactId,
   setConversationIntent,
 } from "@/lib/firestore/conversations";
 import {
@@ -327,9 +330,16 @@ import {
 } from "@/lib/firestore/messages";
 import { getInngestClient } from "@/lib/inngest/client";
 import { handoffRequested, smsReplyReceived, smsReplySendRequested } from "@/lib/inngest/events";
+import { getDashboardConversationUrl } from "@/lib/slack/dashboard-url";
+import { sendInboundAfterHandoffNotification } from "@/lib/slack/notify-inbound-after-handoff";
+import { ValidationError } from "@/lib/utils/errors";
 import { captureMonitoringWarning } from "@/lib/utils/observability";
 import { hashPii, PHONE_HASH_PREFIX, safePhoneHash } from "@/lib/utils/pii-detector";
-import type { ReplyGeneratedPayload } from "@/types/audit-log";
+import type {
+  InboundRelayedOptOutVia,
+  InboundRelayedToHumanPayload,
+  ReplyGeneratedPayload,
+} from "@/types/audit-log";
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Constantes
@@ -386,12 +396,36 @@ export type ProcessReplyResult =
       intent: "STOP";
       /**
        * Discriminant analytics + forensic L.34-5 CPCE :
-       *   - `"short_form"` : fast-path déterministe (step 5).
-       *   - `"classifier_long_form"` : rattrapé par Claude (step 7).
-       * Permet de mesurer en prod le ratio des 2 voies (vérifier que le
-       * classifier ne capture pas trop de faux positifs côté GUARD-001).
+       *   - `"short_form"` : fast-path déterministe (step 5) sur conv active.
+       *   - `"classifier_long_form"` : rattrapé par Claude (step 7) sur conv active.
+       *   - `"handed_off_short_form"` (PR-A) : fast-path déterministe sur
+       *     conv `handed_off`. La conv transitionne de `handed_off` →
+       *     `opted_out` dans la même tx que le flip contact.
+       *   - `"handed_off_classifier_long_form"` (PR-A) : rattrapé par Claude
+       *     sur conv `handed_off`. Même transition conv.
+       * Permet de mesurer en prod le ratio des 4 voies (vérifier que le
+       * classifier ne capture pas trop de faux positifs côté GUARD-001 ET
+       * mesurer le volume d'opt-out post-handoff — signal commercial).
        */
-      via: "short_form" | "classifier_long_form";
+      via:
+        | "short_form"
+        | "classifier_long_form"
+        | "handed_off_short_form"
+        | "handed_off_classifier_long_form";
+    }
+  | {
+      /**
+       * PR-A-INBOUND-HANDED-OFF — SMS entrant arrivé sur conv `handed_off`
+       * SANS être un opt-out (ni court-forme ni long-forme). Léa muette.
+       * Le message est stocké, le commercial titulaire reçoit un DM Slack,
+       * un audit `inbound_relayed_to_human` est posé avec `wasOptOut: false`.
+       */
+      status: "relayed_to_human";
+      contactId: string;
+      conversationId: string;
+      messageId: string;
+      /** Slack user ID du commercial titulaire (`handoff.assignedTo`). */
+      assignedTo: string;
     }
   | {
       status: "classified";
@@ -436,6 +470,11 @@ export interface ProcessReplyDeps {
   listRecentMessages?: typeof listRecentMessages;
   generateReply?: typeof generateReply;
   addOutboundDraft?: typeof addOutboundDraft;
+  // PR-A-INBOUND-HANDED-OFF — branche "relayed_to_human"
+  getHandedOffConversationByContactId?: typeof getHandedOffConversationByContactId;
+  getContact?: typeof getContact;
+  sendInboundAfterHandoffNotification?: typeof sendInboundAfterHandoffNotification;
+  getDashboardConversationUrl?: typeof getDashboardConversationUrl;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -506,6 +545,13 @@ export async function processReplyHandler(
   const _listRecentMessages = deps.listRecentMessages ?? listRecentMessages;
   const _generateReply = deps.generateReply ?? generateReply;
   const _addOutboundDraft = deps.addOutboundDraft ?? addOutboundDraft;
+  // PR-A-INBOUND-HANDED-OFF — branche "relayed_to_human"
+  const _getHandedOffConv =
+    deps.getHandedOffConversationByContactId ?? getHandedOffConversationByContactId;
+  const _getContact = deps.getContact ?? getContact;
+  const _sendInboundAfterHandoff =
+    deps.sendInboundAfterHandoffNotification ?? sendInboundAfterHandoffNotification;
+  const _getDashboardUrl = deps.getDashboardConversationUrl ?? getDashboardConversationUrl;
 
   const { event, step, logger } = ctx;
   const { phone, body, ovhMessageId } = event.data;
@@ -636,21 +682,74 @@ export async function processReplyHandler(
   });
 
   // ── Step 2 — resolve-conversation ─────────────────────────────────────
+  //
+  // PR-A-INBOUND-HANDED-OFF — essaie d'abord une conv ACTIVE, puis fallback
+  // sur HANDED_OFF. Le fallback referme le trou L.34-5 CPCE : avant cette
+  // PR, un SMS entrant sur une conv `handed_off` était silencieusement
+  // droppé — le STOP n'était jamais enregistré, le contact restait
+  // consentant, et un envoi admin ultérieur pouvait partir sur un PS qui
+  // avait pourtant dit STOP.
+  //
+  // La conv `handed_off` basculera sur une branche dédiée après le
+  // dédup + store-inbound (short-form opt-out + classifier STOP-only +
+  // DM Slack au titulaire). Pas de classification pour générer, pas de
+  // dispatch-reply-event, pas de dispatch-handoff-event.
+  //
+  // 🚨 PRIORITÉ `active` > `handed_off` par construction : les
+  // ACTIVE_CONVERSATION_STATUSES excluent `handed_off`, donc si une conv
+  // active existe pour ce contact, elle n'est pas `handed_off`. Si aucune
+  // conv active n'existe, on tente le fallback.
   const convStep = await step.run("resolve-conversation", async () => {
-    const result = await _getActiveConv(contactId);
-    if (!result) {
-      const phoneHash = safePhoneHash(phone, _hashPii);
-      await _appendAuditLog({
-        actorId: "system",
-        actorType: "system",
-        action: "reply_dropped",
-        targetType: "contact",
-        targetId: contactId,
-        payload: { reason: "no_active_conversation", phoneHash },
-      });
-      return { found: false as const };
+    const active = await _getActiveConv(contactId);
+    if (active) {
+      return {
+        found: true as const,
+        conversationId: active.conversationId,
+        isHandedOff: false as const,
+      };
     }
-    return { found: true as const, conversationId: result.conversationId };
+
+    const handedOff = await _getHandedOffConv(contactId);
+    if (handedOff) {
+      // Récupération de `handoff.assignedTo` ici pour la mémorisation du
+      // step (sur retry, pas de re-lecture Firestore nécessaire). Si le
+      // doc handoff est absent (invariant cassé — ne devrait pas arriver
+      // puisque status=handed_off exige setHandoff préalable), on log et
+      // on drop proprement plutôt que de throw dans le step.
+      const assignedTo = handedOff.conversation.handoff?.assignedTo;
+      if (assignedTo === undefined || assignedTo === "") {
+        // Invariant soft brisé : handed_off sans handoff.assignedTo.
+        // Trace forensique via `reply_dropped` avec reason dédiée, pour
+        // qu'un ops puisse enquêter sans perdre le signal.
+        const phoneHash = safePhoneHash(phone, _hashPii);
+        await _appendAuditLog({
+          actorId: "system",
+          actorType: "system",
+          action: "reply_dropped",
+          targetType: "contact",
+          targetId: contactId,
+          payload: { reason: "no_active_conversation", phoneHash },
+        });
+        return { found: false as const };
+      }
+      return {
+        found: true as const,
+        conversationId: handedOff.conversationId,
+        isHandedOff: true as const,
+        assignedTo,
+      };
+    }
+
+    const phoneHash = safePhoneHash(phone, _hashPii);
+    await _appendAuditLog({
+      actorId: "system",
+      actorType: "system",
+      action: "reply_dropped",
+      targetType: "contact",
+      targetId: contactId,
+      payload: { reason: "no_active_conversation", phoneHash },
+    });
+    return { found: false as const };
   });
 
   if (!convStep.found) {
@@ -664,10 +763,12 @@ export async function processReplyHandler(
   }
 
   const conversationId = convStep.conversationId;
+  const isHandedOff = convStep.isHandedOff;
   logger.info("[process-reply] conversation resolved", {
     eventId: event.id,
     contactId,
     conversationId,
+    isHandedOff,
   });
 
   // ── Step 3 — dedup-by-external-id ─────────────────────────────────────
@@ -723,6 +824,312 @@ export async function processReplyHandler(
     conversationId,
     messageId,
   });
+
+  // ── PR-A — helper race "conversation_became_terminal" ─────────────────
+  //
+  // Entre le step 2 (resolve-conversation handed_off) et le markOptedOut
+  // du bloc handed_off, la conversation peut avoir ete passee a `closed`
+  // ou `blocked` par un autre flux (admin, compliance). Le guard
+  // TERMINAL_CONV_STATUSES_FOR_OPT_OUT dans `markOptedOut` throw alors
+  // `ValidationError` avec `context.currentStatus` → le pipeline Inngest
+  // retry 3x pour rien (meme erreur a chaque fois).
+  //
+  // Ce helper intercepte la race et :
+  //   1. Pose un audit `reply_dropped reason:"conversation_became_terminal"`
+  //      pour forensique.
+  //   2. Alerte Sentry via `captureMonitoringWarning` — tag critique
+  //      `was_opt_out` pour qu'un humain traite le STOP en manuel.
+  //   3. Throw `NonRetriableError` pour couper le retry Inngest.
+  //
+  // Une erreur ValidationError sans currentStatus terminal (= autre cause,
+  // ex: contactId vide) est propagee telle quelle → Inngest retry OK.
+  async function markOptedOutWithRaceGuard(params: {
+    contactId: string;
+    conversationId: string;
+    messageId: string;
+    was: InboundRelayedOptOutVia;
+  }): Promise<"ok" | "race"> {
+    try {
+      await _markOptedOut(params.contactId, "sms", {
+        conversationId: params.conversationId,
+        intent: "STOP",
+      });
+      return "ok";
+    } catch (err) {
+      // Detection du guard terminal : ValidationError + context.currentStatus
+      // present (c'est markOptedOut qui pose ce champ, cf. contacts.ts:566-572).
+      if (err instanceof ValidationError) {
+        const ctx = (err.context ?? {}) as { currentStatus?: unknown };
+        const currentStatus = typeof ctx.currentStatus === "string" ? ctx.currentStatus : undefined;
+        if (currentStatus === "closed" || currentStatus === "blocked") {
+          const phoneHash = safePhoneHash(phone, _hashPii);
+          await _appendAuditLog({
+            actorId: "system",
+            actorType: "system",
+            action: "reply_dropped",
+            targetType: "conversation",
+            targetId: params.conversationId,
+            payload: {
+              reason: "conversation_became_terminal",
+              contactId: params.contactId,
+              conversationId: params.conversationId,
+              messageId: params.messageId,
+              currentStatus,
+              wasOptOut: true,
+              optOutVia: params.was,
+              phoneHash,
+            },
+          });
+
+          // Alerte Sentry : un humain DOIT traiter ce STOP manuellement.
+          // Message explicite "wasOptOut" pour que l'operateur comprenne
+          // qu'il faut flip le consent cote CRM meme si la conv Firestore
+          // est en etat terminal.
+          _captureMonitoringWarning("process_reply.handed_off_opt_out_terminal_race", {
+            tags: { was_opt_out: "true", current_status: currentStatus },
+            extra: {
+              contactId: params.contactId,
+              conversationId: params.conversationId,
+              messageId: params.messageId,
+              optOutVia: params.was,
+              hint:
+                "STOP recu sur conv devenue terminale pendant le pipeline. " +
+                "L'opt-out N'A PAS ete applique en base. Un humain doit flip " +
+                "contact.consent.optedOut manuellement et ne plus recontacter.",
+            },
+          });
+
+          logger.warn("[process-reply] handed-off opt-out race: conv became terminal", {
+            eventId: event.id,
+            contactId: params.contactId,
+            conversationId: params.conversationId,
+            messageId: params.messageId,
+            currentStatus,
+            optOutVia: params.was,
+          });
+
+          // NonRetriableError : la condition est permanente (closed/blocked
+          // sont terminaux), aucun retry Inngest ne peut la resoudre.
+          throw new NonRetriableError(
+            `conversation_became_terminal (currentStatus=${currentStatus})`,
+          );
+        }
+      }
+      // Autre ValidationError (contactId vide, doc corrompu...) ou autre
+      // erreur : propagation telle quelle, Inngest decide (retry si transient).
+      throw err;
+    }
+  }
+
+  // ── PR-A — branche "relayed_to_human" (handed_off only) ───────────────
+  // Court-circuite les steps 5-9 classiques. Léa reste MUETTE : pas de
+  // setConversationIntent (le status reste handed_off, ou devient
+  // opted_out si STOP), pas de generateReply, pas de dispatch-reply-event,
+  // pas de dispatch-handoff-event. Le pipeline ne consulte Claude QUE pour
+  // détecter un STOP long-forme (invariant GUARD-001 préservé pour les
+  // conv handed_off aussi).
+  //
+  // 🔒 ORDRE DES SOUS-STEPS :
+  //   (a) handed-off-short-form-opt-out-check → markOptedOut si STOP court
+  //   (b) handed-off-claude-classify → classifier Claude SI pas d'opt-out
+  //       court. Branche STOP uniquement. Toute autre valeur (INTERESSE,
+  //       OBJECTION, NEUTRE, AUTO_REPLY) est ignorée côté effet métier :
+  //       on relaye tel quel au titulaire humain.
+  //   (c) handed-off-markoptedout-long-form → markOptedOut si classifier STOP
+  //   (d) enrich-for-notify → getContact pour firstName/speciality/city
+  //   (e) notify-inbound-after-handoff → DM Slack au titulaire
+  //   (f) audit-inbound-relayed-to-human → audit forensic
+  if (isHandedOff) {
+    const assignedTo = convStep.assignedTo;
+
+    // (a) short-form opt-out — fast-path déterministe, zéro appel Claude.
+    const hoOptOutStep = await step.run("handed-off-short-form-opt-out-check", async () => {
+      if (_isOptOut(body)) {
+        // markOptedOut étendu : grâce au fix PR-A (handed_off retiré de
+        // TERMINAL_CONV_STATUSES_FOR_OPT_OUT côté contacts.ts), la tx
+        // réussit : contact.consent.optedOut flip + conv passe de
+        // handed_off → opted_out + audit opt_out posé dans la même tx.
+        //
+        // RACE GUARD : si la conv est devenue `closed`/`blocked` entre
+        // step 2 et ici, `markOptedOutWithRaceGuard` audit
+        // `reply_dropped reason:"conversation_became_terminal"` +
+        // alerte Sentry + throw NonRetriableError pour couper le retry.
+        await markOptedOutWithRaceGuard({
+          contactId,
+          conversationId,
+          messageId,
+          was: "short_form",
+        });
+        return { isOptOut: true as const };
+      }
+      return { isOptOut: false as const };
+    });
+
+    // Décision du chemin opt-out : short-forme | classifier long-forme | aucun.
+    let wasOptOut = hoOptOutStep.isOptOut;
+    let optOutVia: InboundRelayedOptOutVia | undefined = hoOptOutStep.isOptOut
+      ? "short_form"
+      : undefined;
+
+    // (b) + (c) classifier STOP-only — SEULEMENT si pas d'opt-out court-forme.
+    // Fail-safe : si le classifier throw / renvoie STOP par fallback, on
+    // ferme GUARD-001 côté handed_off aussi.
+    if (!wasOptOut) {
+      const hoClassification = await step.run("handed-off-claude-classify", async () => {
+        return _classifyReply(body);
+      });
+
+      // Audit du verdict classifier (miroir du step 6b classique) — même
+      // forme de payload, même anti-PII strict. Préserve la trace du
+      // verdict Claude indépendamment de ce que fait la branche.
+      await step.run("handed-off-audit-intent-classified", async () => {
+        await _appendAuditLog({
+          actorId: "system",
+          actorType: "system",
+          action: "intent_classified",
+          targetType: "message",
+          targetId: messageId,
+          payload: {
+            contactId,
+            conversationId,
+            intent: hoClassification.intent,
+            confidence: hoClassification.confidence,
+            fallback: hoClassification.fallback,
+            promptVersion: CLASSIFY_INTENT_PROMPT_VERSION,
+            model: CLASSIFY_INTENT_MODEL,
+          },
+        });
+      });
+
+      if (hoClassification.intent === "STOP") {
+        await step.run("handed-off-markoptedout-long-form", async () => {
+          // Race guard identique a la branche short-form.
+          await markOptedOutWithRaceGuard({
+            contactId,
+            conversationId,
+            messageId,
+            was: "classifier_long_form",
+          });
+        });
+        wasOptOut = true;
+        optOutVia = "classifier_long_form";
+
+        logger.info("[process-reply] handed-off classifier long-form opt-out applied", {
+          eventId: event.id,
+          contactId,
+          conversationId,
+          messageId,
+          step: "handed-off-markoptedout-long-form",
+          classifierFallback: hoClassification.fallback,
+        });
+      }
+    }
+
+    // (d) enrich-for-notify — on relit le contact pour obtenir
+    // firstName/speciality/city. Lecture isolée dans son propre step →
+    // idempotence Inngest (memoization sur retry).
+    //
+    // Si le contact a disparu entre step 1 et ici (très improbable, mais
+    // techniquement possible si un admin supprime en course), on log et
+    // on bascule sur un DM "fallback" neutre. On NE drop PAS : le
+    // message est déjà stocké, le commercial doit être prévenu même
+    // avec un contexte minimal.
+    const enrichedContact = await step.run("enrich-for-notify", async () => {
+      const contact = await _getContact(contactId);
+      if (!contact) {
+        logger.warn(
+          "[process-reply] handed-off relay: contact disappeared between step 1 and enrich",
+          {
+            eventId: event.id,
+            contactId,
+            conversationId,
+          },
+        );
+        return { found: false as const };
+      }
+      return {
+        found: true as const,
+        firstName: contact.firstName,
+        speciality: contact.speciality,
+        city: contact.city,
+      };
+    });
+
+    // (e) notify-inbound-after-handoff — DM Slack. Memoized Inngest step →
+    // retry après succès ne re-poste pas. Sur failure propage
+    // ExternalServiceError pour que Inngest retry (retries:3).
+    const slackResult = await step.run("notify-inbound-after-handoff", async () => {
+      const dashboardUrl = _getDashboardUrl(conversationId);
+      return _sendInboundAfterHandoff({
+        target: { kind: "dm", slackUserId: assignedTo },
+        firstName: enrichedContact.found ? enrichedContact.firstName : "le lead",
+        speciality: enrichedContact.found ? enrichedContact.speciality : "contact inconnu",
+        city: enrichedContact.found ? enrichedContact.city : "ville inconnue",
+        lastInboundBody: body,
+        conversationId,
+        isOptOut: wasOptOut,
+        dashboardUrl,
+      });
+    });
+
+    // (f) audit-inbound-relayed-to-human — forensic L.34-5 CPCE + traçabilité
+    // commerciale. Payload strict `InboundRelayedToHumanPayload` : IDs
+    // opaques + Slack IDs + boolean + enum fermé. Aucune PII.
+    await step.run("audit-inbound-relayed-to-human", async () => {
+      const payload: InboundRelayedToHumanPayload = {
+        contactId,
+        conversationId,
+        messageId,
+        assignedTo,
+        slackTs: slackResult.ts,
+        slackChannel: slackResult.channel,
+        wasOptOut,
+        ...(optOutVia !== undefined ? { optOutVia } : {}),
+      };
+      await _appendAuditLog({
+        actorId: "system",
+        actorType: "system",
+        action: "inbound_relayed_to_human",
+        targetType: "conversation",
+        targetId: conversationId,
+        payload,
+      });
+    });
+
+    logger.info("[process-reply] handed-off relay done", {
+      eventId: event.id,
+      contactId,
+      conversationId,
+      messageId,
+      wasOptOut,
+      step: "audit-inbound-relayed-to-human",
+    });
+
+    if (wasOptOut) {
+      // Discriminant `via` : short_form OU classifier_long_form sur handed_off.
+      // Préfixe `handed_off_` pour les distinguer des branches sur conv active.
+      const via =
+        optOutVia === "classifier_long_form"
+          ? "handed_off_classifier_long_form"
+          : "handed_off_short_form";
+      return {
+        status: "opt_out",
+        contactId,
+        conversationId,
+        messageId,
+        intent: "STOP",
+        via,
+      };
+    }
+
+    return {
+      status: "relayed_to_human",
+      contactId,
+      conversationId,
+      messageId,
+      assignedTo,
+    };
+  }
 
   // ── Step 5 — short-form-opt-out-check (fast-path déterministe) ────────
   // Économise un appel Claude pour les opt-out courts évidents (STOP,

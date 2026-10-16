@@ -61,6 +61,7 @@
  */
 import {
   type DocumentReference,
+  type QueryDocumentSnapshot,
   type QuerySnapshot,
   Timestamp,
   type Transaction,
@@ -69,6 +70,7 @@ import { z } from "zod";
 
 import { getAdminDb } from "@/lib/firestore/admin";
 import { appendAuditLogTx } from "@/lib/firestore/audit-log";
+import { assertSlackUserId } from "@/lib/slack/slack-user-id";
 import { ConflictError, InternalError, NotFoundError, ValidationError } from "@/lib/utils/errors";
 import { logger } from "@/lib/utils/logger";
 import { shortFingerprint } from "@/lib/utils/short-fingerprint";
@@ -102,6 +104,15 @@ const HANDOFF_NOTES_MIN_LENGTH = 10;
  * N conversations sont TOUTES retournées ET que le warn est émis.
  */
 const CONVERSATION_FANOUT_WARN_THRESHOLD = 10;
+
+/**
+ * 🔒 Borne haute du fetch `getHandedOffConversationByContactId` (PR-A).
+ *
+ * L'invariant soft est 1-2 conv `handed_off` par contact (multi-campagne
+ * reprises simultanément — rare). On alloue 10 pour absorber un cas
+ * pathologique sans ramener une liste pathologique.
+ */
+const HANDED_OFF_FETCH_LIMIT = 10;
 
 /**
  * 🔒 Status conversation considérés "terminaux" — refusent toute mutation
@@ -640,6 +651,146 @@ export async function getActiveConversationByContactId(
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// getHandedOffConversationByContactId (PR-A-INBOUND-HANDED-OFF)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * Convertit en millisecondes la MEILLEURE preuve de récence d'un doc
+ * conversation BRUT (non validé Zod), avec fallback en cascade :
+ * `lastInboundAt` → `lastMessageAt` → `createdAt`. Si aucun des trois
+ * n'est exploitable, retourne `0` — le doc sera relégué en fin de liste
+ * mais JAMAIS exclu.
+ *
+ * Volontairement tolérant : cette valeur ne sert QU'À ORDONNER la liste
+ * dans `getHandedOffConversationByContactId`. Elle n'entre dans AUCUNE
+ * décision compliance (le routage DM dépend du doc choisi, pas de sa date).
+ */
+function conversationRelayTimestampMillis(doc: QueryDocumentSnapshot): number {
+  const candidates = [doc.get("lastInboundAt"), doc.get("lastMessageAt"), doc.get("createdAt")];
+  for (const value of candidates) {
+    if (value instanceof Timestamp) return value.toMillis();
+    if (value instanceof Date) return value.getTime();
+  }
+  return 0;
+}
+
+/**
+ * Retourne LA conversation `handed_off` du contact — s'il en a une.
+ *
+ * ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ * RAISON D'ÊTRE (PR-A-INBOUND-HANDED-OFF)
+ *
+ * Jusqu'à cette PR, un SMS entrant arrivant sur une conv déjà reprise par
+ * un commercial humain était silencieusement droppé par `process-reply`
+ * (step 2 `resolve-conversation` ne regardait que `ACTIVE_CONVERSATION_STATUSES`
+ * qui exclut `handed_off`). Conséquence : message non stocké, STOP non
+ * enregistré, commercial titulaire non prévenu → trou L.34-5 CPCE + fil
+ * cassé côté dashboard.
+ *
+ * Cette fonction fournit le fallback utilisé par le step 2 : si
+ * `getActiveConversationByContactId` retourne `null`, on tente une
+ * résolution ciblée sur `status: "handed_off"`. Si une conv est trouvée,
+ * le pipeline bascule sur la branche "relayed-to-human" :
+ *   - stockage inbound (preuve L.34-5 CPCE)
+ *   - contrôle opt-out (court-forme + classifier long-forme)
+ *   - DM Slack au titulaire (`handoff.assignedTo`)
+ *   - PAS de generateReply, PAS de dispatch-reply-event
+ *
+ * ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ * ⚠️ DIFFÉRENCES vs `getActiveConversationByContactId`
+ *
+ *   1. **Status différent** — on cible UNIQUEMENT `handed_off`. Pas
+ *      d'union, pas de `.in(...)` : égalité stricte.
+ *
+ *   2. **N > 1 EST TOLÉRÉ, on NE throw PAS.** Un même contact peut
+ *      théoriquement avoir plusieurs conv `handed_off` (multi-campagne,
+ *      reprises successives) — rare mais pas interdit par le schéma. Pour
+ *      ne pas bloquer le pipeline sur une rareté, on logge un `warn` et
+ *      on retourne la plus récente par `lastInboundAt ?? lastMessageAt ??
+ *      createdAt`. Compliance d'abord : on continue à stocker le SMS et
+ *      à relayer vers un humain plutôt que de drop.
+ *
+ *   3. **`.limit(10)`** — borne haute défensive pour éviter de rapatrier
+ *      une liste pathologique (corruption / backfill). 10 est largement
+ *      au-dessus de l'invariant soft (1-2 attendues).
+ *
+ * ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ * INDEX FIRESTORE COMPOSITE
+ *
+ * La query utilise l'index composite DÉJÀ déclaré (`contactId ASC, status
+ * ASC`) — même index que `getActiveConversationByContactId`. Rien à
+ * déployer en plus.
+ *
+ * ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ * TRI EN MÉMOIRE (pas `orderBy` Firestore)
+ *
+ * `where(contactId==).where(status==).orderBy(lastInboundAt desc)` exigerait
+ * un index composite 3-champs à déployer. On trie en mémoire sur la petite
+ * liste (<= 10) — pas de nouvel index, pas de fenêtre de déploiement.
+ *
+ * ⚠️ PII DOWNSTREAM — mêmes règles que `getActiveConversationByContactId` :
+ * `conversation.summary` et `conversation.handoff.notes` peuvent contenir
+ * du quasi-PII, le caller NE doit PAS logger ni auditer ces champs.
+ *
+ * @param contactId  ID Firestore du contact (= hubspotId). NON vide.
+ *
+ * @returns `{ conversationId, conversation }` si une conv `handed_off`
+ *          est trouvée (la plus récente si plusieurs), sinon `null`.
+ *
+ * @throws ValidationError  si `contactId` est vide ou un doc est corrompu.
+ */
+export async function getHandedOffConversationByContactId(
+  contactId: string,
+): Promise<{ conversationId: string; conversation: Conversation } | null> {
+  if (contactId.length === 0) {
+    throw new ValidationError({
+      message: "getHandedOffConversationByContactId: contactId is empty",
+      context: { op: "getHandedOffConversationByContactId", inputLength: 0 },
+    });
+  }
+
+  const snap = await getAdminDb()
+    .collection(CONVERSATIONS_COLLECTION)
+    .where("contactId", "==", contactId)
+    .where("status", "==", "handed_off")
+    .limit(HANDED_OFF_FETCH_LIMIT)
+    .get();
+
+  if (snap.empty) {
+    return null;
+  }
+
+  if (snap.size > 1) {
+    // Invariant soft — on continue mais on trace. shortFingerprint pour
+    // ne pas leaker un hubspotId numérique au scrubber Pino (cf. JSDoc
+    // orderConversationIdsForFanout l.738-748).
+    logger.warn(
+      {
+        op: "getHandedOffConversationByContactId",
+        contactIdFingerprint: shortFingerprint(contactId),
+        count: snap.size,
+      },
+      "[conversations] multiple handed_off conversations for same contact — picking most recent (soft invariant)",
+    );
+  }
+
+  // Tri en mémoire : plus récent d'abord par lastInboundAt, fallback
+  // lastMessageAt, fallback createdAt. Déterminisme des tests : départage
+  // par docId croissant si les 3 timestamps sont égaux (quasi-impossible
+  // en prod mais stable en seed de test).
+  const sorted = snap.docs.slice().sort((a, b) => {
+    const am = conversationRelayTimestampMillis(a);
+    const bm = conversationRelayTimestampMillis(b);
+    if (am !== bm) return bm - am;
+    return a.id < b.id ? -1 : a.id > b.id ? 1 : 0;
+  });
+
+  const doc = sorted[0]!;
+  const conversation = parseConversationOrThrow(doc.data(), doc.id);
+  return { conversationId: doc.id, conversation };
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // listConversationIdsByContact{,InTx} (PR-PER-CONTACT) — fan-out rate-limit
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -951,6 +1102,14 @@ export async function setHandoff(
   assignedTo: string,
   notes: string,
 ): Promise<void> {
+  // Fix LOW security-reviewer PR-A : regex valide le format Slack user ID
+  // AVANT write Firestore. Verrou en 2 lignes de defense miroir avec le
+  // check dans les senders Slack (defense-in-depth docs legacy).
+  // Trade-off : on NE met PAS ce check au parse Zod de ConversationHandoffSchema
+  // pour eviter de casser le pipeline sur un doc legacy non-conforme —
+  // cf. JSDoc de assertSlackUserId pour le raisonnement complet.
+  assertSlackUserId(assignedTo, "setHandoff");
+
   if (notes.length < HANDOFF_NOTES_MIN_LENGTH) {
     throw new ValidationError({
       message: `setHandoff: notes must be at least ${HANDOFF_NOTES_MIN_LENGTH} characters`,

@@ -184,6 +184,20 @@ function makeDeps(overrides: Partial<ProcessReplyDeps> = {}): ProcessReplyDeps {
       generationDurationMs: 1234,
     }),
     addOutboundDraft: vi.fn().mockResolvedValue("draftfirestoreid20ch"),
+    // PR-A-INBOUND-HANDED-OFF — defaults qui ne CHANGENT RIEN pour les
+    // tests existants (branche active). getHandedOffConversationByContactId
+    // retourne null → le pipeline part sur `no_active_conversation` comme
+    // avant quand active est null, OU reste sur la branche active quand
+    // getActiveConv retourne une conv.
+    //
+    // Les autres deps PR-A (getContact, sendInboundAfterHandoffNotification,
+    // getDashboardConversationUrl) ne sont jamais atteintes dans les tests
+    // non-handed_off — on fournit quand même des mocks neutres pour éviter
+    // qu'une régression accidentelle entre dans la branche sans les mocker.
+    getHandedOffConversationByContactId: vi.fn().mockResolvedValue(null),
+    getContact: vi.fn().mockResolvedValue(null),
+    sendInboundAfterHandoffNotification: vi.fn().mockResolvedValue({ ts: "0", channel: "D0" }),
+    getDashboardConversationUrl: vi.fn().mockReturnValue("https://dashboard.test/conv/xxx"),
     ...overrides,
   };
 }

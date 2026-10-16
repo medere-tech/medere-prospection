@@ -89,20 +89,35 @@ const CONVERSATIONS_COLLECTION = "conversations";
  * 🔒 Status conversation considérés "terminaux" — impossibles à transitionner
  * vers `opted_out` via `markOptedOut` étendu (S9.2.2.1).
  *
- *   - `handed_off` : déjà chez commercial humain. Un STOP arrivant après
- *                    handoff doit alerter le commercial via Slack, PAS
- *                    rollback le handoff côté Firestore.
  *   - `closed`     : conversation terminée explicitement.
  *   - `blocked`    : bloquée par compliance (Bloctel, plafond...).
  *
  * `opted_out` est EXCLU de ce set car c'est l'état cible — le re-mark est
  * traité comme idempotent (cf. JSDoc `markOptedOut`).
+ *
+ * ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ * 🚨 PR-A-INBOUND-HANDED-OFF — `handed_off` RETIRÉ de ce set
+ *
+ * Jusqu'à cette PR, `handed_off` figurait dans la liste des statuts
+ * terminaux : un STOP arrivant sur une conv déjà reprise par un commercial
+ * humain était refusé par `markOptedOut`, et le contact restait consentant
+ * en base. Résultat : un envoi admin ultérieur pouvait partir sur un PS
+ * qui avait pourtant dit STOP → infraction art. L.34-5 CPCE + RGPD.
+ *
+ * Décision Déthié PR-A : `opted_out` l'emporte sur `handed_off`. Un STOP
+ * valide (short-forme ou long-forme classifier) sur conv handed_off
+ * transitionne la conv vers `opted_out` dans la MÊME transaction que le
+ * flip `consent.optedOut` du contact. Le commercial titulaire est en
+ * parallèle notifié via Slack par le pipeline `process-reply` (audit
+ * `inbound_relayed_to_human` avec `wasOptOut: true`).
+ *
+ * Les deux autres statuts (`closed`, `blocked`) RESTENT refusés en l'état :
+ * leur comportement sera arbitré dans une PR ultérieure (même type de
+ * trou, surface plus réduite — à traiter séparément).
  */
-const TERMINAL_CONV_STATUSES_FOR_OPT_OUT: readonly ConversationStatus[] = [
-  "handed_off",
-  "closed",
-  "blocked",
-];
+// STOP sur closed/blocked non traite ici : ticket Notion PR-B-UNLOCK-CLOSED-BLOCKED,
+// a fermer avant la bascule 26k.
+const TERMINAL_CONV_STATUSES_FOR_OPT_OUT: readonly ConversationStatus[] = ["closed", "blocked"];
 
 /**
  * Whitelist STRICTE des champs modifiables via `updateContactStatus`.
