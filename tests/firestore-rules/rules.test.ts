@@ -339,6 +339,58 @@ describe("firestore.rules — MVP option A (deny all client)", () => {
   });
 
   // ───────────────────────────────────────────────────────────────────────
+  // ovh_stop_callbacks/{id} — DIAG-STOP-OVH étape B
+  // 4 actors × 2 ops = 8 tests
+  //
+  // Pattern miroir strict de audit_log — collection d'observation du
+  // callback OVH stopCallBack, écrite UNIQUEMENT via Admin SDK par
+  // /api/webhooks/ovh-sms-stop. Aucun client ne doit pouvoir lire
+  // (les hashs oih_... y figurent, semi-sensibles) ni écrire.
+  // ───────────────────────────────────────────────────────────────────────
+
+  describe("ovh_stop_callbacks/{id} — DIAG-STOP-OVH étape B", () => {
+    it("anonyme : read refusé", async () => {
+      const db = actors().anon.firestore();
+      await assertFails(db.collection("ovh_stop_callbacks").doc("x").get());
+    });
+
+    it("anonyme : write refusé", async () => {
+      const db = actors().anon.firestore();
+      await assertFails(db.collection("ovh_stop_callbacks").doc("x").set(STUB_PAYLOAD));
+    });
+
+    it("signed (no role) : read refusé", async () => {
+      const db = actors().signed.firestore();
+      await assertFails(db.collection("ovh_stop_callbacks").doc("x").get());
+    });
+
+    it("signed (no role) : write refusé", async () => {
+      const db = actors().signed.firestore();
+      await assertFails(db.collection("ovh_stop_callbacks").doc("x").set(STUB_PAYLOAD));
+    });
+
+    it("commercial Custom Claim : read refusé", async () => {
+      const db = actors().commercial.firestore();
+      await assertFails(db.collection("ovh_stop_callbacks").doc("x").get());
+    });
+
+    it("commercial Custom Claim : write refusé", async () => {
+      const db = actors().commercial.firestore();
+      await assertFails(db.collection("ovh_stop_callbacks").doc("x").set(STUB_PAYLOAD));
+    });
+
+    it("admin Custom Claim : read refusé (Admin SDK only)", async () => {
+      const db = actors().admin.firestore();
+      await assertFails(db.collection("ovh_stop_callbacks").doc("x").get());
+    });
+
+    it("admin Custom Claim : write refusé (Admin SDK only)", async () => {
+      const db = actors().admin.firestore();
+      await assertFails(db.collection("ovh_stop_callbacks").doc("x").set(STUB_PAYLOAD));
+    });
+  });
+
+  // ───────────────────────────────────────────────────────────────────────
   // Catchall — collection arbitraire non listée
   // 4 actors × 1 op (write) = 4 tests
   //
