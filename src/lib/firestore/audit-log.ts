@@ -89,6 +89,11 @@ const ACTIONS = [
   // orphelins de `slack-handoff` S9.9-PR5b). Cf. types/audit-log.ts pour
   // la sémantique complète + `HandoffUnassignedPayload` typé.
   "handoff_unassigned",
+  // PR-A-INBOUND-HANDED-OFF — SMS entrant arrivé sur conv `handed_off`.
+  // Posé par `process-reply` sur la branche handed_off AVANT return. Léa
+  // reste muette ; le commercial titulaire reçoit un DM. Cf. types/audit-log.ts
+  // pour la sémantique complète + `InboundRelayedToHumanPayload` typé.
+  "inbound_relayed_to_human",
   // ── CAMPAIGN / ADMIN ───────────────────────────────────────────────────
   "manual_override",
   "prompt_changed",

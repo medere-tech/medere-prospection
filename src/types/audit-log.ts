@@ -112,6 +112,24 @@ import { type Timestamp } from "firebase-admin/firestore";
  *     speciality, city, body, phone — uniquement IDs opaques + reason
  *     (enum fermé) + Slack IDs (ts + channel).
  *
+ * Extensions PR-A-INBOUND-HANDED-OFF (SMS entrant sur conv `handed_off`) :
+ *   - `inbound_relayed_to_human` — un SMS entrant est arrivé sur une
+ *     conversation déjà en `handed_off`. Léa reste muette (pas de
+ *     classification pour générer une réponse, pas d'envoi), le message
+ *     est stocké par `addInbound`, le contrôle opt-out s'applique
+ *     normalement, et le commercial titulaire (`handoff.assignedTo`)
+ *     reçoit un DM Slack avec l'extrait du message. Posé par le pipeline
+ *     Inngest `process-reply` sur la branche handed_off AVANT return.
+ *     `targetType: "conversation"`, `targetId: conversationId`. Payload =
+ *     `InboundRelayedToHumanPayload` (cf. interface ci-dessous).
+ *     Discriminant `wasOptOut` : si `true`, le DM a signifié "ne plus
+ *     recontacter" et un audit `opt_out` séparé a été posé par
+ *     `markOptedOut` dans la même pipeline. Si `false`, c'est un échange
+ *     ordinaire que le commercial doit reprendre côté canal humain.
+ *     🚨 INVARIANT ANTI-PII : pas de firstName, speciality, city, body,
+ *     phone, ovhMessageId — uniquement IDs opaques + Slack IDs (ts +
+ *     channel) + booleans + enum fermé `optOutVia` optionnel.
+ *
  * ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
  * ORGANISATION VISUELLE (S9.1) — sections par cycle de vie
  *
@@ -155,6 +173,13 @@ export type AuditAction =
   // Payload = `HandoffUnassignedPayload` (cf. interface ci-dessous) avec
   // `reason` discriminant l'origine du fallback.
   | "handoff_unassigned"
+  // PR-A-INBOUND-HANDED-OFF — SMS entrant arrivé sur une conv `handed_off`.
+  // Posé par `process-reply` sur la branche handed_off AVANT return. Léa
+  // reste muette : pas de setConversationIntent, pas de generateReply,
+  // pas de dispatch-reply-event. Le commercial titulaire reçoit un DM.
+  // `targetType: "conversation"`, `targetId: conversationId`. Payload =
+  // `InboundRelayedToHumanPayload` (cf. interface ci-dessous).
+  | "inbound_relayed_to_human"
   // ── CAMPAIGN / ADMIN ───────────────────────────────────────────────────
   | "manual_override"
   | "prompt_changed"
@@ -427,6 +452,111 @@ export interface HandoffUnassignedPayload {
   // Index signature explicite : permet l'assignation à
   // `AuditLogInput.payload: Record<string, unknown>` sans cast (cf. pattern
   // miroir `ReplyGeneratedPayload` — TS-level uniquement, no-op runtime).
+  readonly [k: string]: unknown;
+}
+
+/**
+ * Discriminant du chemin d'opt-out emprunté sur une branche `handed_off`
+ * (PR-A-INBOUND-HANDED-OFF). Enum fermé — toute nouvelle voie d'opt-out
+ * détectée DOIT étendre explicitement cette union (compile-time safety).
+ *
+ *   - `"short_form"`             : `isOptOut(body)` match déterministe
+ *                                  (STOP, ARRET, DESINSCRIPTION, <= 50 chars).
+ *   - `"classifier_long_form"`   : classifier Claude a retourné `intent:"STOP"`
+ *                                  sur un body > 50 chars sans mot-clé
+ *                                  déterministe (ferme GUARD-001 pour
+ *                                  handed_off aussi).
+ */
+export type InboundRelayedOptOutVia = "short_form" | "classifier_long_form";
+
+/**
+ * Payload type pour action `inbound_relayed_to_human` (PR-A-INBOUND-HANDED-OFF).
+ *
+ * **Cible** : `targetType: "conversation"`, `targetId: conversationId`.
+ *
+ * ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ * 🚨 INVARIANT ANTI-PII — INTERDITS EN PAYLOAD
+ *
+ * Interdits (compile-time via cette signature stricte + defense-in-depth
+ * scrubber runtime `detectPiiInPayload`) :
+ *   - `firstName`, `lastName`, `civilite` — identité du PS
+ *   - `speciality`, `city`, `postalCode` — contexte métier du PS
+ *   - `body`, `lastInboundBody` — contenu SMS entrant
+ *   - `phone`, `email`, `ovhMessageId` — coordonnées / IDs semi-sensibles
+ *
+ * Ces champs vivent dans :
+ *   - le doc `messages/{messageId}` (body + externalReceiver phone), posé
+ *     par `addInbound` dans la MÊME exécution — forensic L.34-5 CPCE.
+ *   - le doc `contacts/{contactId}` (identité, spé, ville) accessible via
+ *     dashboard Clerk-protected.
+ *   - les blocks Slack de la notification elle-même (fenêtre courte, pas
+ *     persistée en audit).
+ *
+ * Le forensic complet est obtenu par cohabitation :
+ *   contenu notifié    → `messages/{id}` + logs Slack workspace
+ *   événement audité   → doc `audit_log/{id}` sans contenu
+ *
+ * ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ * Champs scrubber-safe par construction
+ *
+ *   - `contactId`/`conversationId`/`messageId` : IDs opaques internes.
+ *   - `assignedTo`                            : Slack user ID (`U…`),
+ *                                               ID technique workspace,
+ *                                               pas PII personnelle.
+ *   - `slackTs`                               : timestamp Slack
+ *                                               (`"1234567890.123456"`).
+ *   - `slackChannel`                          : Slack channel ID — pour un
+ *                                               DM, c'est un DM channel ID
+ *                                               (`D…`), ID interne workspace.
+ *   - `wasOptOut`                             : boolean. Discriminant du
+ *                                               chemin (true → DM "ne plus
+ *                                               recontacter", `opt_out`
+ *                                               audit posé en parallèle
+ *                                               par `markOptedOut`).
+ *   - `optOutVia`                             : enum fermé OPTIONNEL
+ *                                               (`short_form` /
+ *                                               `classifier_long_form`),
+ *                                               présent SSI `wasOptOut`
+ *                                               vaut `true`.
+ */
+export interface InboundRelayedToHumanPayload {
+  /** hubspotId opaque. */
+  contactId: string;
+  /** docId composite `${contactId}_${campaignId}`. */
+  conversationId: string;
+  /** Firestore auto-ID `[A-Za-z0-9]{20}` du doc inbound posé par `addInbound`. */
+  messageId: string;
+  /**
+   * Slack user ID (`U…`) du commercial titulaire — valeur miroir de
+   * `conversation.handoff.assignedTo`. Pas PII personnelle (identifiant
+   * technique workspace).
+   */
+  assignedTo: string;
+  /**
+   * Timestamp Slack retourné par `chat.postMessage` (format
+   * `"1234567890.123456"`). Permet de rebondir en thread Slack et de
+   * corréler la trace audit avec l'historique Slack workspace.
+   */
+  slackTs: string;
+  /**
+   * Slack channel ID retourné par `chat.postMessage`. Pour un DM, c'est
+   * un DM channel ID (`D…`) scopé workspace.
+   */
+  slackChannel: string;
+  /**
+   * `true` si le message entrant a déclenché l'opt-out (court-forme OU
+   * long-forme). Dans ce cas un audit `opt_out` séparé est posé par
+   * `markOptedOut` dans la MÊME exécution du pipeline.
+   */
+  wasOptOut: boolean;
+  /**
+   * Présent UNIQUEMENT si `wasOptOut === true`. Discriminant du chemin
+   * de détection (court-forme déterministe vs long-forme classifier).
+   */
+  optOutVia?: InboundRelayedOptOutVia;
+  // Index signature explicite : permet l'assignation à
+  // `AuditLogInput.payload: Record<string, unknown>` sans cast (cf. pattern
+  // miroir `HandoffUnassignedPayload` — TS-level uniquement, no-op runtime).
   readonly [k: string]: unknown;
 }
 

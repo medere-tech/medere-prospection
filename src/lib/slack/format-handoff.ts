@@ -37,7 +37,24 @@
  *
  * `isOrphan=false` → DM direct au commercial, aucune mention (il n'y a
  * qu'un destinataire, le ping serait redondant).
+ *
+ * ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ * 🚨 SECURITE — ECHAPPEMENT MRKDWN (fix HIGH security-reviewer PR-A)
+ *
+ * TOUT champ interpole dans un block `type: "mrkdwn"` et provenant d'une
+ * source externe (SMS entrant, HubSpot/Lusha) DOIT passer par
+ * `escapeSlackMrkdwn`. Sinon un PS malveillant peut poster `<url|texte>`
+ * / `<@U...>` / `<!here>` dans un SMS et faire apparaitre un lien
+ * phishing cliquable OU une mention active dans le DM/canal, poste par
+ * le bot Medere (= fort trust visuel). Vecteur miroir sur `firstName`,
+ * `speciality`, `city` qui viennent de HubSpot/Lusha, editables
+ * manuellement par des humains.
+ *
+ * Champs couverts ici : `firstName`, `speciality`, `city`, `lastInboundBody`.
+ * `conversationId` est opaque par construction, `dashboardUrl` passe par
+ * `encodeURIComponent` dans son helper d'origine.
  */
+import { escapeSlackMrkdwn } from "./escape-mrkdwn";
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Constantes — bornes I/O
@@ -125,8 +142,20 @@ function toBlockquote(text: string): string {
  */
 export function buildHandoffBlocks(input: HandoffInput): HandoffBlock[] {
   const header = input.isOrphan ? "❓ Lead non attribué à traiter" : "🎯 Lead intéressé";
+  // herePing est une CONSTANTE litterale, pas une entree externe —
+  // volontairement NON echappee pour que Slack rende effectivement la
+  // mention `<!here>` sur la branche orphelins (c'est le ping voulu D8).
   const herePing = input.isOrphan ? "<!here>\n" : "";
-  const truncatedBody = truncate(input.lastInboundBody, LAST_INBOUND_MAX_CHARS);
+
+  // 🚨 ECHAPPEMENT MRKDWN — tous les champs externes passent par
+  // escapeSlackMrkdwn AVANT interpolation (fix HIGH security-reviewer).
+  // Troncature APRES echappement : un echappement sur un corps deja
+  // tronque peut laisser une entite coupee en 2.
+  const safeFirstName = escapeSlackMrkdwn(input.firstName);
+  const safeSpeciality = escapeSlackMrkdwn(input.speciality);
+  const safeCity = escapeSlackMrkdwn(input.city);
+  const safeBody = escapeSlackMrkdwn(input.lastInboundBody);
+  const truncatedBody = truncate(safeBody, LAST_INBOUND_MAX_CHARS);
   const blockquotedBody = toBlockquote(truncatedBody);
 
   return [
@@ -138,7 +167,7 @@ export function buildHandoffBlocks(input: HandoffInput): HandoffBlock[] {
       type: "section",
       text: {
         type: "mrkdwn",
-        text: `${herePing}*${input.firstName}* — ${input.speciality}\n📍 ${input.city}`,
+        text: `${herePing}*${safeFirstName}* — ${safeSpeciality}\n📍 ${safeCity}`,
       },
     },
     {

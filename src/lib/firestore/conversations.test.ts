@@ -45,6 +45,7 @@ import {
   conversationDocId,
   getActiveConversationByContactId,
   getConversation,
+  getHandedOffConversationByContactId,
   getOrCreateInitialConversation,
   incrementMessageCount,
   listConversationIdsByContact,
@@ -349,6 +350,93 @@ describe("conversations.ts", () => {
   });
 
   // ───────────────────────────────────────────────────────────────────────
+  // getHandedOffConversationByContactId (PR-A-INBOUND-HANDED-OFF)
+  // ───────────────────────────────────────────────────────────────────────
+
+  describe("getHandedOffConversationByContactId (PR-A)", () => {
+    it("1 conv handed_off → retourne { conversationId, conversation }", async () => {
+      const convId = conversationDocId("contact_ho_1", "camp_a");
+      await seedConversation(convId, {
+        contactId: "contact_ho_1",
+        campaignId: "camp_a",
+        status: "handed_off",
+      });
+      const got = await getHandedOffConversationByContactId("contact_ho_1");
+      expect(got).not.toBeNull();
+      expect(got?.conversationId).toBe(convId);
+      expect(got?.conversation.status).toBe("handed_off");
+    });
+
+    it("aucune conv → null", async () => {
+      const got = await getHandedOffConversationByContactId("contact_ho_none");
+      expect(got).toBeNull();
+    });
+
+    it("conv `in_dialogue` (NON handed_off) → null (filtre strict)", async () => {
+      // Sentinelle anti-drift : si quelqu'un remplace l'égalité stricte
+      // par un IN élargi, ce test casse.
+      await seedConversation(conversationDocId("contact_ho_wrong", "camp_a"), {
+        contactId: "contact_ho_wrong",
+        campaignId: "camp_a",
+        status: "in_dialogue",
+      });
+      const got = await getHandedOffConversationByContactId("contact_ho_wrong");
+      expect(got).toBeNull();
+    });
+
+    it("multi-campagne handed_off → retourne la plus récente par lastInboundAt + warn (invariant soft)", async () => {
+      // Deux conv handed_off pour le même contact → cas rare mais toléré.
+      // Déterminisme : la plus récente par lastInboundAt l'emporte.
+      const now = Timestamp.now();
+      const older = Timestamp.fromMillis(now.toMillis() - 60_000);
+      const newer = Timestamp.fromMillis(now.toMillis() - 1_000);
+
+      await seedConversation(conversationDocId("contact_ho_dup", "camp_a"), {
+        contactId: "contact_ho_dup",
+        campaignId: "camp_a",
+        status: "handed_off",
+        lastInboundAt: older,
+      });
+      await seedConversation(conversationDocId("contact_ho_dup", "camp_b"), {
+        contactId: "contact_ho_dup",
+        campaignId: "camp_b",
+        status: "handed_off",
+        lastInboundAt: newer,
+      });
+
+      const got = await getHandedOffConversationByContactId("contact_ho_dup");
+      expect(got?.conversationId).toBe(conversationDocId("contact_ho_dup", "camp_b"));
+    });
+
+    it("contactId vide → throw ValidationError sans PII (inputLength only)", async () => {
+      try {
+        await getHandedOffConversationByContactId("");
+        expect.fail("should have thrown");
+      } catch (e) {
+        expect(e).toBeInstanceOf(ValidationError);
+        const ctx = (e as ValidationError).context as { op: string; inputLength: number };
+        expect(ctx.op).toBe("getHandedOffConversationByContactId");
+        expect(ctx.inputLength).toBe(0);
+      }
+    });
+
+    it("doc handed_off corrompu → throw ValidationError au parse Zod", async () => {
+      await getAdminDb()
+        .collection(__CONVERSATIONS_COLLECTION_FOR_TESTS)
+        .doc("conv_ho_corrupt")
+        .set({
+          contactId: "contact_ho_corrupt",
+          campaignId: "camp_ho_corrupt",
+          status: "handed_off",
+          // messageCount manquant → Zod fail
+        });
+      await expect(
+        getHandedOffConversationByContactId("contact_ho_corrupt"),
+      ).rejects.toBeInstanceOf(ValidationError);
+    });
+  });
+
+  // ───────────────────────────────────────────────────────────────────────
   // incrementMessageCount
   // ───────────────────────────────────────────────────────────────────────
 
@@ -454,6 +542,16 @@ describe("conversations.ts", () => {
 
   describe("setHandoff", () => {
     const VALID_NOTES = "INTERESSE: prend RDV"; // 21 chars
+
+    it("fix LOW PR-A : assignedTo invalide (humain qui tape un nom) → throw ValidationError AVANT write Firestore", async () => {
+      await seedConversation("conv_bad_handoff");
+      await expect(setHandoff("conv_bad_handoff", "VanessaRabba", VALID_NOTES)).rejects.toThrow(
+        /invalid Slack user ID/,
+      );
+      // Aucune mutation Firestore attendue — le doc reste a son status seed.
+      const conv = await getConversation("conv_bad_handoff");
+      expect(conv?.status).not.toBe("handed_off");
+    });
 
     it("1er handoff → status=handed_off, handoff sous-objet rempli, 1 audit handoff", async () => {
       await seedConversation("conv_hand_1");

@@ -95,6 +95,7 @@ const EXPECTED_AUDIT_ACTIONS: ReadonlySet<AuditAction> = new Set<AuditAction>([
   "handoff",
   "handoff_accepted",
   "handoff_unassigned", // S9.9-PR5a — lead INTERESSE non routé (branche orphelins slack-handoff)
+  "inbound_relayed_to_human", // PR-A-INBOUND-HANDED-OFF — SMS entrant sur conv handed_off
   // CAMPAIGN / ADMIN
   "manual_override",
   "prompt_changed",
@@ -167,6 +168,17 @@ describe("ACTIONS whitelist — sentinelle anti-drift TS ↔ runtime (S9.1)", ()
     expect(EXPECTED_AUDIT_ACTIONS.has("contact_imported_from_hubspot")).toBe(true);
     expect(EXPECTED_AUDIT_ACTIONS.has("contact_created")).toBe(true);
     expect(EXPECTED_AUDIT_ACTIONS.has("contact_import_skipped")).toBe(true);
+  });
+
+  it("contient l'action PR-A `inbound_relayed_to_human` (sentinelle dédiée)", () => {
+    // Verrouillage spécifique pour repérer un revert/squash accidentel de
+    // l'ajout PR-A-INBOUND-HANDED-OFF. Cette action est CRITIQUE compliance :
+    // elle trace la relance d'un commercial humain quand un PS répond
+    // après un hand-off, et elle est posée en PARALLÈLE d'un `opt_out`
+    // quand le PS a demandé l'arrêt. Sans elle, on peut avoir un `opt_out`
+    // isolé sur une conv handed_off sans trace de la notification Slack
+    // au titulaire → trou forensique L.34-5 CPCE.
+    expect(EXPECTED_AUDIT_ACTIONS.has("inbound_relayed_to_human")).toBe(true);
   });
 
   it("contient l'action S10.1.4.c `sms_send_initiated_by_admin` (sentinelle dédiée)", () => {
@@ -852,5 +864,104 @@ describe("S10.1.3 — 4 nouvelles actions seed (cas append valides)", () => {
         },
       }),
     ).rejects.toThrow(AuditPiiError);
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// PR-A-INBOUND-HANDED-OFF — sentinelle inbound_relayed_to_human anti-PII
+// ─────────────────────────────────────────────────────────────────────────────
+
+describe("PR-A — sentinelle inbound_relayed_to_human anti-PII (defense-in-depth)", () => {
+  beforeEach(async () => {
+    vi.unstubAllEnvs();
+    vi.stubEnv("AUDIT_PII_PEPPER", PEPPER);
+    await fullReset();
+  });
+
+  afterEach(async () => {
+    vi.unstubAllEnvs();
+    await fullReset();
+  });
+
+  it("payload avec E.164 (bypass via `as any`) → AuditPiiError + 0 doc cree", async () => {
+    const leakedPayload = {
+      contactId: "ct_relay",
+      conversationId: "cv_relay",
+      messageId: "msg_relay",
+      assignedTo: "U05UVHGBURX",
+      slackTs: "1700000000.001",
+      slackChannel: "D0VANESSA",
+      wasOptOut: false,
+      // INTERDIT — un dev qui aurait injecte le phone du PS dans le payload.
+      phone: "+33612345678",
+    };
+
+    await expect(
+      appendAuditLog({
+        actorId: "system",
+        actorType: "system",
+        action: "inbound_relayed_to_human",
+        targetType: "conversation",
+        targetId: "cv_relay",
+        payload: leakedPayload,
+      }),
+    ).rejects.toBeInstanceOf(AuditPiiError);
+
+    expect(await countAuditDocs()).toBe(0);
+  });
+
+  it("payload avec FR national → AuditPiiError + 0 doc cree", async () => {
+    const leakedPayload = {
+      contactId: "ct_relay_fr",
+      conversationId: "cv_relay_fr",
+      messageId: "msg_relay_fr",
+      assignedTo: "U05UVHGBURX",
+      slackTs: "1700000000.002",
+      slackChannel: "D0VANESSA",
+      wasOptOut: true,
+      optOutVia: "classifier_long_form",
+      // INTERDIT — numero FR national 10 chiffres.
+      callbackPhone: "0612345678",
+    };
+
+    await expect(
+      appendAuditLog({
+        actorId: "system",
+        actorType: "system",
+        action: "inbound_relayed_to_human",
+        targetType: "conversation",
+        targetId: "cv_relay_fr",
+        payload: leakedPayload,
+      }),
+    ).rejects.toBeInstanceOf(AuditPiiError);
+
+    expect(await countAuditDocs()).toBe(0);
+  });
+
+  it("payload avec email → AuditPiiError + 0 doc cree", async () => {
+    const leakedPayload = {
+      contactId: "ct_relay_em",
+      conversationId: "cv_relay_em",
+      messageId: "msg_relay_em",
+      assignedTo: "U05UVHGBURX",
+      slackTs: "1700000000.003",
+      slackChannel: "D0VANESSA",
+      wasOptOut: false,
+      // INTERDIT — email leak.
+      contactEmail: "dr.dupont@cabinet.fr",
+    };
+
+    await expect(
+      appendAuditLog({
+        actorId: "system",
+        actorType: "system",
+        action: "inbound_relayed_to_human",
+        targetType: "conversation",
+        targetId: "cv_relay_em",
+        payload: leakedPayload,
+      }),
+    ).rejects.toBeInstanceOf(AuditPiiError);
+
+    expect(await countAuditDocs()).toBe(0);
   });
 });

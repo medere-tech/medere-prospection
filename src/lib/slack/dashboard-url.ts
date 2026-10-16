@@ -1,0 +1,91 @@
+/**
+ * Construit l'URL dashboard d'une conversation
+ * (`${base}/conversations/${conversationId}`) — helper partagé des
+ * notifications Slack (hand-off initial + relais post-handed_off PR-A).
+ *
+ * ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ * Rôle
+ *
+ *   Deux pipelines Slack construisent exactement la même URL dashboard
+ *   pour pointer un commercial vers une conversation :
+ *
+ *     1. `slack-handoff` (S9.9-PR5b) — notification initiale INTERESSE.
+ *     2. `notify-inbound-after-handoff` (PR-A) — relais d'un SMS entrant
+ *        arrivé APRÈS la reprise humaine.
+ *
+ *   Les deux doivent produire STRICTEMENT la même URL — sinon un
+ *   commercial reçoit deux liens différents pour la même conversation
+ *   et ne sait pas lequel est "le bon". Ce helper verrouille l'invariant.
+ *
+ * ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ * 🔒 FALLBACK ANTI-DRIFT
+ *
+ *   `DASHBOARD_URL_FALLBACK` est strictement égal à celui déclaré dans
+ *   `src/lib/inngest/functions/slack-handoff.ts` (constante locale D5).
+ *   Je ne modifie pas slack-handoff.ts dans cette PR pour éviter toute
+ *   régression sur le chemin hand-off initial — à la place, un test
+ *   sentinelle importe `__DASHBOARD_URL_FALLBACK_FOR_TESTS` depuis
+ *   slack-handoff.ts et verrouille l'égalité des deux constantes.
+ *
+ * ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ * 🔒 FORME DE L'URL
+ *
+ *   - Trailing slash du `baseUrl` toléré (`.replace(/\/+$/, "")`).
+ *   - `conversationId` injecté tel quel — il est opaque par construction
+ *     (`${contactId}_${campaignId}`, scrubber-safe). Aucun encodeURIComponent
+ *     NÉCESSAIRE côté format (pas de `#` ni `?` dans les hubspotId numériques
+ *     ni les campaignId slug). On applique quand même `encodeURIComponent`
+ *     defense-in-depth : si un futur campaignId introduit un `/`, l'URL
+ *     reste cohérente.
+ */
+
+import { getCoreEnv } from "@/lib/security/env";
+import { logger } from "@/lib/utils/logger";
+
+/**
+ * Fallback utilisé quand `NEXT_PUBLIC_APP_URL` est absent. URL Vercel prod
+ * fixe. DOIT rester strictement égal à `slack-handoff.ts::DASHBOARD_URL_FALLBACK`
+ * (sentinelle test anti-drift).
+ */
+export const DASHBOARD_URL_FALLBACK = "https://medere-prospection.vercel.app";
+
+/**
+ * Options d'injection pour tests unitaires. En production, ne pas fournir
+ * `getBaseUrl` — la fonction lit `getCoreEnv().NEXT_PUBLIC_APP_URL`.
+ *
+ * @internal Public uniquement pour le testing.
+ */
+export interface GetDashboardConversationUrlDeps {
+  /**
+   * Fournit la base URL (sans trailing slash obligatoire). Si retourne
+   * `undefined` ou chaîne vide, le fallback Vercel est utilisé et un
+   * `logger.warn` est émis.
+   */
+  getBaseUrl?: () => string | undefined;
+}
+
+/**
+ * Retourne l'URL dashboard d'une conversation. JAMAIS de PII dans la
+ * chaîne de sortie — `conversationId` est opaque par construction.
+ *
+ * @param conversationId  docId composite `${contactId}_${campaignId}`.
+ * @param deps            optionnel ; en prod, lit `NEXT_PUBLIC_APP_URL`.
+ * @returns               `"${base}/conversations/${encodeURIComponent(conversationId)}"`.
+ */
+export function getDashboardConversationUrl(
+  conversationId: string,
+  deps: GetDashboardConversationUrlDeps = {},
+): string {
+  const read = deps.getBaseUrl ?? (() => getCoreEnv().NEXT_PUBLIC_APP_URL);
+  const raw = read();
+  const base = raw !== undefined && raw !== "" ? raw.replace(/\/+$/, "") : DASHBOARD_URL_FALLBACK;
+  if (raw === undefined || raw === "") {
+    // Observabilité : surface une config partielle sans bloquer la notif.
+    // Aucune PII dans ce log — juste le fait que le fallback est utilisé.
+    logger.warn(
+      { op: "getDashboardConversationUrl" },
+      "[dashboard-url] NEXT_PUBLIC_APP_URL missing — using Vercel fallback",
+    );
+  }
+  return `${base}/conversations/${encodeURIComponent(conversationId)}`;
+}

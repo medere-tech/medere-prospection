@@ -36,6 +36,7 @@ import { logger } from "@/lib/utils/logger";
 
 import { getSlackClient } from "./client";
 import { buildHandoffBlocks, type HandoffInput } from "./format-handoff";
+import { assertSlackUserId } from "./slack-user-id";
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Types
@@ -89,6 +90,15 @@ export interface SendHandoffResult {
  * manque au moment du premier appel.
  */
 export async function sendHandoffNotification(input: SendHandoffInput): Promise<SendHandoffResult> {
+  // Fix LOW security-reviewer PR-A : valide le format Slack user ID sur
+  // la branche DM UNIQUEMENT. La branche `channel` (`C...`) a un prefixe
+  // different et son propre invariant (ID canal orphelins fourni par
+  // env/config, pas sous controle externe) — on la laisse passer sans
+  // regex pour ne pas introduire un deuxieme helper qui ferait doublon.
+  if (input.target.kind === "dm") {
+    assertSlackUserId(input.target.slackUserId, "sendHandoffNotification");
+  }
+
   const blocks = buildHandoffBlocks({
     firstName: input.firstName,
     speciality: input.speciality,

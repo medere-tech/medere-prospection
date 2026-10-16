@@ -100,7 +100,7 @@ describe("sendHandoffNotification — contenu chat.postMessage", () => {
 
     await sendHandoffNotification({
       ...BASE_HANDOFF,
-      target: { kind: "dm", slackUserId: "U05" },
+      target: { kind: "dm", slackUserId: "U05UVHGBURX" },
     });
 
     const args = spy.mock.calls[0]?.[0];
@@ -115,7 +115,7 @@ describe("sendHandoffNotification — contenu chat.postMessage", () => {
 
     await sendHandoffNotification({
       ...BASE_HANDOFF,
-      target: { kind: "dm", slackUserId: "U05" },
+      target: { kind: "dm", slackUserId: "U05UVHGBURX" },
     });
 
     const args = spy.mock.calls[0]?.[0];
@@ -143,7 +143,7 @@ describe("sendHandoffNotification — contenu chat.postMessage", () => {
 
     await sendHandoffNotification({
       ...BASE_HANDOFF,
-      target: { kind: "dm", slackUserId: "U05" },
+      target: { kind: "dm", slackUserId: "U05UVHGBURX" },
     });
 
     const args = spy.mock.calls[0]?.[0];
@@ -166,7 +166,7 @@ describe("sendHandoffNotification — erreurs", () => {
     try {
       await sendHandoffNotification({
         ...BASE_HANDOFF,
-        target: { kind: "dm", slackUserId: "U05" },
+        target: { kind: "dm", slackUserId: "U05UVHGBURX" },
       });
       expect.fail("should have thrown");
     } catch (e) {
@@ -208,7 +208,7 @@ describe("sendHandoffNotification — erreurs", () => {
     try {
       await sendHandoffNotification({
         ...BASE_HANDOFF,
-        target: { kind: "dm", slackUserId: "U05" },
+        target: { kind: "dm", slackUserId: "U05UVHGBURX" },
       });
       expect.fail("should have thrown");
     } catch (e) {
@@ -227,7 +227,7 @@ describe("sendHandoffNotification — erreurs", () => {
     await expect(
       sendHandoffNotification({
         ...BASE_HANDOFF,
-        target: { kind: "dm", slackUserId: "U05" },
+        target: { kind: "dm", slackUserId: "U05UVHGBURX" },
       }),
     ).rejects.toBeInstanceOf(ExternalServiceError);
   });
@@ -251,5 +251,42 @@ describe("sendHandoffNotification — erreurs", () => {
       expect(serialized).not.toContain(BASE_HANDOFF.lastInboundBody);
       expect(serialized).not.toContain(BASE_HANDOFF.dashboardUrl);
     }
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Sentinelles format Slack user ID (fix LOW security-reviewer PR-A)
+// ─────────────────────────────────────────────────────────────────────────────
+
+describe("sendHandoffNotification — defense-in-depth format slackUserId (PR-A fix LOW)", () => {
+  it("DM + slackUserId invalide (doc legacy humain qui aurait tape un nom) → throw ValidationError AVANT postMessage", async () => {
+    const spy = stubSlackClient(async () => ({ ok: true, ts: "t", channel: "c" }));
+    const input: SendHandoffInput = {
+      ...BASE_HANDOFF,
+      target: { kind: "dm", slackUserId: "VanessaRabba" },
+    };
+    await expect(sendHandoffNotification(input)).rejects.toThrow(/invalid Slack user ID/);
+    expect(spy).not.toHaveBeenCalled();
+  });
+
+  it("DM + slackUserId `<@U...>` wrappe → throw (anti-mention smuggling)", async () => {
+    const spy = stubSlackClient(async () => ({ ok: true, ts: "t", channel: "c" }));
+    const input: SendHandoffInput = {
+      ...BASE_HANDOFF,
+      target: { kind: "dm", slackUserId: "<@U05UVHGBURX>" },
+    };
+    await expect(sendHandoffNotification(input)).rejects.toThrow(/invalid Slack user ID/);
+    expect(spy).not.toHaveBeenCalled();
+  });
+
+  it("channel kind : regex user ID NON appliquee (preserve branche orphelins C.../G...)", async () => {
+    const spy = stubSlackClient(async () => ({ ok: true, ts: "t", channel: "C0ORPHANLEADS" }));
+    const input: SendHandoffInput = {
+      ...BASE_HANDOFF,
+      isOrphan: true,
+      target: { kind: "channel", channelId: "C0ORPHANLEADS" },
+    };
+    await sendHandoffNotification(input);
+    expect(spy).toHaveBeenCalledOnce();
   });
 });

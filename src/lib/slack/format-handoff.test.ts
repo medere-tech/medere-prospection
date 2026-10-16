@@ -224,3 +224,56 @@ describe("buildHandoffBlocks — dashboardUrl", () => {
     expect(text).toMatch(/^<https:\/\/[^|]+\|Voir la conversation>$/);
   });
 });
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Sentinelles anti-phishing mrkdwn (fix HIGH security-reviewer PR-A)
+// ─────────────────────────────────────────────────────────────────────────────
+
+describe("buildHandoffBlocks — sentinelles anti-phishing mrkdwn", () => {
+  const HOSTILES: Array<{ input: string; label: string }> = [
+    { input: "<https://phishing.site|URGENT: Valider Medere>", label: "lien masque" },
+    { input: "<!here>", label: "mention here" },
+    { input: "<!channel>", label: "mention channel" },
+    { input: "<@U12345678>", label: "mention user" },
+    { input: "a & b < c > d", label: "mix special chars" },
+  ];
+
+  for (const { input, label } of HOSTILES) {
+    it(`entree hostile dans lastInboundBody (${label}) : plus aucune syntaxe active`, () => {
+      const blocks = buildHandoffBlocks({ ...BASE_INPUT, lastInboundBody: input });
+      const serialized = JSON.stringify(blocks);
+      expect(serialized).not.toContain(input);
+    });
+
+    it(`entree hostile dans firstName (${label}) : plus aucune syntaxe active`, () => {
+      const blocks = buildHandoffBlocks({ ...BASE_INPUT, firstName: input });
+      const serialized = JSON.stringify(blocks);
+      expect(serialized).not.toContain(input);
+    });
+
+    it(`entree hostile dans city (${label}) : plus aucune syntaxe active`, () => {
+      const blocks = buildHandoffBlocks({ ...BASE_INPUT, city: input });
+      const serialized = JSON.stringify(blocks);
+      expect(serialized).not.toContain(input);
+    });
+  }
+
+  it("branche orphan : `<!here>` CONSTANT reste actif (ping intentionnel D8)", () => {
+    // Verrouille que l'echappement NE casse PAS la mention `<!here>`
+    // posee par le code lui-meme sur la branche orphan. C'est une
+    // constante litterale, pas une entree externe.
+    const blocks = buildHandoffBlocks({ ...BASE_INPUT, isOrphan: true });
+    const text = (blocks[1] as { text: { text: string } }).text.text;
+    expect(text.startsWith("<!here>\n")).toBe(true);
+  });
+
+  it("lien phishing specifiquement : plus aucun `<https://phishing.site|` connectable", () => {
+    const blocks = buildHandoffBlocks({
+      ...BASE_INPUT,
+      lastInboundBody: "<https://phishing.site|URGENT: Valider Medere>",
+    });
+    const serialized = JSON.stringify(blocks);
+    expect(serialized).not.toContain("<https://phishing.site|");
+    expect(serialized).toContain("&lt;https://phishing.site|URGENT: Valider Medere&gt;");
+  });
+});
