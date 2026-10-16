@@ -344,7 +344,9 @@ export const PHONE_HASH_CHUNK_SIZE = 4;
  *               malgré le chunking) ; pour `hashPii` (hex pur) c'est
  *               trivialement vrai. Le chunking par 4 chars suffit déjà
  *               à neutraliser `RE_FR_NATIONAL` (10 digits requis > 4).
- * @returns      `"hph_XXXX_XXXX_..._XXXX"` (typ. 8 chunks de 4 = 36 chars).
+ * @returns      `"hph_XXXX_XXXX_..._XXXX"` — 43 chars exactement
+ *               (`hph_` 4 chars + 32 hex + 7 underscores). Verrouille par
+ *               `pii-detector.test.ts` sentinelle de longueur.
  *
  * @example
  *   safePhoneHash("+33600000103") →
@@ -359,4 +361,95 @@ export function safePhoneHash(phone: string, hashFn: typeof hashPii = hashPii): 
   const chunkRegex = new RegExp(`.{1,${PHONE_HASH_CHUNK_SIZE}}`, "g");
   const chunks = hex.match(chunkRegex) ?? [hex];
   return PHONE_HASH_PREFIX + chunks.join("_");
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// safeExternalIdHash — hash d'identifiant externe (ovhMessageId) pour
+// idempotence (event.id Inngest + docId Firestore). Fix BUG-DEDUP-RACE.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * 🔒 Marker préfixé identifiant sémantiquement un hash d'external ID
+ * (typiquement un ovhMessageId) dans un dump forensic. Convention
+ * `oih_` = "OVH Inbound Hash", stable à travers les logs, les docIds
+ * et les event.id Inngest.
+ */
+export const EXTERNAL_ID_HASH_PREFIX = "oih_";
+
+/**
+ * Hash safe pour forger un identifiant d'idempotence (event.id Inngest,
+ * docId Firestore sous-collection `messages/`) depuis un `ovhMessageId`
+ * ou tout autre externalId semi-sensible.
+ *
+ * ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ * Pourquoi un helper dédié ET pas `safePhoneHash` réutilisé
+ *
+ *   - Lisibilité forensic : préfixe `oih_` vs `hph_` permet de distinguer
+ *     en coup d'œil un hash d'ovhMessageId d'un hash de téléphone dans un
+ *     dump d'audit log ou dans un docId Firestore (`conversations/{convId}/
+ *     messages/oih_xxxx_...`).
+ *   - Scope métier séparé : si demain on veut durcir le hash des
+ *     externalIds (ex: pepper distinct), on modifie ici sans toucher à
+ *     `safePhoneHash` (surface compliance différente).
+ *
+ * ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ * Pourquoi crypto HMAC et pas djb2 (`shortFingerprint`)
+ *
+ *   djb2 est non-cryptographique : connaissant l'ovhMessageId, un
+ *   attaquant peut forger le docId Firestore ou l'event.id Inngest et
+ *   empoisonner le dédup (déni de service sélectif, injection de doc
+ *   pré-créé). HMAC avec `AUDIT_PII_PEPPER` (secret server-side, min
+ *   32 chars) rend la forge impossible sans le pepper.
+ *
+ * ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ * Pourquoi chunking identique à `safePhoneHash`
+ *
+ *   `hashPii` renvoie 32 chars hex. ~0.3% d'entre eux contiennent une
+ *   sous-séquence `0[1-9]\d{8}` matchant `RE_FR_NATIONAL` du scrubber
+ *   `detectPiiInPayload`. Si un futur caller met ce hash dans un payload
+ *   audit (ex: `payload.messageId = oih_...` dans un `reply_dropped`),
+ *   l'écriture serait rejetée en `AuditPiiError`. Le chunking par 4
+ *   chars neutralise ce match (max 4 digits consécutifs < 10 digits
+ *   requis par la regex).
+ *
+ * ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ * Propriétés
+ *
+ *   - **Déterministe** : même externalId → même hash. C'est l'invariant
+ *     dont dépendent les 2 lignes de défense BUG-DEDUP-RACE :
+ *       1. event.id Inngest `sms.reply.<hash>` → dédup 60s native.
+ *       2. docId Firestore `conversations/{convId}/messages/<hash>` →
+ *          `tx.create` throw `ALREADY_EXISTS` sur le run perdant.
+ *   - **Non-réversible** : impossible de retrouver l'ovhMessageId
+ *     depuis le hash (sans pepper + sans dictionnaire exhaustif).
+ *   - **Format safe** pour docId Firestore (pas de `/`, pas d'espace)
+ *     et pour event.id Inngest (string arbitraire).
+ *
+ * ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ * ⚠️ Rotation du pepper
+ *
+ * Une rotation de `AUDIT_PII_PEPPER` change ce hash et rompt l'idempotence
+ * pendant la transition (un meme `ovhMessageId` recu avant et apres la
+ * rotation produirait 2 docIds distincts, donc 2 docs Firestore stockes).
+ * Procedure de rotation documentee dans BACKLOG-002.
+ *
+ * @param externalId  typiquement ovhMessageId. NON vide (le caller
+ *                    doit valider en amont, cette fonction ne vérifie
+ *                    pas pour rester un primitive bas-niveau).
+ * @param hashFn      implémentation du hash sous-jacent. Injectable
+ *                    pour tests. Défaut : `hashPii` (HMAC-SHA256 +
+ *                    pepper).
+ * @returns           `"oih_XXXX_XXXX_..._XXXX"` — 43 chars exactement
+ *                    (`oih_` 4 chars + 32 hex + 7 underscores). Verrouille
+ *                    par sentinelle de longueur dans
+ *                    `pii-detector.test.ts`.
+ *
+ * @example
+ *   safeExternalIdHash("ovh-msg-12345") → "oih_7f3c_a9d2_..."
+ */
+export function safeExternalIdHash(externalId: string, hashFn: typeof hashPii = hashPii): string {
+  const hex = hashFn(externalId);
+  const chunkRegex = new RegExp(`.{1,${PHONE_HASH_CHUNK_SIZE}}`, "g");
+  const chunks = hex.match(chunkRegex) ?? [hex];
+  return EXTERNAL_ID_HASH_PREFIX + chunks.join("_");
 }

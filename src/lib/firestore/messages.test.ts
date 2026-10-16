@@ -74,6 +74,7 @@ import {
   __STALE_MESSAGES_DEFAULT_LIMIT_FOR_TESTS,
   _parseMessageOrThrow,
   addInbound,
+  addInboundIdempotent,
   addOutbound,
   addOutboundDraft,
   addOutboundDraftInTx,
@@ -3282,5 +3283,358 @@ describe("messages.ts", () => {
     it("DEFAULT_LIMIT === 100 (anti-DoS borne défensive)", () => {
       expect(__STALE_MESSAGES_DEFAULT_LIMIT_FOR_TESTS).toBe(100);
     });
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// addInboundIdempotent — fix BUG-DEDUP-RACE (B)
+// ─────────────────────────────────────────────────────────────────────────────
+
+describe("addInboundIdempotent (BUG-DEDUP-RACE B)", () => {
+  beforeEach(async () => {
+    vi.unstubAllEnvs();
+    vi.stubEnv("AUDIT_PII_PEPPER", PEPPER);
+    await fullReset();
+  });
+
+  afterEach(async () => {
+    vi.unstubAllEnvs();
+    await fullReset();
+  });
+
+  it("happy path -> docId deterministe commence par `oih_`, created=true, inboundCount+1", async () => {
+    await seedConversation("conv_idem_1");
+    const r = await addInboundIdempotent("conv_idem_1", {
+      body: "Message test idempotent",
+      channel: "sms",
+      externalId: "ovh-idem-001",
+      externalReceiver: "+33612345678",
+    });
+
+    expect(r.created).toBe(true);
+    expect(r.messageId.startsWith("oih_")).toBe(true);
+    // Chunking par 4 chars : prefixe + 8 chunks separes par `_`.
+    expect(r.messageId).toMatch(/^oih_([a-f0-9]{1,4}_){7}[a-f0-9]{1,4}$/);
+
+    const conv = (
+      await getAdminDb().collection(__CONVERSATIONS_COLLECTION_FOR_TESTS).doc("conv_idem_1").get()
+    ).data() as Conversation;
+    expect(conv.inboundCount).toBe(1);
+  });
+
+  it("meme externalId -> MEME docId (deterministe)", async () => {
+    await seedConversation("conv_idem_det_1");
+    const r1 = await addInboundIdempotent("conv_idem_det_1", {
+      body: "Premier appel",
+      channel: "sms",
+      externalId: "ovh-fixed-id-abc",
+      externalReceiver: "+33612345678",
+    });
+    // Reset conv compteur pour isoler le 2e appel.
+    await getAdminDb()
+      .collection(__CONVERSATIONS_COLLECTION_FOR_TESTS)
+      .doc("conv_idem_det_1")
+      .collection(__MESSAGES_SUBCOLLECTION_FOR_TESTS)
+      .doc(r1.messageId)
+      .delete();
+    const r2 = await addInboundIdempotent("conv_idem_det_1", {
+      body: "Second appel",
+      channel: "sms",
+      externalId: "ovh-fixed-id-abc",
+      externalReceiver: "+33612345678",
+    });
+    expect(r2.messageId).toBe(r1.messageId);
+  });
+
+  it("2e appel SANS reset -> created=false, 1 seul doc, pas de double audit, pas de double bump", async () => {
+    await seedConversation("conv_idem_race_1");
+    const r1 = await addInboundIdempotent("conv_idem_race_1", {
+      body: "Premier",
+      channel: "sms",
+      externalId: "ovh-race-same",
+      externalReceiver: "+33612345678",
+    });
+    expect(r1.created).toBe(true);
+
+    const r2 = await addInboundIdempotent("conv_idem_race_1", {
+      body: "Doublon",
+      channel: "sms",
+      externalId: "ovh-race-same",
+      externalReceiver: "+33612345678",
+    });
+    expect(r2.created).toBe(false);
+    expect(r2.messageId).toBe(r1.messageId);
+
+    // Un seul doc message.
+    const msgs = await getAdminDb()
+      .collection(__MESSAGES_PARENT_COLLECTION_FOR_TESTS)
+      .doc("conv_idem_race_1")
+      .collection(__MESSAGES_SUBCOLLECTION_FOR_TESTS)
+      .get();
+    expect(msgs.size).toBe(1);
+
+    // Un seul audit sms_received (le run perdant n'en pose PAS).
+    const audits = await getAdminDb().collection(__AUDIT_COLLECTION_FOR_TESTS).get();
+    const smsReceived = audits.docs.filter((d) => d.data().action === "sms_received");
+    expect(smsReceived).toHaveLength(1);
+
+    // Un seul bump de inboundCount.
+    const conv = (
+      await getAdminDb()
+        .collection(__CONVERSATIONS_COLLECTION_FOR_TESTS)
+        .doc("conv_idem_race_1")
+        .get()
+    ).data() as Conversation;
+    expect(conv.inboundCount).toBe(1);
+  });
+
+  // Verrou de non-flakiness : 10 iterations distinctes via it.each pour
+  // que chaque iteration beneficie du `afterEach` setup firestore qui
+  // DELETE toutes les collections de l'emulator entre iterations (fullReset
+  // ci-dessus ne purge PAS les docs, il reset les singletons SDK). Chaque
+  // iteration lance 2 appels Promise.all et verifie l'invariant.
+  it.each(Array.from({ length: 10 }, (_, i) => i))(
+    "concurrence iter %i : 2 appels paralleles sur meme externalId -> EXACTEMENT 1 inbound stocke",
+    async (i) => {
+      await seedConversation(`conv_race_iter_${i}`);
+      const extId = `ovh-race-par-${i}`;
+
+      const [r1, r2] = await Promise.all([
+        addInboundIdempotent(`conv_race_iter_${i}`, {
+          body: `Run A iter ${i}`,
+          channel: "sms",
+          externalId: extId,
+          externalReceiver: "+33612345678",
+        }),
+        addInboundIdempotent(`conv_race_iter_${i}`, {
+          body: `Run B iter ${i}`,
+          channel: "sms",
+          externalId: extId,
+          externalReceiver: "+33612345678",
+        }),
+      ]);
+
+      // EXACTEMENT 1 run avec created=true, 1 run avec created=false.
+      const createdCount = [r1.created, r2.created].filter(Boolean).length;
+      expect(createdCount).toBe(1);
+      expect(r1.messageId).toBe(r2.messageId);
+
+      // Un seul doc message.
+      const msgs = await getAdminDb()
+        .collection(__MESSAGES_PARENT_COLLECTION_FOR_TESTS)
+        .doc(`conv_race_iter_${i}`)
+        .collection(__MESSAGES_SUBCOLLECTION_FOR_TESTS)
+        .get();
+      expect(msgs.size).toBe(1);
+
+      // Un seul audit sms_received dans toute la collection audit_log.
+      const audits = await getAdminDb().collection(__AUDIT_COLLECTION_FOR_TESTS).get();
+      const smsReceived = audits.docs.filter((d) => d.data().action === "sms_received");
+      expect(smsReceived).toHaveLength(1);
+    },
+  );
+
+  it("externalId vide -> throw ValidationError sans ecriture", async () => {
+    await seedConversation("conv_idem_empty");
+    await expect(
+      addInboundIdempotent("conv_idem_empty", {
+        body: "body",
+        channel: "sms",
+        externalId: "",
+        externalReceiver: "+33612345678",
+      }),
+    ).rejects.toBeInstanceOf(ValidationError);
+    const msgs = await getAdminDb()
+      .collection(__MESSAGES_PARENT_COLLECTION_FOR_TESTS)
+      .doc("conv_idem_empty")
+      .collection(__MESSAGES_SUBCOLLECTION_FOR_TESTS)
+      .get();
+    expect(msgs.size).toBe(0);
+  });
+
+  it("conv absente -> throw NotFoundError, pas d'ecriture", async () => {
+    await expect(
+      addInboundIdempotent("conv_ghost_idem", {
+        body: "body",
+        channel: "sms",
+        externalId: "ovh-ghost",
+        externalReceiver: "+33612345678",
+      }),
+    ).rejects.toBeInstanceOf(NotFoundError);
+  });
+
+  it("compatibilite docs legacy auto-ID : findInboundByExternalId retrouve ancien et nouveau format", async () => {
+    // Un ancien doc avec auto-ID (= addInbound), puis un nouveau doc avec
+    // docId deterministe (= addInboundIdempotent) sur un autre externalId.
+    // findInboundByExternalId doit retrouver chacun par son externalId.
+    await seedConversation("conv_legacy_mix");
+    const legacyId = await addInbound("conv_legacy_mix", {
+      body: "ancien doc",
+      channel: "sms",
+      externalId: "ovh-legacy-A",
+      externalReceiver: "+33612345678",
+    });
+    expect(legacyId).toMatch(FIRESTORE_AUTO_ID_PATTERN);
+
+    const r = await addInboundIdempotent("conv_legacy_mix", {
+      body: "nouveau doc",
+      channel: "sms",
+      externalId: "ovh-new-B",
+      externalReceiver: "+33612345678",
+    });
+    expect(r.messageId.startsWith("oih_")).toBe(true);
+
+    const foundLegacy = await findInboundByExternalId("conv_legacy_mix", "ovh-legacy-A");
+    expect(foundLegacy?.messageId).toBe(legacyId);
+    const foundNew = await findInboundByExternalId("conv_legacy_mix", "ovh-new-B");
+    expect(foundNew?.messageId).toBe(r.messageId);
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// addInboundIdempotent — fallback défensif anti-regression firebase-admin
+// (fix security-reviewer OBS point 2)
+// ─────────────────────────────────────────────────────────────────────────────
+
+describe("addInboundIdempotent — fallback relecture doc si erreur non reconnue", () => {
+  beforeEach(async () => {
+    vi.unstubAllEnvs();
+    vi.stubEnv("AUDIT_PII_PEPPER", PEPPER);
+    await fullReset();
+  });
+
+  afterEach(async () => {
+    vi.unstubAllEnvs();
+    await fullReset();
+  });
+
+  /**
+   * Helper : seed un doc inbound DIRECTEMENT (sans passer par addInbound /
+   * addInboundIdempotent) pour simuler l'etat "run gagnant a deja commit"
+   * sans en declencher la tx.
+   */
+  async function seedInboundDoc(
+    conversationId: string,
+    docId: string,
+    overrides: { externalId: string; body?: string },
+  ) {
+    const now = Timestamp.now();
+    await getAdminDb()
+      .collection(__MESSAGES_PARENT_COLLECTION_FOR_TESTS)
+      .doc(conversationId)
+      .collection(__MESSAGES_SUBCOLLECTION_FOR_TESTS)
+      .doc(docId)
+      .set({
+        direction: "inbound",
+        body: overrides.body ?? "seeded",
+        status: "received",
+        channel: "sms",
+        externalId: overrides.externalId,
+        externalReceiver: "+33612345678",
+        generatedBy: "human",
+        createdAt: now,
+        receivedAt: now,
+      });
+  }
+
+  it("(a) erreur inconnue + doc present meme externalId -> created=false (fallback valide le doublon)", async () => {
+    await seedConversation("conv_fb_a");
+    // Compute le docId deterministe en appelant une fois le helper public
+    // (meme input -> meme docId).
+    const dummy = await addInboundIdempotent("conv_fb_a", {
+      body: "seed via helper",
+      channel: "sms",
+      externalId: "ovh-fb-a-SAME",
+      externalReceiver: "+33612345678",
+    });
+    // Reset conv compteurs pour isoler le 2e appel (on garde le doc seede).
+    await fullReset();
+    vi.stubEnv("AUDIT_PII_PEPPER", PEPPER);
+    await seedConversation("conv_fb_a");
+    await seedInboundDoc("conv_fb_a", dummy.messageId, {
+      externalId: "ovh-fb-a-SAME",
+    });
+
+    // Spy sur runTransaction pour throw une erreur avec un code INCONNU
+    // (pas 6, pas "already-exists") — simule un wrap SDK hypothetique.
+    const db = getAdminDb();
+    const spy = vi.spyOn(db, "runTransaction").mockRejectedValueOnce(
+      Object.assign(new Error("wrapped already exists mystere"), {
+        code: "mystery-wrapped-code",
+      }),
+    );
+
+    const r = await addInboundIdempotent("conv_fb_a", {
+      body: "nouveau run perdant",
+      channel: "sms",
+      externalId: "ovh-fb-a-SAME",
+      externalReceiver: "+33612345678",
+    });
+
+    expect(r.created).toBe(false);
+    expect(r.messageId).toBe(dummy.messageId);
+    spy.mockRestore();
+  });
+
+  it("(b) erreur inconnue + doc ABSENT -> erreur relancee (pas d'absorption silencieuse)", async () => {
+    await seedConversation("conv_fb_b");
+    const db = getAdminDb();
+    const mysteryError = Object.assign(new Error("transient 5xx mystere"), {
+      code: "fake-transient-code",
+    });
+    const spy = vi.spyOn(db, "runTransaction").mockRejectedValueOnce(mysteryError);
+
+    await expect(
+      addInboundIdempotent("conv_fb_b", {
+        body: "run isolé",
+        channel: "sms",
+        externalId: "ovh-fb-b-NEW",
+        externalReceiver: "+33612345678",
+      }),
+    ).rejects.toBe(mysteryError);
+
+    // Aucun doc n'a ete cree.
+    const msgs = await getAdminDb()
+      .collection(__MESSAGES_PARENT_COLLECTION_FOR_TESTS)
+      .doc("conv_fb_b")
+      .collection(__MESSAGES_SUBCOLLECTION_FOR_TESTS)
+      .get();
+    expect(msgs.size).toBe(0);
+    spy.mockRestore();
+  });
+
+  it("(c) erreur inconnue + doc present MAIS externalId different -> erreur relancee (collision suspecte)", async () => {
+    await seedConversation("conv_fb_c");
+    // Compute le docId deterministe pour "ovh-fb-c-NEW".
+    const probe = await addInboundIdempotent("conv_fb_c", {
+      body: "probe",
+      channel: "sms",
+      externalId: "ovh-fb-c-NEW",
+      externalReceiver: "+33612345678",
+    });
+    await fullReset();
+    vi.stubEnv("AUDIT_PII_PEPPER", PEPPER);
+    await seedConversation("conv_fb_c");
+    // Seed un doc au MEME docId mais avec un externalId DIFFERENT (simule
+    // une collision inattendue : hash collision, bug amont, corruption).
+    await seedInboundDoc("conv_fb_c", probe.messageId, {
+      externalId: "ovh-fb-c-OTHER", // DIFFERENT de ce qu'on va passer
+    });
+
+    const db = getAdminDb();
+    const mysteryError = Object.assign(new Error("wrapped collision mystere"), {
+      code: "mystery-collision-code",
+    });
+    const spy = vi.spyOn(db, "runTransaction").mockRejectedValueOnce(mysteryError);
+
+    await expect(
+      addInboundIdempotent("conv_fb_c", {
+        body: "run perdant",
+        channel: "sms",
+        externalId: "ovh-fb-c-NEW", // on passe NEW mais le doc stocke porte OTHER
+        externalReceiver: "+33612345678",
+      }),
+    ).rejects.toBe(mysteryError);
+    spy.mockRestore();
   });
 });

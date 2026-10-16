@@ -324,6 +324,7 @@ import {
 } from "@/lib/firestore/conversations";
 import {
   addInbound,
+  addInboundIdempotent,
   addOutboundDraft,
   findInboundByExternalId,
   listRecentMessages,
@@ -335,6 +336,7 @@ import { sendInboundAfterHandoffNotification } from "@/lib/slack/notify-inbound-
 import { ValidationError } from "@/lib/utils/errors";
 import { captureMonitoringWarning } from "@/lib/utils/observability";
 import { hashPii, PHONE_HASH_PREFIX, safePhoneHash } from "@/lib/utils/pii-detector";
+import { shortFingerprint } from "@/lib/utils/short-fingerprint";
 import type {
   InboundRelayedOptOutVia,
   InboundRelayedToHumanPayload,
@@ -458,6 +460,8 @@ export interface ProcessReplyDeps {
   getActiveConversationByContactId?: typeof getActiveConversationByContactId;
   findInboundByExternalId?: typeof findInboundByExternalId;
   addInbound?: typeof addInbound;
+  // BUG-DEDUP-RACE (B) — docId Firestore deterministe + tx.create atomique.
+  addInboundIdempotent?: typeof addInboundIdempotent;
   markOptedOut?: typeof markOptedOut;
   isOptOut?: typeof isOptOut;
   captureMonitoringWarning?: typeof captureMonitoringWarning;
@@ -533,7 +537,12 @@ export async function processReplyHandler(
   const _getContactByPhone = deps.getContactByPhone ?? getContactByPhone;
   const _getActiveConv = deps.getActiveConversationByContactId ?? getActiveConversationByContactId;
   const _findInbound = deps.findInboundByExternalId ?? findInboundByExternalId;
-  const _addInbound = deps.addInbound ?? addInbound;
+  // BUG-DEDUP-RACE : le pipeline consomme maintenant `addInboundIdempotent`.
+  // `deps.addInbound` reste exposé via la signature `ProcessReplyDeps` pour
+  // que les tests historiques puissent le mocker et que `addInboundIdempotent`
+  // par defaut delegue au MEME mock (cf. makeDeps des tests). On ne resout
+  // donc pas `_addInbound` ici — il n'est plus appelé directement.
+  const _addInboundIdempotent = deps.addInboundIdempotent ?? addInboundIdempotent;
   const _markOptedOut = deps.markOptedOut ?? markOptedOut;
   const _isOptOut = deps.isOptOut ?? isOptOut;
   const _captureMonitoringWarning = deps.captureMonitoringWarning ?? captureMonitoringWarning;
@@ -804,19 +813,102 @@ export async function processReplyHandler(
     return { status: "dropped", reason: "duplicate" };
   }
 
-  // ── Step 4 — store-inbound ────────────────────────────────────────────
+  // ── Step 4 — store-inbound (atomique via docId deterministe) ──────────
+  //
+  // 🔒 FIX BUG-DEDUP-RACE (B) — Idempotence Firestore STRICTE.
+  //
+  // AVANT ce fix : `addInbound` creait un doc avec un auto-ID aleatoire.
+  // 2 pipelines concurrents sur le meme ovhMessageId creaient 2 docs
+  // distincts (externalId identique, docId different) -> 2 inbounds
+  // stockes + 2 drafts + 2 SMS envoyes au PS en prod sur conv active.
+  //
+  // Maintenant : `addInboundIdempotent` utilise un docId DETERMINISTE
+  // derive de l'externalId (safeExternalIdHash). `tx.create` throw
+  // ALREADY_EXISTS si un run concurrent a deja commit -> le run perdant
+  // recoit `{ created: false }`, pose un audit `reply_dropped` avec
+  // reason "duplicate", et sort proprement SANS effet downstream (pas
+  // de DM Slack, pas de generation Claude, pas de dispatch OVH).
+  //
+  // Belt-and-braces avec la dedup Inngest 60s (fix A dans route.ts) :
+  // le fix A couvre > 95% des retries OVH (meme event.id), le fix B
+  // garantit la correction meme sur une race au-dela de la fenetre
+  // Inngest OU si un cold-start / bascule region fait echouer la
+  // memoization.
+  //
   // Stocke TOUS les inbounds AVANT le check opt-out (forensic juridique
-  // L.34-5 CPCE : un STOP doit être conservé en preuve).
-  const messageId = await step.run("store-inbound", async () => {
-    return _addInbound(conversationId, {
+  // L.34-5 CPCE : un STOP doit etre conserve en preuve).
+  const storeResult = await step.run("store-inbound", async () => {
+    return _addInboundIdempotent(conversationId, {
       body,
       channel: "sms",
       externalId: ovhMessageId,
-      // L'EXPÉDITEUR (= PS), nommé `externalReceiver` par homogénéité
-      // schéma (cf. JSDoc messages.ts:234-239).
+      // L'EXPEDITEUR (= PS), nomme `externalReceiver` par homogeneite
+      // schema (cf. JSDoc messages.ts:234-239).
       externalReceiver: phone,
     });
   });
+
+  if (!storeResult.created) {
+    // Run perdant d'une race Firestore. Un autre pipeline a deja stocke
+    // l'inbound (ou retry Inngest apres un commit succes du run gagnant).
+    // On pose un audit `reply_dropped reason:"duplicate"` et on sort
+    // sans effet downstream.
+    const phoneHash = safePhoneHash(phone, _hashPii);
+
+    // Alerte Sentry observabilite (fix compliance-auditor INFO-1) :
+    // en prod, un volume anormalement eleve de duplicate_atomic_race
+    // (vs findInbound step-3) est un symptome de retry OVH anormal OU
+    // d'une bascule region Inngest qui casse la memoization. Permet
+    // d'alerter avant que l'operateur ne doive requeter audit_log.
+    //
+    // Payload scrubber-safe : IDs opaques + fingerprints djb2 (pas
+    // d'ovhMessageId brut ni de phone — le scrubber Sentry pourrait
+    // les masquer en [PHONE] ou alerter en PII leak).
+    await step.run("observe-duplicate-atomic-race", async () => {
+      _captureMonitoringWarning("process_reply.duplicate_atomic_race", {
+        tags: { via: "atomic_create" },
+        extra: {
+          contactId,
+          conversationId,
+          messageId: storeResult.messageId,
+          // event.id est optionnel cote Inngest typing — fallback string
+          // vide pour satisfaire le type `extra` (string|number|boolean|null).
+          eventId: event.id ?? "",
+          ovhMessageIdFingerprint: shortFingerprint(ovhMessageId),
+          phoneFingerprint: shortFingerprint(phone),
+        },
+      });
+    });
+
+    await step.run("audit-duplicate-atomic", async () => {
+      await _appendAuditLog({
+        actorId: "system",
+        actorType: "system",
+        action: "reply_dropped",
+        targetType: "message",
+        targetId: storeResult.messageId,
+        payload: {
+          reason: "duplicate",
+          contactId,
+          conversationId,
+          duplicateOfMessageId: storeResult.messageId,
+          phoneHash,
+          via: "atomic_create",
+        },
+      });
+    });
+    logger.info("[process-reply] dropped", {
+      eventId: event.id,
+      contactId,
+      conversationId,
+      step: "store-inbound",
+      reason: "duplicate",
+      via: "atomic_create",
+    });
+    return { status: "dropped", reason: "duplicate" };
+  }
+
+  const messageId = storeResult.messageId;
 
   logger.info("[process-reply] inbound stored", {
     eventId: event.id,

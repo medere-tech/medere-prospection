@@ -122,6 +122,10 @@ function makeHandedOffConversation(
 }
 
 function makeDeps(overrides: Partial<ProcessReplyDeps> = {}): ProcessReplyDeps {
+  // BUG-DEDUP-RACE : `addInboundIdempotent` par defaut appelle en interne
+  // le MEME mock `addInbound` pour que les assertions historiques
+  // `expect(deps.addInbound).toHaveBeenCalledOnce()` restent vraies.
+  const addInboundMock = overrides.addInbound ?? vi.fn().mockResolvedValue("msg-ho-firestore-id20");
   return {
     getContactByPhone: vi.fn().mockResolvedValue(makeFakeContact("hs-ho-1")),
     getActiveConversationByContactId: vi.fn().mockResolvedValue(null),
@@ -131,7 +135,6 @@ function makeDeps(overrides: Partial<ProcessReplyDeps> = {}): ProcessReplyDeps {
     }),
     getContact: vi.fn().mockResolvedValue(makeFakeContact("hs-ho-1")),
     findInboundByExternalId: vi.fn().mockResolvedValue(null),
-    addInbound: vi.fn().mockResolvedValue("msg-ho-firestore-id20"),
     markOptedOut: vi.fn().mockResolvedValue(undefined),
     isOptOut: vi.fn().mockReturnValue(false),
     hashPii: vi.fn().mockReturnValue("hashed-pii-ho-abcd1234abcd1234abcd1234"),
@@ -162,6 +165,13 @@ function makeDeps(overrides: Partial<ProcessReplyDeps> = {}): ProcessReplyDeps {
       .fn()
       .mockImplementation((convId: string) => `https://dashboard.test/conversations/${convId}`),
     ...overrides,
+    addInbound: addInboundMock,
+    addInboundIdempotent:
+      overrides.addInboundIdempotent ??
+      (vi.fn(async (convId: string, input) => {
+        const messageId = (await addInboundMock(convId, input)) as string;
+        return { messageId, created: true as const };
+      }) as unknown as ProcessReplyDeps["addInboundIdempotent"]),
   };
 }
 

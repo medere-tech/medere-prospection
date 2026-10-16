@@ -215,6 +215,11 @@ function makeFakeConversation(contactId: string, campaignId: string): Conversati
  * (`mockImplementation` avec compteur, `mockRejectedValueOnce`, etc.).
  */
 function makeDeps(overrides: Partial<ProcessReplyDeps> = {}): ProcessReplyDeps {
+  // BUG-DEDUP-RACE : `addInboundIdempotent` par defaut appelle le MEME
+  // mock `addInbound` -> `expect(deps.addInbound).toHaveBeenCalledTimes(N)`
+  // dans les tests memoization reste la metrique de reference pour mesurer
+  // les retries Firestore sur store-inbound.
+  const addInboundMock = overrides.addInbound ?? vi.fn().mockResolvedValue("msgid-mem-default");
   return {
     getContactByPhone: vi.fn().mockResolvedValue(makeFakeContact("hs-mem-default")),
     getActiveConversationByContactId: vi.fn().mockResolvedValue({
@@ -222,7 +227,6 @@ function makeDeps(overrides: Partial<ProcessReplyDeps> = {}): ProcessReplyDeps {
       conversation: makeFakeConversation("hs-mem-default", "camp-default"),
     }),
     findInboundByExternalId: vi.fn().mockResolvedValue(null),
-    addInbound: vi.fn().mockResolvedValue("msgid-mem-default"),
     markOptedOut: vi.fn().mockResolvedValue(undefined),
     isOptOut: vi.fn().mockReturnValue(false),
     hashPii: vi.fn().mockReturnValue("hashed-pii-abcd1234abcd1234abcd1234"),
@@ -252,6 +256,13 @@ function makeDeps(overrides: Partial<ProcessReplyDeps> = {}): ProcessReplyDeps {
     }),
     addOutboundDraft: vi.fn().mockResolvedValue("draftidmemdefault000"),
     ...overrides,
+    addInbound: addInboundMock,
+    addInboundIdempotent:
+      overrides.addInboundIdempotent ??
+      (vi.fn(async (convId: string, input) => {
+        const messageId = (await addInboundMock(convId, input)) as string;
+        return { messageId, created: true as const };
+      }) as unknown as ProcessReplyDeps["addInboundIdempotent"]),
   };
 }
 
@@ -448,8 +459,13 @@ describe("MED-1 — Memoization Inngest sur retry (S9.2.3.2)", () => {
     expect(deps.classifyReply).toHaveBeenCalledTimes(1);
     expect(deps.setConversationIntent).toHaveBeenCalledTimes(1);
 
-    // Step 4 cached avec le messageId du run success
-    expect(cache.get("evt-mem-2::store-inbound")).toBe("msgid-mem-2-success");
+    // Step 4 cached avec `{messageId, created}` du run success (BUG-DEDUP-RACE :
+    // le pipeline consomme maintenant `addInboundIdempotent` qui retourne
+    // un objet discriminant, pas une string).
+    expect(cache.get("evt-mem-2::store-inbound")).toEqual({
+      messageId: "msgid-mem-2-success",
+      created: true,
+    });
   });
 
   // ───────────────────────────────────────────────────────────────────────────
