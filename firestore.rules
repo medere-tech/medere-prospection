@@ -128,6 +128,18 @@ service cloud.firestore {
       allow update, delete: if false;             // S9+ : isAdmin()
     }
 
+    // === OVH stop callbacks (DIAG-STOP-OVH étape B) ===
+    // Collection d'observation du callback `sms.Account.stopCallBack`.
+    // Écriture via Admin SDK UNIQUEMENT (handler /api/webhooks/ovh-sms-stop).
+    // Lecture : STRICTEMENT INACCESSIBLE côté client — les docs contiennent
+    // des hashs d'identifiants OVH (`oih_...`) qui sont semi-sensibles.
+    // Pattern défensif explicite même si la règle catchall ci-dessous
+    // couvrirait déjà (defense-in-depth, miroir pattern audit_log).
+    match /ovh_stop_callbacks/{docId} {
+      allow read: if false;                       // STRICTEMENT JAMAIS côté client
+      allow write: if false;                      // STRICTEMENT JAMAIS côté client
+    }
+
     // === Catchall ===
     // Toute collection non listée ci-dessus est INACCESSIBLE côté client.
     // Protection contre l'ajout futur d'une collection qu'on aurait
