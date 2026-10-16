@@ -76,6 +76,8 @@ import { createRateLimiter } from "@/lib/security/rate-limit";
 import { verifyOvhWebhookToken } from "@/lib/security/webhook-signatures";
 import { AppError, ValidationError } from "@/lib/utils/errors";
 import { logger } from "@/lib/utils/logger";
+import { safeExternalIdHash } from "@/lib/utils/pii-detector";
+import { shortFingerprint } from "@/lib/utils/short-fingerprint";
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Rate-limit — module-level lazy singleton
@@ -227,24 +229,46 @@ export async function POST(req: NextRequest): Promise<NextResponse> {
       throw err;
     }
 
-    // ── 5. Émission event Inngest (Zod re-validation en 2e couche) ────────
-    // `.create()` re-valide via Standard Schema — une régression du parser
-    // qui laisserait passer un payload mal formé serait attrapée ici et
-    // ferait remonter un throw. Défense-en-profondeur.
+    // ── 5. Émission event Inngest avec id déterministe (fix BUG-DEDUP-RACE) ──
     //
-    // event.id NON forgé manuellement — laisse Inngest générer un UUID v4
-    // (règle anti-PII `events.ts:49-73` : `phone` / `ovhMessageId` interdits
-    // dans le forge d'event.id).
+    // 🔒 IDEMPOTENCE INNGEST (A) — event.id = `sms.reply.<hash>` où hash est
+    // dérivé de ovhMessageId via `safeExternalIdHash` (HMAC-SHA256 + pepper
+    // + chunking anti-scrubber). Inngest dédupe nativement les events avec
+    // le même `id` sur une fenêtre de 60s. Les retries OVH (observés 3× en
+    // ~1s en prod le 16/10) sont donc absorbés par Inngest AVANT même que
+    // le pipeline `process-reply` ne soit lancé pour les copies.
+    //
+    // 🔒 ANTI-PII — on NE met PAS `ovhMessageId` brut dans `event.id` (règle
+    // `events.ts:49-73`, l'`id` apparaît en clair dans l'UI Inngest cloud).
+    // Le hash HMAC avec pepper `AUDIT_PII_PEPPER` satisfait la clause
+    // explicite "hash HMAC-SHA256 d'un tuple sensible" autorisée ligne 70.
+    // Le préfixe `sms.reply.` reste en clair pour filtrer facilement dans
+    // le dashboard.
+    //
+    // 🔒 BELT-AND-BRACES — l'idempotence en base (`addInboundIdempotent` via
+    // docId Firestore déterministe) protège contre les cas où la dédup
+    // Inngest échoue : fenêtre > 60s, race ingestion/dispatch, ou si un
+    // futur retry traverse une bascule région Inngest. Fix B dans
+    // `process-reply.ts` + `messages.ts`.
+    //
+    // `.create()` re-valide via Standard Schema — défense-en-profondeur.
     const inngest = getInngestClient();
     const event = smsReplyReceived.create(eventData);
-    await inngest.send(event);
+    const deterministicEventId = `sms.reply.${safeExternalIdHash(eventData.ovhMessageId)}`;
+    await inngest.send({ ...event, id: deterministicEventId });
 
     // ── 6. Ack 200 rapide (OVH attend < 3s côté callback) ─────────────────
-    // Log post-envoi avec `bodyLength` / `ovhMessageId` uniquement (PII-safe
-    // par construction — le logger scrube en plus les valeurs).
+    //
+    // 🔒 ANTI-SCRUBBER — on NE log PAS `ovhMessageId` en clair (le scrubber
+    // Pino `RE_PHONE` peut le masquer en `[PHONE]` si la valeur ressemble
+    // à une sous-séquence E.164, rendant le log inexploitable). On utilise
+    // `shortFingerprint` (djb2, 8 chars hex) pour la trace forensique —
+    // non-crypto mais suffisant pour corréler avec Inngest cloud via
+    // `eventId` déterministe ci-dessus (= `sms.reply.oih_...`).
     logger.info(
       {
-        ovhMessageId: eventData.ovhMessageId,
+        ovhMessageIdFingerprint: shortFingerprint(eventData.ovhMessageId),
+        eventId: deterministicEventId,
         bodyLength: eventData.body.length,
       },
       "[POST /api/webhooks/ovh-sms] event queued",

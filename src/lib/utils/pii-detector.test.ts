@@ -6,10 +6,12 @@ import { logger } from "@/lib/utils/logger";
 
 import {
   detectPiiInPayload,
+  EXTERNAL_ID_HASH_PREFIX,
   hashPii,
   PHONE_HASH_PREFIX,
   PII_WALK_MAX_DEPTH,
   type PiiViolation,
+  safeExternalIdHash,
   safePhoneHash,
 } from "./pii-detector";
 
@@ -518,5 +520,81 @@ describe("safePhoneHash — wrapper anti-collision scrubber (HIGH-1 S9.2.1)", ()
     const out = safePhoneHash("+33612345678", fakeHash);
     // L'input padé est "+33612345678xxxxxxxxxxxxxxxxxxxx" (32 chars).
     expect(out).toBe("hph_+336_1234_5678_xxxx_xxxx_xxxx_xxxx_xxxx");
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// safeExternalIdHash — fix BUG-DEDUP-RACE
+// ─────────────────────────────────────────────────────────────────────────────
+
+describe("safeExternalIdHash — hash d'external ID pour idempotence (BUG-DEDUP-RACE)", () => {
+  it("deterministe : meme input -> meme hash", () => {
+    const a = safeExternalIdHash("ovh-msg-abc-123");
+    const b = safeExternalIdHash("ovh-msg-abc-123");
+    expect(a).toBe(b);
+  });
+
+  it("inputs differents -> hashes differents", () => {
+    const a = safeExternalIdHash("ovh-msg-aaa");
+    const b = safeExternalIdHash("ovh-msg-bbb");
+    expect(a).not.toBe(b);
+  });
+
+  it("prefixe EXTERNAL_ID_HASH_PREFIX = 'oih_' present", () => {
+    const hash = safeExternalIdHash("ovh-msg-xyz");
+    expect(hash.startsWith(EXTERNAL_ID_HASH_PREFIX)).toBe(true);
+    expect(EXTERNAL_ID_HASH_PREFIX).toBe("oih_");
+  });
+
+  it("chunking par 4 chars (anti-scrubber RE_FR_NATIONAL)", () => {
+    // hashFn injecte renvoie du hex pur deterministe, on verifie le format.
+    const fakeHash = (v: string): string => v.padEnd(32, "a").slice(0, 32);
+    const out = safeExternalIdHash("abcdefgh", fakeHash);
+    // Input padde = "abcdefghaaaaaaaaaaaaaaaaaaaaaaaa" (32 chars) -> 8 chunks de 4
+    expect(out).toBe("oih_abcd_efgh_aaaa_aaaa_aaaa_aaaa_aaaa_aaaa");
+    // Invariant cle : aucun groupe de 5+ digits consecutifs (le chunking
+    // par 4 chars empeche RE_FR_NATIONAL qui exige 10 digits).
+    expect(out).not.toMatch(/\d{5,}/);
+  });
+
+  it("safe pour docId Firestore : pas de `/`, pas d'espace", () => {
+    const hash = safeExternalIdHash("ovh-msg-with-slash/and space");
+    expect(hash).not.toContain("/");
+    expect(hash).not.toContain(" ");
+  });
+
+  it("longueur EXACTE = 43 chars (prefixe + 32 hex + 7 underscores) — verrou JSDoc", () => {
+    // Verrouille la valeur annoncee dans la JSDoc. hashPii renvoie 32
+    // hex chars. Chunking par 4 -> 8 chunks de 4, joints par 7 `_`.
+    // Prefixe `oih_` (4 chars) + 32 chars + 7 underscores = 43.
+    // Si le chunkSize ou le prefixe changent, ce test tombe et la JSDoc
+    // doit etre mise a jour.
+    const hash = safeExternalIdHash("ovh-sample-length-check");
+    expect(hash.length).toBe(43);
+    expect(hash.startsWith("oih_")).toBe(true);
+    // Compte 7 underscores DANS la portion post-prefixe (le `_` du prefixe
+    // n'est pas compte comme separateur de chunk).
+    const postPrefix = hash.slice(4);
+    expect(postPrefix.split("_")).toHaveLength(8);
+  });
+
+  it("safePhoneHash longueur EXACTE = 43 chars — verrou JSDoc (sentinelle miroir)", () => {
+    const hash = safePhoneHash("+33612345678");
+    expect(hash.length).toBe(43);
+    expect(hash.startsWith("hph_")).toBe(true);
+    expect(hash.slice(4).split("_")).toHaveLength(8);
+  });
+
+  it("sentinelle anti-collision scrubber : hash ne matche jamais RE_FR_NATIONAL (100 inputs)", () => {
+    // Teste 100 ovhMessageIds synthetiques : avec le chunking, AUCUN hash
+    // ne peut contenir 10 digits consecutifs (max 4 par chunk).
+    const violations: Array<{ i: number; hash: string }> = [];
+    for (let i = 0; i < 100; i++) {
+      const hash = safeExternalIdHash(`ovh-msg-${i}`);
+      if (/0[1-9]\d{8}/.test(hash)) {
+        violations.push({ i, hash });
+      }
+    }
+    expect(violations).toEqual([]);
   });
 });

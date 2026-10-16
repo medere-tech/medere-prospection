@@ -43,6 +43,9 @@ const { mockRateLimitCheck, mockInngestSend, mockGetOvhEnv } = vi.hoisted(() => 
 
 vi.mock("@/lib/security/env", () => ({
   getOvhEnv: mockGetOvhEnv,
+  // BUG-DEDUP-RACE : safeExternalIdHash -> hashPii -> getAuditEnv().AUDIT_PII_PEPPER.
+  // Pepper fixe pour determinisme des tests event.id.
+  getAuditEnv: () => ({ AUDIT_PII_PEPPER: "x".repeat(64) }),
 }));
 
 vi.mock("@/lib/security/rate-limit", () => ({
@@ -227,11 +230,48 @@ describe("POST /api/webhooks/ovh-sms", () => {
       });
     });
 
-    it("event.id NON forgé manuellement (règle anti-PII events.ts:49-73)", async () => {
+    it("event.id est deterministe sms.reply.<hash> (fix BUG-DEDUP-RACE A)", async () => {
+      // Depuis BUG-DEDUP-RACE : event.id est forge DELIBEREMENT a partir
+      // d'un hash HMAC + chunking de ovhMessageId (regle events.ts:70
+      // "hash HMAC-SHA256 d'un tuple sensible AUTORISE"). Permet la dedup
+      // 60s native Inngest sur les retries OVH.
       await POST(buildFormRequest(REAL_CALLBACK_FIELDS));
 
       const event = mockInngestSend.mock.calls[0]?.[0] as { id?: string };
-      expect(event.id).toBeUndefined();
+      expect(event.id).toBeDefined();
+      // Format strict : prefixe + hash chunke (oih_XXXX_XXXX_...).
+      expect(event.id).toMatch(/^sms\.reply\.oih_([a-f0-9]{1,4}_){7}[a-f0-9]{1,4}$/);
+      // ANTI-PII : pas d'ovhMessageId brut, pas de phone, pas de body
+      // dans l'event.id (defense-in-depth events.ts:49-73).
+      expect(event.id).not.toContain("118791103"); // ovhMessageId brut
+      expect(event.id).not.toContain("33775745453"); // phone brut
+      expect(event.id).not.toContain("Medere"); // body brut
+    });
+
+    it("3 retries OVH avec meme ovhMessageId -> MEME event.id (fix BUG-DEDUP-RACE A)", async () => {
+      // Scenario prod 16/10 : OVH a envoye 3 appels webhook en ~1s pour
+      // UN SEUL SMS. Avec event.id deterministe, Inngest dedupe les 2
+      // doublons sur une fenetre 60s AVANT que le pipeline process-reply
+      // ne soit lance.
+      await POST(buildFormRequest(REAL_CALLBACK_FIELDS));
+      await POST(buildFormRequest(REAL_CALLBACK_FIELDS));
+      await POST(buildFormRequest(REAL_CALLBACK_FIELDS));
+
+      expect(mockInngestSend).toHaveBeenCalledTimes(3);
+      const id1 = (mockInngestSend.mock.calls[0]?.[0] as { id?: string }).id;
+      const id2 = (mockInngestSend.mock.calls[1]?.[0] as { id?: string }).id;
+      const id3 = (mockInngestSend.mock.calls[2]?.[0] as { id?: string }).id;
+      expect(id1).toBe(id2);
+      expect(id2).toBe(id3);
+    });
+
+    it("ovhMessageIds differents -> event.id differents (anti-collision)", async () => {
+      await POST(buildFormRequest(REAL_CALLBACK_FIELDS));
+      await POST(buildFormRequest({ ...REAL_CALLBACK_FIELDS, id: "999999999" }));
+
+      const id1 = (mockInngestSend.mock.calls[0]?.[0] as { id?: string }).id;
+      const id2 = (mockInngestSend.mock.calls[1]?.[0] as { id?: string }).id;
+      expect(id1).not.toBe(id2);
     });
 
     it("les champs OVH annexes (keyword/shortcode/tag/token) ne fuitent PAS dans l'event data", async () => {

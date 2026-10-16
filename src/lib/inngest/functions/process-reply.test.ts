@@ -145,11 +145,15 @@ function makeFakeInboundMessage(externalId: string, body: string): Message {
  * ce dont il a besoin.
  */
 function makeDeps(overrides: Partial<ProcessReplyDeps> = {}): ProcessReplyDeps {
+  // BUG-DEDUP-RACE : le pipeline appelle `addInboundIdempotent`, pas
+  // `addInbound` direct. Pour que `expect(deps.addInbound).toHaveBeenCalled()`
+  // reste vrai dans les tests historiques, le mock `addInboundIdempotent`
+  // par defaut appelle en INTERNE le MEME mock `addInbound`.
+  const addInboundMock = overrides.addInbound ?? vi.fn().mockResolvedValue("msg-firestore-id-20ch");
   return {
     getContactByPhone: vi.fn(),
     getActiveConversationByContactId: vi.fn(),
     findInboundByExternalId: vi.fn().mockResolvedValue(null),
-    addInbound: vi.fn().mockResolvedValue("msg-firestore-id-20ch"),
     markOptedOut: vi.fn().mockResolvedValue(undefined),
     isOptOut: vi.fn().mockReturnValue(false),
     hashPii: vi.fn().mockReturnValue("hashed-pii-abcd1234abcd1234abcd1234"),
@@ -199,6 +203,18 @@ function makeDeps(overrides: Partial<ProcessReplyDeps> = {}): ProcessReplyDeps {
     sendInboundAfterHandoffNotification: vi.fn().mockResolvedValue({ ts: "0", channel: "D0" }),
     getDashboardConversationUrl: vi.fn().mockReturnValue("https://dashboard.test/conv/xxx"),
     ...overrides,
+    // Override `addInbound` SEPAREMENT du spread : si `overrides.addInbound`
+    // etait fourni, on l'a deja capture dans `addInboundMock` ci-dessus ;
+    // sinon on utilise le default. Dans les 2 cas, `addInboundIdempotent`
+    // par defaut appelle ce MEME mock -> expect(deps.addInbound).toHaveBeenCalled()
+    // reste vrai pour les tests historiques.
+    addInbound: addInboundMock,
+    addInboundIdempotent:
+      overrides.addInboundIdempotent ??
+      (vi.fn(async (convId: string, input) => {
+        const messageId = (await addInboundMock(convId, input)) as string;
+        return { messageId, created: true as const };
+      }) as unknown as ProcessReplyDeps["addInboundIdempotent"]),
   };
 }
 
@@ -2520,5 +2536,69 @@ describe("S9.9-PR4 — dispatch-handoff-event (step 8e)", () => {
     expect(payload.id).not.toMatch(/\S+@\S+\.\S+/);
     // ovhMessageId NE DOIT PAS apparaître (semi-sensible).
     expect(payload.id).not.toContain("ovh-msg-789");
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// BUG-DEDUP-RACE — branche atomique duplicate (fix B dans process-reply.ts)
+// ─────────────────────────────────────────────────────────────────────────────
+
+describe("BUG-DEDUP-RACE — branche duplicate atomique (addInboundIdempotent created=false)", () => {
+  it("run perdant : audit reply_dropped + alerte Sentry duplicate_atomic_race + ZERO effet downstream", async () => {
+    const captureSpy = vi.fn();
+    const ctx = makeFakeCtx();
+    const deps = makeDeps({
+      getContactByPhone: vi.fn().mockResolvedValue(makeFakeContact("hs-race-1")),
+      getActiveConversationByContactId: vi.fn().mockResolvedValue({
+        conversationId: "hs-race-1_camp-a",
+        conversation: makeFakeConversation("hs-race-1", "camp-a"),
+      }),
+      // Simule un run perdant : addInboundIdempotent retourne created=false.
+      addInboundIdempotent: vi
+        .fn()
+        .mockResolvedValue({ messageId: "oih_dedup_race_winner", created: false as const }),
+      captureMonitoringWarning: captureSpy,
+    });
+
+    const result = await processReplyHandler(ctx, deps);
+
+    // Resultat : dropped duplicate.
+    expect(result).toEqual({ status: "dropped", reason: "duplicate" });
+
+    // 1 alerte Sentry avec le bon event name + tags + extras scrubber-safe.
+    expect(captureSpy).toHaveBeenCalledOnce();
+    const [eventName, payload] = captureSpy.mock.calls[0]!;
+    expect(eventName).toBe("process_reply.duplicate_atomic_race");
+    expect((payload as { tags: { via: string } }).tags.via).toBe("atomic_create");
+    const extra = (payload as { extra: Record<string, unknown> }).extra;
+    expect(extra.contactId).toBe("hs-race-1");
+    expect(extra.conversationId).toBe("hs-race-1_camp-a");
+    expect(extra.messageId).toBe("oih_dedup_race_winner");
+    // Fingerprints djb2 (8 chars hex) — pas d'ovhMessageId brut, pas de phone brut.
+    expect(extra.ovhMessageIdFingerprint).toMatch(/^[a-f0-9]{8}$/);
+    expect(extra.phoneFingerprint).toMatch(/^[a-f0-9]{8}$/);
+    expect(extra.ovhMessageIdFingerprint).not.toBe("ovh-msg-789");
+    expect(extra.phoneFingerprint).not.toContain("33775745453");
+
+    // 1 audit reply_dropped avec reason=duplicate, via=atomic_create.
+    const dropAudit = vi
+      .mocked(deps.appendAuditLog!)
+      .mock.calls.find(
+        (c) =>
+          c[0].action === "reply_dropped" &&
+          (c[0].payload as { reason?: string }).reason === "duplicate",
+      );
+    expect(dropAudit).toBeDefined();
+    const auditPayload = dropAudit![0].payload as Record<string, unknown>;
+    expect(auditPayload.via).toBe("atomic_create");
+    expect(auditPayload.duplicateOfMessageId).toBe("oih_dedup_race_winner");
+
+    // ZERO effet downstream : pas de classify, pas de generate, pas de
+    // dispatch-reply-event, pas de setConversationIntent, pas de markOptedOut.
+    expect(deps.classifyReply).not.toHaveBeenCalled();
+    expect(deps.generateReply).not.toHaveBeenCalled();
+    expect(deps.addOutboundDraft).not.toHaveBeenCalled();
+    expect(deps.markOptedOut).not.toHaveBeenCalled();
+    expect(ctx.step.sendEvent).not.toHaveBeenCalled();
   });
 });

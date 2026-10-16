@@ -120,6 +120,7 @@ import {
   listConversationIdsByContactInTx,
 } from "@/lib/firestore/conversations";
 import { NotFoundError, ValidationError } from "@/lib/utils/errors";
+import { safeExternalIdHash } from "@/lib/utils/pii-detector";
 import type { Conversation } from "@/types/conversation";
 import type {
   Message,
@@ -852,6 +853,182 @@ export async function addInbound(conversationId: string, input: AddInboundInput)
 
     return messageRef.id;
   });
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// addInboundIdempotent — fix BUG-DEDUP-RACE (B)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * Variante IDEMPOTENTE de `addInbound` — garantit qu'un `externalId` donné
+ * (= `ovhMessageId`) ne peut JAMAIS produire 2 docs messages distincts,
+ * meme en cas de 2 pipelines concurrents (fix BUG-DEDUP-RACE B).
+ *
+ * ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ * Diff critique vs `addInbound`
+ *
+ *   - **docId Firestore DETERMINISTE** = `safeExternalIdHash(externalId)`
+ *     (prefixe `oih_`, chunking anti-scrubber). Au lieu d'un auto-ID
+ *     aleatoire, le docId est deductible du seul `externalId`.
+ *   - **`tx.create` ATOMIQUE** : Firestore refuse (`ALREADY_EXISTS`) si
+ *     un doc avec cet ID existe deja. 2 runs concurrents demarrent chacun
+ *     leur tx, celui qui commit en second se voit retourner l'erreur
+ *     native Firestore -> on l'attrape et on renvoie `{ created: false }`.
+ *   - **Retour enrichi** `{ messageId, created }` : le caller
+ *     (`process-reply`) peut aiguiller vers la branche `reply_dropped
+ *     reason:"duplicate"` sans ambiguite (vs retour `string` opaque qui
+ *     obligeait a pre-check avec `findInboundByExternalId`).
+ *
+ * ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ * Compatibilite docs legacy (auto-ID aleatoire 20 chars)
+ *
+ * Les docs cree par `addInbound` avant ce fix ont un docId aleatoire.
+ * `findInboundByExternalId` lit sur le CHAMP `externalId`, pas sur le
+ * docId -> compatible. Les anciens docs restent lisibles sans migration.
+ *
+ * Risque theorique de collision avec un ancien doc aleatoire ayant par
+ * chance le format `oih_...` : negligeable (prefixe 4 chars + chunking
+ * underscore = pattern tres distinct des auto-IDs Firestore de 20 chars
+ * alphanum sans underscore).
+ *
+ * ⚠️ Fail-mode en cas de collision theorique (probabilite ~0, impact
+ * borne) : si un ancien doc random avait par chance un ID du format
+ * `oih_...`, un NOUVEAU SMS entrant dont le hash correspondrait au meme
+ * ID serait silencieusement traite comme doublon (`created: false`) et
+ * droppe sans effet downstream. Le PS n'est PAS doublement sollicite —
+ * c'est l'inverse : son SMS legitime n'est PAS stocke. Impact : perte
+ * d'un inbound (perte de donnee locale, pas de violation L.34-5 CPCE).
+ * Si l'inbound etait un STOP, l'ancien doc par collision pointe vers
+ * un AUTRE SMS en base, donc le STOP est perdu de maniere invisible.
+ * Mitigation jamais declenchee en pratique (zero occurrence du format
+ * `oih_...` dans les auto-IDs Firestore `[A-Za-z0-9]{20}` sans
+ * underscore), mais trace ici pour forensic complet.
+ *
+ * ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ * Comportement sur duplicate
+ *
+ *   Si le doc existe deja (= 2e run concurrent, OU retry Inngest apres
+ *   un succes commit) :
+ *     1. La tx throw `ALREADY_EXISTS` (code gRPC 6 OU string "already-exists"
+ *        selon la surface API, cf. isAlreadyExistsError miroir).
+ *     2. On relit le doc pour obtenir le messageId (= docId deterministe).
+ *     3. On retourne `{ messageId, created: false }`.
+ *     4. AUCUN bump counter, AUCUN audit `sms_received` : les effets de
+ *        bord ont deja ete poses par le run gagnant. Idempotence stricte.
+ *
+ *   Le run perdant ressort PROPREMENT (pas de throw). Le caller doit
+ *   gerer `created === false` en posant un audit `reply_dropped
+ *   reason:"duplicate"` sans effets de bord downstream (pas de DM Slack,
+ *   pas de generation Claude, pas de dispatch OVH).
+ *
+ * @returns `{ messageId: string, created: boolean }` ou `created=false`
+ *          signifie que le doc existait deja (run perdant d'une race).
+ */
+export async function addInboundIdempotent(
+  conversationId: string,
+  input: AddInboundInput,
+): Promise<{ messageId: string; created: boolean }> {
+  validateBodyOrThrow(input.body, conversationId);
+
+  if (input.externalId.length === 0) {
+    throw new ValidationError({
+      message: "addInboundIdempotent: externalId must be non-empty",
+      context: { conversationId, op: "addInboundIdempotent" },
+    });
+  }
+
+  // DocId deterministe derive de l'externalId. Le prefixe `oih_` + le
+  // chunking garantissent qu'aucun hash ne match RE_FR_NATIONAL du
+  // scrubber (sentinelle pii-detector.test.ts).
+  const deterministicMessageId = safeExternalIdHash(input.externalId);
+
+  try {
+    return await getAdminDb().runTransaction(async (tx) => {
+      const convRef = getAdminDb().collection(CONVERSATIONS_COLLECTION).doc(conversationId);
+      const conv = await readConversationInTxOrThrow(tx, convRef, conversationId);
+
+      const messageRef = messagesSubcollectionRef(conversationId).doc(deterministicMessageId);
+      const now = Timestamp.now();
+
+      const messageDoc: Message = {
+        direction: "inbound",
+        body: input.body,
+        status: "received",
+        channel: input.channel,
+        externalId: input.externalId,
+        externalReceiver: input.externalReceiver,
+        generatedBy: "human",
+        createdAt: now,
+        receivedAt: now,
+      };
+      // ATOMIQUE — Firestore refuse ALREADY_EXISTS si un autre run a deja
+      // commit avec ce meme docId. Pattern miroir `getOrCreateInitialConversation`
+      // dans conversations.ts.
+      tx.create(messageRef, messageDoc);
+
+      _bumpConversationCountersTx(tx, convRef, conv, "inbound", now);
+
+      appendAuditLogTx(tx, {
+        actorId: "system",
+        actorType: "system",
+        action: "sms_received",
+        targetType: "message",
+        targetId: messageRef.id,
+        payload: { direction: "inbound", messageId: messageRef.id },
+      });
+
+      return { messageId: messageRef.id, created: true as const };
+    });
+  } catch (err) {
+    if (isInboundAlreadyExistsError(err)) {
+      // Le doc existe deja -> run perdant d'une race. On retourne le
+      // messageId deterministe sans effet de bord. Le caller aiguillera
+      // vers la branche duplicate.
+      return { messageId: deterministicMessageId, created: false as const };
+    }
+    // Fallback defensif anti-regression firebase-admin : si l'erreur
+    // n'est pas RECONNUE comme ALREADY_EXISTS (ex: le SDK wrappe un jour
+    // le code sous `err.details.code` ou `err.cause.code`), on refuse
+    // d'avaler l'erreur sur le texte du message (fragile, risque de
+    // perdre un vrai STOP). A la place, on relit le docId deterministe :
+    //   - doc existe + MEME externalId -> c'etait bien un ALREADY_EXISTS
+    //     masque -> `created: false` propre.
+    //   - doc existe + externalId DIFFERENT -> collision inattendue
+    //     (hash collision, bug amont, corruption) -> relance l'erreur
+    //     brute pour que Inngest retry et qu'on investigue.
+    //   - doc absent -> l'erreur n'avait rien a voir avec ALREADY_EXISTS
+    //     (ex: Firestore 5xx transient) -> relance pour Inngest retry.
+    //
+    // Ce fallback NE sauve PAS le pipeline en cas d'erreur transiente :
+    // il distingue uniquement "doublon atomique vraiment detecte" vs
+    // "autre probleme". Le re-throw preserve l'invariant "jamais perdre
+    // un STOP silencieusement".
+    const docRef = messagesSubcollectionRef(conversationId).doc(deterministicMessageId);
+    const existing = await docRef.get();
+    if (existing.exists) {
+      const existingExternalId = existing.get("externalId");
+      if (existingExternalId === input.externalId) {
+        return { messageId: deterministicMessageId, created: false as const };
+      }
+    }
+    throw err;
+  }
+}
+
+/**
+ * Detecte une erreur ALREADY_EXISTS du SDK firebase-admin sans dependre
+ * d'un import gRPC direct. Pattern miroir `conversations.ts::isAlreadyExistsError`.
+ *
+ * ⚠️ Un fallback defensif existe dans `addInboundIdempotent` au cas ou le
+ * SDK evoluerait et wrapperait le code (`err.details.code`, `err.cause.code`) :
+ * on NE lit PAS le texte du message (`"already exists"` dans la string) car
+ * ca pourrait avaler une autre erreur et perdre un STOP. On relit le docId
+ * deterministe et on compare l'externalId pour confirmer le doublon.
+ */
+function isInboundAlreadyExistsError(err: unknown): boolean {
+  if (typeof err !== "object" || err === null) return false;
+  const code = (err as { code?: unknown }).code;
+  return code === 6 || code === "already-exists";
 }
 
 /**
