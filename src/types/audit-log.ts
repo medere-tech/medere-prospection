@@ -180,6 +180,18 @@ export type AuditAction =
   // `targetType: "conversation"`, `targetId: conversationId`. Payload =
   // `InboundRelayedToHumanPayload` (cf. interface ci-dessous).
   | "inbound_relayed_to_human"
+  // PR-NO-DROPPED-SMS — SMS entrant qu'aucun chemin "actif" ne gère : conv
+  // closed/opted_out/blocked, handed_off sans assignedTo, aucune conv du
+  // tout, contact inconnu, parse webhook en echec, mise en file Inngest
+  // en echec, race P6 (opt-out pendant transition closed/blocked). Pose
+  // d'un enregistrement forensic qui remplace les anciens
+  // `reply_dropped reason:"contact_unknown" | "no_active_conversation" |
+  // "conversation_became_terminal"`. `reply_dropped` reste utilise
+  // UNIQUEMENT pour les vrais doublons. Payload =
+  // `InboundOnInactiveConversationPayload` (cf. interface ci-dessous).
+  // `targetType` : "conversation" quand une conv est connue, sinon
+  // "contact" (contact connu sans conv) ou "message" (orphan docId).
+  | "inbound_on_inactive_conversation"
   // ── CAMPAIGN / ADMIN ───────────────────────────────────────────────────
   | "manual_override"
   | "prompt_changed"
@@ -559,6 +571,144 @@ export interface InboundRelayedToHumanPayload {
   // miroir `HandoffUnassignedPayload` — TS-level uniquement, no-op runtime).
   readonly [k: string]: unknown;
 }
+
+/**
+ * Enum ferme des raisons pour `inbound_on_inactive_conversation`.
+ * Toute nouvelle branche d'abandon DOIT etendre explicitement cette union
+ * (compile-time safety contre le "drop silencieux").
+ *
+ *   - `"closed"`                  : conv la plus recente du contact est en
+ *                                   `closed` — PS reecrit apres fermeture
+ *                                   legitime (RDV, abandon, etc.).
+ *   - `"opted_out"`               : conv la plus recente est `opted_out` —
+ *                                   PS reecrit apres s'etre desabonne.
+ *                                   Confirmation DM "ne plus recontacter".
+ *   - `"blocked"`                 : conv la plus recente est `blocked`
+ *                                   (Bloctel / plafond / autre guard).
+ *   - `"handed_off_no_assignee"`  : conv `handed_off` sans
+ *                                   `handoff.assignedTo` (invariant soft
+ *                                   brise cote donnee). Alerte canal
+ *                                   orphelins + Sentry error.
+ *   - `"no_conversation"`         : contact connu mais aucune conv ne lui
+ *                                   est attachee (bug amont ou donnee
+ *                                   corrompue). Stocke en orphelins avec
+ *                                   contactId renseigne.
+ *   - `"unknown_contact"`         : numero emetteur ne matche aucun
+ *                                   contact. Stocke en orphelins avec
+ *                                   `phoneHash` seul.
+ *   - `"parse_failed"`            : webhook OVH token-valide mais payload
+ *                                   illisible (JSON / formData / Zod).
+ *                                   Stocke en orphelins avec hash du
+ *                                   payload brut (docId `oih_...`).
+ *   - `"enqueue_failed"`          : webhook OVH token-valide, payload
+ *                                   parse, mais `inngest.send` echoue.
+ *                                   Stocke en orphelins best-effort.
+ *   - `"conversation_became_terminal"` : race P6 — conv passee a
+ *                                   closed/blocked entre resolve-conv et
+ *                                   markOptedOut dans la branche
+ *                                   handed_off. Message stocke, DM "verifier
+ *                                   la fiche" envoye, Sentry critique.
+ */
+export type InboundOnInactiveConversationReason =
+  | "closed"
+  | "opted_out"
+  | "blocked"
+  | "handed_off_no_assignee"
+  | "no_conversation"
+  | "unknown_contact"
+  | "parse_failed"
+  | "enqueue_failed"
+  | "conversation_became_terminal";
+
+/**
+ * Payload type pour action `inbound_on_inactive_conversation` (PR-NO-DROPPED-SMS).
+ *
+ * **Cible** : `targetType` depend du cas :
+ *   - `"conversation"` + `targetId: conversationId` quand la conv est connue.
+ *   - `"contact"` + `targetId: contactId` quand contact connu sans conv.
+ *   - `"message"` + `targetId: orphanDocId` quand contact ET conv absents
+ *     (ou pour parse_failed / enqueue_failed).
+ *
+ * ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ * 🚨 INVARIANT ANTI-PII — INTERDITS EN PAYLOAD
+ *
+ * Interdits (compile-time via cette signature stricte + defense-in-depth
+ * scrubber runtime `detectPiiInPayload`) :
+ *   - `firstName`, `lastName`, `civilite`, `speciality`, `city`, `postalCode`
+ *   - `body`, `lastInboundBody` — contenu SMS entrant
+ *   - `phone`, `email`, `ovhMessageId` — coordonnees / IDs semi-sensibles
+ *
+ * Ces champs vivent AILLEURS (doc message / doc orphan / doc contact /
+ * blocks Slack). Le forensic complet est obtenu par cohabitation.
+ *
+ * ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ * Champs scrubber-safe par construction
+ *
+ *   - `reason`         : enum ferme (ci-dessus).
+ *   - `wasOptOut`      : boolean (opt-out detecte dans le body entrant).
+ *   - `contactId`      : hubspotId opaque, optionnel (absent si inconnu).
+ *   - `conversationId` : docId composite, optionnel (absent si aucune).
+ *   - `messageId`      : docId Firestore 20 chars, optionnel (absent si
+ *                        le message n'a pas pu etre stocke sur une conv).
+ *   - `orphanDocId`    : docId `oih_...` (`inbound_messages_orphans`),
+ *                        optionnel (present SSI stocke en orphelins).
+ *   - `phoneHash`      : hash HMAC `hph_...` (prefix safePhoneHash),
+ *                        optionnel. Pas PII.
+ *   - `assignedTo`     : Slack user ID (`U...`), optionnel (DM titulaire).
+ *   - `slackChannel`   : Slack channel ID retourne par chat.postMessage
+ *                        (DM `D...` OU canal orphelins `C.../G...`),
+ *                        optionnel (absent si notif a echoue).
+ *   - `slackTs`        : timestamp Slack, optionnel.
+ *   - `notifiedVia`    : enum ferme partage avec le webhook route.
+ *                        Cf. `InboundOnInactiveNotifiedVia`. `"digest"` quand
+ *                        l'alerte individuelle a ete regroupee par le plafond
+ *                        anti-inondation (MED-1).
+ */
+export interface InboundOnInactiveConversationPayload {
+  reason: InboundOnInactiveConversationReason;
+  wasOptOut: boolean;
+  contactId?: string;
+  conversationId?: string;
+  messageId?: string;
+  orphanDocId?: string;
+  phoneHash?: string;
+  assignedTo?: string;
+  slackChannel?: string;
+  slackTs?: string;
+  notifiedVia?: InboundOnInactiveNotifiedVia;
+  // Index signature explicite : permet l'assignation a
+  // `AuditLogInput.payload: Record<string, unknown>` sans cast (cf. pattern
+  // miroir `InboundRelayedToHumanPayload` — TS-level uniquement, no-op runtime).
+  readonly [k: string]: unknown;
+}
+
+/**
+ * Enum ferme partage entre `process-reply` (pipeline Inngest) et
+ * `/api/webhooks/ovh-sms` (route Next.js). Toute branche qui pose un audit
+ * `inbound_on_inactive_conversation` DOIT utiliser une des 5 valeurs.
+ *
+ *   - `"dm"`            : DM Slack au titulaire (`handoff.assignedTo`).
+ *   - `"orphan_channel"`: alerte individuelle envoyee au canal partage
+ *                         `SLACK_ORPHAN_LEADS_CHANNEL_ID`.
+ *   - `"digest"`        : alerte INDIVIDUELLE REGROUPEE dans un digest
+ *                         par le plafond anti-inondation (MED-1
+ *                         compliance-auditor). UN digest par minute par
+ *                         reason remplace les alertes 21+ dans la
+ *                         fenetre. wasOptOut=true ne tombe JAMAIS en
+ *                         "digest" (plafond court-circuite).
+ *   - `"suppressed"`    : 21e alerte+ ET digest de la minute deja emis.
+ *                         Rien envoye a Slack. Audit pose malgre tout
+ *                         (forensic L.34-5 CPCE preserve), Sentry
+ *                         warning signale l'anomalie.
+ *   - `"notify_failed"` : erreur SDK Slack au moment du post (ex: 500).
+ *                         Audit pose malgre tout, Sentry error signale.
+ */
+export type InboundOnInactiveNotifiedVia =
+  | "dm"
+  | "orphan_channel"
+  | "digest"
+  | "suppressed"
+  | "notify_failed";
 
 /**
  * Forme persistée d'une entrée d'audit (avec `timestamp` posé par le

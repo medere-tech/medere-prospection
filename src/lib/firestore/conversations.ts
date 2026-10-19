@@ -791,6 +791,107 @@ export async function getHandedOffConversationByContactId(
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// getLatestConversationByContactId (PR-NO-DROPPED-SMS)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * Borne haute defensive pour `getLatestConversationByContactId`. En pratique
+ * un contact est enrole dans quelques campagnes (<= 10 attendues). On
+ * rapatrie max 20 docs pour trier en memoire — pas d'`orderBy` Firestore
+ * donc pas d'index composite supplementaire a deployer.
+ */
+const LATEST_CONV_FETCH_LIMIT = 20;
+
+/**
+ * Retourne LA conversation la plus recente d'un contact, QUEL QUE SOIT son
+ * statut (y compris `closed`, `opted_out`, `blocked`).
+ *
+ * ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ * RAISON D'ETRE (PR-NO-DROPPED-SMS, branche P3)
+ *
+ * Lorsque le pipeline `process-reply` ne trouve ni conv `active`
+ * (`getActiveConversationByContactId`) ni conv `handed_off`
+ * (`getHandedOffConversationByContactId`), la conv la plus recente du
+ * contact est forcement dans un etat non-interagissant : `closed`,
+ * `opted_out`, `blocked`. Avant cette PR, le SMS entrant etait silencieusement
+ * droppe (`reply_dropped reason:"no_active_conversation"`). Fait prouve
+ * en prod le 16/10/2026 16:57 UTC avec un PS deja desabonne (opted_out
+ * depuis 16:24) qui a ecrit depuis le MEME numero : perte totale du
+ * message, aucun DM, aucun audit stocke pour trace.
+ *
+ * Cette fonction fournit le point de reroutage : le pipeline stocke le
+ * message sur la conv la plus recente via `addInboundIdempotent`
+ * (idempotence stricte miroir des autres branches), applique la detection
+ * d'opt-out, et notifie le titulaire (DM ou canal orphelins) sans JAMAIS
+ * modifier le statut de la conv. Lea reste muette.
+ *
+ * ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ * DIFFERENCES vs `getActiveConversationByContactId` / `getHandedOffConversationByContactId`
+ *
+ *   1. **Tous les statuts** — pas de filtre `where("status", ...)`. L'egalite
+ *      sur `contactId` est servie par l'index mono-champ AUTOMATIQUE de
+ *      Firestore — aucun index composite a declarer.
+ *
+ *   2. **N > 1 TOLERE sans warn** — un contact a souvent 1-N conv (une par
+ *      campagne), c'est le cas nominal. Tri `lastInboundAt ?? lastMessageAt
+ *      ?? createdAt` DESC, meme helper `conversationRelayTimestampMillis`.
+ *
+ *   3. **`.limit(20)`** — borne defensive. En prod aucun contact n'a 20+
+ *      conv, mais une donnee corrompue ou un backfill pathologique pourrait
+ *      rapatrier une liste illimitee.
+ *
+ * ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ * TRI EN MEMOIRE (pas `orderBy` Firestore)
+ *
+ * Memes raisons que `getHandedOffConversationByContactId` : eviter de
+ * declarer un index composite `(contactId ASC, lastInboundAt DESC)` pour
+ * une liste bornee a 20.
+ *
+ * ⚠️ PII DOWNSTREAM — memes regles : `conversation.summary` et
+ * `conversation.handoff.notes` peuvent contenir du quasi-PII, le caller
+ * NE doit PAS logger ni auditer ces champs.
+ *
+ * @param contactId  ID Firestore du contact (= hubspotId). NON vide.
+ *
+ * @returns `{ conversationId, conversation }` si au moins une conv existe,
+ *          sinon `null` (contact connu mais sans conversation — cas P3
+ *          deporte sur la branche "no_conversation" en orphelins).
+ *
+ * @throws ValidationError  si `contactId` est vide ou un doc est corrompu.
+ */
+export async function getLatestConversationByContactId(
+  contactId: string,
+): Promise<{ conversationId: string; conversation: Conversation } | null> {
+  if (contactId.length === 0) {
+    throw new ValidationError({
+      message: "getLatestConversationByContactId: contactId is empty",
+      context: { op: "getLatestConversationByContactId", inputLength: 0 },
+    });
+  }
+
+  const snap = await getAdminDb()
+    .collection(CONVERSATIONS_COLLECTION)
+    .where("contactId", "==", contactId)
+    .limit(LATEST_CONV_FETCH_LIMIT)
+    .get();
+
+  if (snap.empty) {
+    return null;
+  }
+
+  const sorted = snap.docs.slice().sort((a, b) => {
+    const am = conversationRelayTimestampMillis(a);
+    const bm = conversationRelayTimestampMillis(b);
+    if (am !== bm) return bm - am;
+    return a.id < b.id ? -1 : a.id > b.id ? 1 : 0;
+  });
+
+  const doc = sorted[0]!;
+  const conversation = parseConversationOrThrow(doc.data(), doc.id);
+  return { conversationId: doc.id, conversation };
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // listConversationIdsByContact{,InTx} (PR-PER-CONTACT) — fan-out rate-limit
 // ─────────────────────────────────────────────────────────────────────────────
 

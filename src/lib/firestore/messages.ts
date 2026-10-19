@@ -111,6 +111,7 @@ import { z } from "zod";
 import type { ClaudeModel } from "@/lib/claude/types";
 import { DEFAULT_OUTBOUND_KIND } from "@/lib/compliance/outbound-kind";
 import { type OutboundMessageRecord } from "@/lib/compliance/rate-limits";
+import { confirmAlreadyExistsByReread, isAlreadyExistsError } from "@/lib/firestore/_idempotent";
 import { getAdminDb } from "@/lib/firestore/admin";
 import { appendAuditLogTx } from "@/lib/firestore/audit-log";
 import {
@@ -980,55 +981,31 @@ export async function addInboundIdempotent(
       return { messageId: messageRef.id, created: true as const };
     });
   } catch (err) {
-    if (isInboundAlreadyExistsError(err)) {
+    // Primitif partage : code 6 / "already-exists". Cf. `_idempotent.ts`.
+    if (isAlreadyExistsError(err)) {
       // Le doc existe deja -> run perdant d'une race. On retourne le
       // messageId deterministe sans effet de bord. Le caller aiguillera
       // vers la branche duplicate.
       return { messageId: deterministicMessageId, created: false as const };
     }
-    // Fallback defensif anti-regression firebase-admin : si l'erreur
-    // n'est pas RECONNUE comme ALREADY_EXISTS (ex: le SDK wrappe un jour
-    // le code sous `err.details.code` ou `err.cause.code`), on refuse
-    // d'avaler l'erreur sur le texte du message (fragile, risque de
-    // perdre un vrai STOP). A la place, on relit le docId deterministe :
-    //   - doc existe + MEME externalId -> c'etait bien un ALREADY_EXISTS
-    //     masque -> `created: false` propre.
-    //   - doc existe + externalId DIFFERENT -> collision inattendue
-    //     (hash collision, bug amont, corruption) -> relance l'erreur
-    //     brute pour que Inngest retry et qu'on investigue.
-    //   - doc absent -> l'erreur n'avait rien a voir avec ALREADY_EXISTS
-    //     (ex: Firestore 5xx transient) -> relance pour Inngest retry.
-    //
-    // Ce fallback NE sauve PAS le pipeline en cas d'erreur transiente :
-    // il distingue uniquement "doublon atomique vraiment detecte" vs
-    // "autre probleme". Le re-throw preserve l'invariant "jamais perdre
-    // un STOP silencieusement".
+    // Fallback defensif anti-regression firebase-admin via primitif
+    // partage `confirmAlreadyExistsByReread` : si l'erreur n'est pas
+    // reconnue (ex: SDK wrappe un jour le code sous `err.details.code`),
+    // on relit le docId deterministe et on compare l'externalId.
+    //   - match -> ALREADY_EXISTS masque -> `created: false` propre.
+    //   - mismatch (collision inattendue) ou doc absent (erreur transiente)
+    //     -> relance l'erreur brute pour que Inngest retry et qu'on
+    //     investigue. Preserve l'invariant "jamais perdre un STOP".
     const docRef = messagesSubcollectionRef(conversationId).doc(deterministicMessageId);
-    const existing = await docRef.get();
-    if (existing.exists) {
-      const existingExternalId = existing.get("externalId");
-      if (existingExternalId === input.externalId) {
-        return { messageId: deterministicMessageId, created: false as const };
-      }
+    const confirmed = await confirmAlreadyExistsByReread(docRef, {
+      expectedField: "externalId",
+      expectedValue: input.externalId,
+    });
+    if (confirmed) {
+      return { messageId: deterministicMessageId, created: false as const };
     }
     throw err;
   }
-}
-
-/**
- * Detecte une erreur ALREADY_EXISTS du SDK firebase-admin sans dependre
- * d'un import gRPC direct. Pattern miroir `conversations.ts::isAlreadyExistsError`.
- *
- * ⚠️ Un fallback defensif existe dans `addInboundIdempotent` au cas ou le
- * SDK evoluerait et wrapperait le code (`err.details.code`, `err.cause.code`) :
- * on NE lit PAS le texte du message (`"already exists"` dans la string) car
- * ca pourrait avaler une autre erreur et perdre un STOP. On relit le docId
- * deterministe et on compare l'externalId pour confirmer le doublon.
- */
-function isInboundAlreadyExistsError(err: unknown): boolean {
-  if (typeof err !== "object" || err === null) return false;
-  const code = (err as { code?: unknown }).code;
-  return code === 6 || code === "already-exists";
 }
 
 /**

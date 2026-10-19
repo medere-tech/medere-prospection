@@ -187,18 +187,18 @@ const slackEnvSchema = z.object({
   SLACK_BOT_TOKEN: z.string().startsWith("xoxb-"),
   SLACK_SIGNING_SECRET: z.string().min(1),
   /**
-   * Optional Phase 1 : canal Slack où sont notifiés les leads INTERESSE dont
-   * le propriétaire HubSpot n'a pas de ligne exploitable dans Airtable
-   * Commerciaux (owner sans slack_user_id, inactif, ou contact sans owner).
-   * Filet de secours quand le routage owner→DM ne peut pas résoudre de
-   * Slack ID. Format = channel ID Slack (C…/G…). Required une fois le
-   * module hand-off livré ; laissé optional pour ne pas bloquer le boot
-   * tant que le consumer prod n'est pas branché.
+   * REQUIRED (PR-NO-DROPPED-SMS Finding 5 compliance-auditor) : canal Slack
+   * ou sont notifies TOUS les SMS entrants qui n'ont pas de titulaire DM
+   * - leads INTERESSE orphelins (hand-off S9.9),
+   * - SMS entrant sur conversation inactive sans assignedTo
+   *   (process-reply.ts P1/P2/P3'/P6),
+   * - parse_failed / enqueue_failed (webhook /api/webhooks/ovh-sms W3-W6).
+   *
+   * Un canal manquant = perte de signal operationnel sur un STOP latent =
+   * infraction L.34-5 CPCE. Verifie present en prod et preview (Vercel).
+   * Format = channel ID Slack (C.../G...).
    */
-  SLACK_ORPHAN_LEADS_CHANNEL_ID: z
-    .string()
-    .regex(/^[CG][A-Z0-9]+$/, "must be a Slack channel ID")
-    .optional(),
+  SLACK_ORPHAN_LEADS_CHANNEL_ID: z.string().regex(/^[CG][A-Z0-9]+$/, "must be a Slack channel ID"),
   /** Optional Phase 1 : Phase 4 hand-off. JSON `{ specialty: slackUserId }`. */
   SLACK_USER_IDS: slackUserIdsSchema.optional(),
 });

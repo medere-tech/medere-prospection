@@ -85,6 +85,17 @@ export type ObservabilityExtra = Record<string, string | number | boolean | null
 
 export interface CaptureMonitoringWarningOptions {
   /**
+   * Niveau Sentry effectif. Defaut `"warning"` (backward-compat avec
+   * tous les callers S9.x). `"error"` reserve aux signaux ou un humain
+   * DOIT intervenir rapidement : invariants donnee cassees
+   * (`handed_off_no_assignee`), echecs transport reparables
+   * (`parse_failed`, `enqueue_failed`), races critiques
+   * (`conversation_became_terminal`).
+   *
+   * Impacte uniquement le niveau Sentry + le niveau Pino (warn vs error).
+   */
+  level?: "warning" | "error";
+  /**
    * Données structurées attachées à l'event Sentry (équivalent
    * `Sentry.captureMessage(msg, { extra })`). TYPE STRICT pour bloquer
    * les objets imbriqués qui pourraient leak PII (cf. invariant 1).
@@ -135,19 +146,22 @@ export function captureMonitoringWarning(
   messageKey: string,
   options: CaptureMonitoringWarningOptions = {},
 ): void {
-  // ── 1. Log Pino warn (TOUJOURS) ─────────────────────────────────────────
-  // Filet de sécurité visible Vercel logs même si Sentry SDK non init
-  // (cf. JSDoc — Sentry no-op silencieux sans instrumentation.ts).
-  // Pattern Pino : object en 1er, message en 2ème.
-  logger.warn(
-    {
-      ...options.extra,
-      tags: options.tags,
-      fingerprint: options.fingerprint,
-      observability_kind: "monitoring_warning",
-    },
-    `[observability] ${messageKey}`,
-  );
+  const level = options.level ?? "warning";
+
+  // ── 1. Log Pino (TOUJOURS, filet de securite Vercel logs meme sans Sentry) ──
+  // Niveau Pino aligne sur Sentry : warn vs error.
+  const logObj = {
+    ...options.extra,
+    tags: options.tags,
+    fingerprint: options.fingerprint,
+    observability_kind: "monitoring_warning",
+  };
+  const logMsg = `[observability] ${messageKey}`;
+  if (level === "error") {
+    logger.error(logObj, logMsg);
+  } else {
+    logger.warn(logObj, logMsg);
+  }
 
   // ── 2. Sentry.captureMessage (no-op silencieux si SDK non init) ────────
   // Pattern best-effort : on n'attend PAS la résolution Sentry. Si le
@@ -157,7 +171,7 @@ export function captureMonitoringWarning(
   // Sentry uptime).
   try {
     Sentry.captureMessage(messageKey, {
-      level: "warning",
+      level,
       extra: options.extra,
       tags: options.tags,
       fingerprint: options.fingerprint,

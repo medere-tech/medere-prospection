@@ -140,6 +140,23 @@ service cloud.firestore {
       allow write: if false;                      // STRICTEMENT JAMAIS côté client
     }
 
+    // === Inbound messages orphans (PR-NO-DROPPED-SMS) ===
+    // Collection racine pour les SMS entrants qu'aucune branche active ne gère
+    // (contact inconnu, parse Zod/transport failed, enqueue Inngest failed,
+    // conv la plus récente en closed/opted_out/blocked sans conv à rattacher,
+    // handed_off sans assignedTo). Les docs contiennent le TEXTE DU SMS en
+    // clair + un hash du numéro émetteur (`hph_...`), semi-sensibles.
+    // Écriture via Admin SDK UNIQUEMENT (orphan-inbounds.ts, caller
+    // process-reply ou webhook ovh-sms).
+    // Lecture : STRICTEMENT INACCESSIBLE côté client — forensic uniquement
+    // via API serveur Clerk-protected en S9+.
+    // Pattern défensif explicite même si la règle catchall ci-dessous
+    // couvrirait déjà (defense-in-depth, miroir pattern audit_log).
+    match /inbound_messages_orphans/{docId} {
+      allow read: if false;                       // STRICTEMENT JAMAIS côté client
+      allow write: if false;                      // STRICTEMENT JAMAIS côté client
+    }
+
     // === Catchall ===
     // Toute collection non listée ci-dessus est INACCESSIBLE côté client.
     // Protection contre l'ajout futur d'une collection qu'on aurait
