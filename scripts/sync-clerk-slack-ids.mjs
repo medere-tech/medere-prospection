@@ -10,11 +10,16 @@
  *   « Mes conversations » de la vue conversation sera vide pour tout le
  *   monde (fallback onglet « À traiter »).
  *
- *   Ce script lit la table Airtable Commerciaux (même source que
- *   `src/lib/airtable/commerciaux.ts`) et, pour chaque ligne active
- *   avec un `slack_user_id` renseigné, associe au compte Clerk
- *   correspondant par EMAIL puis écrit `publicMetadata.slackUserId` via
- *   la Clerk Backend REST API (`PATCH /v1/users/{id}`).
+ *   Ce script lit la table Airtable Commerciaux via
+ *   `fetchAirtableRecords()` (`src/lib/airtable/client.ts`) + la validation
+ *   d'env `getAirtableEnv()` / `getClerkEnv()` (`src/lib/security/env.ts`).
+ *   Même source de vérité que l'application en prod — aucun nom de
+ *   variable d'env inventé, aucun réimplémentation du fetch.
+ *
+ *   Pour chaque ligne active avec un `slack_user_id` renseigné, le script
+ *   associe au compte Clerk correspondant par EMAIL puis écrit
+ *   `publicMetadata.slackUserId` via la Clerk Backend REST API
+ *   (`PATCH /v1/users/{id}/metadata`).
  *
  *   Ne touche AUCUN autre champ `publicMetadata`. Ne crée pas de compte
  *   Clerk. Ne supprime pas de compte. Lecture seule par défaut (dry-run).
@@ -27,30 +32,36 @@
  *   npx tsx scripts/sync-clerk-slack-ids.mjs --apply --force-overwrite
  *     # écrit même si un slackUserId est déjà présent et diffère
  *
- * Pré-requis .env.local :
- *   - CLERK_SECRET_KEY (sk_...) — Clerk Backend REST API
- *   - AIRTABLE_API_KEY, AIRTABLE_BASE_ID, AIRTABLE_COMMERCIAUX_TABLE_ID
+ * Pré-requis .env.local (noms EXACTS, identiques à l'app) :
+ *   - `CLERK_SECRET_KEY`                : `sk_...` (Clerk Backend REST API)
+ *   - `AIRTABLE_PAT`                    : `pat...` (Personal Access Token)
+ *   - `AIRTABLE_BASE_ID`                : `app...`
+ *   - `AIRTABLE_COMMERCIAUX_TABLE_ID`   : `tbl...`
+ *
+ *   La validation Zod est faite par `getAirtableEnv()` et `getClerkEnv()`.
+ *   Toute variable manquante ou mal formée → `ConfigError` avec message
+ *   explicite listant les champs problématiques (via `sanitizeZodError`,
+ *   aucune fuite de la valeur reçue). Script exit code 2.
  *
  * ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
  * Garde-fous (fail-closed)
  *
- *   1. Email Airtable sans compte Clerk → ligne tracée comme `no_clerk`,
- *      PAS d'écriture, PAS d'exit en dry-run. En --apply : refuse l'écriture
- *      de CETTE ligne mais continue (rapport final liste tous les manquants).
- *   2. Email Airtable ambigu (2 lignes Airtable même email, OU 2 users Clerk
- *      même email) → ligne tracée `ambiguous`, PAS d'écriture, exit code 5.
+ *   1. Email Airtable sans compte Clerk → ligne tracée `no_clerk`, PAS
+ *      d'écriture pour cette ligne (continue, rapport final).
+ *   2. Email Airtable ambigu (2 lignes Airtable même email, OU 2 users
+ *      Clerk même email) → ligne tracée `ambiguous`, exit code 5.
  *   3. slackUserId Clerk déjà présent ET différent de l'Airtable → PAS
  *      d'écrasement sans `--force-overwrite`, exit code 5.
  *   4. slackUserId Clerk déjà présent ET identique → no-op, log `noop`.
- *   5. slackUserId Airtable mal formé (regex /^U[A-Z0-9]+$/ fail) → refus,
+ *   5. slackUserId Airtable mal formé (regex `/^U[A-Z0-9]+$/`) → refus,
  *      exit code 5.
  *
  * ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
  * Exit codes
  *   0 OK (dry-run OK ou --apply OK sans conflit)
- *   1 erreur I/O (fetch Clerk ou Airtable échoué)
- *   2 env manquant
- *   3 ressource introuvable (table Airtable vide, etc.)
+ *   1 erreur I/O (fetch Clerk échoué, fetch Airtable échoué via retry)
+ *   2 env manquant ou mal formé (Zod)
+ *   3 ressource introuvable (table Airtable vide)
  *   4 exception non gérée
  *   5 garde-fou refusé (ambiguïté, écrasement sans --force-overwrite, format)
  *
@@ -58,11 +69,14 @@
  * Zéro PII en stdout/stderr
  *
  *   Les emails sont AFFICHÉS MASQUÉS (`****@domain.tld`). Les slackUserId
- *   ne sont pas PII (identifiant workspace technique). Le rapport final
- *   agrège par action (`updated`, `noop`, `conflict`, `no_clerk`, ...).
+ *   ne sont pas PII (identifiant workspace technique). Les secrets ne
+ *   sont jamais logués (Bearer dans fetch uniquement).
  */
 import { config } from "dotenv";
 config({ path: ".env.local" });
+
+import { fetchAirtableRecords } from "../src/lib/airtable/client.ts";
+import { getAirtableEnv, getClerkEnv } from "../src/lib/security/env.ts";
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Constantes
@@ -70,30 +84,39 @@ config({ path: ".env.local" });
 
 const SLACK_USER_ID_REGEX = /^U[A-Z0-9]+$/;
 const CLERK_API_BASE = "https://api.clerk.com/v1";
-const AIRTABLE_API_BASE = "https://api.airtable.com/v0";
+
+/**
+ * Champs Airtable demandés. Même source que
+ * `src/lib/airtable/commerciaux.ts:COMMERCIAUX_FIELDS` + ajout de `email`
+ * (indispensable au matching Clerk — non requis par le hand-off, data min
+ * côté lib ; nécessaire ici pour le mapping identité).
+ */
+const COMMERCIAUX_FIELDS = ["email", "slack_user_id", "Statut", "hubspot_name"];
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Env
+// Env — validation stricte via les helpers du projet (fail-closed, Zod)
 // ─────────────────────────────────────────────────────────────────────────────
 
-function getEnvOrDie() {
-  const required = [
-    "CLERK_SECRET_KEY",
-    "AIRTABLE_API_KEY",
-    "AIRTABLE_BASE_ID",
-    "AIRTABLE_COMMERCIAUX_TABLE_ID",
-  ];
-  const missing = required.filter((k) => !process.env[k]);
-  if (missing.length > 0) {
-    console.error(`Env manquant : ${missing.join(", ")}`);
+function loadEnvOrDie() {
+  try {
+    const clerkEnv = getClerkEnv();
+    const airtableEnv = getAirtableEnv();
+    return {
+      CLERK_SECRET_KEY: clerkEnv.CLERK_SECRET_KEY,
+      AIRTABLE_COMMERCIAUX_TABLE_ID: airtableEnv.AIRTABLE_COMMERCIAUX_TABLE_ID,
+    };
+  } catch (err) {
+    const msg = err && err.message ? err.message : String(err);
+    console.error("Env invalide ou manquant (validation getClerkEnv/getAirtableEnv) :");
+    console.error(`  ${msg}`);
+    console.error("");
+    console.error("Noms attendus (identiques à l'app, cf. src/lib/security/env.ts) :");
+    console.error("  - CLERK_SECRET_KEY");
+    console.error("  - AIRTABLE_PAT");
+    console.error("  - AIRTABLE_BASE_ID");
+    console.error("  - AIRTABLE_COMMERCIAUX_TABLE_ID");
     process.exit(2);
   }
-  return {
-    CLERK_SECRET_KEY: process.env.CLERK_SECRET_KEY,
-    AIRTABLE_API_KEY: process.env.AIRTABLE_API_KEY,
-    AIRTABLE_BASE_ID: process.env.AIRTABLE_BASE_ID,
-    AIRTABLE_COMMERCIAUX_TABLE_ID: process.env.AIRTABLE_COMMERCIAUX_TABLE_ID,
-  };
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -109,47 +132,10 @@ function maskEmail(email) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Airtable fetch (sans dep, direct REST)
-// ─────────────────────────────────────────────────────────────────────────────
-
-async function fetchAirtableCommerciaux(env) {
-  // On demande explicitement email + slack_user_id + Statut + hubspot_name.
-  // `email` n'est PAS demandé par src/lib/airtable/commerciaux.ts (data min),
-  // mais ici il nous est strictement nécessaire pour le matching Clerk.
-  const url = new URL(
-    `${AIRTABLE_API_BASE}/${env.AIRTABLE_BASE_ID}/${env.AIRTABLE_COMMERCIAUX_TABLE_ID}`,
-  );
-  const fields = ["email", "slack_user_id", "Statut", "hubspot_name"];
-  for (const f of fields) url.searchParams.append("fields[]", f);
-  url.searchParams.set("pageSize", "100");
-
-  let allRecords = [];
-  let offset;
-  let pageCount = 0;
-  do {
-    const u = new URL(url.toString());
-    if (offset) u.searchParams.set("offset", offset);
-    const res = await fetch(u, {
-      headers: { Authorization: `Bearer ${env.AIRTABLE_API_KEY}` },
-    });
-    if (!res.ok) {
-      console.error(`Airtable fetch failed: ${res.status} ${res.statusText}`);
-      process.exit(1);
-    }
-    const data = await res.json();
-    allRecords = allRecords.concat(data.records ?? []);
-    offset = data.offset;
-    pageCount += 1;
-    if (pageCount > 10) break; // defense anti-boucle
-  } while (offset);
-  return allRecords;
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
 // Clerk fetch
 // ─────────────────────────────────────────────────────────────────────────────
 
-async function fetchAllClerkUsers(env) {
+async function fetchAllClerkUsers(clerkSecretKey) {
   const users = [];
   let offset = 0;
   const limit = 100;
@@ -158,7 +144,7 @@ async function fetchAllClerkUsers(env) {
     url.searchParams.set("limit", String(limit));
     url.searchParams.set("offset", String(offset));
     const res = await fetch(url, {
-      headers: { Authorization: `Bearer ${env.CLERK_SECRET_KEY}` },
+      headers: { Authorization: `Bearer ${clerkSecretKey}` },
     });
     if (!res.ok) {
       console.error(`Clerk fetch failed: ${res.status} ${res.statusText}`);
@@ -174,24 +160,25 @@ async function fetchAllClerkUsers(env) {
   return users;
 }
 
-/** Patch le `publicMetadata` d'un user Clerk via API REST. */
-async function patchClerkUserMetadata(env, userId, newSlackUserId) {
+/** Patch le `publicMetadata.slackUserId` d'un user Clerk via REST API. */
+async function patchClerkUserMetadata(clerkSecretKey, userId, newSlackUserId) {
   const res = await fetch(`${CLERK_API_BASE}/users/${userId}/metadata`, {
     method: "PATCH",
     headers: {
-      Authorization: `Bearer ${env.CLERK_SECRET_KEY}`,
+      Authorization: `Bearer ${clerkSecretKey}`,
       "Content-Type": "application/json",
     },
     body: JSON.stringify({ public_metadata: { slackUserId: newSlackUserId } }),
   });
   if (!res.ok) {
-    const text = await res.text();
-    throw new Error(`Clerk PATCH ${userId} failed: ${res.status} ${res.statusText} — ${text}`);
+    // On ne mentionne pas le body de la réponse — Clerk peut y inclure
+    // l'email de l'utilisateur en détail d'erreur (INFO security-reviewer).
+    throw new Error(`Clerk PATCH ${userId} failed: ${res.status} ${res.statusText}`);
   }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Normalisation Airtable
+// Normalisation Airtable (helper miroir `firstOrString` de commerciaux.ts)
 // ─────────────────────────────────────────────────────────────────────────────
 
 function firstOrString(value) {
@@ -247,19 +234,31 @@ function buildClerkEmailIndex(users) {
 async function main() {
   const apply = process.argv.includes("--apply");
   const forceOverwrite = process.argv.includes("--force-overwrite");
-  const env = getEnvOrDie();
+  const env = loadEnvOrDie();
 
   console.log("");
   console.log(`SYNC-CLERK-SLACK-IDS — mode : ${apply ? "APPLY" : "dry-run / lecture seule"}`);
   console.log(`Force overwrite : ${forceOverwrite ? "oui" : "non"}`);
   console.log("");
 
-  // 1. Fetch Airtable + Clerk en parallèle
+  // 1. Fetch Airtable + Clerk en parallèle.
+  //    - Airtable via `fetchAirtableRecords` (`src/lib/airtable/client.ts`),
+  //      qui utilise déjà `getAirtableEnv()` en interne + retry + pat Bearer.
+  //    - Clerk via `fetch` natif (pas de dep à ajouter), Bearer CLERK_SECRET_KEY.
   console.log("Lecture Airtable Commerciaux + Clerk Users en parallèle...");
-  const [airtableRecords, clerkUsers] = await Promise.all([
-    fetchAirtableCommerciaux(env),
-    fetchAllClerkUsers(env),
-  ]);
+  let airtableRecords;
+  let clerkUsers;
+  try {
+    [airtableRecords, clerkUsers] = await Promise.all([
+      fetchAirtableRecords(env.AIRTABLE_COMMERCIAUX_TABLE_ID, COMMERCIAUX_FIELDS),
+      fetchAllClerkUsers(env.CLERK_SECRET_KEY),
+    ]);
+  } catch (err) {
+    const name = err && err.name ? err.name : "unknown";
+    const msg = err && err.message ? err.message : String(err);
+    console.error(`Lecture Airtable/Clerk a échoué : ${name} - ${msg}`);
+    process.exit(1);
+  }
   console.log(`  Airtable : ${airtableRecords.length} ligne(s)`);
   console.log(`  Clerk    : ${clerkUsers.length} user(s)`);
   console.log("");
@@ -434,7 +433,7 @@ async function main() {
   for (const r of actions) {
     if (r.action !== "updated") continue;
     try {
-      await patchClerkUserMetadata(env, r.clerkUserId, r.slackUserIdAirtable);
+      await patchClerkUserMetadata(env.CLERK_SECRET_KEY, r.clerkUserId, r.slackUserIdAirtable);
       patchedOk += 1;
       console.log(`  OK  ${r.maskedEmail} ← ${r.slackUserIdAirtable}`);
     } catch (err) {

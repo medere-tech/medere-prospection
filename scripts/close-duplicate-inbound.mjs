@@ -99,6 +99,7 @@ import { cert, getApps, initializeApp } from "firebase-admin/app";
 import { getFirestore, Timestamp } from "firebase-admin/firestore";
 
 import { appendAuditLogTx } from "../src/lib/firestore/audit-log.ts";
+import { getFirebaseEnv } from "../src/lib/security/env.ts";
 // Core helpers (fonctions pures, zero process.exit, zero I/O direct) —
 // extraits dans `scripts/_lib/close-duplicate-inbound-core.mjs` pour
 // permettre l'ecriture de tests Vitest unitaires sans emulator.
@@ -126,21 +127,31 @@ import {
 // ─────────────────────────────────────────────────────────────────────────────
 
 function getAdminDbOrDie() {
-  const projectId = process.env.FIREBASE_PROJECT_ID;
-  const clientEmail = process.env.FIREBASE_CLIENT_EMAIL;
-  const rawKey = process.env.FIREBASE_PRIVATE_KEY;
-  if (!projectId || !clientEmail || !rawKey) {
-    console.error(
-      "Env manquant : FIREBASE_PROJECT_ID / FIREBASE_CLIENT_EMAIL / FIREBASE_PRIVATE_KEY",
-    );
+  // Validation Zod strict via le helper partage — meme source que l'app.
+  let env;
+  try {
+    env = getFirebaseEnv();
+  } catch (err) {
+    const msg = err && err.message ? err.message : String(err);
+    console.error("Env invalide ou manquant (validation getFirebaseEnv) :");
+    console.error(`  ${msg}`);
+    console.error("");
+    console.error("Noms attendus (identiques a l'app, cf. src/lib/security/env.ts) :");
+    console.error("  - FIREBASE_PROJECT_ID");
+    console.error("  - FIREBASE_CLIENT_EMAIL");
+    console.error("  - FIREBASE_PRIVATE_KEY");
     process.exit(2);
   }
-  const privateKey = rawKey.replace(/\\n/g, "\n");
-
   if (getApps().length === 0) {
-    initializeApp({ credential: cert({ projectId, clientEmail, privateKey }) });
+    initializeApp({
+      credential: cert({
+        projectId: env.FIREBASE_PROJECT_ID,
+        clientEmail: env.FIREBASE_CLIENT_EMAIL,
+        privateKey: env.FIREBASE_PRIVATE_KEY,
+      }),
+    });
   }
-  return { db: getFirestore(), projectId };
+  return { db: getFirestore(), projectId: env.FIREBASE_PROJECT_ID };
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -229,11 +240,13 @@ function assertStateIsDuplicableOrExit(state) {
 // Snapshot forensique AVANT ecriture (payload build via core, write local)
 // ─────────────────────────────────────────────────────────────────────────────
 
-function writeSnapshotOrDie(state, corrections) {
+function writeSnapshotOrDie(state, corrections, projectId) {
   const nowIso = new Date().toISOString().replace(/[:.]/g, "-");
   const relPath = `tmp/close-duplicate-inbound-snapshot-${nowIso}.json`;
   const absPath = resolvePath(process.cwd(), relPath);
-  const payload = buildSnapshotPayload(state, corrections, process.env.FIREBASE_PROJECT_ID);
+  // `projectId` est deja valide par `getFirebaseEnv()` dans main — pas de
+  // relecture `process.env.FIREBASE_PROJECT_ID` ici (source unique).
+  const payload = buildSnapshotPayload(state, corrections, projectId);
   writeFileSync(absPath, JSON.stringify(payload, null, 2), { encoding: "utf8" });
   return relPath;
 }
@@ -412,7 +425,7 @@ async function main() {
   }
 
   console.log("Snapshot pre-mutation...");
-  const snapshotPath = writeSnapshotOrDie(before, corrections);
+  const snapshotPath = writeSnapshotOrDie(before, corrections, projectId);
   console.log(`  ecrit : ${snapshotPath}`);
   console.log("");
 

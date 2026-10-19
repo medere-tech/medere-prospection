@@ -65,7 +65,7 @@ import { getFirestore, Timestamp } from "firebase-admin/firestore";
 import { listConversationIdsByContact } from "../src/lib/firestore/conversations.ts";
 import { getOvhClient } from "../src/lib/ovh/client.ts";
 import { OVH_STOP_CALLBACKS_COLLECTION } from "../src/lib/ovh/stop-callback.ts";
-import { getOvhEnv } from "../src/lib/security/env.ts";
+import { getFirebaseEnv, getOvhEnv } from "../src/lib/security/env.ts";
 import { scrubOvhErrorMessage } from "./_lib/ovh-scrub.mjs";
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -91,16 +91,23 @@ const TEST_CONTACT_ID = "427963864300"; // bloc 5b : contact Firestore scope
 // ─────────────────────────────────────────────────────────────────────────────
 
 function initFirebaseAdminOrDie() {
-  const projectId = process.env.FIREBASE_PROJECT_ID;
-  const clientEmail = process.env.FIREBASE_CLIENT_EMAIL;
-  const rawKey = process.env.FIREBASE_PRIVATE_KEY;
-  if (!projectId || !clientEmail || !rawKey) {
-    console.error(
-      "Env manquant : FIREBASE_PROJECT_ID / FIREBASE_CLIENT_EMAIL / FIREBASE_PRIVATE_KEY",
-    );
+  let env;
+  try {
+    env = getFirebaseEnv();
+  } catch (err) {
+    const msg = err && err.message ? err.message : String(err);
+    console.error("Env invalide ou manquant (validation getFirebaseEnv) :");
+    console.error(`  ${msg}`);
+    console.error("");
+    console.error("Noms attendus (identiques a l'app, cf. src/lib/security/env.ts) :");
+    console.error("  - FIREBASE_PROJECT_ID");
+    console.error("  - FIREBASE_CLIENT_EMAIL");
+    console.error("  - FIREBASE_PRIVATE_KEY");
     process.exit(2);
   }
-  const privateKey = rawKey.replace(/\\n/g, "\n");
+  const projectId = env.FIREBASE_PROJECT_ID;
+  const clientEmail = env.FIREBASE_CLIENT_EMAIL;
+  const privateKey = env.FIREBASE_PRIVATE_KEY;
   if (getApps().length === 0) {
     initializeApp({ credential: cert({ projectId, clientEmail, privateKey }) });
   }
