@@ -42,7 +42,7 @@ import { z } from "zod";
 import { getAdminDb } from "@/lib/firestore/admin";
 import { AuditPiiError, ValidationError } from "@/lib/utils/errors";
 import { detectPiiInPayload } from "@/lib/utils/pii-detector";
-import type { AuditLogInput } from "@/types/audit-log";
+import type { AuditLog, AuditLogInput, AuditTargetType } from "@/types/audit-log";
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Constantes
@@ -99,6 +99,10 @@ const ACTIONS = [
   // "no_active_conversation" | "conversation_became_terminal"`. Cf.
   // types/audit-log.ts pour la semantique + `InboundOnInactiveConversationPayload`.
   "inbound_on_inactive_conversation",
+  // VUE-CONVERSATION PR0 — accès au numéro depuis la vue conversation.
+  // Payload = `ContactPhoneAccessedPayload` avec `method ∈ {display, copy, call}`.
+  // Cf. types/audit-log.ts pour la sémantique.
+  "contact_phone_accessed",
   // ── CAMPAIGN / ADMIN ───────────────────────────────────────────────────
   "manual_override",
   "prompt_changed",
@@ -257,6 +261,118 @@ export function appendAuditLogTx(tx: Transaction, entry: AuditLogInput): string 
     timestamp: Timestamp.now(),
   });
   return docRef.id;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// listAuditLogByTarget (VUE-CONVERSATION PR0) — lecture pour panneau journal
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * Nombre d'entrées par page par défaut (`limit` omis). 20 = panneau latéral
+ * compact dans la vue conversation. Pagination si plus d'historique.
+ */
+export const LIST_AUDIT_LOG_DEFAULT_LIMIT = 20;
+
+/**
+ * Plafond strict — anti-DoS Firestore. Un audit log par contact peut
+ * monter à quelques centaines sur un cycle long (3 ans conservation).
+ */
+export const LIST_AUDIT_LOG_MAX_LIMIT = 100;
+
+/** Input typé. */
+export interface ListAuditLogByTargetInput {
+  targetType: AuditTargetType;
+  targetId: string;
+  limit?: number;
+  /** docId Firestore du dernier doc de la page précédente. */
+  cursor?: string;
+}
+
+/** Sortie typée. */
+export interface ListAuditLogByTargetOutput {
+  entries: Array<AuditLog & { docId: string }>;
+  nextCursor: string | null;
+  hasMore: boolean;
+}
+
+/**
+ * Liste les entrées d'`audit_log/` ciblant un `(targetType, targetId)`,
+ * triées `timestamp desc` (plus récente en haut).
+ *
+ * ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ * INDEX FIRESTORE REQUIS
+ *
+ *   `audit_log` COLLECTION : `targetType + targetId + timestamp DESC`.
+ *   Ajouté dans `firestore.indexes.json` (VUE-CONVERSATION PR0). Déployer
+ *   via `npm run firebase:deploy:indexes` AVANT runtime pointant sur
+ *   Firestore Cloud (l'emulator accepte sans index).
+ *
+ * ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ * ⚠️ PII — `payload` scrubber-safe par construction
+ *
+ * Les payloads sont déjà scrubbés par `validateAndScrub` à l'écriture
+ * (`detectPiiInPayload` throw `AuditPiiError`). Aucun phone/email/body
+ * en clair ne peut être persisté. Lecture de retour → safe pour UI.
+ *
+ * `ipAddress` / `userAgent` peuvent être présents mais sont considérés
+ * semi-sensibles (traçabilité HTTP, pas PII RGPD).
+ *
+ * @throws ValidationError si input invalide ou cursor inexistant.
+ */
+export async function listAuditLogByTarget(
+  input: ListAuditLogByTargetInput,
+): Promise<ListAuditLogByTargetOutput> {
+  const { targetType, targetId, limit: requestedLimit, cursor } = input;
+
+  if (typeof targetId !== "string" || targetId.length === 0) {
+    throw new ValidationError({
+      message: "listAuditLogByTarget: targetId must be non-empty",
+      context: { op: "listAuditLogByTarget", targetType },
+    });
+  }
+  if (
+    requestedLimit !== undefined &&
+    (!Number.isInteger(requestedLimit) ||
+      requestedLimit < 1 ||
+      requestedLimit > LIST_AUDIT_LOG_MAX_LIMIT)
+  ) {
+    throw new ValidationError({
+      message: `listAuditLogByTarget: limit must be in [1, ${LIST_AUDIT_LOG_MAX_LIMIT}]`,
+      context: { op: "listAuditLogByTarget", requestedLimit },
+    });
+  }
+  const limit = requestedLimit ?? LIST_AUDIT_LOG_DEFAULT_LIMIT;
+
+  let q: FirebaseFirestore.Query = getAdminDb()
+    .collection(AUDIT_COLLECTION)
+    .where("targetType", "==", targetType)
+    .where("targetId", "==", targetId)
+    .orderBy("timestamp", "desc");
+
+  if (cursor !== undefined) {
+    const cursorSnap = await getAdminDb().collection(AUDIT_COLLECTION).doc(cursor).get();
+    if (!cursorSnap.exists) {
+      throw new ValidationError({
+        message: "listAuditLogByTarget: cursor refers to a non-existent audit entry",
+        context: { op: "listAuditLogByTarget", cursorPresent: true },
+      });
+    }
+    q = q.startAfter(cursorSnap);
+  }
+
+  const snap = await q.limit(limit + 1).get();
+  const docs = snap.docs;
+  const hasMore = docs.length > limit;
+  const slice = hasMore ? docs.slice(0, limit) : docs;
+
+  const entries: Array<AuditLog & { docId: string }> = slice.map((doc) => {
+    const data = doc.data() as AuditLog;
+    return { ...data, docId: doc.id };
+  });
+
+  const nextCursor = hasMore && slice.length > 0 ? (slice[slice.length - 1]?.id ?? null) : null;
+
+  return { entries, nextCursor, hasMore };
 }
 
 /**

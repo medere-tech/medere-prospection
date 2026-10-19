@@ -260,5 +260,144 @@ export async function addOrphanInboundIdempotent(
   }
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// listOrphanInbounds (VUE-CONVERSATION PR0) — pagination cursor + filtre reason
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * Nombre d'orphelins par page par défaut (`limit` omis). Aligné sur
+ * `LIST_CONTACTS_DEFAULT_LIMIT` : 50 lignes = bonne densité TanStack Table.
+ */
+export const LIST_ORPHAN_INBOUNDS_DEFAULT_LIMIT = 50;
+
+/**
+ * Plafond strict sur `limit` — anti-DoS Firestore quota. Même seuil que
+ * `LIST_CONTACTS_MAX_LIMIT` (cf. `contacts.ts:731` pour le raisonnement).
+ */
+export const LIST_ORPHAN_INBOUNDS_MAX_LIMIT = 100;
+
+/**
+ * Filtres passables à `listOrphanInbounds`. Whitelist stricte :
+ *   - `reason`  : enum fermé aligné `InboundOnInactiveConversationReason`.
+ *                 Omis → tous les motifs.
+ *   - `source`  : discriminant process-reply vs webhook. Omis → les deux.
+ */
+export interface ListOrphanInboundsFilters {
+  reason?: InboundOnInactiveConversationReason;
+  source?: OrphanInboundSource;
+}
+
+/** Input typé du caller. Tous les champs sont optionnels. */
+export interface ListOrphanInboundsInput {
+  filters?: ListOrphanInboundsFilters;
+  limit?: number;
+  /** docId `oih_...` du dernier doc de la page précédente. */
+  cursor?: string;
+}
+
+/** Sortie typée. Même shape que `ListContactsOutput`. */
+export interface ListOrphanInboundsOutput {
+  orphans: Array<OrphanInboundDoc & { docId: string }>;
+  /** `docId` à passer dans `input.cursor` pour la page suivante. `null` si fin. */
+  nextCursor: string | null;
+  /** True si une page suivante existe. */
+  hasMore: boolean;
+}
+
+/**
+ * Liste les SMS orphelins paginés via cursor, triés `receivedAt desc`
+ * (plus récent en haut).
+ *
+ * ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ * INDEX FIRESTORE REQUIS
+ *
+ *   Query sans filtres : `orderBy("receivedAt", "desc")` — index single-field
+ *   automatique côté Firestore (aucune action requise).
+ *
+ *   Query avec filtre `reason` ou `source` : composite requis
+ *   `reason + receivedAt desc` ou `source + receivedAt desc`. Ajoutés dans
+ *   `firestore.indexes.json` (VUE-CONVERSATION PR0) — vérifier le déploiement
+ *   via `npm run firebase:deploy:indexes`.
+ *
+ * ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ * CURSOR — pattern `startAfter(DocumentSnapshot)`
+ *
+ * Le cursor exposé est le `docId` opaque (`oih_...`). Réhydratation
+ * server-side via `get(cursorDocId)` :
+ *   - Cursor inexistant → `ValidationError` (pas de fall-through silencieux
+ *     qui retournerait la page 1).
+ *   - Cursor existant → `startAfter(snap)` continue après ce doc.
+ *
+ * Coût : 1 read supplémentaire par page.
+ *
+ * ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ * ⚠️ PII — `body` est présent en clair dans chaque doc retourné.
+ *
+ * `OrphanInboundDoc.body` contient le SMS tel que reçu (texte PS). Les
+ * callers UI DOIVENT :
+ *   1. Ne JAMAIS logger le body via Pino/Sentry.
+ *   2. Ne JAMAIS l'inclure dans un audit log payload.
+ *   3. Masquer le téléphone (déjà hashé en `phoneHash` — pas affichable
+ *      côté UI, utiliser le flux audité `contact_phone_accessed` si le
+ *      contact est résolu).
+ *
+ * @throws ValidationError si input invalide (limit hors bornes, cursor absent).
+ */
+export async function listOrphanInbounds(
+  input: ListOrphanInboundsInput = {},
+): Promise<ListOrphanInboundsOutput> {
+  const { filters, limit: requestedLimit, cursor } = input;
+
+  // Validation input manuelle (pas de Zod schema — peu de champs).
+  if (
+    requestedLimit !== undefined &&
+    (!Number.isInteger(requestedLimit) ||
+      requestedLimit < 1 ||
+      requestedLimit > LIST_ORPHAN_INBOUNDS_MAX_LIMIT)
+  ) {
+    throw new ValidationError({
+      message: `listOrphanInbounds: limit must be in [1, ${LIST_ORPHAN_INBOUNDS_MAX_LIMIT}]`,
+      context: { op: "listOrphanInbounds", requestedLimit },
+    });
+  }
+  const limit = requestedLimit ?? LIST_ORPHAN_INBOUNDS_DEFAULT_LIMIT;
+
+  let q: FirebaseFirestore.Query = getAdminDb().collection(ORPHAN_INBOUNDS_COLLECTION);
+
+  if (filters?.reason !== undefined) {
+    q = q.where("reason", "==", filters.reason);
+  }
+  if (filters?.source !== undefined) {
+    q = q.where("source", "==", filters.source);
+  }
+  q = q.orderBy("receivedAt", "desc");
+
+  if (cursor !== undefined) {
+    const cursorSnap = await getAdminDb().collection(ORPHAN_INBOUNDS_COLLECTION).doc(cursor).get();
+    if (!cursorSnap.exists) {
+      throw new ValidationError({
+        message: "listOrphanInbounds: cursor refers to a non-existent orphan doc",
+        context: { op: "listOrphanInbounds", cursorPresent: true },
+      });
+    }
+    q = q.startAfter(cursorSnap);
+  }
+
+  // Fetch limit+1 pour détecter `hasMore` en 1 round-trip (pattern listContacts).
+  const snap = await q.limit(limit + 1).get();
+  const docs = snap.docs;
+  const hasMore = docs.length > limit;
+  const slice = hasMore ? docs.slice(0, limit) : docs;
+
+  const orphans: Array<OrphanInboundDoc & { docId: string }> = slice.map((doc) => {
+    const data = doc.data() as OrphanInboundDoc;
+    return { ...data, docId: doc.id };
+  });
+
+  const nextCursor = hasMore && slice.length > 0 ? (slice[slice.length - 1]?.id ?? null) : null;
+
+  return { orphans, nextCursor, hasMore };
+}
+
 /** @internal exposition pour tests sentinelles. */
 export const __ORPHAN_BODY_MAX_LENGTH_FOR_TESTS = ORPHAN_BODY_MAX_LENGTH;

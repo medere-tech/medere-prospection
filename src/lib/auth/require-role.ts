@@ -25,15 +25,25 @@
  *
  *   Côté Clerk dashboard → Sessions → Customize session token, on définit :
  *     {
- *       "role":      "{{user.public_metadata.role}}",
- *       "firstName": "{{user.first_name}}",
- *       "lastName":  "{{user.last_name}}"
+ *       "role":         "{{user.public_metadata.role}}",
+ *       "firstName":    "{{user.first_name}}",
+ *       "lastName":     "{{user.last_name}}",
+ *       "slackUserId":  "{{user.public_metadata.slackUserId}}"
  *     }
  *
  *   Chaque utilisateur Clerk doit avoir `publicMetadata.role` ∈
  *   `{"admin", "commercial"}`. Si absent ou mal formé, l'utilisateur est
  *   refusé avec un message FR explicite + un `logger.warn` côté serveur
  *   pour faciliter le debug en dev (sentinelle de config).
+ *
+ *   `publicMetadata.slackUserId` est OPTIONNEL (format `U[A-Z0-9]+`,
+ *   validé Zod). Permet la correspondance Clerk ↔ Slack pour la vue
+ *   conversation (titulaire d'un hand-off = `conversation.handoff.assignedTo`
+ *   Slack userId → résolution Clerk via ce claim). Si absent, le commercial
+ *   ne verra PAS l'onglet « Mes conversations » rempli (fallback onglet
+ *   « À traiter »). Peuplement initial via le script
+ *   `scripts/sync-clerk-slack-ids.mjs` qui lit Airtable Commerciaux
+ *   et écrit `publicMetadata.slackUserId` via Clerk Backend API.
  *
  *   Cf. `src/lib/auth/README.md` pour la procédure complète Clerk dashboard.
  *
@@ -80,14 +90,30 @@ export type Role = "admin" | "commercial";
 export const RoleSchema = z.enum(["admin", "commercial"]);
 
 /**
+ * Regex Slack user ID. Format `U` suivi de 1+ caractères `[A-Z0-9]`
+ * (ex: `U05UVHGBURX`). Alignée avec `assertSlackUserId` et le scrubber
+ * logger `TECHNICAL_ID_KEYS["slackUserId"]`.
+ */
+const SLACK_USER_ID_REGEX = /^U[A-Z0-9]+$/;
+
+/**
  * Schéma des sessionClaims attendus du JWT Clerk. `firstName` / `lastName`
- * optionnels (Clerk les remplit si le compte les a — sinon `undefined`,
- * on dégrade gracieusement côté UI).
+ * / `slackUserId` optionnels (Clerk les remplit si le compte les a — sinon
+ * `undefined`, on dégrade gracieusement côté UI).
+ *
+ * Note sur le claim transforme : Clerk JWT templates remplacent
+ * `{{user.public_metadata.slackUserId}}` par la chaîne vide si le metadata
+ * est absent. Zod `optional()` ne suffit donc pas — on tolère également
+ * `""` et on le normalise en `undefined` via `.transform()`.
  */
 const SessionClaimsSchema = z.object({
   role: RoleSchema,
   firstName: z.string().min(1).optional(),
   lastName: z.string().min(1).optional(),
+  slackUserId: z
+    .union([z.string().regex(SLACK_USER_ID_REGEX), z.literal("")])
+    .optional()
+    .transform((v) => (v === "" || v === undefined ? undefined : v)),
 });
 
 /** Contexte utilisateur retourné par `requireRole`. */
@@ -96,6 +122,15 @@ export interface RoleContext {
   role: Role;
   firstName?: string;
   lastName?: string;
+  /**
+   * Slack user ID du commercial (`U...`), si configuré dans
+   * `publicMetadata.slackUserId`. Utilisé pour résoudre le titulaire d'une
+   * conversation (vue conversation, onglet « Mes conversations »).
+   * Absent pour les admins Déthié/Harry/Justine qui n'ont pas de compte
+   * Slack Médéré, OU pour tout utilisateur dont le metadata n'est pas
+   * encore seedé (fallback propre — pas de crash).
+   */
+  slackUserId?: string;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -149,7 +184,7 @@ export async function requireRole(required: Role): Promise<RoleContext> {
     });
   }
 
-  const { role, firstName, lastName } = parsed.data;
+  const { role, firstName, lastName, slackUserId } = parsed.data;
 
   // Hiérarchie : admin couvre tout, commercial couvre uniquement commercial.
   const allowed = role === "admin" || role === required;
@@ -160,5 +195,5 @@ export async function requireRole(required: Role): Promise<RoleContext> {
     });
   }
 
-  return { userId, role, firstName, lastName };
+  return { userId, role, firstName, lastName, slackUserId };
 }

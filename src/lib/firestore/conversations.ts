@@ -255,6 +255,14 @@ export const ConversationSchema = z.object({
   lastInboundAt: TimestampLike.optional(),
   lastIntentChangeAt: TimestampLike.optional(),
   handoff: ConversationHandoffSchema.optional(),
+  /**
+   * Dénormalisation `handoff.assignedTo` racine (VUE-CONVERSATION PR0).
+   * Permet `where("assignedTo", "==", null)` pour l'onglet « À traiter ».
+   * Optional pour tolérer les docs legacy pré-backfill (`scripts/backfill-assigned-to.mjs`).
+   * Union `string | null` : `null` explicite = pas de titulaire,
+   * `string` = Slack userId, `undefined` = doc legacy à backfill.
+   */
+  assignedTo: z.union([z.string().min(1), z.null()]).optional(),
   nextActionAt: TimestampLike.optional(),
   nextActionType: z.enum(["followup_3d", "followup_7d", "archive", "none"]).optional(),
   followupCount: z.number().int().nonnegative(),
@@ -502,6 +510,9 @@ export async function getOrCreateInitialConversation(
     outboundCount: 0,
     inboundCount: 0,
     followupCount: 0,
+    // VUE-CONVERSATION PR0 — dénormalisation. `null` explicite (vs undefined)
+    // pour permettre `where("assignedTo", "==", null)` sur l'onglet « À traiter ».
+    assignedTo: null,
     createdAt: now,
     updatedAt: now,
   };
@@ -1249,6 +1260,12 @@ export async function setHandoff(
       "handoff.assignedTo": assignedTo,
       "handoff.assignedAt": now,
       "handoff.notes": notes,
+      // VUE-CONVERSATION PR0 — dénormalisation : écrit le champ racine
+      // `assignedTo` dans la MÊME transaction que `handoff.assignedTo`.
+      // Invariant : les deux valeurs doivent rester cohérentes. Permet
+      // `where("assignedTo", "==", slackId)` et `where("assignedTo", "==", null)`
+      // pour les onglets de la vue conversation.
+      assignedTo: assignedTo,
       updatedAt: now,
     });
 
@@ -1389,6 +1406,294 @@ export async function setConversationIntent(
     }
     tx.update(ref, updates);
   });
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// listConversations* (VUE-CONVERSATION PR0) — pagination cursor + filtres
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * Nombre de conversations par page par défaut. 25 lignes = densité
+ * TanStack Table ergonomique pour vue conversation (plus dense que
+ * `listContacts` qui est à 50 : chaque ligne porte plus d'info).
+ */
+export const LIST_CONVERSATIONS_DEFAULT_LIMIT = 25;
+
+/**
+ * Plafond strict sur `limit`. 100 = aligné `LIST_CONTACTS_MAX_LIMIT`.
+ */
+export const LIST_CONVERSATIONS_MAX_LIMIT = 100;
+
+/**
+ * Filtres passables aux fonctions `listConversations*`. Whitelist stricte :
+ *   - `status`  : enum fermé `ConversationStatus`.
+ *   - `intent`  : enum fermé `Intent`.
+ *
+ * Les filtres de plage (dates) sont volontairement OMIS du MVP VUE-CONVERSATION
+ * PR0 : la query avec un `.where("lastInboundAt", ">=", ...)` + `orderBy`
+ * exige un index composite spécifique par combinaison. On ajoutera à la
+ * demande (PR2 UI) quand on saura quelles plages sont effectivement
+ * utilisées — minimise la combinatoire d'index.
+ */
+const ListConversationsFiltersSchema = z.object({
+  status: z
+    .enum([
+      "active",
+      "awaiting_reply",
+      "in_dialogue",
+      "qualified",
+      "handed_off",
+      "closed",
+      "opted_out",
+      "blocked",
+    ])
+    .optional(),
+  intent: z.enum(["INTERESSE", "NEUTRE", "OBJECTION", "STOP", "unknown"]).optional(),
+});
+
+export type ListConversationsFilters = z.input<typeof ListConversationsFiltersSchema>;
+
+const ListConversationsInputSchema = z.object({
+  filters: ListConversationsFiltersSchema.optional(),
+  limit: z.number().int().min(1).max(LIST_CONVERSATIONS_MAX_LIMIT).optional(),
+  /** docId `${contactId}_${campaignId}` opaque du dernier doc de la page précédente. */
+  cursor: z.string().min(1).optional(),
+});
+
+export type ListConversationsInput = z.input<typeof ListConversationsInputSchema>;
+
+export interface ListConversationsOutput {
+  conversations: Array<Conversation & { conversationId: string }>;
+  nextCursor: string | null;
+  hasMore: boolean;
+}
+
+/**
+ * Helper interne — construit la query Firestore de base avec les filtres
+ * optionnels + orderBy + cursor + limit. Factorise les 3 variantes
+ * (`listConversations`, `listConversationsByAssignee`,
+ * `listUnassignedConversations`).
+ *
+ * ⚠️ ORDERING — on trie TOUJOURS par `lastInboundAt desc`, NULLS LAST.
+ * Firestore ne supporte pas `NULLS LAST` nativement : un doc sans
+ * `lastInboundAt` n'apparaît PAS dans le résultat de `.orderBy(...)`. On
+ * accepte cette sémantique MVP : les conversations qui n'ont pas encore
+ * reçu d'inbound (`lastInboundAt === undefined`) ne figurent pas dans la
+ * liste — c'est cohérent avec un dashboard « conversations avec activité ».
+ */
+async function buildListConversationsQuery(options: {
+  filters?: ListConversationsFilters;
+  limit: number;
+  cursor?: string;
+  assigneeFilter?:
+    | { kind: "none" }
+    | { kind: "specific"; slackUserId: string }
+    | { kind: "unassigned" };
+}): Promise<FirebaseFirestore.Query> {
+  let q: FirebaseFirestore.Query = getAdminDb().collection(CONVERSATIONS_COLLECTION);
+
+  // Filtre assignedTo d'abord (plus sélectif en général).
+  const assigneeFilter = options.assigneeFilter ?? { kind: "none" };
+  if (assigneeFilter.kind === "specific") {
+    q = q.where("assignedTo", "==", assigneeFilter.slackUserId);
+  } else if (assigneeFilter.kind === "unassigned") {
+    q = q.where("assignedTo", "==", null);
+  }
+
+  if (options.filters?.status !== undefined) {
+    q = q.where("status", "==", options.filters.status);
+  }
+  if (options.filters?.intent !== undefined) {
+    q = q.where("intent", "==", options.filters.intent);
+  }
+
+  q = q.orderBy("lastInboundAt", "desc");
+
+  if (options.cursor !== undefined) {
+    const cursorSnap = await getAdminDb()
+      .collection(CONVERSATIONS_COLLECTION)
+      .doc(options.cursor)
+      .get();
+    if (!cursorSnap.exists) {
+      throw new ValidationError({
+        message: "listConversations: cursor refers to a non-existent conversation",
+        context: { op: "listConversations", cursorPresent: true },
+      });
+    }
+    q = q.startAfter(cursorSnap);
+  }
+
+  return q.limit(options.limit + 1);
+}
+
+/**
+ * Fonction interne qui exécute la query et parse les résultats. Partagée
+ * par les 3 variantes publiques.
+ */
+async function executeListQuery(
+  q: FirebaseFirestore.Query,
+  limit: number,
+): Promise<ListConversationsOutput> {
+  const snap = await q.get();
+  const docs = snap.docs;
+  const hasMore = docs.length > limit;
+  const slice = hasMore ? docs.slice(0, limit) : docs;
+
+  const conversations: Array<Conversation & { conversationId: string }> = slice.map((doc) => {
+    const conv = parseConversationOrThrow(doc.data(), doc.id);
+    return { ...conv, conversationId: doc.id };
+  });
+
+  const nextCursor = hasMore && slice.length > 0 ? (slice[slice.length - 1]?.id ?? null) : null;
+
+  return { conversations, nextCursor, hasMore };
+}
+
+/**
+ * Liste PAGINÉE des conversations, triées `lastInboundAt desc`. Admin
+ * seulement : la vue conversation respecte le RBAC via `requireRole`
+ * côté route handler (403 commercial sur onglet « Toutes »).
+ *
+ * ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ * INDEX FIRESTORE REQUIS
+ *
+ *   - Query sans filtres : `orderBy("lastInboundAt", "desc")` — single-field
+ *     auto.
+ *   - Query filtre `status` seul : composite `status + lastInboundAt desc`.
+ *   - Query filtre `intent` seul : composite `intent + lastInboundAt desc`.
+ *   - Query filtre `status + intent` : composite
+ *     `status + intent + lastInboundAt desc`.
+ *
+ * Ajoutés dans `firestore.indexes.json` (VUE-CONVERSATION PR0). Déployer
+ * via `npm run firebase:deploy:indexes` avant runtime Firestore Cloud.
+ *
+ * @throws ValidationError si input invalide ou cursor inexistant.
+ * @throws ValidationError si un doc est corrompu (Zod fail).
+ */
+export async function listConversations(
+  input: ListConversationsInput = {},
+): Promise<ListConversationsOutput> {
+  const parsed = ListConversationsInputSchema.safeParse(input);
+  if (!parsed.success) {
+    throw new ValidationError({
+      message: "listConversations: invalid input",
+      context: {
+        op: "listConversations",
+        issues: parsed.error.issues.map((i) => ({
+          path: i.path.join("."),
+          code: i.code,
+        })),
+      },
+    });
+  }
+
+  const { filters, limit: requestedLimit, cursor } = parsed.data;
+  const limit = requestedLimit ?? LIST_CONVERSATIONS_DEFAULT_LIMIT;
+
+  const q = await buildListConversationsQuery({ filters, limit, cursor });
+  return executeListQuery(q, limit);
+}
+
+/**
+ * Liste PAGINÉE des conversations assignées à un commercial Slack
+ * (`handoff.assignedTo === slackUserId`, dénormalisé racine
+ * `assignedTo === slackUserId`).
+ *
+ * ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ * INDEX FIRESTORE REQUIS
+ *
+ *   - Query filtre `assignedTo` seul : composite
+ *     `assignedTo + lastInboundAt desc`.
+ *   - Query filtre `assignedTo + status` : composite
+ *     `assignedTo + status + lastInboundAt desc`.
+ *
+ * Ajoutés dans `firestore.indexes.json` (VUE-CONVERSATION PR0).
+ *
+ * @throws ValidationError si input invalide, slackUserId mal formé,
+ *                         ou cursor inexistant.
+ */
+export async function listConversationsByAssignee(
+  slackUserId: string,
+  input: ListConversationsInput = {},
+): Promise<ListConversationsOutput> {
+  assertSlackUserId(slackUserId, "listConversationsByAssignee");
+
+  const parsed = ListConversationsInputSchema.safeParse(input);
+  if (!parsed.success) {
+    throw new ValidationError({
+      message: "listConversationsByAssignee: invalid input",
+      context: {
+        op: "listConversationsByAssignee",
+        issues: parsed.error.issues.map((i) => ({
+          path: i.path.join("."),
+          code: i.code,
+        })),
+      },
+    });
+  }
+
+  const { filters, limit: requestedLimit, cursor } = parsed.data;
+  const limit = requestedLimit ?? LIST_CONVERSATIONS_DEFAULT_LIMIT;
+
+  const q = await buildListConversationsQuery({
+    filters,
+    limit,
+    cursor,
+    assigneeFilter: { kind: "specific", slackUserId },
+  });
+  return executeListQuery(q, limit);
+}
+
+/**
+ * Liste PAGINÉE des conversations SANS titulaire (`assignedTo === null`).
+ * Alimente l'onglet « À traiter » de la vue conversation.
+ *
+ * ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ * INDEX FIRESTORE REQUIS
+ *
+ *   Même composite que `listConversationsByAssignee` :
+ *   `assignedTo + lastInboundAt desc` (le filtre `== null` utilise le
+ *   même index que `== slackUserId`).
+ *
+ * ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ * ⚠️ CONTRAT NULL EXPLICITE
+ *
+ * Les docs conversation CRÉÉS APRÈS VUE-CONVERSATION PR0 ont
+ * `assignedTo: null` à la création (cf. `getOrCreateInitialConversation`).
+ * Les docs legacy pré-backfill ont `assignedTo === undefined` → ils
+ * n'apparaissent PAS dans cette query. Le script
+ * `scripts/backfill-assigned-to.mjs` doit tourner avant la mise en service
+ * de l'onglet pour qu'aucun doc ne soit laissé invisible.
+ *
+ * @throws ValidationError si input invalide ou cursor inexistant.
+ */
+export async function listUnassignedConversations(
+  input: ListConversationsInput = {},
+): Promise<ListConversationsOutput> {
+  const parsed = ListConversationsInputSchema.safeParse(input);
+  if (!parsed.success) {
+    throw new ValidationError({
+      message: "listUnassignedConversations: invalid input",
+      context: {
+        op: "listUnassignedConversations",
+        issues: parsed.error.issues.map((i) => ({
+          path: i.path.join("."),
+          code: i.code,
+        })),
+      },
+    });
+  }
+
+  const { filters, limit: requestedLimit, cursor } = parsed.data;
+  const limit = requestedLimit ?? LIST_CONVERSATIONS_DEFAULT_LIMIT;
+
+  const q = await buildListConversationsQuery({
+    filters,
+    limit,
+    cursor,
+    assigneeFilter: { kind: "unassigned" },
+  });
+  return executeListQuery(q, limit);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

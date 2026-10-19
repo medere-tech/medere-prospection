@@ -22,19 +22,39 @@ reflète `firestore.rules::isCommercial()` qui autorise `hasRole('commercial') |
 
 ### 1. JWT template — custom session claims
 
-Dashboard Clerk → **Sessions** → **Customize session token** → Edit :
+Dashboard Clerk → **Sessions** → **Customize session token** → Edit.
+
+**Texte EXACT à copier dans le champ JSON** (ne pas réordonner, ne pas
+ajouter de clé — `requireRole` fait un parse Zod strict) :
 
 ```json
 {
-  "role":      "{{user.public_metadata.role}}",
-  "firstName": "{{user.first_name}}",
-  "lastName":  "{{user.last_name}}"
+  "role":         "{{user.public_metadata.role}}",
+  "firstName":    "{{user.first_name}}",
+  "lastName":     "{{user.last_name}}",
+  "slackUserId":  "{{user.public_metadata.slackUserId}}"
 }
 ```
 
-- `role` est lu par `requireRole()` côté serveur.
+**Puis cliquer « Apply changes » en bas de la page.** Les nouveaux
+claims sont lus au prochain refresh de session de chaque utilisateur
+(Clerk régénère le JWT à l'expiration naturelle ou au prochain sign-in).
+Pour forcer une bascule immédiate en dev, se déconnecter et se reconnecter.
+
+**À propos de chaque claim** :
+
+- `role` est lu par `requireRole()` côté serveur. Valeurs attendues :
+  `"admin"` ou `"commercial"`.
 - `firstName` / `lastName` permettent d'afficher l'avatar/menu user dans
   l'UI sans round-trip API Clerk supplémentaire à chaque page.
+- `slackUserId` (VUE-CONVERSATION PR0) : Slack user ID du commercial
+  (`U05UVHGBURX`), lu depuis `publicMetadata.slackUserId`. Utilisé pour
+  résoudre le titulaire d'une conversation (vue conversation, onglet
+  « Mes conversations »). Validation côté serveur par regex
+  `^U[A-Z0-9]+$` (Zod). Si `publicMetadata.slackUserId` est absent,
+  Clerk remplace par la chaîne vide `""` dans le JWT — `requireRole`
+  normalise `""` en `undefined` et dégrade gracieusement (le commercial
+  verra l'onglet « Mes conversations » vide, fallback onglet « À traiter »).
 
 ### 2. publicMetadata.role pour chaque utilisateur
 
@@ -47,20 +67,58 @@ Dashboard Clerk → **Users** → sélectionner un utilisateur →
 }
 ```
 
-ou
+ou pour un commercial :
 
 ```json
 {
-  "role": "commercial"
+  "role": "commercial",
+  "slackUserId": "U05UVHGBURX"
 }
 ```
 
-**Toute autre valeur** (`"superadmin"`, `""`, `null`, absente) → l'utilisateur
-sera refusé par `requireRole()` avec `ForbiddenError` et un message FR
-« Rôle utilisateur non configuré. Contactez l'administrateur. »
+- `role` : obligatoire, `"admin"` ou `"commercial"`.
+- `slackUserId` : optionnel pour admin (Déthié, Harry, Justine n'ont pas
+  de compte Slack Médéré). Obligatoire pour commercial si on veut
+  l'onglet « Mes conversations » peuplé. Format `U` suivi de majuscules
+  et chiffres (ex: `U05UVHGBURX`).
+
+**Toute autre valeur** de `role` (`"superadmin"`, `""`, `null`, absente)
+→ l'utilisateur sera refusé par `requireRole()` avec `ForbiddenError`
+et un message FR « Rôle utilisateur non configuré. Contactez l'administrateur. »
+
+**Un `slackUserId` mal formé** (minuscules, caractères spéciaux, pas de
+préfixe `U`) → refus Zod + `ForbiddenError`. Un `slackUserId` absent est
+toléré (dégradation gracieuse).
 
 Sentinelle de config : un `logger.warn` est émis côté serveur quand le
 JWT n'a pas la forme attendue — facile à voir en dev.
+
+### 3. Peuplement automatique des `slackUserId` (VUE-CONVERSATION PR0)
+
+Pour éviter d'éditer les 10+ utilisateurs à la main dans Clerk dashboard :
+
+```bash
+# Dry-run (par défaut) — affiche ce qui SERAIT écrit
+npx tsx scripts/sync-clerk-slack-ids.mjs
+
+# Apply — écrit vraiment publicMetadata.slackUserId via Clerk Backend API
+npx tsx scripts/sync-clerk-slack-ids.mjs --apply
+
+# Force overwrite (si un slackUserId existant diffère)
+npx tsx scripts/sync-clerk-slack-ids.mjs --apply --force-overwrite
+```
+
+Le script lit la table Airtable Commerciaux (même source que
+`src/lib/airtable/commerciaux.ts`) et associe chaque utilisateur Clerk
+par email. Garde-fous :
+
+- refuse d'écrire si l'email d'un commercial Airtable n'a pas de compte
+  Clerk ;
+- refuse d'écrire si plusieurs commerciaux Airtable partagent le même
+  email (ambiguïté) ;
+- refuse d'écraser un `slackUserId` existant sans `--force-overwrite`.
+
+Pré-requis env : `CLERK_SECRET_KEY`, `AIRTABLE_API_KEY`, `AIRTABLE_BASE_ID`.
 
 ---
 
@@ -127,6 +185,9 @@ dans `require-role.ts`).
 - commercial sur admin → 403
 - firstName/lastName présents → extraits
 - firstName vide → 403 (Zod `min(1).optional()`)
+- `slackUserId` bien formé (U + majuscules/digits) → extrait
+- `slackUserId` absent OU chaîne vide `""` → normalisé en `undefined`
+- `slackUserId` mal formé (minuscules, caractères spéciaux, pas de `U`) → 403
 
 Mock `@clerk/nextjs/server::auth` via `vi.mock`. Pas de `@clerk/testing`
 en S10.1.1 — réservé pour Playwright E2E (sprint S11+).

@@ -205,3 +205,56 @@ describe("requireRole — extraction firstName/lastName", () => {
     await expect(requireRole("admin")).rejects.toBeInstanceOf(ForbiddenError);
   });
 });
+
+describe("requireRole — extraction slackUserId (VUE-CONVERSATION PR0)", () => {
+  it("retourne slackUserId si bien formé (`U` + majuscules/digits)", async () => {
+    mocks.auth.mockResolvedValue({
+      userId: "user_abc",
+      sessionClaims: { role: "commercial", slackUserId: "U05UVHGBURX" },
+    });
+    const ctx = await requireRole("commercial");
+    expect(ctx.slackUserId).toBe("U05UVHGBURX");
+  });
+
+  it("retourne undefined si slackUserId absent (admin sans compte Slack)", async () => {
+    mocks.auth.mockResolvedValue({
+      userId: "user_dethie",
+      sessionClaims: { role: "admin" },
+    });
+    const ctx = await requireRole("admin");
+    expect(ctx.slackUserId).toBeUndefined();
+  });
+
+  it("normalise '' en undefined (Clerk JWT template remplace missing metadata par chaîne vide)", async () => {
+    mocks.auth.mockResolvedValue({
+      userId: "user_abc",
+      sessionClaims: { role: "commercial", slackUserId: "" },
+    });
+    const ctx = await requireRole("commercial");
+    expect(ctx.slackUserId).toBeUndefined();
+  });
+
+  it("REFUSE un slackUserId mal formé (pas de prefix U)", async () => {
+    mocks.auth.mockResolvedValue({
+      userId: "user_abc",
+      sessionClaims: { role: "commercial", slackUserId: "X12345ABC" },
+    });
+    await expect(requireRole("commercial")).rejects.toBeInstanceOf(ForbiddenError);
+  });
+
+  it("REFUSE un slackUserId avec minuscules", async () => {
+    mocks.auth.mockResolvedValue({
+      userId: "user_abc",
+      sessionClaims: { role: "commercial", slackUserId: "U05uvhgburx" },
+    });
+    await expect(requireRole("commercial")).rejects.toBeInstanceOf(ForbiddenError);
+  });
+
+  it("REFUSE un slackUserId avec caractères spéciaux", async () => {
+    mocks.auth.mockResolvedValue({
+      userId: "user_abc",
+      sessionClaims: { role: "commercial", slackUserId: "U05-UVHG" },
+    });
+    await expect(requireRole("commercial")).rejects.toBeInstanceOf(ForbiddenError);
+  });
+});

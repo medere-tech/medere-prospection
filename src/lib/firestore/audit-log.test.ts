@@ -97,6 +97,7 @@ const EXPECTED_AUDIT_ACTIONS: ReadonlySet<AuditAction> = new Set<AuditAction>([
   "handoff_unassigned", // S9.9-PR5a — lead INTERESSE non routé (branche orphelins slack-handoff)
   "inbound_relayed_to_human", // PR-A-INBOUND-HANDED-OFF — SMS entrant sur conv handed_off
   "inbound_on_inactive_conversation", // PR-NO-DROPPED-SMS — SMS entrant sur conv inactive / contact inconnu / parse ou enqueue en echec
+  "contact_phone_accessed", // VUE-CONVERSATION PR0 — reveal/copy/call tracé depuis la vue conversation
   // CAMPAIGN / ADMIN
   "manual_override",
   "prompt_changed",

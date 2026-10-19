@@ -2321,6 +2321,163 @@ export async function listStaleMessages(
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// listMessagesInConversation (VUE-CONVERSATION PR0) — shape complète pour UI
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * Nombre de messages par page par défaut (`limit` omis). 100 = couvre une
+ * conversation médiane complète (10-20 échanges) sans pagination.
+ */
+export const LIST_MESSAGES_IN_CONVERSATION_DEFAULT_LIMIT = 100;
+
+/**
+ * Plafond strict sur `limit` — anti-DoS Firestore. 200 = conversation
+ * exceptionnellement longue (jamais dépassé en prod, sentinelle en pré-prod).
+ */
+export const LIST_MESSAGES_IN_CONVERSATION_MAX_LIMIT = 200;
+
+/**
+ * Statuts EXCLUS du résultat (filtre côté code post-parse). Masqués de
+ * l'UI de la vue conversation :
+ *   - `"duplicate"` : doublon BUG-DEDUP-RACE, forensic préservé mais invisible.
+ *
+ * Statuts INCLUS (contrairement à `listRecentMessages` qui est plus strict) :
+ *   - `"draft"`     : visible dans la vue conversation (grisé libellé « Brouillon »).
+ *   - `"abandoned"` : visible, grisé, libellé « Non envoyé ».
+ */
+const LIST_MESSAGES_HIDDEN_STATUSES: ReadonlyArray<"duplicate"> = ["duplicate"] as const;
+
+/** Ordre chronologique du résultat. */
+export type ListMessagesInConversationOrder = "asc" | "desc";
+
+/** Input typé. */
+export interface ListMessagesInConversationInput {
+  conversationId: string;
+  limit?: number;
+  /** `messageId` du dernier doc de la page précédente. */
+  cursor?: string;
+  /**
+   * Ordre de tri. Default `"asc"` (chronologique croissant — plus ancien
+   * en haut, cohérent avec un fil de chat).
+   */
+  order?: ListMessagesInConversationOrder;
+}
+
+/** Sortie typée. */
+export interface ListMessagesInConversationOutput {
+  messages: Array<Message & { messageId: string }>;
+  nextCursor: string | null;
+  hasMore: boolean;
+}
+
+/**
+ * Liste les messages d'une conversation avec shape COMPLÈTE
+ * (`Message` validé Zod + `messageId`) et pagination cursor.
+ *
+ * ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ * DIFFÉRENCE AVEC `listRecentMessages`
+ *
+ *   - `listRecentMessages` : shape minimale `{direction, body}`, filtre
+ *     `draft + abandoned + duplicate` out (prompt Claude).
+ *   - `listMessagesInConversation` : shape COMPLÈTE, filtre `duplicate`
+ *     SEULEMENT (UI vue conversation affiche `abandoned` grisé et `draft`
+ *     avec un libellé dédié).
+ *
+ * Les deux coexistent intentionnellement : deux consommateurs, deux
+ * besoins forensiques distincts. Sentinelle test : vérifier que les deux
+ * filtrent `duplicate`.
+ *
+ * ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ * INDEX FIRESTORE REQUIS
+ *
+ * Query sous-collection `conversations/{convId}/messages` avec
+ * `orderBy("createdAt", ...)` : index single-field automatique, aucune
+ * action nécessaire. Les filtres (`duplicate`) sont appliqués POST-parse
+ * côté code pour éviter un composite inutile.
+ *
+ * ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ * ⚠️ PII — `body`, `externalReceiver`, `aiReasoning`
+ *
+ * Les docs retournés contiennent le `body` SMS en clair + `externalReceiver`
+ * (E.164). Les callers UI DOIVENT :
+ *   1. Ne JAMAIS logger les messages via Pino/Sentry.
+ *   2. Ne JAMAIS inclure `body`/`externalReceiver` dans un audit log payload.
+ *   3. Ne JAMAIS sérialiser `externalReceiver` dans un payload RSC ni
+ *      dans la réponse HTTP d'une API — sentinelle serialization dans
+ *      les tests Playwright/E2E (VUE-CONVERSATION PR1-PR3).
+ *
+ * @throws ValidationError si input invalide ou cursor inexistant.
+ * @throws ValidationError si un doc est corrompu (Zod fail — defense-in-depth).
+ */
+export async function listMessagesInConversation(
+  input: ListMessagesInConversationInput,
+): Promise<ListMessagesInConversationOutput> {
+  const { conversationId, limit: requestedLimit, cursor, order = "asc" } = input;
+
+  if (typeof conversationId !== "string" || conversationId.length === 0) {
+    throw new ValidationError({
+      message: "listMessagesInConversation: conversationId must be non-empty",
+      context: { op: "listMessagesInConversation" },
+    });
+  }
+  if (
+    requestedLimit !== undefined &&
+    (!Number.isInteger(requestedLimit) ||
+      requestedLimit < 1 ||
+      requestedLimit > LIST_MESSAGES_IN_CONVERSATION_MAX_LIMIT)
+  ) {
+    throw new ValidationError({
+      message: `listMessagesInConversation: limit must be in [1, ${LIST_MESSAGES_IN_CONVERSATION_MAX_LIMIT}]`,
+      context: { op: "listMessagesInConversation", requestedLimit },
+    });
+  }
+  const limit = requestedLimit ?? LIST_MESSAGES_IN_CONVERSATION_DEFAULT_LIMIT;
+
+  let q: FirebaseFirestore.Query = messagesSubcollectionRef(conversationId).orderBy(
+    "createdAt",
+    order,
+  );
+
+  if (cursor !== undefined) {
+    const cursorSnap = await messagesSubcollectionRef(conversationId).doc(cursor).get();
+    if (!cursorSnap.exists) {
+      throw new ValidationError({
+        message: "listMessagesInConversation: cursor refers to a non-existent message",
+        context: { op: "listMessagesInConversation", cursorPresent: true },
+      });
+    }
+    q = q.startAfter(cursorSnap);
+  }
+
+  // Fetch limit+1 pour détecter `hasMore` SANS 2e round-trip. Mais comme
+  // on filtre `duplicate` POST-parse côté code, le compte final peut être
+  // < limit+1 — c'est acceptable : `hasMore` reste correct puisque les
+  // `duplicate` sont rares (quelques docs max par conversation).
+  const snap = await q.limit(limit + 1).get();
+
+  const parsed: Array<Message & { messageId: string }> = [];
+  for (const doc of snap.docs) {
+    const msg = _parseMessageOrThrow(doc.data(), conversationId, doc.id);
+    // Filtre `duplicate` côté code (défense-in-depth miroir listRecentMessages).
+    if (LIST_MESSAGES_HIDDEN_STATUSES.includes(msg.status as "duplicate")) {
+      continue;
+    }
+    parsed.push({ ...msg, messageId: doc.id });
+  }
+
+  // Pattern limit+1 : si on a parsé >= limit+1 docs, il y a une page suivante.
+  // Si on a parsé moins (filtre duplicate a retiré des docs), on vérifie si
+  // `snap.docs` lui-même avait l'extra — c'est le vrai signal "page suivante".
+  const hasMore = snap.docs.length > limit;
+  const slice = hasMore ? parsed.slice(0, limit) : parsed;
+
+  const nextCursor =
+    hasMore && slice.length > 0 ? (slice[slice.length - 1]?.messageId ?? null) : null;
+
+  return { messages: slice, nextCursor, hasMore };
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Exposés pour tests
 // ─────────────────────────────────────────────────────────────────────────────
 

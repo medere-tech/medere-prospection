@@ -135,6 +135,116 @@ le pipeline IA.
   `npm run firebase:deploy:indexes` — politique cohérente avec Index 2
   (éviter le drift cross-branch durant le sprint).
 
+### 7. `conversations` — `assignedTo` ASC + `lastInboundAt` DESC (scope COLLECTION) — VUE-CONVERSATION PR0
+
+**Requêtes qui en dépendent** :
+
+- `listConversationsByAssignee(slackUserId, input)` — onglet « Mes conversations ».
+- `listUnassignedConversations(input)` — onglet « À traiter » (filtre `assignedTo == null`).
+  → `src/lib/firestore/conversations.ts`
+
+**Pattern de la query** :
+
+```typescript
+getAdminDb()
+  .collection("conversations")
+  .where("assignedTo", "==", slackUserId) // OU null pour "à traiter"
+  .orderBy("lastInboundAt", "desc")
+  .limit(26);
+```
+
+**Pourquoi cet index** : Firestore exige un composite pour combiner un
+`where` d'égalité (`assignedTo`) ET un `orderBy` sur un autre champ
+(`lastInboundAt`). Le filtre `== null` et `== slackUserId` utilisent
+le même index (Firestore matche `null` comme valeur discrète).
+
+**Dépend de la dénormalisation `conversation.assignedTo`** : écrite par
+`setHandoff` dans la même tx que `handoff.assignedTo` (VUE-CONVERSATION
+PR0). Les docs legacy pré-backfill ont `assignedTo === undefined` et
+n'apparaissent PAS dans cette query — exécuter
+`scripts/backfill-assigned-to.mjs --apply` avant la mise en service UI.
+
+### 8. `conversations` — `status` ASC + `lastInboundAt` DESC (scope COLLECTION) — VUE-CONVERSATION PR0
+
+**Requêtes qui en dépendent** :
+
+- `listConversations({filters: {status}, ...})` — onglet « Toutes » admin
+  avec filtre statut unique.
+
+**Pattern de la query** :
+
+```typescript
+getAdminDb()
+  .collection("conversations")
+  .where("status", "==", "in_dialogue")
+  .orderBy("lastInboundAt", "desc");
+```
+
+### 9. `conversations` — `intent` ASC + `lastInboundAt` DESC (scope COLLECTION) — VUE-CONVERSATION PR0
+
+**Requêtes qui en dépendent** :
+
+- `listConversations({filters: {intent}, ...})` — onglet « Toutes » admin
+  avec filtre intent unique.
+
+### 10. `conversations` — `assignedTo` ASC + `status` ASC + `lastInboundAt` DESC — VUE-CONVERSATION PR0
+
+**Requêtes qui en dépendent** :
+
+- `listConversationsByAssignee(slackUserId, {filters: {status}, ...})` —
+  « Mes conversations » filtre statut.
+- `listUnassignedConversations({filters: {status}, ...})` —
+  « À traiter » filtre statut.
+
+### 11. `conversations` — `status` ASC + `intent` ASC + `lastInboundAt` DESC — VUE-CONVERSATION PR0
+
+**Requêtes qui en dépendent** :
+
+- `listConversations({filters: {status, intent}, ...})` — « Toutes »
+  double filtre.
+
+### 12. `audit_log` — `targetType` ASC + `targetId` ASC + `timestamp` DESC — VUE-CONVERSATION PR0
+
+**Requêtes qui en dépendent** :
+
+- `listAuditLogByTarget({targetType, targetId, ...})` — panneau latéral
+  « Journal » de la vue conversation.
+  → `src/lib/firestore/audit-log.ts`
+
+**Pattern de la query** :
+
+```typescript
+getAdminDb()
+  .collection("audit_log")
+  .where("targetType", "==", "conversation")
+  .where("targetId", "==", conversationId)
+  .orderBy("timestamp", "desc");
+```
+
+### 13. `inbound_messages_orphans` — `reason` ASC + `receivedAt` DESC — VUE-CONVERSATION PR0
+
+**Requêtes qui en dépendent** :
+
+- `listOrphanInbounds({filters: {reason}, ...})` — page
+  `/admin/orphan-inbounds` filtre motif.
+
+### 14. `inbound_messages_orphans` — `source` ASC + `receivedAt` DESC — VUE-CONVERSATION PR0
+
+**Requêtes qui en dépendent** :
+
+- `listOrphanInbounds({filters: {source}, ...})` — filtre
+  `process-reply` vs `webhook-ovh-sms`.
+
+**Historique indexes 7-14** :
+
+- Ajoutés en VUE-CONVERSATION PR0 pour supporter la vue conversation
+  (`/admin/conversations/*` + `/admin/orphan-inbounds`).
+- **Déploiement obligatoire AVANT le merge** PR0 : exécuter
+  `npm run firebase:deploy:indexes` sur `medere-prospection-mvp` et
+  vérifier la bascule d'état `Ready` dans Firebase Console. Un `main`
+  avec les reads déployées mais pas les indexes = `FAILED_PRECONDITION`
+  runtime côté dashboard.
+
 ## Déploiement
 
 ### Première installation sur un projet Firebase neuf
