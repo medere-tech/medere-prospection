@@ -94,6 +94,11 @@ const ACTIONS = [
   // reste muette ; le commercial titulaire reçoit un DM. Cf. types/audit-log.ts
   // pour la sémantique complète + `InboundRelayedToHumanPayload` typé.
   "inbound_relayed_to_human",
+  // PR-NO-DROPPED-SMS — SMS entrant qu'aucun chemin "actif" ne gere.
+  // Remplace les anciens `reply_dropped reason:"contact_unknown" |
+  // "no_active_conversation" | "conversation_became_terminal"`. Cf.
+  // types/audit-log.ts pour la semantique + `InboundOnInactiveConversationPayload`.
+  "inbound_on_inactive_conversation",
   // ── CAMPAIGN / ADMIN ───────────────────────────────────────────────────
   "manual_override",
   "prompt_changed",

@@ -164,6 +164,16 @@ function makeDeps(overrides: Partial<ProcessReplyDeps> = {}): ProcessReplyDeps {
     getDashboardConversationUrl: vi
       .fn()
       .mockImplementation((convId: string) => `https://dashboard.test/conversations/${convId}`),
+    // PR-NO-DROPPED-SMS — defaults neutres pour les branches inactive/orphans.
+    getLatestConversationByContactId: vi.fn().mockResolvedValue(null),
+    addOrphanInboundIdempotent: vi
+      .fn()
+      .mockResolvedValue({ docId: "oih_orphan_ho_default_000", created: true }),
+    sendInboundOnInactiveConversationNotification: vi
+      .fn()
+      .mockResolvedValue({ ts: "orphan.ts", channel: "D0VANESSA", kind: "send" }),
+    getOrphanChannelId: vi.fn().mockReturnValue("C0ORPHANHO"),
+    captureMonitoringWarning: vi.fn(),
     ...overrides,
     addInbound: addInboundMock,
     addInboundIdempotent:
@@ -510,9 +520,8 @@ describe("PR-A — anti-PII logger (branche handed_off)", () => {
 // Course STOP / statut terminal (MED compliance-auditor, fix PR-A)
 // ─────────────────────────────────────────────────────────────────────────────
 
-describe("PR-A — race conversation_became_terminal entre step 2 et markOptedOut", () => {
-  it("markOptedOut throw ValidationError(currentStatus=closed) → audit reply_dropped + alerte Sentry + NonRetriableError", async () => {
-    const { NonRetriableError } = await import("inngest");
+describe("P6 PR-NO-DROPPED-SMS — race conversation_became_terminal entre step 2 et markOptedOut", () => {
+  it("markOptedOut throw ValidationError(currentStatus=closed) short-form → stored_on_inactive_conversation + audit inbound_on_inactive_conversation + Sentry error + DM envoye", async () => {
     const { ValidationError } = await import("@/lib/utils/errors");
     const captureSpy = vi.fn();
     const ctx = makeFakeCtx({ body: "STOP" });
@@ -531,36 +540,56 @@ describe("PR-A — race conversation_became_terminal entre step 2 et markOptedOu
       captureMonitoringWarning: captureSpy,
     });
 
-    await expect(processReplyHandler(ctx, deps)).rejects.toBeInstanceOf(NonRetriableError);
+    const result = await processReplyHandler(ctx, deps);
 
-    // Audit reply_dropped avec reason=conversation_became_terminal
-    const dropAudit = vi
+    // Nouveau : plus de NonRetriableError, retour `stored_on_inactive_conversation`.
+    expect(result.status).toBe("stored_on_inactive_conversation");
+    if (result.status === "stored_on_inactive_conversation") {
+      expect(result.reason).toBe("conversation_became_terminal");
+      expect(result.wasOptOut).toBe(true);
+      expect(result.contactId).toBe("hs-ho-1");
+      expect(result.conversationId).toBe("hs-ho-1_camp-a");
+      expect(result.messageId).toBe("msg-ho-firestore-id20");
+    }
+
+    // Nouvelle action d'audit `inbound_on_inactive_conversation` (plus `reply_dropped`).
+    const inactiveAudit = vi
+      .mocked(deps.appendAuditLog!)
+      .mock.calls.find(
+        (c) =>
+          c[0].action === "inbound_on_inactive_conversation" &&
+          (c[0].payload as { reason?: string }).reason === "conversation_became_terminal",
+      );
+    expect(inactiveAudit).toBeDefined();
+    const payload = inactiveAudit![0].payload as Record<string, unknown>;
+    expect(payload.wasOptOut).toBe(true);
+    expect(payload.notifiedVia).toBe("dm");
+
+    // Alerte Sentry level="error"
+    const inactiveAlert = captureSpy.mock.calls.find((c) =>
+      String(c[0]).startsWith("process_reply.inbound_on_inactive_conversation."),
+    );
+    expect(inactiveAlert).toBeDefined();
+    expect((inactiveAlert![1] as { level: string }).level).toBe("error");
+
+    // DM Slack ENVOYE (vs ancien comportement : race → PAS de DM)
+    expect(deps.sendInboundOnInactiveConversationNotification).toHaveBeenCalledWith(
+      expect.objectContaining({
+        reason: "conversation_became_terminal",
+        wasOptOut: true,
+        target: { kind: "dm", slackUserId: "U05VANESSA" },
+      }),
+    );
+
+    // Plus d'audit `reply_dropped reason:conversation_became_terminal`.
+    const legacyDropAudit = vi
       .mocked(deps.appendAuditLog!)
       .mock.calls.find(
         (c) =>
           c[0].action === "reply_dropped" &&
           (c[0].payload as { reason?: string }).reason === "conversation_became_terminal",
       );
-    expect(dropAudit).toBeDefined();
-    const payload = dropAudit![0].payload as Record<string, unknown>;
-    expect(payload.wasOptOut).toBe(true);
-    expect(payload.optOutVia).toBe("short_form");
-    expect(payload.currentStatus).toBe("closed");
-
-    // Alerte Sentry explicite "was_opt_out: true"
-    expect(captureSpy).toHaveBeenCalledOnce();
-    const alert = captureSpy.mock.calls[0]!;
-    expect(alert[0]).toBe("process_reply.handed_off_opt_out_terminal_race");
-    const alertPayload = alert[1] as {
-      tags: { was_opt_out: string; current_status: string };
-      extra: { hint: string };
-    };
-    expect(alertPayload.tags.was_opt_out).toBe("true");
-    expect(alertPayload.tags.current_status).toBe("closed");
-    expect(alertPayload.extra.hint).toMatch(/humain/i);
-
-    // Pas de DM Slack poste : la race est detectee AVANT notify.
-    expect(deps.sendInboundAfterHandoffNotification).not.toHaveBeenCalled();
+    expect(legacyDropAudit).toBeUndefined();
   });
 
   it("markOptedOut throw ValidationError sans currentStatus (autre erreur) → propagation telle quelle (retry Inngest classique)", async () => {
@@ -580,17 +609,16 @@ describe("PR-A — race conversation_became_terminal entre step 2 et markOptedOu
 
     // Propage la ValidationError originale (= Inngest classique retry×3).
     await expect(processReplyHandler(ctx, deps)).rejects.toBeInstanceOf(ValidationError);
-    // AUCUN audit reply_dropped car ce n'est pas la race geree.
-    const dropAudit = vi
+    // AUCUN audit `inbound_on_inactive_conversation` car ce n'est pas la race geree.
+    const inactiveAudit = vi
       .mocked(deps.appendAuditLog!)
-      .mock.calls.find((c) => c[0].action === "reply_dropped");
-    expect(dropAudit).toBeUndefined();
-    // AUCUNE alerte Sentry
-    expect(captureSpy).not.toHaveBeenCalled();
+      .mock.calls.find((c) => c[0].action === "inbound_on_inactive_conversation");
+    expect(inactiveAudit).toBeUndefined();
+    // Pas de DM `inbound_on_inactive_conversation` non plus.
+    expect(deps.sendInboundOnInactiveConversationNotification).not.toHaveBeenCalled();
   });
 
-  it("race long-forme (classifier STOP + conv blocked) → meme traitement + optOutVia=classifier_long_form", async () => {
-    const { NonRetriableError } = await import("inngest");
+  it("race long-forme (classifier STOP + conv blocked) → meme traitement + reason=conversation_became_terminal", async () => {
     const { ValidationError } = await import("@/lib/utils/errors");
     const captureSpy = vi.fn();
     const ctx = makeFakeCtx({ body: "Je ne veux plus recevoir de SMS, merci." });
@@ -615,20 +643,34 @@ describe("PR-A — race conversation_became_terminal entre step 2 et markOptedOu
       captureMonitoringWarning: captureSpy,
     });
 
-    await expect(processReplyHandler(ctx, deps)).rejects.toBeInstanceOf(NonRetriableError);
+    const result = await processReplyHandler(ctx, deps);
+    expect(result.status).toBe("stored_on_inactive_conversation");
+    if (result.status === "stored_on_inactive_conversation") {
+      expect(result.reason).toBe("conversation_became_terminal");
+      expect(result.wasOptOut).toBe(true);
+    }
 
-    const dropAudit = vi
+    const inactiveAudit = vi
       .mocked(deps.appendAuditLog!)
       .mock.calls.find(
         (c) =>
-          c[0].action === "reply_dropped" &&
+          c[0].action === "inbound_on_inactive_conversation" &&
           (c[0].payload as { reason?: string }).reason === "conversation_became_terminal",
       );
-    const payload = dropAudit![0].payload as Record<string, unknown>;
-    expect(payload.optOutVia).toBe("classifier_long_form");
-    expect(payload.currentStatus).toBe("blocked");
+    expect(inactiveAudit).toBeDefined();
+    expect((inactiveAudit![0].payload as { notifiedVia: string }).notifiedVia).toBe("dm");
 
-    const alert = captureSpy.mock.calls[0]!;
-    expect((alert[1] as { tags: { current_status: string } }).tags.current_status).toBe("blocked");
+    // DM envoye avec reason conversation_became_terminal
+    expect(deps.sendInboundOnInactiveConversationNotification).toHaveBeenCalledWith(
+      expect.objectContaining({
+        reason: "conversation_became_terminal",
+        wasOptOut: true,
+      }),
+    );
+
+    const inactiveAlert = captureSpy.mock.calls.find((c) =>
+      String(c[0]).startsWith("process_reply.inbound_on_inactive_conversation."),
+    );
+    expect((inactiveAlert![1] as { level: string }).level).toBe("error");
   });
 });

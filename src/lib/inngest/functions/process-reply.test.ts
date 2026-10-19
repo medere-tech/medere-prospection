@@ -14,6 +14,7 @@ import type { Timestamp } from "firebase-admin/firestore";
 import { describe, expect, it, vi } from "vitest";
 
 import { CLASSIFY_INTENT_PROMPT_VERSION } from "@/lib/claude/prompts/classify-intent";
+import { preSendCheck } from "@/lib/compliance/pre-send-check";
 import { ExternalServiceError } from "@/lib/utils/errors";
 import type { Contact } from "@/types/contact";
 import type { Conversation } from "@/types/conversation";
@@ -202,6 +203,17 @@ function makeDeps(overrides: Partial<ProcessReplyDeps> = {}): ProcessReplyDeps {
     getContact: vi.fn().mockResolvedValue(null),
     sendInboundAfterHandoffNotification: vi.fn().mockResolvedValue({ ts: "0", channel: "D0" }),
     getDashboardConversationUrl: vi.fn().mockReturnValue("https://dashboard.test/conv/xxx"),
+    // PR-NO-DROPPED-SMS — defaults neutres pour les branches orphans/inactive.
+    // Les tests qui ciblent explicitement ces branches overrident.
+    getLatestConversationByContactId: vi.fn().mockResolvedValue(null),
+    addOrphanInboundIdempotent: vi
+      .fn()
+      .mockResolvedValue({ docId: "oih_orphan_default_0000000000000000000000000", created: true }),
+    sendInboundOnInactiveConversationNotification: vi
+      .fn()
+      .mockResolvedValue({ ts: "orphan.ts", channel: "C-ORPH", kind: "send" }),
+    getOrphanChannelId: vi.fn().mockReturnValue("C0ORPHAN000"),
+    captureMonitoringWarning: vi.fn(),
     ...overrides,
     // Override `addInbound` SEPAREMENT du spread : si `overrides.addInbound`
     // etait fourni, on l'a deja capture dans `addInboundMock` ci-dessus ;
@@ -242,14 +254,12 @@ describe("sentinelles structurelles process-reply (S9.2.1)", () => {
     expect(opts.retries).toBe(3);
   });
 
-  it("DROP_REASONS verrouillé à ['contact_unknown', 'no_active_conversation', 'duplicate']", () => {
-    // 🔒 Sentinelle anti-régression : ajouter une raison de drop sans
-    // miroir dans le pipeline (et inversement) = bug forensic / audit.
-    expect([...__DROP_REASONS_FOR_TESTS].sort()).toEqual([
-      "contact_unknown",
-      "duplicate",
-      "no_active_conversation",
-    ]);
+  it("DROP_REASONS verrouille a ['duplicate'] seul (PR-NO-DROPPED-SMS)", () => {
+    // 🔒 Sentinelle anti-regression : apres PR-NO-DROPPED-SMS, les anciens
+    // `contact_unknown` / `no_active_conversation` basculent sur l'action
+    // d'audit `inbound_on_inactive_conversation` + stockage orphelins. Seul
+    // `duplicate` reste comme raison de drop (vrai doublon atomique).
+    expect([...__DROP_REASONS_FOR_TESTS].sort()).toEqual(["duplicate"]);
   });
 
   it("PHONE_HASH_PREFIX === 'hph_' (fix HIGH-1 security-reviewer S9.2.1)", () => {
@@ -290,39 +300,71 @@ describe("Step 1 — resolve-contact", () => {
     expect(deps.getContactByPhone).toHaveBeenCalledWith("+33775745453");
   });
 
-  it("contact inconnu → drop avec audit reply_dropped + phoneHash préfixé (hph_), JAMAIS phone en clair", async () => {
+  it("contact inconnu (P1 PR-NO-DROPPED-SMS) → stored_on_inactive_conversation reason=unknown_contact + orphelins + canal + audit", async () => {
+    // Avant PR-NO-DROPPED-SMS : status=dropped, reason=contact_unknown.
+    // Apres : stockage orphelins + canal Slack + audit
+    // inbound_on_inactive_conversation + Sentry warning. Lea muette.
     const ctx = makeFakeCtx();
     const deps = makeDeps({
       getContactByPhone: vi.fn().mockResolvedValue(null),
+      addOrphanInboundIdempotent: vi
+        .fn()
+        .mockResolvedValue({ docId: "oih_orphan_unknown_contact_123", created: true }),
     });
 
     const result = await processReplyHandler(ctx, deps);
 
-    expect(result).toEqual({ status: "dropped", reason: "contact_unknown" });
+    expect(result.status).toBe("stored_on_inactive_conversation");
+    if (result.status === "stored_on_inactive_conversation") {
+      expect(result.reason).toBe("unknown_contact");
+      expect(result.orphanDocId).toBe("oih_orphan_unknown_contact_123");
+      expect(result.contactId).toBeUndefined();
+      expect(result.conversationId).toBeUndefined();
+      expect(result.messageId).toBeUndefined();
+    }
     expect(deps.hashPii).toHaveBeenCalledWith("+33775745453");
-    // Fix HIGH-1 security-reviewer S9.2.1 : préfixe `hph_` casse les
-    // frontières anti-digit du scrubber RE_FR_NATIONAL, prévient les
-    // ~0.3% de collisions hex pur.
-    const expectedHash = "hph_hash_ed-p_ii-a_bcd1_234a_bcd1_234a_bcd1_234";
-    expect(deps.appendAuditLog).toHaveBeenCalledWith({
-      actorId: "system",
-      actorType: "system",
-      action: "reply_dropped",
-      targetType: "contact",
-      targetId: expectedHash,
-      payload: {
-        reason: "contact_unknown",
-        phoneHash: expectedHash,
-      },
-    });
-    // Pas de message stocké, pas de conv résolue.
+
+    // Nouvelle action d'audit `inbound_on_inactive_conversation` avec
+    // phoneHash prefixe `hph_` + reason + notifiedVia + orphanDocId.
+    const expectedPhoneHash = "hph_hash_ed-p_ii-a_bcd1_234a_bcd1_234a_bcd1_234";
+    expect(deps.appendAuditLog).toHaveBeenCalledWith(
+      expect.objectContaining({
+        action: "inbound_on_inactive_conversation",
+        targetType: "message",
+        targetId: "oih_orphan_unknown_contact_123",
+        payload: expect.objectContaining({
+          reason: "unknown_contact",
+          wasOptOut: false,
+          phoneHash: expectedPhoneHash,
+          orphanDocId: "oih_orphan_unknown_contact_123",
+          notifiedVia: "orphan_channel",
+        }),
+      }),
+    );
+    // L'ancien audit reply_dropped n'est PAS pose sur cette branche.
+    expect(deps.appendAuditLog).not.toHaveBeenCalledWith(
+      expect.objectContaining({ action: "reply_dropped" }),
+    );
+    // Stockage orphelins.
+    expect(deps.addOrphanInboundIdempotent).toHaveBeenCalledWith(
+      expect.objectContaining({
+        reason: "unknown_contact",
+        source: "process-reply",
+        phoneHash: expectedPhoneHash,
+      }),
+    );
+    // Notif canal orphelins (pas DM car pas de contactId/assignedTo).
+    expect(deps.sendInboundOnInactiveConversationNotification).toHaveBeenCalledWith(
+      expect.objectContaining({
+        target: { kind: "channel", channelId: "C0ORPHAN000" },
+        reason: "unknown_contact",
+      }),
+    );
+    // Pas de message stocke sur conv, pas de resolve conv.
     expect(deps.addInbound).not.toHaveBeenCalled();
     expect(deps.getActiveConversationByContactId).not.toHaveBeenCalled();
 
-    // S9.2.3 — sentinelle négative : reply_processed JAMAIS posé sur
-    // les drops. reply_dropped suffit (forensic complet via reason +
-    // phoneHash). Éviter redondance + brouiller analytics "inbound
-    // traités vs abandonnés".
+    // Sentinelle negative : reply_processed JAMAIS pose.
     expect(deps.appendAuditLog).not.toHaveBeenCalledWith(
       expect.objectContaining({ action: "reply_processed" }),
     );
@@ -353,34 +395,308 @@ describe("Step 2 — resolve-conversation", () => {
     expect(deps.getActiveConversationByContactId).toHaveBeenCalledWith("hubspot-456");
   });
 
-  it("aucune conv active → drop reply_dropped no_active_conversation + audit avec contactId comme targetId", async () => {
+  it("aucune conv (active + handed_off + latest) (P3' PR-NO-DROPPED-SMS) → stored_on_inactive_conversation reason=no_conversation", async () => {
+    // Avant : status=dropped reason=no_active_conversation. Apres : contact
+    // connu sans aucune conv → orphelins avec contactId renseigne, canal
+    // orphelins + audit `inbound_on_inactive_conversation` reason="no_conversation".
     const ctx = makeFakeCtx();
     const deps = makeDeps({
       getContactByPhone: vi.fn().mockResolvedValue(makeFakeContact("hubspot-789")),
       getActiveConversationByContactId: vi.fn().mockResolvedValue(null),
+      getHandedOffConversationByContactId: vi.fn().mockResolvedValue(null),
+      getLatestConversationByContactId: vi.fn().mockResolvedValue(null),
+      addOrphanInboundIdempotent: vi
+        .fn()
+        .mockResolvedValue({ docId: "oih_orphan_no_conv_abc", created: true }),
     });
 
     const result = await processReplyHandler(ctx, deps);
 
-    expect(result).toEqual({ status: "dropped", reason: "no_active_conversation" });
-    // Fix HIGH-1 : phoneHash préfixé `hph_` (cf. test step 1 contact_unknown).
-    expect(deps.appendAuditLog).toHaveBeenCalledWith({
-      actorId: "system",
-      actorType: "system",
-      action: "reply_dropped",
-      targetType: "contact",
-      targetId: "hubspot-789",
-      payload: {
-        reason: "no_active_conversation",
-        phoneHash: "hph_hash_ed-p_ii-a_bcd1_234a_bcd1_234a_bcd1_234",
-      },
-    });
+    expect(result.status).toBe("stored_on_inactive_conversation");
+    if (result.status === "stored_on_inactive_conversation") {
+      expect(result.reason).toBe("no_conversation");
+      expect(result.contactId).toBe("hubspot-789");
+      expect(result.conversationId).toBeUndefined();
+      expect(result.orphanDocId).toBe("oih_orphan_no_conv_abc");
+    }
+    expect(deps.appendAuditLog).toHaveBeenCalledWith(
+      expect.objectContaining({
+        action: "inbound_on_inactive_conversation",
+        targetType: "contact",
+        targetId: "hubspot-789",
+        payload: expect.objectContaining({
+          reason: "no_conversation",
+          wasOptOut: false,
+          contactId: "hubspot-789",
+          phoneHash: "hph_hash_ed-p_ii-a_bcd1_234a_bcd1_234a_bcd1_234",
+          notifiedVia: "orphan_channel",
+        }),
+      }),
+    );
+    expect(deps.appendAuditLog).not.toHaveBeenCalledWith(
+      expect.objectContaining({ action: "reply_dropped" }),
+    );
     expect(deps.addInbound).not.toHaveBeenCalled();
-
-    // S9.2.3 — sentinelle négative reply_processed sur drop (cf. step 1).
+    expect(deps.sendInboundOnInactiveConversationNotification).toHaveBeenCalledWith(
+      expect.objectContaining({
+        target: { kind: "channel", channelId: "C0ORPHAN000" },
+        reason: "no_conversation",
+      }),
+    );
     expect(deps.appendAuditLog).not.toHaveBeenCalledWith(
       expect.objectContaining({ action: "reply_processed" }),
     );
+  });
+
+  it("handed_off sans assignedTo (P2 PR-NO-DROPPED-SMS) → store conv + canal orphelins + audit + Sentry error", async () => {
+    const ctx = makeFakeCtx();
+    const handedOffConv = makeFakeConversation("hubspot-noassign", "camp-a");
+    (handedOffConv as unknown as { status: string }).status = "handed_off";
+    // Volontairement handoff.assignedTo vide
+    (handedOffConv as unknown as { handoff: { assignedTo: string } }).handoff = {
+      assignedTo: "",
+    };
+    const deps = makeDeps({
+      getContactByPhone: vi.fn().mockResolvedValue(makeFakeContact("hubspot-noassign")),
+      getActiveConversationByContactId: vi.fn().mockResolvedValue(null),
+      getHandedOffConversationByContactId: vi.fn().mockResolvedValue({
+        conversationId: "hubspot-noassign_camp-a",
+        conversation: handedOffConv,
+      }),
+    });
+
+    const result = await processReplyHandler(ctx, deps);
+
+    expect(result.status).toBe("stored_on_inactive_conversation");
+    if (result.status === "stored_on_inactive_conversation") {
+      expect(result.reason).toBe("handed_off_no_assignee");
+      expect(result.conversationId).toBe("hubspot-noassign_camp-a");
+      expect(result.contactId).toBe("hubspot-noassign");
+      expect(result.messageId).toBeDefined();
+    }
+    // Message bien stocke sur la conv (preuve L.34-5 CPCE)
+    expect(deps.addInboundIdempotent).toHaveBeenCalledWith(
+      "hubspot-noassign_camp-a",
+      expect.any(Object),
+    );
+    // Audit action nouveau
+    expect(deps.appendAuditLog).toHaveBeenCalledWith(
+      expect.objectContaining({
+        action: "inbound_on_inactive_conversation",
+        payload: expect.objectContaining({
+          reason: "handed_off_no_assignee",
+          notifiedVia: "orphan_channel",
+        }),
+      }),
+    );
+    // Notif canal orphelins (pas DM car pas d'assignedTo)
+    expect(deps.sendInboundOnInactiveConversationNotification).toHaveBeenCalledWith(
+      expect.objectContaining({
+        target: { kind: "channel", channelId: "C0ORPHAN000" },
+        reason: "handed_off_no_assignee",
+      }),
+    );
+    // Sentry level=error
+    const sentryCall = (
+      deps.captureMonitoringWarning as unknown as {
+        mock: { calls: Array<[string, { level?: string }]> };
+      }
+    ).mock.calls.find((c) => c[0].startsWith("process_reply.inbound_on_inactive_conversation."));
+    expect(sentryCall).toBeDefined();
+    expect(sentryCall![1].level).toBe("error");
+  });
+
+  it("P3 opt-out detecte + contact DEJA opted_out (Finding 3) → audit opt_out alreadyOptedOut:true + markOptedOut skip", async () => {
+    const ctx = makeFakeCtx({ body: "STOP" });
+    const latestConv = makeFakeConversation("hubspot-already-opt", "camp-a");
+    (latestConv as unknown as { status: string }).status = "opted_out";
+    const alreadyOptedContact = makeFakeContact("hubspot-already-opt");
+    alreadyOptedContact.consent = {
+      ...alreadyOptedContact.consent,
+      optedOut: true,
+    };
+    const deps = makeDeps({
+      getContactByPhone: vi.fn().mockResolvedValue(alreadyOptedContact),
+      getActiveConversationByContactId: vi.fn().mockResolvedValue(null),
+      getHandedOffConversationByContactId: vi.fn().mockResolvedValue(null),
+      getLatestConversationByContactId: vi.fn().mockResolvedValue({
+        conversationId: "hubspot-already-opt_camp-a",
+        conversation: latestConv,
+      }),
+      getContact: vi.fn().mockResolvedValue(alreadyOptedContact),
+      isOptOut: vi.fn().mockReturnValue(true),
+    });
+
+    const result = await processReplyHandler(ctx, deps);
+
+    expect(result.status).toBe("stored_on_inactive_conversation");
+    // Finding 3 : audit opt_out alreadyOptedOut:true pose en plus de
+    // inbound_on_inactive_conversation.
+    expect(deps.appendAuditLog).toHaveBeenCalledWith(
+      expect.objectContaining({
+        action: "opt_out",
+        targetType: "contact",
+        targetId: "hubspot-already-opt",
+        payload: expect.objectContaining({
+          channel: "sms",
+          conversationId: "hubspot-already-opt_camp-a",
+          alreadyOptedOut: true,
+          reason: "reaffirmation_on_inactive_conversation",
+        }),
+      }),
+    );
+    // Audit inbound_on_inactive_conversation reste pose aussi.
+    expect(deps.appendAuditLog).toHaveBeenCalledWith(
+      expect.objectContaining({
+        action: "inbound_on_inactive_conversation",
+        payload: expect.objectContaining({ reason: "opted_out", wasOptOut: true }),
+      }),
+    );
+    // Pas de markOptedOut (contact deja opt-out, no-op garanti).
+    expect(deps.markOptedOut).not.toHaveBeenCalled();
+  });
+
+  it("P3 opt-out detecte + contact PAS opt-out + latestStatus=closed (Finding 2 base) → markOptedOut SANS conversationId", async () => {
+    const ctx = makeFakeCtx({ body: "STOP" });
+    const latestConv = makeFakeConversation("hubspot-closed", "camp-a");
+    (latestConv as unknown as { status: string }).status = "closed";
+    const notOptedContact = makeFakeContact("hubspot-closed");
+    const deps = makeDeps({
+      getContactByPhone: vi.fn().mockResolvedValue(notOptedContact),
+      getActiveConversationByContactId: vi.fn().mockResolvedValue(null),
+      getHandedOffConversationByContactId: vi.fn().mockResolvedValue(null),
+      getLatestConversationByContactId: vi.fn().mockResolvedValue({
+        conversationId: "hubspot-closed_camp-a",
+        conversation: latestConv,
+      }),
+      getContact: vi.fn().mockResolvedValue(notOptedContact),
+      isOptOut: vi.fn().mockReturnValue(true),
+    });
+
+    const result = await processReplyHandler(ctx, deps);
+
+    expect(result.status).toBe("stored_on_inactive_conversation");
+    // markOptedOut appele SANS conversationId pour eviter
+    // TERMINAL_CONV_STATUSES_FOR_OPT_OUT (closed throw ValidationError).
+    expect(deps.markOptedOut).toHaveBeenCalledWith("hubspot-closed", "sms", {
+      intent: "STOP",
+    });
+  });
+
+  it("P3' no_conversation + opt-out detecte + contact PAS opt (Finding 2) → markOptedOut OBLIGATOIRE sans convId + audit opt_out via markOptedOut", async () => {
+    // Finding 2 scellee : contact connu sans aucune conv qui envoie STOP ->
+    // markOptedOut OBLIGATOIRE. Preuve que l'opt-out est propage en base.
+    const ctx = makeFakeCtx({ body: "STOP" });
+    const notOptedContact = makeFakeContact("hubspot-no-conv");
+    const deps = makeDeps({
+      getContactByPhone: vi.fn().mockResolvedValue(notOptedContact),
+      getActiveConversationByContactId: vi.fn().mockResolvedValue(null),
+      getHandedOffConversationByContactId: vi.fn().mockResolvedValue(null),
+      getLatestConversationByContactId: vi.fn().mockResolvedValue(null),
+      getContact: vi.fn().mockResolvedValue(notOptedContact),
+      isOptOut: vi.fn().mockReturnValue(true),
+    });
+
+    const result = await processReplyHandler(ctx, deps);
+
+    expect(result.status).toBe("stored_on_inactive_conversation");
+    if (result.status === "stored_on_inactive_conversation") {
+      expect(result.reason).toBe("no_conversation");
+      expect(result.wasOptOut).toBe(true);
+      expect(result.contactId).toBe("hubspot-no-conv");
+    }
+    // markOptedOut OBLIGATOIRE (Finding 2) : sans conversationId car aucune.
+    expect(deps.markOptedOut).toHaveBeenCalledWith("hubspot-no-conv", "sms", {
+      intent: "STOP",
+    });
+    // L'orphelin + canal + audit inbound_on_inactive_conversation sont poses.
+    expect(deps.addOrphanInboundIdempotent).toHaveBeenCalledWith(
+      expect.objectContaining({ reason: "no_conversation", wasOptOut: true }),
+    );
+  });
+
+  it("P3' no_conversation + opt-out detecte + contact DEJA opt (Finding 2+3) → audit opt_out alreadyOptedOut:true + pas de markOptedOut", async () => {
+    const ctx = makeFakeCtx({ body: "STOP" });
+    const alreadyOptedContact = makeFakeContact("hubspot-no-conv-already");
+    alreadyOptedContact.consent = {
+      ...alreadyOptedContact.consent,
+      optedOut: true,
+    };
+    const deps = makeDeps({
+      getContactByPhone: vi.fn().mockResolvedValue(alreadyOptedContact),
+      getActiveConversationByContactId: vi.fn().mockResolvedValue(null),
+      getHandedOffConversationByContactId: vi.fn().mockResolvedValue(null),
+      getLatestConversationByContactId: vi.fn().mockResolvedValue(null),
+      getContact: vi.fn().mockResolvedValue(alreadyOptedContact),
+      isOptOut: vi.fn().mockReturnValue(true),
+    });
+
+    const result = await processReplyHandler(ctx, deps);
+
+    expect(result.status).toBe("stored_on_inactive_conversation");
+    expect(deps.appendAuditLog).toHaveBeenCalledWith(
+      expect.objectContaining({
+        action: "opt_out",
+        targetType: "contact",
+        targetId: "hubspot-no-conv-already",
+        payload: expect.objectContaining({
+          channel: "sms",
+          alreadyOptedOut: true,
+          reason: "reaffirmation_on_no_conversation",
+        }),
+      }),
+    );
+    // Pas de markOptedOut car contact deja opt (no-op garanti).
+    expect(deps.markOptedOut).not.toHaveBeenCalled();
+  });
+
+  it("latest conv en opted_out (P3 PR-NO-DROPPED-SMS) → store + audit reason=opted_out + Sentry warning", async () => {
+    const ctx = makeFakeCtx();
+    const latestConv = makeFakeConversation("hubspot-optedout", "camp-a");
+    (latestConv as unknown as { status: string }).status = "opted_out";
+    const deps = makeDeps({
+      getContactByPhone: vi.fn().mockResolvedValue(makeFakeContact("hubspot-optedout")),
+      getActiveConversationByContactId: vi.fn().mockResolvedValue(null),
+      getHandedOffConversationByContactId: vi.fn().mockResolvedValue(null),
+      getLatestConversationByContactId: vi.fn().mockResolvedValue({
+        conversationId: "hubspot-optedout_camp-a",
+        conversation: latestConv,
+      }),
+    });
+
+    const result = await processReplyHandler(ctx, deps);
+
+    expect(result.status).toBe("stored_on_inactive_conversation");
+    if (result.status === "stored_on_inactive_conversation") {
+      expect(result.reason).toBe("opted_out");
+      expect(result.conversationId).toBe("hubspot-optedout_camp-a");
+    }
+    // Message stocke sur la conv la plus recente
+    expect(deps.addInboundIdempotent).toHaveBeenCalledWith(
+      "hubspot-optedout_camp-a",
+      expect.any(Object),
+    );
+    // Pas de markOptedOut car deja opted_out (no-op)
+    expect(deps.markOptedOut).not.toHaveBeenCalled();
+    // Pas de setConversationIntent (jamais modifier le statut)
+    expect(deps.setConversationIntent).not.toHaveBeenCalled();
+    // Audit nouveau
+    expect(deps.appendAuditLog).toHaveBeenCalledWith(
+      expect.objectContaining({
+        action: "inbound_on_inactive_conversation",
+        payload: expect.objectContaining({
+          reason: "opted_out",
+        }),
+      }),
+    );
+    // Sentry level=warning
+    const sentryCall = (
+      deps.captureMonitoringWarning as unknown as {
+        mock: { calls: Array<[string, { level?: string }]> };
+      }
+    ).mock.calls.find((c) => c[0].startsWith("process_reply.inbound_on_inactive_conversation."));
+    expect(sentryCall).toBeDefined();
+    expect(sentryCall![1].level).toBe("warning");
   });
 });
 
@@ -2600,5 +2916,81 @@ describe("BUG-DEDUP-RACE — branche duplicate atomique (addInboundIdempotent cr
     expect(deps.addOutboundDraft).not.toHaveBeenCalled();
     expect(deps.markOptedOut).not.toHaveBeenCalled();
     expect(ctx.step.sendEvent).not.toHaveBeenCalled();
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Finding 2 PR-NO-DROPPED-SMS — preuve chaine P3' -> markOptedOut flip ->
+// pre-send-check refuse un first-sms ulterieur.
+//
+// Cette suite est une INTEGRATION FONCTIONNELLE LEGERE : elle ne branche pas
+// un emulator Firestore (les tests unitaires precedents prouvent que
+// handleInactiveInbound appelle markOptedOut, les tests contacts.test.ts
+// prouvent que markOptedOut flip bien contact.consent.optedOut). Ici on
+// prouve le DERNIER maillon : apres markOptedOut, un envoi first-sms est
+// refuse par preSendCheck avec rule="opt_out".
+// ─────────────────────────────────────────────────────────────────────────────
+
+describe("Finding 2 PR-NO-DROPPED-SMS — chaine opt-out P3' -> pre-send-check", () => {
+  it("contact dont consent.optedOut=true (apres markOptedOut) -> preSendCheck refuse first-sms rule=opt_out", () => {
+    // Simule le contact TEL QUEL apres que markOptedOut l'ait flip.
+    // markOptedOut (contacts.ts:607-614) ecrit `consent.optedOut = true`
+    // dans la MEME tx que l'audit opt_out. Un re-fetch Firestore ulterieur
+    // via `getContactByPhone` renvoie donc un contact avec ce champ a true.
+    const flippedContact = makeFakeContact("hubspot-chain-proof");
+    flippedContact.consent = {
+      ...flippedContact.consent,
+      optedOut: true,
+    };
+
+    // Preparation du 1er SMS vers ce contact (ex: send-first-sms via
+    // nouvelle campagne ulterieure). messageCount=0 -> premier SMS.
+    const freshConversation = makeFakeConversation("hubspot-chain-proof", "camp-future");
+    (freshConversation as unknown as { messageCount: number }).messageCount = 0;
+
+    const result = preSendCheck({
+      contact: flippedContact,
+      conversation: freshConversation,
+      message:
+        "Bonjour Dr Dupont, je suis Lea, assistante virtuelle de Medere. Repondez STOP pour ne plus recevoir.",
+      recentOutboundMessages: [],
+      outboundKind: "solicitation",
+    });
+
+    // Preuve : la rule opt_out court-circuite imediatement l'envoi
+    // (pre-send-check.ts:550-561). Le first-sms est refuse.
+    expect(result.ok).toBe(false);
+    if (!result.ok) {
+      expect(result.failure.rule).toBe("opt_out");
+      expect(result.failure.code).toBe("opted_out");
+    }
+  });
+
+  it("contact dont consent.optedOut=false (jamais flip) -> preSendCheck NE casse PAS sur opt_out (sentinel inverse)", () => {
+    // Sentinelle inverse : si le test precedent casse sur une regression
+    // de la rule opt_out, ce test prouve que c'est la rule opt_out qui a
+    // peté, PAS tout preSendCheck (ex: ai_disclosure peut rester).
+    const notOptedContact = makeFakeContact("hubspot-chain-proof-ok");
+    notOptedContact.consent = {
+      ...notOptedContact.consent,
+      optedOut: false,
+    };
+    const freshConversation = makeFakeConversation("hubspot-chain-proof-ok", "camp-future");
+    (freshConversation as unknown as { messageCount: number }).messageCount = 0;
+
+    const result = preSendCheck({
+      contact: notOptedContact,
+      conversation: freshConversation,
+      message:
+        "Bonjour Dr Dupont, je suis Lea, assistante virtuelle de Medere. Repondez STOP pour ne plus recevoir.",
+      recentOutboundMessages: [],
+      outboundKind: "solicitation",
+    });
+
+    // La rule opt_out N'A PAS court-circuite. Si preSendCheck echoue,
+    // c'est pour autre chose (bloctel, hours, etc.) - PAS opt_out.
+    if (!result.ok) {
+      expect(result.failure.rule).not.toBe("opt_out");
+    }
   });
 });

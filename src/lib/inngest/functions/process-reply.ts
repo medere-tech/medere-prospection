@@ -305,8 +305,6 @@
  *
  * @see `processReplyHandler` ci-dessous pour le typage.
  */
-import { NonRetriableError } from "inngest";
-
 import { classifyReply } from "@/lib/claude/intent-classifier";
 import {
   CLASSIFY_INTENT_MODEL,
@@ -320,6 +318,7 @@ import { getContact, getContactByPhone, markOptedOut } from "@/lib/firestore/con
 import {
   getActiveConversationByContactId,
   getHandedOffConversationByContactId,
+  getLatestConversationByContactId,
   setConversationIntent,
 } from "@/lib/firestore/conversations";
 import {
@@ -329,19 +328,26 @@ import {
   findInboundByExternalId,
   listRecentMessages,
 } from "@/lib/firestore/messages";
+import { addOrphanInboundIdempotent } from "@/lib/firestore/orphan-inbounds";
 import { getInngestClient } from "@/lib/inngest/client";
 import { handoffRequested, smsReplyReceived, smsReplySendRequested } from "@/lib/inngest/events";
+import { getSlackEnv } from "@/lib/security/env";
 import { getDashboardConversationUrl } from "@/lib/slack/dashboard-url";
 import { sendInboundAfterHandoffNotification } from "@/lib/slack/notify-inbound-after-handoff";
+import { sendInboundOnInactiveConversationNotification } from "@/lib/slack/notify-inbound-on-inactive-conversation";
 import { ValidationError } from "@/lib/utils/errors";
 import { captureMonitoringWarning } from "@/lib/utils/observability";
 import { hashPii, PHONE_HASH_PREFIX, safePhoneHash } from "@/lib/utils/pii-detector";
 import { shortFingerprint } from "@/lib/utils/short-fingerprint";
 import type {
+  InboundOnInactiveConversationPayload,
+  InboundOnInactiveConversationReason,
+  InboundOnInactiveNotifiedVia,
   InboundRelayedOptOutVia,
   InboundRelayedToHumanPayload,
   ReplyGeneratedPayload,
 } from "@/types/audit-log";
+import type { ConversationStatus } from "@/types/conversation";
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Constantes
@@ -355,11 +361,14 @@ import type {
 const FUNCTION_ID = "process-reply";
 
 /**
- * Raisons de drop possibles en S9.2.1. Discriminant du retour
- * `ProcessReplyResult.status === "dropped"`. Sentinelle test verrouille
- * cette union.
+ * Raisons de drop encore valides apres PR-NO-DROPPED-SMS. SEUL `duplicate`
+ * reste : les anciens `contact_unknown` / `no_active_conversation` basculent
+ * sur l'action d'audit `inbound_on_inactive_conversation` + stockage orphelins
+ * + notif Slack (DM titulaire ou canal orphelins). Sentinelle test verrouille
+ * cette union — modifier cette liste = modifier le contrat forensic L.34-5
+ * CPCE, decision explicite.
  */
-const DROP_REASONS = ["contact_unknown", "no_active_conversation", "duplicate"] as const;
+const DROP_REASONS = ["duplicate"] as const;
 type DropReason = (typeof DROP_REASONS)[number];
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -367,10 +376,20 @@ type DropReason = (typeof DROP_REASONS)[number];
 // ─────────────────────────────────────────────────────────────────────────────
 
 /**
- * Résultat du pipeline `process-reply` (S9.2.2). Discriminé sur `status`.
+ * Résultat du pipeline `process-reply`. Discriminé sur `status`.
  *
- *   - `dropped`     : pipeline court-circuité par contact_unknown /
- *                     no_active_conversation / duplicate.
+ *   - `dropped`     : pipeline court-circuité pour duplicate UNIQUEMENT
+ *                     (vrai doublon atomique detecte par
+ *                     `addInboundIdempotent` ou dedup `findInbound`).
+ *
+ *   - `stored_on_inactive_conversation` (PR-NO-DROPPED-SMS) :
+ *                     SMS entrant qu'aucune branche active ne gere. Le
+ *                     message est TOUJOURS persiste (sur la conv la plus
+ *                     recente du contact, OU dans `inbound_messages_orphans/`
+ *                     si pas de conv), un humain est TOUJOURS notifie
+ *                     (DM titulaire ou canal orphelins), un audit
+ *                     `inbound_on_inactive_conversation` est pose, et une
+ *                     alerte Sentry est emise. Lea reste muette.
  *
  *   - `opt_out`     : STOP appliqué. Discriminant `via` :
  *                     - `"short_form"` : détecté par `isOptOut(body)` au
@@ -390,6 +409,25 @@ type DropReason = (typeof DROP_REASONS)[number];
  */
 export type ProcessReplyResult =
   | { status: "dropped"; reason: DropReason }
+  | {
+      /**
+       * PR-NO-DROPPED-SMS — branche "aucun chemin actif ne gere ce SMS",
+       * mais le message a ete stocke (sur conv la plus recente OU en
+       * orphelins), notifie et audite. `reason` discrimine le cas forensique.
+       */
+      status: "stored_on_inactive_conversation";
+      reason: InboundOnInactiveConversationReason;
+      /** Present SSI on a resolu un contact. */
+      contactId?: string;
+      /** Present SSI on a rattache a une conv existante. */
+      conversationId?: string;
+      /** Present SSI on a persiste un doc `messages/{id}` sur une conv. */
+      messageId?: string;
+      /** Present SSI on a persiste un doc `inbound_messages_orphans/{id}`. */
+      orphanDocId?: string;
+      /** `true` si opt-out detecte dans le body. */
+      wasOptOut: boolean;
+    }
   | {
       status: "opt_out";
       contactId: string;
@@ -479,6 +517,22 @@ export interface ProcessReplyDeps {
   getContact?: typeof getContact;
   sendInboundAfterHandoffNotification?: typeof sendInboundAfterHandoffNotification;
   getDashboardConversationUrl?: typeof getDashboardConversationUrl;
+  // PR-NO-DROPPED-SMS — branche "stored_on_inactive_conversation"
+  getLatestConversationByContactId?: typeof getLatestConversationByContactId;
+  addOrphanInboundIdempotent?: typeof addOrphanInboundIdempotent;
+  sendInboundOnInactiveConversationNotification?: typeof sendInboundOnInactiveConversationNotification;
+  /**
+   * Lecture optionnelle du canal Slack orphelins. Injectable pour tests
+   * sans mocker `getSlackEnv` global. Null/undefined accepte : le caller
+   * aiguille en consequence (si DM pas disponible et channel absent, log
+   * error + Sentry mais ne throw pas pour pas perdre l'audit).
+   *
+   * Point 5 round 3 : depuis Finding 5 PR-NO-DROPPED-SMS,
+   * `SLACK_ORPHAN_LEADS_CHANNEL_ID` est REQUIRED dans getSlackEnv() —
+   * ce dep retourne donc TOUJOURS une string Zod-validee. Les tests
+   * doivent passer un string valide (format regex `/^[CG][A-Z0-9]+$/`).
+   */
+  getOrphanChannelId?: () => string;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -561,6 +615,14 @@ export async function processReplyHandler(
   const _sendInboundAfterHandoff =
     deps.sendInboundAfterHandoffNotification ?? sendInboundAfterHandoffNotification;
   const _getDashboardUrl = deps.getDashboardConversationUrl ?? getDashboardConversationUrl;
+  // PR-NO-DROPPED-SMS — branche "stored_on_inactive_conversation"
+  const _getLatestConv = deps.getLatestConversationByContactId ?? getLatestConversationByContactId;
+  const _addOrphan = deps.addOrphanInboundIdempotent ?? addOrphanInboundIdempotent;
+  const _sendInactiveNotif =
+    deps.sendInboundOnInactiveConversationNotification ??
+    sendInboundOnInactiveConversationNotification;
+  const _getOrphanChannelId =
+    deps.getOrphanChannelId ?? (() => getSlackEnv().SLACK_ORPHAN_LEADS_CHANNEL_ID);
 
   const { event, step, logger } = ctx;
   const { phone, body, ovhMessageId } = event.data;
@@ -653,35 +715,306 @@ export async function processReplyHandler(
     });
   }
 
+  // ─────────────────────────────────────────────────────────────────────
+  // Helper PR-NO-DROPPED-SMS — flux "inbound sur conv inactive / orphan"
+  // ─────────────────────────────────────────────────────────────────────
+  //
+  // Encapsule les sous-steps COMMUNS a toutes les branches qui, avant
+  // cette PR, droppaient silencieusement un SMS entrant :
+  //
+  //   - P1  : contact inconnu              (unknown_contact)
+  //   - P2  : handed_off sans assignedTo  (handed_off_no_assignee)
+  //   - P3  : aucune conv active ni handed_off, conv la plus recente en
+  //           closed/opted_out/blocked      (closed | opted_out | blocked)
+  //   - P3' : contact connu sans aucune conv (no_conversation)
+  //   - P6  : race opt-out pendant transition closed/blocked
+  //           (conversation_became_terminal)
+  //
+  // Responsabilites (chacune step.run memoisee pour idempotence Inngest) :
+  //   (a) Stocker en orphelins si `messageId` absent (= pas de conv
+  //       rattachee). Si `messageId` est deja pose par le pipeline sur une
+  //       conv (P2 / P3 avec conv la plus recente / P6), on NE restocke PAS :
+  //       le forensic L.34-5 CPCE vit deja dans `messages/{id}`.
+  //   (b) Envoyer la notification Slack : DM `assignedTo` si fourni ET
+  //       canal orphelins disponible pour les reasons critiques (via
+  //       includeHereMention). Fallback canal orphelins pour tous les autres
+  //       cas sans assignedTo. Si NI DM NI canal disponible → audit avec
+  //       `notifiedVia:"notify_failed"` + Sentry error (jamais throw).
+  //   (c) Pose l'audit `inbound_on_inactive_conversation` avec le payload
+  //       typé scrubber-safe.
+  //   (d) Alerte Sentry via `captureMonitoringWarning` (level `warning` par
+  //       defaut, `error` pour `handed_off_no_assignee` / `parse_failed` /
+  //       `enqueue_failed` / `conversation_became_terminal`).
+  //
+  // Le markOptedOut eventuel reste a la charge du caller (contexte-dependant :
+  // P1 n'a pas de contactId, P3 depend du status, P6 est deja dans la race).
+  async function handleInactiveInbound(params: {
+    reason: InboundOnInactiveConversationReason;
+    stepSuffix: string;
+    wasOptOut: boolean;
+    sentryLevel?: "warning" | "error";
+    includeHereMention?: boolean;
+    contactId?: string;
+    conversationId?: string;
+    messageId?: string;
+    assignedTo?: string;
+    phoneHash?: string;
+    phoneLast4?: string;
+    firstName?: string;
+    speciality?: string;
+    city?: string;
+  }): Promise<ProcessReplyResult & { status: "stored_on_inactive_conversation" }> {
+    const sentryLevel = params.sentryLevel ?? "warning";
+
+    // (a) Store orphan si pas de messageId existant.
+    let orphanDocId: string | undefined;
+    if (params.messageId === undefined) {
+      const orphanResult = await step.run(`store-orphan-inbound-${params.stepSuffix}`, async () => {
+        return _addOrphan({
+          reason: params.reason,
+          body,
+          idempotencyKey: ovhMessageId,
+          source: "process-reply",
+          ...(params.phoneHash !== undefined ? { phoneHash: params.phoneHash } : {}),
+          ...(params.contactId !== undefined ? { contactId: params.contactId } : {}),
+          ...(params.conversationId !== undefined ? { conversationId: params.conversationId } : {}),
+          wasOptOut: params.wasOptOut,
+        });
+      });
+      orphanDocId = orphanResult.docId;
+    }
+
+    // (b) Determiner la cible Slack. Priorite DM si assignedTo valide,
+    // sinon canal orphelins. Depuis Finding 5 PR-NO-DROPPED-SMS,
+    // SLACK_ORPHAN_LEADS_CHANNEL_ID est REQUIRED (env.ts) : `_getOrphanChannelId()`
+    // retourne toujours une string Zod-validee (regex `/^[CG][A-Z0-9]+$/`).
+    // L'ancien check `channelValid` + branche "notify_failed" quand canal
+    // absent a ete retire (point 5 round 3 — dead code depuis Finding 5).
+    const orphanChannelId = _getOrphanChannelId();
+    const SLACK_USER_ID_REGEX = /^U[A-Z0-9]+$/;
+    const assignedToValid =
+      params.assignedTo !== undefined &&
+      params.assignedTo !== "" &&
+      SLACK_USER_ID_REGEX.test(params.assignedTo);
+
+    const dashboardUrl =
+      params.conversationId !== undefined
+        ? _getDashboardUrl(params.conversationId)
+        : _getDashboardUrl("orphans");
+
+    // Enrichissement firstName/speciality/city — meilleur effort via
+    // getContact si contactId fourni et champs pas deja renseignes.
+    let enriched = {
+      firstName: params.firstName,
+      speciality: params.speciality,
+      city: params.city,
+    };
+    if (
+      params.contactId !== undefined &&
+      (enriched.firstName === undefined ||
+        enriched.speciality === undefined ||
+        enriched.city === undefined)
+    ) {
+      const enrichResult = await step.run(`enrich-contact-${params.stepSuffix}`, async () => {
+        const c = await _getContact(params.contactId!);
+        if (!c) return { found: false as const };
+        return {
+          found: true as const,
+          firstName: c.firstName,
+          speciality: c.speciality,
+          city: c.city,
+        };
+      });
+      if (enrichResult.found) {
+        enriched = {
+          firstName: enriched.firstName ?? enrichResult.firstName,
+          speciality: enriched.speciality ?? enrichResult.speciality,
+          city: enriched.city ?? enrichResult.city,
+        };
+      }
+    }
+
+    // Point 2 + 3 round 3 : notifiedVia utilise le type partage
+    // `InboundOnInactiveNotifiedVia`. Mapping precis depuis la decision
+    // Slack :
+    //   - DM : toujours "dm" (le plafond anti-inondation ne touche pas les DMs).
+    //   - Channel + decision.kind === "send"        -> "orphan_channel"
+    //   - Channel + decision.kind === "send_digest" -> "digest" (MED-1)
+    //   - Channel + decision.kind === "suppressed"  -> "suppressed" (MED-1)
+    //   - Si _sendInactiveNotif throw -> propage (Inngest retry), on ne
+    //     pose pas d'audit "notify_failed" ici (c'est le role du caller
+    //     downstream s'il veut gerer differemment).
+    let notifiedVia: InboundOnInactiveNotifiedVia = "notify_failed";
+    let slackTs: string | undefined;
+    let slackChannel: string | undefined;
+
+    if (assignedToValid) {
+      const r = await step.run(`notify-dm-${params.stepSuffix}`, async () => {
+        return _sendInactiveNotif({
+          target: { kind: "dm", slackUserId: params.assignedTo! },
+          reason: params.reason,
+          wasOptOut: params.wasOptOut,
+          lastInboundBody: body,
+          dashboardUrl,
+          includeHereMention: false,
+          ...(enriched.firstName !== undefined ? { firstName: enriched.firstName } : {}),
+          ...(enriched.speciality !== undefined ? { speciality: enriched.speciality } : {}),
+          ...(enriched.city !== undefined ? { city: enriched.city } : {}),
+          ...(params.phoneLast4 !== undefined ? { phoneLast4: params.phoneLast4 } : {}),
+          ...(params.conversationId !== undefined ? { conversationId: params.conversationId } : {}),
+          ...(orphanDocId !== undefined ? { orphanDocId } : {}),
+        });
+      });
+      notifiedVia = "dm";
+      slackTs = r.ts;
+      slackChannel = r.channel;
+    } else {
+      const r = await step.run(`notify-orphan-${params.stepSuffix}`, async () => {
+        return _sendInactiveNotif({
+          target: { kind: "channel", channelId: orphanChannelId },
+          reason: params.reason,
+          wasOptOut: params.wasOptOut,
+          lastInboundBody: body,
+          dashboardUrl,
+          includeHereMention: params.includeHereMention === true,
+          ...(enriched.firstName !== undefined ? { firstName: enriched.firstName } : {}),
+          ...(enriched.speciality !== undefined ? { speciality: enriched.speciality } : {}),
+          ...(enriched.city !== undefined ? { city: enriched.city } : {}),
+          ...(params.phoneLast4 !== undefined ? { phoneLast4: params.phoneLast4 } : {}),
+          ...(params.conversationId !== undefined ? { conversationId: params.conversationId } : {}),
+          ...(orphanDocId !== undefined ? { orphanDocId } : {}),
+        });
+      });
+      // Mapping precis decision.kind -> notifiedVia (point 2 round 3).
+      if (r.kind === "send") {
+        notifiedVia = "orphan_channel";
+        slackTs = r.ts;
+        slackChannel = r.channel;
+      } else if (r.kind === "send_digest") {
+        notifiedVia = "digest";
+        slackTs = r.ts;
+        slackChannel = r.channel;
+      } else {
+        // r.kind === "suppressed" : ts/channel sont des chaines vides
+        // dans le return du notifier (plafond MED-1 atteint). On NE
+        // peuple PAS slackTs/slackChannel pour que l'audit n'ait pas
+        // de valeur mensongere.
+        notifiedVia = "suppressed";
+      }
+    }
+
+    // (c) Audit `inbound_on_inactive_conversation` — targetType depend du cas.
+    await step.run(`audit-inbound-on-inactive-${params.stepSuffix}`, async () => {
+      let targetType: "conversation" | "contact" | "message";
+      let targetId: string;
+      if (params.conversationId !== undefined) {
+        targetType = "conversation";
+        targetId = params.conversationId;
+      } else if (params.contactId !== undefined) {
+        targetType = "contact";
+        targetId = params.contactId;
+      } else {
+        targetType = "message";
+        targetId = orphanDocId ?? `orphan_${shortFingerprint(ovhMessageId)}`;
+      }
+      const payload: InboundOnInactiveConversationPayload = {
+        reason: params.reason,
+        wasOptOut: params.wasOptOut,
+        ...(params.contactId !== undefined ? { contactId: params.contactId } : {}),
+        ...(params.conversationId !== undefined ? { conversationId: params.conversationId } : {}),
+        ...(params.messageId !== undefined ? { messageId: params.messageId } : {}),
+        ...(orphanDocId !== undefined ? { orphanDocId } : {}),
+        ...(params.phoneHash !== undefined ? { phoneHash: params.phoneHash } : {}),
+        ...(params.assignedTo !== undefined ? { assignedTo: params.assignedTo } : {}),
+        ...(slackChannel !== undefined ? { slackChannel } : {}),
+        ...(slackTs !== undefined ? { slackTs } : {}),
+        notifiedVia,
+      };
+      await _appendAuditLog({
+        actorId: "system",
+        actorType: "system",
+        action: "inbound_on_inactive_conversation",
+        targetType,
+        targetId,
+        payload,
+      });
+    });
+
+    // (d) Sentry.
+    await step.run(`observe-inactive-inbound-${params.stepSuffix}`, async () => {
+      _captureMonitoringWarning(`process_reply.inbound_on_inactive_conversation.${params.reason}`, {
+        level: sentryLevel,
+        tags: {
+          reason: params.reason,
+          was_opt_out: params.wasOptOut ? "true" : "false",
+          notified_via: notifiedVia,
+        },
+        extra: {
+          eventId: event.id ?? "",
+          ovhMessageIdFingerprint: shortFingerprint(ovhMessageId),
+          phoneFingerprint: shortFingerprint(phone),
+          ...(params.contactId !== undefined ? { contactId: params.contactId } : {}),
+          ...(params.conversationId !== undefined ? { conversationId: params.conversationId } : {}),
+          ...(params.messageId !== undefined ? { messageId: params.messageId } : {}),
+          ...(orphanDocId !== undefined ? { orphanDocId } : {}),
+        },
+      });
+    });
+
+    logger.info("[process-reply] stored on inactive conversation", {
+      eventId: event.id,
+      reason: params.reason,
+      wasOptOut: params.wasOptOut,
+      notifiedVia,
+      hasConversationId: params.conversationId !== undefined,
+      hasMessageId: params.messageId !== undefined,
+      hasOrphanDocId: orphanDocId !== undefined,
+    });
+
+    return {
+      status: "stored_on_inactive_conversation" as const,
+      reason: params.reason,
+      wasOptOut: params.wasOptOut,
+      ...(params.contactId !== undefined ? { contactId: params.contactId } : {}),
+      ...(params.conversationId !== undefined ? { conversationId: params.conversationId } : {}),
+      ...(params.messageId !== undefined ? { messageId: params.messageId } : {}),
+      ...(orphanDocId !== undefined ? { orphanDocId } : {}),
+    };
+  }
+
   // ── Step 1 — resolve-contact ──────────────────────────────────────────
   const contactStep = await step.run("resolve-contact", async () => {
     const contact = await _getContactByPhone(phone);
     if (!contact) {
-      // Drop : contact inconnu. Hash phone (préfixé `hph_`) pour forensic
-      // sans PII brut + sans collision scrubber (cf. PHONE_HASH_PREFIX
-      // JSDoc — HIGH-1 S9.2.1 security-reviewer).
-      const phoneHash = safePhoneHash(phone, _hashPii);
-      await _appendAuditLog({
-        actorId: "system",
-        actorType: "system",
-        action: "reply_dropped",
-        targetType: "contact",
-        targetId: phoneHash,
-        payload: { reason: "contact_unknown", phoneHash },
-      });
       return { found: false as const };
     }
     return { found: true as const, contactId: contact.hubspotId };
   });
 
   if (!contactStep.found) {
-    logger.info("[process-reply] dropped", {
+    // PR-NO-DROPPED-SMS — P1 : contact inconnu. Avant cette PR : audit
+    // `reply_dropped reason:"contact_unknown"` + return `dropped`. Fait
+    // prouve en prod le 16/10/2026 16:57 UTC : SMS perdu.
+    // Nouveau : stockage orphelins + alerte canal + opt-out detecte signale
+    // en header. Lea muette.
+    const phoneHash = safePhoneHash(phone, _hashPii);
+    const digitsOnly = phone.replace(/\D/g, "");
+    const phoneLast4 = digitsOnly.slice(-4);
+    const wasOptOut = _isOptOut(body);
+    logger.info("[process-reply] contact unknown — routing to orphans", {
       eventId: event.id,
       step: "resolve-contact",
-      reason: "contact_unknown",
-      // PAS de phoneHash dans le log applicatif (forensique côté audit Firestore).
+      wasOptOut,
     });
-    return { status: "dropped", reason: "contact_unknown" };
+    return handleInactiveInbound({
+      reason: "unknown_contact",
+      stepSuffix: "unknown-contact",
+      wasOptOut,
+      sentryLevel: "warning",
+      includeHereMention: wasOptOut,
+      phoneHash,
+      phoneLast4,
+    });
   }
 
   const contactId = contactStep.contactId;
@@ -692,87 +1025,258 @@ export async function processReplyHandler(
 
   // ── Step 2 — resolve-conversation ─────────────────────────────────────
   //
-  // PR-A-INBOUND-HANDED-OFF — essaie d'abord une conv ACTIVE, puis fallback
-  // sur HANDED_OFF. Le fallback referme le trou L.34-5 CPCE : avant cette
-  // PR, un SMS entrant sur une conv `handed_off` était silencieusement
-  // droppé — le STOP n'était jamais enregistré, le contact restait
-  // consentant, et un envoi admin ultérieur pouvait partir sur un PS qui
-  // avait pourtant dit STOP.
+  // PR-NO-DROPPED-SMS — cascade de resolution :
+  //   1. Conv ACTIVE (active/awaiting_reply/in_dialogue/qualified) → nominal
+  //      flow (steps 3+).
+  //   2. Conv HANDED_OFF avec assignedTo valide → branche PR-A "relayed_to_human"
+  //      (steps 3+ puis bloc isHandedOff).
+  //   3. Conv HANDED_OFF SANS assignedTo (invariant soft brise) → P2 : store
+  //      sur cette conv + canal orphelins + audit + Sentry error.
+  //   4. Aucune active ni handed_off → `getLatestConv` pour trouver la conv
+  //      la plus recente, quel que soit son statut (closed/opted_out/blocked).
+  //      → P3 : store sur cette conv + markOptedOut si applicable + notif
+  //      titulaire DM OU canal + audit reason=status + Sentry warning.
+  //   5. Aucune conv du tout → P3' : store orphelins + canal + audit
+  //      reason="no_conversation" + Sentry warning.
   //
-  // La conv `handed_off` basculera sur une branche dédiée après le
-  // dédup + store-inbound (short-form opt-out + classifier STOP-only +
-  // DM Slack au titulaire). Pas de classification pour générer, pas de
-  // dispatch-reply-event, pas de dispatch-handoff-event.
-  //
-  // 🚨 PRIORITÉ `active` > `handed_off` par construction : les
-  // ACTIVE_CONVERSATION_STATUSES excluent `handed_off`, donc si une conv
-  // active existe pour ce contact, elle n'est pas `handed_off`. Si aucune
-  // conv active n'existe, on tente le fallback.
+  // Les 3 cas (3), (4), (5) sortent du pipeline normal via la branche
+  // `stored_on_inactive_conversation`. Lea reste muette : pas de generation
+  // Claude, pas de dispatch, pas de modification du statut de la conv.
   const convStep = await step.run("resolve-conversation", async () => {
     const active = await _getActiveConv(contactId);
     if (active) {
       return {
-        found: true as const,
+        kind: "active" as const,
         conversationId: active.conversationId,
-        isHandedOff: false as const,
       };
     }
 
     const handedOff = await _getHandedOffConv(contactId);
     if (handedOff) {
-      // Récupération de `handoff.assignedTo` ici pour la mémorisation du
-      // step (sur retry, pas de re-lecture Firestore nécessaire). Si le
-      // doc handoff est absent (invariant cassé — ne devrait pas arriver
-      // puisque status=handed_off exige setHandoff préalable), on log et
-      // on drop proprement plutôt que de throw dans le step.
       const assignedTo = handedOff.conversation.handoff?.assignedTo;
       if (assignedTo === undefined || assignedTo === "") {
-        // Invariant soft brisé : handed_off sans handoff.assignedTo.
-        // Trace forensique via `reply_dropped` avec reason dédiée, pour
-        // qu'un ops puisse enquêter sans perdre le signal.
-        const phoneHash = safePhoneHash(phone, _hashPii);
-        await _appendAuditLog({
-          actorId: "system",
-          actorType: "system",
-          action: "reply_dropped",
-          targetType: "contact",
-          targetId: contactId,
-          payload: { reason: "no_active_conversation", phoneHash },
-        });
-        return { found: false as const };
+        return {
+          kind: "handed_off_no_assignee" as const,
+          conversationId: handedOff.conversationId,
+        };
       }
       return {
-        found: true as const,
+        kind: "handed_off" as const,
         conversationId: handedOff.conversationId,
-        isHandedOff: true as const,
         assignedTo,
       };
     }
 
-    const phoneHash = safePhoneHash(phone, _hashPii);
-    await _appendAuditLog({
-      actorId: "system",
-      actorType: "system",
-      action: "reply_dropped",
-      targetType: "contact",
-      targetId: contactId,
-      payload: { reason: "no_active_conversation", phoneHash },
-    });
-    return { found: false as const };
+    const latest = await _getLatestConv(contactId);
+    if (latest) {
+      return {
+        kind: "latest_inactive" as const,
+        conversationId: latest.conversationId,
+        latestStatus: latest.conversation.status,
+        latestAssignedTo: latest.conversation.handoff?.assignedTo,
+      };
+    }
+
+    return { kind: "none" as const };
   });
 
-  if (!convStep.found) {
-    logger.info("[process-reply] dropped", {
-      eventId: event.id,
-      contactId,
-      step: "resolve-conversation",
-      reason: "no_active_conversation",
+  // Dispatch des cas (3) (4) (5) via `handleInactiveInbound`. Les cas
+  // (1) et (2) tombent dans la suite du pipeline normal.
+  if (convStep.kind === "handed_off_no_assignee") {
+    const phoneHash = safePhoneHash(phone, _hashPii);
+    const digitsOnly = phone.replace(/\D/g, "");
+    const phoneLast4 = digitsOnly.slice(-4);
+    const wasOptOut = _isOptOut(body);
+    // Store sur la conv handed_off meme sans assignedTo (preuve L.34-5 CPCE).
+    const storeResult = await step.run("store-inbound-handed-off-no-assignee", async () => {
+      return _addInboundIdempotent(convStep.conversationId, {
+        body,
+        channel: "sms",
+        externalId: ovhMessageId,
+        externalReceiver: phone,
+      });
     });
-    return { status: "dropped", reason: "no_active_conversation" };
+    // markOptedOut si wasOptOut. Point 4 round 3 : catch RESTREINT au cas
+    // precis `ValidationError` + `context.currentStatus` dans
+    // {closed, blocked} (TERMINAL_CONV_STATUSES_FOR_OPT_OUT dans
+    // contacts.ts). Toute autre erreur se propage pour que Inngest
+    // retry : contactId vide, doc corrompu, Firestore 5xx, etc.
+    if (wasOptOut) {
+      await step.run("markoptedout-handed-off-no-assignee", async () => {
+        try {
+          await _markOptedOut(contactId, "sms", {
+            conversationId: convStep.conversationId,
+            intent: "STOP",
+          });
+        } catch (err) {
+          if (err instanceof ValidationError) {
+            const ctx = (err.context ?? {}) as { currentStatus?: unknown };
+            const currentStatus =
+              typeof ctx.currentStatus === "string" ? ctx.currentStatus : undefined;
+            if (currentStatus === "closed" || currentStatus === "blocked") {
+              logger.warn(
+                "[process-reply] markOptedOut race on handed_off_no_assignee (conv devenue terminale)",
+                {
+                  eventId: event.id,
+                  contactId,
+                  conversationId: convStep.conversationId,
+                  currentStatus,
+                },
+              );
+              return;
+            }
+          }
+          throw err;
+        }
+      });
+    }
+    return handleInactiveInbound({
+      reason: "handed_off_no_assignee",
+      stepSuffix: "handed-off-no-assignee",
+      wasOptOut,
+      sentryLevel: "error",
+      includeHereMention: true,
+      contactId,
+      conversationId: convStep.conversationId,
+      messageId: storeResult.messageId,
+      phoneHash,
+      phoneLast4,
+    });
   }
 
+  if (convStep.kind === "latest_inactive") {
+    const phoneHash = safePhoneHash(phone, _hashPii);
+    const digitsOnly = phone.replace(/\D/g, "");
+    const phoneLast4 = digitsOnly.slice(-4);
+    const wasOptOut = _isOptOut(body);
+    const latestStatus: ConversationStatus = convStep.latestStatus;
+    // Mapping status -> reason. Les statuts non-terminaux (active, etc.)
+    // ne devraient JAMAIS atterrir ici (sinon getActiveConv les aurait
+    // trouves). On fail-safe sur "closed" par defaut si drift inattendu.
+    const reasonByStatus: Partial<Record<ConversationStatus, InboundOnInactiveConversationReason>> =
+      {
+        closed: "closed",
+        opted_out: "opted_out",
+        blocked: "blocked",
+      };
+    const reason: InboundOnInactiveConversationReason = reasonByStatus[latestStatus] ?? "closed";
+    // Store sur la conv la plus recente (sans modifier son statut).
+    const storeResult = await step.run("store-inbound-latest-inactive", async () => {
+      return _addInboundIdempotent(convStep.conversationId, {
+        body,
+        channel: "sms",
+        externalId: ovhMessageId,
+        externalReceiver: phone,
+      });
+    });
+    // Application opt-out (Finding 2 + Finding 3 PR-NO-DROPPED-SMS).
+    //   - Si wasOptOut && contact deja opt-out  -> audit opt_out alreadyOptedOut:true
+    //     en PLUS de inbound_on_inactive_conversation (Finding 3). Pas de
+    //     markOptedOut (serait no-op).
+    //   - Si wasOptOut && contact pas opt-out ET latestStatus `opted_out` ->
+    //     cas edge : contact pas opt mais conv opted_out. On applique
+    //     markOptedOut SANS conversationId (le guard
+    //     TERMINAL_CONV_STATUSES_FOR_OPT_OUT ne liste que closed/blocked,
+    //     donc opted_out ne throw pas, mais on evite de passer convId pour
+    //     ne pas rouvrir une conv terminale).
+    //   - Si wasOptOut && contact pas opt-out && latestStatus `closed`/`blocked` ->
+    //     markOptedOut sans conversationId pour eviter le ValidationError
+    //     TERMINAL_CONV_STATUSES_FOR_OPT_OUT. On flip le contact uniquement.
+    if (wasOptOut) {
+      await step.run("apply-opt-out-latest-inactive", async () => {
+        const contact = await _getContact(contactId);
+        const alreadyOptedOut = contact?.consent.optedOut === true;
+        if (alreadyOptedOut) {
+          // Finding 3 : audit `opt_out alreadyOptedOut:true` en plus de
+          // inbound_on_inactive_conversation (reaffirmation du choix PS).
+          await _appendAuditLog({
+            actorId: "system",
+            actorType: "system",
+            action: "opt_out",
+            targetType: "contact",
+            targetId: contactId,
+            payload: {
+              channel: "sms",
+              conversationId: convStep.conversationId,
+              alreadyOptedOut: true,
+              reason: "reaffirmation_on_inactive_conversation",
+            },
+          });
+          return;
+        }
+        // Contact pas opt-out encore. On flip. Pas de conversationId pour
+        // eviter TERMINAL_CONV_STATUSES_FOR_OPT_OUT quand latestStatus =
+        // closed/blocked. markOptedOut sans convId = flip contact only.
+        await _markOptedOut(contactId, "sms", { intent: "STOP" });
+      });
+    }
+    return handleInactiveInbound({
+      reason,
+      stepSuffix: `latest-inactive-${reason}`,
+      wasOptOut,
+      sentryLevel: "warning",
+      includeHereMention: false,
+      contactId,
+      conversationId: convStep.conversationId,
+      messageId: storeResult.messageId,
+      ...(convStep.latestAssignedTo !== undefined ? { assignedTo: convStep.latestAssignedTo } : {}),
+      phoneHash,
+      phoneLast4,
+    });
+  }
+
+  if (convStep.kind === "none") {
+    // Contact connu sans AUCUNE conv (bug amont ou donnee corrompue).
+    // Stockage orphelins avec contactId renseigne + canal.
+    const phoneHash = safePhoneHash(phone, _hashPii);
+    const digitsOnly = phone.replace(/\D/g, "");
+    const phoneLast4 = digitsOnly.slice(-4);
+    const wasOptOut = _isOptOut(body);
+    // Finding 2 PR-NO-DROPPED-SMS : markOptedOut OBLIGATOIRE si wasOptOut.
+    // Les erreurs propagent (contact disparu entre step 1 et ici = bug
+    // amont). Finding 3 : si contact deja opt-out, audit
+    // `opt_out alreadyOptedOut:true` au lieu du no-op markOptedOut
+    // silencieux (preserver trace de la reaffirmation).
+    if (wasOptOut) {
+      await step.run("apply-opt-out-no-conversation", async () => {
+        const contact = await _getContact(contactId);
+        const alreadyOptedOut = contact?.consent.optedOut === true;
+        if (alreadyOptedOut) {
+          await _appendAuditLog({
+            actorId: "system",
+            actorType: "system",
+            action: "opt_out",
+            targetType: "contact",
+            targetId: contactId,
+            payload: {
+              channel: "sms",
+              alreadyOptedOut: true,
+              reason: "reaffirmation_on_no_conversation",
+            },
+          });
+          return;
+        }
+        // Flip contact (pas de conversationId car aucune conv). Les
+        // erreurs ValidationError (contactId vide) / NotFoundError
+        // (contact disparu) propagent : bug amont, Inngest retry.
+        await _markOptedOut(contactId, "sms", { intent: "STOP" });
+      });
+    }
+    return handleInactiveInbound({
+      reason: "no_conversation",
+      stepSuffix: "no-conversation",
+      wasOptOut,
+      sentryLevel: "warning",
+      includeHereMention: true,
+      contactId,
+      phoneHash,
+      phoneLast4,
+    });
+  }
+
+  // Cas nominaux : active ou handed_off (avec assignedTo valide).
   const conversationId = convStep.conversationId;
-  const isHandedOff = convStep.isHandedOff;
+  const isHandedOff = convStep.kind === "handed_off";
   logger.info("[process-reply] conversation resolved", {
     eventId: event.id,
     contactId,
@@ -923,74 +1427,44 @@ export async function processReplyHandler(
   // du bloc handed_off, la conversation peut avoir ete passee a `closed`
   // ou `blocked` par un autre flux (admin, compliance). Le guard
   // TERMINAL_CONV_STATUSES_FOR_OPT_OUT dans `markOptedOut` throw alors
-  // `ValidationError` avec `context.currentStatus` → le pipeline Inngest
-  // retry 3x pour rien (meme erreur a chaque fois).
+  // `ValidationError` avec `context.currentStatus`.
   //
-  // Ce helper intercepte la race et :
-  //   1. Pose un audit `reply_dropped reason:"conversation_became_terminal"`
-  //      pour forensique.
-  //   2. Alerte Sentry via `captureMonitoringWarning` — tag critique
-  //      `was_opt_out` pour qu'un humain traite le STOP en manuel.
-  //   3. Throw `NonRetriableError` pour couper le retry Inngest.
+  // Comportement PR-NO-DROPPED-SMS (P6) : plus de `throw NonRetriableError`
+  // avant la notification. Le helper RETOURNE un marker `terminal_race`
+  // avec le `currentStatus` observe. Le caller invoque alors
+  // `handleInactiveInbound` reason="conversation_became_terminal" qui
+  // (a) pose l'audit `inbound_on_inactive_conversation` + wasOptOut:true,
+  // (b) envoie le DM au titulaire avec en-tete "Desabonnement recu pendant
+  //     un changement de statut : verifier la fiche.",
+  // (c) alerte Sentry level "error",
+  // (d) retourne proprement `stored_on_inactive_conversation`.
+  //
+  // Pas de retry Inngest sur cette branche (le return est un succes).
+  // Dedup des sous-steps garantit qu'une re-livraison ne redeclenche pas
+  // le DM.
   //
   // Une erreur ValidationError sans currentStatus terminal (= autre cause,
   // ex: contactId vide) est propagee telle quelle → Inngest retry OK.
+  type RaceGuardOutcome =
+    | { outcome: "applied" }
+    | { outcome: "terminal_race"; currentStatus: "closed" | "blocked" };
   async function markOptedOutWithRaceGuard(params: {
     contactId: string;
     conversationId: string;
     messageId: string;
     was: InboundRelayedOptOutVia;
-  }): Promise<"ok" | "race"> {
+  }): Promise<RaceGuardOutcome> {
     try {
       await _markOptedOut(params.contactId, "sms", {
         conversationId: params.conversationId,
         intent: "STOP",
       });
-      return "ok";
+      return { outcome: "applied" };
     } catch (err) {
-      // Detection du guard terminal : ValidationError + context.currentStatus
-      // present (c'est markOptedOut qui pose ce champ, cf. contacts.ts:566-572).
       if (err instanceof ValidationError) {
         const ctx = (err.context ?? {}) as { currentStatus?: unknown };
         const currentStatus = typeof ctx.currentStatus === "string" ? ctx.currentStatus : undefined;
         if (currentStatus === "closed" || currentStatus === "blocked") {
-          const phoneHash = safePhoneHash(phone, _hashPii);
-          await _appendAuditLog({
-            actorId: "system",
-            actorType: "system",
-            action: "reply_dropped",
-            targetType: "conversation",
-            targetId: params.conversationId,
-            payload: {
-              reason: "conversation_became_terminal",
-              contactId: params.contactId,
-              conversationId: params.conversationId,
-              messageId: params.messageId,
-              currentStatus,
-              wasOptOut: true,
-              optOutVia: params.was,
-              phoneHash,
-            },
-          });
-
-          // Alerte Sentry : un humain DOIT traiter ce STOP manuellement.
-          // Message explicite "wasOptOut" pour que l'operateur comprenne
-          // qu'il faut flip le consent cote CRM meme si la conv Firestore
-          // est en etat terminal.
-          _captureMonitoringWarning("process_reply.handed_off_opt_out_terminal_race", {
-            tags: { was_opt_out: "true", current_status: currentStatus },
-            extra: {
-              contactId: params.contactId,
-              conversationId: params.conversationId,
-              messageId: params.messageId,
-              optOutVia: params.was,
-              hint:
-                "STOP recu sur conv devenue terminale pendant le pipeline. " +
-                "L'opt-out N'A PAS ete applique en base. Un humain doit flip " +
-                "contact.consent.optedOut manuellement et ne plus recontacter.",
-            },
-          });
-
           logger.warn("[process-reply] handed-off opt-out race: conv became terminal", {
             eventId: event.id,
             contactId: params.contactId,
@@ -999,12 +1473,7 @@ export async function processReplyHandler(
             currentStatus,
             optOutVia: params.was,
           });
-
-          // NonRetriableError : la condition est permanente (closed/blocked
-          // sont terminaux), aucun retry Inngest ne peut la resoudre.
-          throw new NonRetriableError(
-            `conversation_became_terminal (currentStatus=${currentStatus})`,
-          );
+          return { outcome: "terminal_race", currentStatus };
         }
       }
       // Autre ValidationError (contactId vide, doc corrompu...) ou autre
@@ -1031,7 +1500,7 @@ export async function processReplyHandler(
   //   (d) enrich-for-notify → getContact pour firstName/speciality/city
   //   (e) notify-inbound-after-handoff → DM Slack au titulaire
   //   (f) audit-inbound-relayed-to-human → audit forensic
-  if (isHandedOff) {
+  if (convStep.kind === "handed_off") {
     const assignedTo = convStep.assignedTo;
 
     // (a) short-form opt-out — fast-path déterministe, zéro appel Claude.
@@ -1042,20 +1511,47 @@ export async function processReplyHandler(
         // réussit : contact.consent.optedOut flip + conv passe de
         // handed_off → opted_out + audit opt_out posé dans la même tx.
         //
-        // RACE GUARD : si la conv est devenue `closed`/`blocked` entre
-        // step 2 et ici, `markOptedOutWithRaceGuard` audit
-        // `reply_dropped reason:"conversation_became_terminal"` +
-        // alerte Sentry + throw NonRetriableError pour couper le retry.
-        await markOptedOutWithRaceGuard({
+        // RACE GUARD (P6 PR-NO-DROPPED-SMS) : si la conv est devenue
+        // `closed`/`blocked` entre step 2 et ici, `markOptedOutWithRaceGuard`
+        // retourne `terminal_race` SANS throw. Le caller detecte le marker
+        // apres le step et bascule sur `handleInactiveInbound`.
+        const guard = await markOptedOutWithRaceGuard({
           contactId,
           conversationId,
           messageId,
           was: "short_form",
         });
-        return { isOptOut: true as const };
+        return { isOptOut: true as const, raceOutcome: guard };
       }
       return { isOptOut: false as const };
     });
+
+    // P6 — short-form race : conv devenue terminale pendant le pipeline.
+    if (hoOptOutStep.isOptOut && hoOptOutStep.raceOutcome.outcome === "terminal_race") {
+      const phoneHash = safePhoneHash(phone, _hashPii);
+      const digitsOnly = phone.replace(/\D/g, "");
+      const phoneLast4 = digitsOnly.slice(-4);
+      logger.warn("[process-reply] P6 short-form race -> handleInactiveInbound", {
+        eventId: event.id,
+        contactId,
+        conversationId,
+        messageId,
+        currentStatus: hoOptOutStep.raceOutcome.currentStatus,
+      });
+      return handleInactiveInbound({
+        reason: "conversation_became_terminal",
+        stepSuffix: "p6-short-form",
+        wasOptOut: true,
+        sentryLevel: "error",
+        includeHereMention: true,
+        contactId,
+        conversationId,
+        messageId,
+        assignedTo,
+        phoneHash,
+        phoneLast4,
+      });
+    }
 
     // Décision du chemin opt-out : short-forme | classifier long-forme | aucun.
     let wasOptOut = hoOptOutStep.isOptOut;
@@ -1094,15 +1590,41 @@ export async function processReplyHandler(
       });
 
       if (hoClassification.intent === "STOP") {
-        await step.run("handed-off-markoptedout-long-form", async () => {
-          // Race guard identique a la branche short-form.
-          await markOptedOutWithRaceGuard({
+        const longFormGuard = await step.run("handed-off-markoptedout-long-form", async () => {
+          // Race guard identique a la branche short-form (P6).
+          return markOptedOutWithRaceGuard({
             contactId,
             conversationId,
             messageId,
             was: "classifier_long_form",
           });
         });
+        if (longFormGuard.outcome === "terminal_race") {
+          const phoneHash = safePhoneHash(phone, _hashPii);
+          const digitsOnly = phone.replace(/\D/g, "");
+          const phoneLast4 = digitsOnly.slice(-4);
+          logger.warn("[process-reply] P6 classifier-long-form race -> handleInactiveInbound", {
+            eventId: event.id,
+            contactId,
+            conversationId,
+            messageId,
+            currentStatus: longFormGuard.currentStatus,
+            classifierFallback: hoClassification.fallback,
+          });
+          return handleInactiveInbound({
+            reason: "conversation_became_terminal",
+            stepSuffix: "p6-classifier-long-form",
+            wasOptOut: true,
+            sentryLevel: "error",
+            includeHereMention: true,
+            contactId,
+            conversationId,
+            messageId,
+            assignedTo,
+            phoneHash,
+            phoneLast4,
+          });
+        }
         wasOptOut = true;
         optOutVia = "classifier_long_form";
 

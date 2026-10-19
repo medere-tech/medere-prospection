@@ -391,6 +391,59 @@ describe("firestore.rules — MVP option A (deny all client)", () => {
   });
 
   // ───────────────────────────────────────────────────────────────────────
+  // inbound_messages_orphans/{id} — PR-NO-DROPPED-SMS
+  // 4 actors × 2 ops = 8 tests
+  //
+  // Pattern miroir strict de audit_log + ovh_stop_callbacks — collection
+  // forensic contenant le TEXTE DU SMS en clair + un hash du numéro émetteur.
+  // Aucune ouverture client prévue même en S9+ (dashboard passe par API
+  // serveur Clerk-protected). Garantit qu'aucun client (anonyme, signed,
+  // commercial, admin Custom Claim) ne peut ni lire ni écrire.
+  // ───────────────────────────────────────────────────────────────────────
+
+  describe("inbound_messages_orphans/{id} — PR-NO-DROPPED-SMS", () => {
+    it("anonyme : read refusé", async () => {
+      const db = actors().anon.firestore();
+      await assertFails(db.collection("inbound_messages_orphans").doc("x").get());
+    });
+
+    it("anonyme : write refusé", async () => {
+      const db = actors().anon.firestore();
+      await assertFails(db.collection("inbound_messages_orphans").doc("x").set(STUB_PAYLOAD));
+    });
+
+    it("signed (no role) : read refusé", async () => {
+      const db = actors().signed.firestore();
+      await assertFails(db.collection("inbound_messages_orphans").doc("x").get());
+    });
+
+    it("signed (no role) : write refusé", async () => {
+      const db = actors().signed.firestore();
+      await assertFails(db.collection("inbound_messages_orphans").doc("x").set(STUB_PAYLOAD));
+    });
+
+    it("commercial Custom Claim : read refusé", async () => {
+      const db = actors().commercial.firestore();
+      await assertFails(db.collection("inbound_messages_orphans").doc("x").get());
+    });
+
+    it("commercial Custom Claim : write refusé", async () => {
+      const db = actors().commercial.firestore();
+      await assertFails(db.collection("inbound_messages_orphans").doc("x").set(STUB_PAYLOAD));
+    });
+
+    it("admin Custom Claim : read refusé (Admin SDK only)", async () => {
+      const db = actors().admin.firestore();
+      await assertFails(db.collection("inbound_messages_orphans").doc("x").get());
+    });
+
+    it("admin Custom Claim : write refusé (Admin SDK only)", async () => {
+      const db = actors().admin.firestore();
+      await assertFails(db.collection("inbound_messages_orphans").doc("x").set(STUB_PAYLOAD));
+    });
+  });
+
+  // ───────────────────────────────────────────────────────────────────────
   // Catchall — collection arbitraire non listée
   // 4 actors × 1 op (write) = 4 tests
   //

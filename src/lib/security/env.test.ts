@@ -329,19 +329,24 @@ describe("getLushaEnv", () => {
 // ─────────────────────────────────────────────────────────────────────────────
 
 describe("getSlackEnv", () => {
+  // PR-NO-DROPPED-SMS Finding 5 : SLACK_ORPHAN_LEADS_CHANNEL_ID est passe
+  // de optional a required. Un canal absent = perte de signal sur un STOP
+  // latent (process-reply P1/P2/P3'/P6 + webhook W3-W6 fallbackent sur ce
+  // canal quand il n'y a pas d'assignedTo DM). Verifie present Vercel prod
+  // + preview.
   const SLACK_OK = {
     SLACK_BOT_TOKEN: "xoxb-fake-token",
     SLACK_SIGNING_SECRET: "signsecret",
+    SLACK_ORPHAN_LEADS_CHANNEL_ID: "C0ORPHAN123",
   };
 
-  it("ok avec required seuls (orphan channel + user_ids optional)", () => {
+  it("ok avec required (orphan channel obligatoire PR-NO-DROPPED-SMS, user_ids optional)", () => {
     setEnv({
       ...SLACK_OK,
-      SLACK_ORPHAN_LEADS_CHANNEL_ID: undefined,
       SLACK_USER_IDS: undefined,
     });
     const env = getSlackEnv();
-    expect(env.SLACK_ORPHAN_LEADS_CHANNEL_ID).toBeUndefined();
+    expect(env.SLACK_ORPHAN_LEADS_CHANNEL_ID).toBe("C0ORPHAN123");
     expect(env.SLACK_USER_IDS).toBeUndefined();
   });
 
@@ -353,6 +358,14 @@ describe("getSlackEnv", () => {
     });
     expect(getSlackEnv().SLACK_ORPHAN_LEADS_CHANNEL_ID).toBe("C0123ABC");
     expect(getSlackEnv().SLACK_USER_IDS).toEqual({ dentaire: "U05UVHGBURX" });
+  });
+
+  it("throws si SLACK_ORPHAN_LEADS_CHANNEL_ID absent (PR-NO-DROPPED-SMS Finding 5)", () => {
+    setEnv({
+      ...SLACK_OK,
+      SLACK_ORPHAN_LEADS_CHANNEL_ID: undefined,
+    });
+    expect(() => getSlackEnv()).toThrow(ConfigError);
   });
 
   it("throws si BOT_TOKEN sans préfixe xoxb-", () => {
