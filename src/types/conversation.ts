@@ -83,6 +83,27 @@ export interface Conversation {
 
   handoff?: ConversationHandoff;
 
+  /**
+   * Slack userId du commercial titulaire, OU `null` explicite si aucun
+   * titulaire.
+   *
+   * **Dénormalisation** de `handoff.assignedTo` à la racine du document
+   * pour permettre les queries Firestore :
+   *   - `where("assignedTo", "==", slackUserId)` — « Mes conversations »
+   *   - `where("assignedTo", "==", null)`         — « À traiter » (orphelines)
+   *
+   * Firestore ne supporte pas de query native sur un champ imbriqué
+   * `handoff.assignedTo == null` quand `handoff` lui-même peut être
+   * `undefined`. On duplique donc à la racine avec `null` explicite.
+   *
+   * 🔒 INVARIANT : `assignedTo` et `handoff?.assignedTo` doivent toujours
+   * être cohérents (soit égaux, soit `assignedTo === null && handoff === undefined`).
+   * `setHandoff` écrit les deux dans la MÊME transaction. Le script
+   * `scripts/backfill-assigned-to.mjs` répare les docs legacy qui
+   * auraient uniquement `handoff.assignedTo` sans `assignedTo` racine.
+   */
+  assignedTo?: string | null;
+
   // Relance automatique
   nextActionAt?: Timestamp;
   nextActionType?: ConversationNextActionType;

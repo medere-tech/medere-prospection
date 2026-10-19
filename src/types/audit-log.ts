@@ -192,6 +192,13 @@ export type AuditAction =
   // `targetType` : "conversation" quand une conv est connue, sinon
   // "contact" (contact connu sans conv) ou "message" (orphan docId).
   | "inbound_on_inactive_conversation"
+  // VUE-CONVERSATION PR0 — accès au numéro de téléphone depuis la vue
+  // conversation (`/admin/conversations/[id]`). Posé par
+  // `POST /api/admin/conversations/[id]/reveal-phone` AVANT de renvoyer
+  // la valeur. Payload = `ContactPhoneAccessedPayload` (cf. interface
+  // ci-dessous). Discriminant `method` ∈ `"display"|"copy"|"call"`.
+  // Un audit par clic, trois méthodes distinctes.
+  | "contact_phone_accessed"
   // ── CAMPAIGN / ADMIN ───────────────────────────────────────────────────
   | "manual_override"
   | "prompt_changed"
@@ -709,6 +716,53 @@ export type InboundOnInactiveNotifiedVia =
   | "digest"
   | "suppressed"
   | "notify_failed";
+
+/**
+ * Methode d'acces au numero de telephone pour `contact_phone_accessed`
+ * (VUE-CONVERSATION PR0). Enum FERME — toute nouvelle methode detectee
+ * DOIT etendre explicitement cette union (compile-time safety).
+ *
+ *   - `"display"` : clic sur « Afficher le numero ».
+ *   - `"copy"`    : clic sur « Copier » (navigator.clipboard).
+ *   - `"call"`    : clic sur « Appeler » (href `tel:`).
+ */
+export type ContactPhoneAccessMethod = "display" | "copy" | "call";
+
+/**
+ * Payload type pour action `contact_phone_accessed` (VUE-CONVERSATION PR0).
+ *
+ * **Cible** : `targetType: "contact"`, `targetId: contactId` (hubspotId
+ * opaque). La conversation d'origine est documentee dans le payload pour
+ * forensic (traçabilite de l'origine du clic).
+ *
+ * ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ * 🚨 INVARIANT ANTI-PII — INTERDITS EN PAYLOAD
+ *
+ *   - `e164`, `phone`, `phoneRaw` — le numero NE DOIT JAMAIS figurer dans
+ *     le payload audit. Le numero est renvoye uniquement dans la reponse
+ *     HTTP de l'endpoint audite, et JAMAIS persiste cote audit log.
+ *   - `firstName`, `lastName`, `email` — identite du PS.
+ *
+ * ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ * Champs scrubber-safe par construction
+ *
+ *   - `method`         : enum ferme (3 valeurs), pas PII.
+ *   - `conversationId` : docId composite `${contactId}_${campaignId}`.
+ *   - `contactId`      : hubspotId opaque (deja dans `targetId`, duplique
+ *                        ici pour requete rapide payload-only).
+ */
+export interface ContactPhoneAccessedPayload {
+  /** Methode d'acces : `display` (afficher) | `copy` (copier) | `call` (appeler). */
+  method: ContactPhoneAccessMethod;
+  /** docId composite `${contactId}_${campaignId}` — origine du clic. */
+  conversationId: string;
+  /** hubspotId opaque (duplique avec `targetId` pour requete payload). */
+  contactId: string;
+  // Index signature explicite : permet l'assignation a
+  // `AuditLogInput.payload: Record<string, unknown>` sans cast (cf. pattern
+  // miroir `HandoffUnassignedPayload` — TS-level uniquement, no-op runtime).
+  readonly [k: string]: unknown;
+}
 
 /**
  * Forme persistée d'une entrée d'audit (avec `timestamp` posé par le
