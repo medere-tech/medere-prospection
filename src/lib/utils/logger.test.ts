@@ -250,6 +250,197 @@ describe("logger — serializer err : scrub message et stack", () => {
 // Non-régression : texte sans PII
 // ─────────────────────────────────────────────────────────────────────────────
 
+// ─────────────────────────────────────────────────────────────────────────────
+// R4-Point2 PR-NO-DROPPED-SMS : scrubber "clé + format + anti-segment FR"
+// ─────────────────────────────────────────────────────────────────────────────
+
+describe("logger — R4-Point2 : exemption technique pour IDs non-PII", () => {
+  it("contactId hubspotId numérique (427963864300) reste lisible, PAS [PHONE]", () => {
+    const cap = captureDestination();
+    const log = buildLogger({ level: "debug" }, cap.stream);
+    log.info({ contactId: "427963864300" }, "test");
+    const out = cap.output();
+    expect(out).toContain("427963864300");
+    expect(out).not.toContain("[PHONE]");
+  });
+
+  it("conversationId `${hubspotId}_${campaignId}` reste lisible", () => {
+    const cap = captureDestination();
+    const log = buildLogger({ level: "debug" }, cap.stream);
+    log.info({ conversationId: "427963864300_dentistes-idf-mai-2026" }, "test");
+    const out = cap.output();
+    expect(out).toContain("427963864300_dentistes-idf-mai-2026");
+    expect(out).not.toContain("[PHONE]");
+  });
+
+  it("ts Slack `1792422107.910000` reste lisible (1 à 10 décimales)", () => {
+    const cap = captureDestination();
+    const log = buildLogger({ level: "debug" }, cap.stream);
+    log.info({ slackTs: "1792422107.910000" }, "test");
+    const out = cap.output();
+    expect(out).toContain("1792422107.910000");
+    expect(out).not.toContain("[PHONE]");
+  });
+
+  it("ts Slack `1792422107.9` (1 décimale) reste lisible", () => {
+    const cap = captureDestination();
+    const log = buildLogger({ level: "debug" }, cap.stream);
+    log.info({ ts: "1792422107.9" }, "test");
+    const out = cap.output();
+    expect(out).toContain("1792422107.9");
+    expect(out).not.toContain("[PHONE]");
+  });
+
+  it("messageId Firestore auto-ID 20 chars reste lisible", () => {
+    const cap = captureDestination();
+    const log = buildLogger({ level: "debug" }, cap.stream);
+    log.info({ messageId: "aBcDeFgHiJkLmNoPqRsT" }, "test");
+    const out = cap.output();
+    expect(out).toContain("aBcDeFgHiJkLmNoPqRsT");
+  });
+
+  it("eventId Inngest `sms.reply.oih_abcd_1234_...` reste lisible", () => {
+    const cap = captureDestination();
+    const log = buildLogger({ level: "debug" }, cap.stream);
+    log.info({ eventId: "sms.reply.oih_abcd_1234_5678_9abc_def0_1234_5678_9abc" }, "test");
+    const out = cap.output();
+    expect(out).toContain("sms.reply.oih_abcd_1234");
+  });
+
+  it("assignedTo `U05VANESSA` Slack user ID reste lisible", () => {
+    const cap = captureDestination();
+    const log = buildLogger({ level: "debug" }, cap.stream);
+    log.info({ assignedTo: "U05VANESSA" }, "test");
+    expect(cap.output()).toContain("U05VANESSA");
+  });
+
+  it("slackChannel `C0ORPHAN123` reste lisible", () => {
+    const cap = captureDestination();
+    const log = buildLogger({ level: "debug" }, cap.stream);
+    log.info({ slackChannel: "C0ORPHAN123" }, "test");
+    expect(cap.output()).toContain("C0ORPHAN123");
+  });
+});
+
+describe("logger — R4-Point2 : anti-segment FR verrouille les fausses exemptions", () => {
+  it("contactId `0612345678` (vrai numéro FR national sous clé technique) → [PHONE]", () => {
+    const cap = captureDestination();
+    const log = buildLogger({ level: "debug" }, cap.stream);
+    log.info({ contactId: "0612345678" }, "test");
+    const out = cap.output();
+    expect(out).not.toContain("0612345678");
+    expect(out).toContain("[PHONE]");
+  });
+
+  it("contactId `33612345678` (E.164 sans + sous clé technique) → [PHONE]", () => {
+    const cap = captureDestination();
+    const log = buildLogger({ level: "debug" }, cap.stream);
+    log.info({ contactId: "33612345678" }, "test");
+    const out = cap.output();
+    expect(out).not.toContain("33612345678");
+    expect(out).toContain("[PHONE]");
+  });
+
+  it("contactId `0033612345678` (préfixe 00+33) → [PHONE]", () => {
+    const cap = captureDestination();
+    const log = buildLogger({ level: "debug" }, cap.stream);
+    log.info({ contactId: "0033612345678" }, "test");
+    expect(cap.output()).not.toContain("0033612345678");
+  });
+
+  it("eventId `sms.reply.0612345678` (segment numéro FR dans event) → [PHONE]", () => {
+    const cap = captureDestination();
+    const log = buildLogger({ level: "debug" }, cap.stream);
+    log.info({ eventId: "sms.reply.0612345678" }, "test");
+    const out = cap.output();
+    expect(out).not.toContain("0612345678");
+    expect(out).toContain("[PHONE]");
+  });
+
+  it("conversationId `0612345678_campagne` (segment numéro FR en préfixe) → [PHONE]", () => {
+    const cap = captureDestination();
+    const log = buildLogger({ level: "debug" }, cap.stream);
+    log.info({ conversationId: "0612345678_campagne" }, "test");
+    const out = cap.output();
+    expect(out).not.toContain("0612345678_campagne");
+  });
+
+  it("hubspotId `0612345678` (vrai numéro sous clé hubspotId stricte) → [PHONE]", () => {
+    const cap = captureDestination();
+    const log = buildLogger({ level: "debug" }, cap.stream);
+    log.info({ hubspotId: "0612345678" }, "test");
+    expect(cap.output()).not.toContain("0612345678");
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// R4-Point2-fix : normalisation séparateurs inter-chiffres + anywhere-match
+// ─────────────────────────────────────────────────────────────────────────────
+
+describe("logger — R4-Point2-fix : numéros FR FORMATÉS sous clé technique", () => {
+  it("contactId `06-12-34-56-78` → [PHONE] (normalisation `-` entre chiffres)", () => {
+    const cap = captureDestination();
+    const log = buildLogger({ level: "debug" }, cap.stream);
+    log.info({ contactId: "06-12-34-56-78" }, "test");
+    const out = cap.output();
+    expect(out).not.toContain("06-12-34-56-78");
+    expect(out).toContain("[PHONE]");
+  });
+
+  it("contactId `06.12.34.56.78` → [PHONE] (normalisation `.` entre chiffres)", () => {
+    const cap = captureDestination();
+    const log = buildLogger({ level: "debug" }, cap.stream);
+    log.info({ contactId: "06.12.34.56.78" }, "test");
+    const out = cap.output();
+    expect(out).not.toContain("06.12.34.56.78");
+    expect(out).toContain("[PHONE]");
+  });
+
+  it("contactId `06 12 34 56 78` → [PHONE] (normalisation espace entre chiffres)", () => {
+    const cap = captureDestination();
+    const log = buildLogger({ level: "debug" }, cap.stream);
+    log.info({ contactId: "06 12 34 56 78" }, "test");
+    const out = cap.output();
+    expect(out).not.toContain("06 12 34 56 78");
+    expect(out).toContain("[PHONE]");
+  });
+
+  it("conversationId `427963864300_dentistes-idf-mai-2026` reste lisible (séparateur structurel, pas de numéro FR)", () => {
+    const cap = captureDestination();
+    const log = buildLogger({ level: "debug" }, cap.stream);
+    log.info({ conversationId: "427963864300_dentistes-idf-mai-2026" }, "test");
+    const out = cap.output();
+    expect(out).toContain("427963864300_dentistes-idf-mai-2026");
+    expect(out).not.toContain("[PHONE]");
+  });
+
+  it("ts `1792422107.910000` reste lisible (normalisation produit `1792422107910000` qui ne match aucun pattern FR)", () => {
+    const cap = captureDestination();
+    const log = buildLogger({ level: "debug" }, cap.stream);
+    log.info({ ts: "1792422107.910000" }, "test");
+    const out = cap.output();
+    expect(out).toContain("1792422107.910000");
+    expect(out).not.toContain("[PHONE]");
+  });
+
+  it("eventId `sms.reply.oih_abcd_1234` reste lisible (`.` et `_` entre lettres ou lettre-chiffre, pas de numéro FR)", () => {
+    const cap = captureDestination();
+    const log = buildLogger({ level: "debug" }, cap.stream);
+    log.info({ eventId: "sms.reply.oih_abcd_1234" }, "test");
+    const out = cap.output();
+    expect(out).toContain("sms.reply.oih_abcd_1234");
+    expect(out).not.toContain("[PHONE]");
+  });
+
+  it("conversationId `06-12-34-56-78_campagne` → [PHONE] (numéro FR formaté préfixe + séparateur structurel suffixe)", () => {
+    const cap = captureDestination();
+    const log = buildLogger({ level: "debug" }, cap.stream);
+    log.info({ conversationId: "06-12-34-56-78_campagne" }, "test");
+    const out = cap.output();
+    expect(out).not.toContain("06-12-34-56-78");
+  });
+});
+
 describe("logger — non-régression : pas de PII = pas de modification", () => {
   it("un msg sans téléphone ni email passe tel quel", () => {
     const cap = captureDestination();

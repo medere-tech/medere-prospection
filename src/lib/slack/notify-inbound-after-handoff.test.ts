@@ -96,9 +96,9 @@ describe("sendInboundAfterHandoffNotification — contenu", () => {
       target: { kind: "dm", slackUserId: "U05UVHGBURX" },
     });
     const args = spy.mock.calls[0]?.[0];
-    expect(args?.text).toBe("Demande d'arret (STOP) a traiter");
+    expect(args?.text).toBe("Demande d'arrêt (STOP) à traiter");
     const serialized = JSON.stringify(args?.blocks);
-    expect(serialized).toContain("Demande d'arret (STOP) sur un lead que vous suivez");
+    expect(serialized).toContain("Demande d'arrêt (STOP) sur un lead que vous suivez");
     expect(serialized).toContain("Ne plus recontacter");
   });
 

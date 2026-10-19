@@ -39,46 +39,69 @@ import { E164_REGEX } from "@/lib/utils/phone";
 // Schémas par service
 // ─────────────────────────────────────────────────────────────────────────────
 
-const coreEnvSchema = z.object({
-  NODE_ENV: z.enum(["development", "production", "test"]),
-  /** Optional Phase 1 : default localhost dev, set par Vercel en prod. */
-  NEXT_PUBLIC_APP_URL: z.url().optional(),
-  /** Optional Phase 1 : non utilisée (signatures internes à venir en P2+). */
-  APP_SECRET: z.string().min(32).optional(),
-  /**
-   * Mode dry-run pour les envois SMS Inngest (S8). `"true"` → on logue le
-   * payload qu'on aurait envoyé à OVH puis on retourne un faux messageId,
-   * AUCUN appel HTTP OVH réel n'est fait.
-   *
-   * **Default `"true"` = filet anti-envoi-accidentel.** Une variable
-   * manquante sur un environnement mal configuré (CI, preview Vercel mal
-   * câblé, dev local fraîchement cloné, prod en cours de migration) ne
-   * DOIT JAMAIS basculer vers un envoi réel par omission. C'est l'acte
-   * délibéré de set `"false"` côté infra qui ouvre l'envoi.
-   *
-   * Stratégie de déploiement Vercel :
-   *   - Preview                : DRY_RUN_SMS=true   (jamais d'envoi sur PRs)
-   *   - Production             : DRY_RUN_SMS=false  (envoi réel)
-   *   - Local (.env.local)     : DRY_RUN_SMS=true   (dev sans surprise)
-   *
-   * Type d'usage côté caller :
-   *   ```ts
-   *   const { DRY_RUN_SMS } = getCoreEnv();
-   *   if (DRY_RUN_SMS) {
-   *     log("DRY RUN — would send: ...");
-   *     return { messageIds: ["dry-run-..."], dryRun: true };
-   *   }
-   *   await sendSms(payload);
-   *   ```
-   *
-   * Le `transform` Zod convertit la string env en boolean → typage caller
-   * propre (pas de comparaison `=== "true"` à se rappeler ailleurs).
-   */
-  DRY_RUN_SMS: z
-    .enum(["true", "false"])
-    .default("true")
-    .transform((v) => v === "true"),
-});
+const coreEnvSchema = z
+  .object({
+    NODE_ENV: z.enum(["development", "production", "test"]),
+    /**
+     * R4-Point3 PR-NO-DROPPED-SMS : **REQUIRED en production** (set par
+     * Vercel). Optional en dev/test (fallback Vercel URL dans
+     * `dashboard-url.ts::DASHBOARD_URL_FALLBACK`). Un boot prod sans la
+     * var throw `ConfigError` au `getCoreEnv()`.
+     */
+    NEXT_PUBLIC_APP_URL: z.url().optional(),
+    /** Optional Phase 1 : non utilisée (signatures internes à venir en P2+). */
+    APP_SECRET: z.string().min(32).optional(),
+    /**
+     * Mode dry-run pour les envois SMS Inngest (S8). `"true"` → on logue le
+     * payload qu'on aurait envoyé à OVH puis on retourne un faux messageId,
+     * AUCUN appel HTTP OVH réel n'est fait.
+     *
+     * **Default `"true"` = filet anti-envoi-accidentel.** Une variable
+     * manquante sur un environnement mal configuré (CI, preview Vercel mal
+     * câblé, dev local fraîchement cloné, prod en cours de migration) ne
+     * DOIT JAMAIS basculer vers un envoi réel par omission. C'est l'acte
+     * délibéré de set `"false"` côté infra qui ouvre l'envoi.
+     *
+     * Stratégie de déploiement Vercel :
+     *   - Preview                : DRY_RUN_SMS=true   (jamais d'envoi sur PRs)
+     *   - Production             : DRY_RUN_SMS=false  (envoi réel)
+     *   - Local (.env.local)     : DRY_RUN_SMS=true   (dev sans surprise)
+     *
+     * Type d'usage côté caller :
+     *   ```ts
+     *   const { DRY_RUN_SMS } = getCoreEnv();
+     *   if (DRY_RUN_SMS) {
+     *     log("DRY RUN — would send: ...");
+     *     return { messageIds: ["dry-run-..."], dryRun: true };
+     *   }
+     *   await sendSms(payload);
+     *   ```
+     *
+     * Le `transform` Zod convertit la string env en boolean → typage caller
+     * propre (pas de comparaison `=== "true"` à se rappeler ailleurs).
+     */
+    DRY_RUN_SMS: z
+      .enum(["true", "false"])
+      .default("true")
+      .transform((v) => v === "true"),
+  })
+  .superRefine((val, ctx) => {
+    // R4-Point3 PR-NO-DROPPED-SMS : NEXT_PUBLIC_APP_URL devient required
+    // en production. En dev/test, le fallback Vercel dans
+    // dashboard-url.ts reste autorisé (comportement legacy).
+    if (
+      val.NODE_ENV === "production" &&
+      (val.NEXT_PUBLIC_APP_URL === undefined || val.NEXT_PUBLIC_APP_URL === "")
+    ) {
+      ctx.addIssue({
+        code: "custom",
+        path: ["NEXT_PUBLIC_APP_URL"],
+        message:
+          "NEXT_PUBLIC_APP_URL is required in production (set via Vercel env). " +
+          "Dev and test environments may omit it.",
+      });
+    }
+  });
 
 const anthropicEnvSchema = z.object({
   ANTHROPIC_API_KEY: z.string().startsWith("sk-ant-"),

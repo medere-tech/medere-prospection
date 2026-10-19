@@ -21,6 +21,73 @@ import {
   LAST_INBOUND_MAX_CHARS,
 } from "./format-inbound-on-inactive-conversation";
 
+// ─────────────────────────────────────────────────────────────────────────────
+// R4-Point1 PR-NO-DROPPED-SMS : sentinelles no-emoji + accents FR corrects
+// ─────────────────────────────────────────────────────────────────────────────
+
+const EMOJI_REGEX =
+  // Détecte les emojis Unicode courants (symboles + visages + drapeaux).
+  // Volontairement conservateur : couvre les plages U+1F300–U+1FAFF + sélection
+  // de symboles divers souvent utilisés (⚠️ ❓ 🎯 📍 ✅ ❌ 🚨 🔒 💬 📞 📧).
+  /[\u{1F300}-\u{1FAFF}\u{2600}-\u{27BF}\u{1F000}-\u{1F2FF}]/u;
+
+/**
+ * Mapping explicite reason -> accents attendus. Si un header perd ses
+ * accents (ex: "Desabonne" au lieu de "Désabonné"), ce test casse. C'est
+ * la sentinelle anti-régression R4-Point1 décidée par Déthié.
+ */
+const EXPECTED_ACCENTED_SUBSTRINGS: Readonly<Record<string, readonly string[]>> = {
+  opted_out: ["désabonné"],
+  blocked: ["bloqué"],
+  closed: ["clôturée", "réécrit"],
+  conversation_became_terminal: ["Désabonnement", "reçu", "vérifier"],
+  handed_off_no_assignee: ["attribué", "reçu"],
+  no_conversation: ["reçu", "à rattacher"],
+  unknown_contact: ["Numéro", "reçu", "référencé"],
+  parse_failed: ["reçu"],
+  enqueue_failed: ["échec", "reçu", "lancé"],
+};
+
+describe("Sentinelle R4-Point1 : HEADERS_BY_REASON sans emoji + accents corrects", () => {
+  for (const [reason, expectedSubs] of Object.entries(EXPECTED_ACCENTED_SUBSTRINGS) as Array<
+    [keyof typeof HEADERS_BY_REASON, readonly string[]]
+  >) {
+    it(`reason=${reason} : aucun emoji + accents présents`, () => {
+      const header = HEADERS_BY_REASON[reason];
+      expect(EMOJI_REGEX.test(header)).toBe(false);
+      for (const sub of expectedSubs) {
+        expect(header).toContain(sub);
+      }
+    });
+  }
+
+  it("textes de section 'Numéro inconnu' + 'Désabonnement détecté' sans emoji + accents OK", () => {
+    const withOptOut = buildInboundOnInactiveConversationBlocks({
+      reason: "closed",
+      wasOptOut: true,
+      lastInboundBody: "STOP",
+      dashboardUrl: "https://d.test/x",
+      firstName: "A",
+      speciality: "B",
+      city: "C",
+    });
+    const serializedWithOptOut = JSON.stringify(withOptOut);
+    expect(serializedWithOptOut).toContain("Désabonnement détecté");
+    expect(EMOJI_REGEX.test(serializedWithOptOut)).toBe(false);
+
+    const unknownContact = buildInboundOnInactiveConversationBlocks({
+      reason: "unknown_contact",
+      wasOptOut: false,
+      lastInboundBody: "coucou",
+      dashboardUrl: "https://d.test/x",
+      phoneLast4: "4567",
+    });
+    const serializedUnknown = JSON.stringify(unknownContact);
+    expect(serializedUnknown).toContain("Numéro inconnu");
+    expect(EMOJI_REGEX.test(serializedUnknown)).toBe(false);
+  });
+});
+
 describe("buildInboundOnInactiveConversationBlocks — en-tetes conditionnels", () => {
   for (const [reason, expectedHeader] of Object.entries(HEADERS_BY_REASON) as Array<
     [keyof typeof HEADERS_BY_REASON, string]
@@ -125,7 +192,7 @@ describe("buildInboundOnInactiveConversationBlocks — anti-PII sentinelle", () 
 });
 
 describe("buildInboundOnInactiveConversationBlocks — opt-out mention + here", () => {
-  it("wasOptOut=true -> section 'Desabonnement detecte'", () => {
+  it("wasOptOut=true -> section 'Désabonnement détecté'", () => {
     const blocks = buildInboundOnInactiveConversationBlocks({
       reason: "closed",
       wasOptOut: true,
@@ -136,7 +203,7 @@ describe("buildInboundOnInactiveConversationBlocks — opt-out mention + here", 
       city: "C",
     });
     const serialized = JSON.stringify(blocks);
-    expect(serialized).toContain("Desabonnement detecte");
+    expect(serialized).toContain("Désabonnement détecté");
   });
 
   it("includeHereMention=true -> section <!here>", () => {
@@ -170,7 +237,7 @@ describe("buildInboundOnInactiveConversationBlocks — opt-out mention + here", 
 });
 
 describe("buildInboundOnInactiveConversationBlocks — fallback sans contact", () => {
-  it("pas de firstName/speciality/city mais phoneLast4 -> section 'Numero inconnu' avec last4", () => {
+  it("pas de firstName/speciality/city mais phoneLast4 -> section 'Numéro inconnu' avec last4", () => {
     const blocks = buildInboundOnInactiveConversationBlocks({
       reason: "unknown_contact",
       wasOptOut: false,
@@ -179,7 +246,7 @@ describe("buildInboundOnInactiveConversationBlocks — fallback sans contact", (
       phoneLast4: "4567",
     });
     const serialized = JSON.stringify(blocks);
-    expect(serialized).toContain("Numero inconnu");
+    expect(serialized).toContain("Numéro inconnu");
     expect(serialized).toContain("4567");
   });
 
@@ -191,7 +258,7 @@ describe("buildInboundOnInactiveConversationBlocks — fallback sans contact", (
       dashboardUrl: "https://d.test/x",
     });
     const serialized = JSON.stringify(blocks);
-    expect(serialized).toContain("Contact non identifie");
+    expect(serialized).toContain("Contact non identifié");
   });
 });
 

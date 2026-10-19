@@ -48,6 +48,7 @@ config({ path: ".env.local" });
 
 import { getOvhClient } from "../src/lib/ovh/client.ts";
 import { getOvhEnv } from "../src/lib/security/env.ts";
+import { scrubOvhErrorMessage } from "./_lib/ovh-scrub.mjs";
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Constantes
@@ -228,8 +229,9 @@ async function main() {
 }
 
 main().catch((err) => {
-  console.error(
-    `Erreur fatale : ${err && err.name ? err.name : "unknown"} - ${err && err.message ? err.message : "no message"}`,
-  );
+  // scrubOvhErrorMessage : les erreurs OVH peuvent contenir receiver=0033...
+  const name = err && err.name ? err.name : "unknown";
+  const msg = err && err.message ? err.message : "no message";
+  console.error(`Erreur fatale : ${name} - ${scrubOvhErrorMessage(msg)}`);
   process.exit(1);
 });

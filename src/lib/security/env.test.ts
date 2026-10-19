@@ -116,8 +116,25 @@ describe("getCoreEnv", () => {
   });
 
   it("DRY_RUN_SMS=false (string) → boolean false (seul cas qui ouvre l'envoi)", () => {
-    setEnv({ NODE_ENV: "production", DRY_RUN_SMS: "false" });
+    // R4-Point3 PR-NO-DROPPED-SMS : en production, NEXT_PUBLIC_APP_URL est
+    // désormais required. On la fournit pour que le test continue à couvrir
+    // UNIQUEMENT le path `DRY_RUN_SMS=false`.
+    setEnv({
+      NODE_ENV: "production",
+      DRY_RUN_SMS: "false",
+      NEXT_PUBLIC_APP_URL: "https://medere.example",
+    });
     expect(getCoreEnv().DRY_RUN_SMS).toBe(false);
+  });
+
+  it("R4-Point3 : NODE_ENV=production + NEXT_PUBLIC_APP_URL absent → ConfigError", () => {
+    setEnv({ NODE_ENV: "production", DRY_RUN_SMS: "false", NEXT_PUBLIC_APP_URL: undefined });
+    expect(() => getCoreEnv()).toThrow(ConfigError);
+  });
+
+  it("R4-Point3 : NODE_ENV=development + NEXT_PUBLIC_APP_URL absent → OK (fallback Vercel)", () => {
+    setEnv({ NODE_ENV: "development", DRY_RUN_SMS: "true", NEXT_PUBLIC_APP_URL: undefined });
+    expect(getCoreEnv().NEXT_PUBLIC_APP_URL).toBeUndefined();
   });
 
   it("DRY_RUN_SMS=yes (hors enum) → throw ConfigError (pas de fallback silencieux)", () => {

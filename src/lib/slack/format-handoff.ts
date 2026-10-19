@@ -141,7 +141,9 @@ function toBlockquote(text: string): string {
  *   [4] context — footer discret `conv \`<id>\`` pour correlation debug
  */
 export function buildHandoffBlocks(input: HandoffInput): HandoffBlock[] {
-  const header = input.isOrphan ? "❓ Lead non attribué à traiter" : "🎯 Lead intéressé";
+  // R4-Point1 PR-NO-DROPPED-SMS : emojis retirés (décision Déthié : plus
+  // aucun emoji dans aucun message Slack). Accents FR préservés.
+  const header = input.isOrphan ? "Lead non attribué à traiter" : "Lead intéressé";
   // herePing est une CONSTANTE litterale, pas une entree externe —
   // volontairement NON echappee pour que Slack rende effectivement la
   // mention `<!here>` sur la branche orphelins (c'est le ping voulu D8).
@@ -161,13 +163,13 @@ export function buildHandoffBlocks(input: HandoffInput): HandoffBlock[] {
   return [
     {
       type: "header",
-      text: { type: "plain_text", text: header, emoji: true },
+      text: { type: "plain_text", text: header, emoji: false },
     },
     {
       type: "section",
       text: {
         type: "mrkdwn",
-        text: `${herePing}*${safeFirstName}* — ${safeSpeciality}\n📍 ${safeCity}`,
+        text: `${herePing}*${safeFirstName}* — ${safeSpeciality}\n${safeCity}`,
       },
     },
     {

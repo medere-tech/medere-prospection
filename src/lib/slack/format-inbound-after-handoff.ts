@@ -154,7 +154,7 @@ export function buildInboundAfterHandoffBlocks(
   input: InboundAfterHandoffInput,
 ): InboundAfterHandoffBlock[] {
   const header = input.isOptOut
-    ? "Demande d'arret (STOP) sur un lead que vous suivez"
+    ? "Demande d'arrêt (STOP) sur un lead que vous suivez"
     : "Nouveau message d'un lead que vous suivez";
 
   // 🚨 ECHAPPEMENT MRKDWN — tous les champs externes passent par
@@ -193,7 +193,7 @@ export function buildInboundAfterHandoffBlocks(
       type: "section",
       text: {
         type: "mrkdwn",
-        text: "*Ne plus recontacter.* Le consentement a ete retire (STOP).",
+        text: "*Ne plus recontacter.* Le consentement a été retiré (STOP).",
       },
     });
   }

@@ -83,16 +83,16 @@ export const LAST_INBOUND_MAX_CHARS = 300;
  * (verrou de l'ensemble des valeurs).
  */
 export const HEADERS_BY_REASON: Readonly<Record<InboundOnInactiveConversationReason, string>> = {
-  opted_out: "Contact desabonne : aucune sollicitation SMS sans nouveau consentement explicite.",
-  blocked: "Contact bloque : ne pas recontacter par SMS.",
-  closed: "Conversation cloturee : le contact a reecrit.",
+  opted_out: "Contact désabonné : aucune sollicitation SMS sans nouveau consentement explicite.",
+  blocked: "Contact bloqué : ne pas recontacter par SMS.",
+  closed: "Conversation clôturée : le contact a réécrit.",
   conversation_became_terminal:
-    "Desabonnement recu pendant un changement de statut : verifier la fiche.",
-  handed_off_no_assignee: "Lead sans commercial attribue : SMS recu, a traiter manuellement.",
-  no_conversation: "Contact sans conversation ouverte : SMS recu, a rattacher manuellement.",
-  unknown_contact: "Numero inconnu : SMS recu depuis un contact non reference.",
-  parse_failed: "Webhook SMS illisible : payload recu avec un token valide mais non parsable.",
-  enqueue_failed: "Mise en file Inngest en echec : SMS recu mais pipeline non lance.",
+    "Désabonnement reçu pendant un changement de statut : vérifier la fiche.",
+  handed_off_no_assignee: "Lead sans commercial attribué : SMS reçu, à traiter manuellement.",
+  no_conversation: "Contact sans conversation ouverte : SMS reçu, à rattacher manuellement.",
+  unknown_contact: "Numéro inconnu : SMS reçu depuis un contact non référencé.",
+  parse_failed: "Webhook SMS illisible : payload reçu avec un token valide mais non parsable.",
+  enqueue_failed: "Mise en file Inngest en échec : SMS reçu mais pipeline non lancé.",
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -222,7 +222,7 @@ export function buildInboundOnInactiveConversationBlocks(
       type: "section",
       text: {
         type: "mrkdwn",
-        text: `Numero inconnu (derniers chiffres : *${safeLast4}*)`,
+        text: `Numéro inconnu (derniers chiffres : *${safeLast4}*)`,
       },
     });
   } else {
@@ -230,7 +230,7 @@ export function buildInboundOnInactiveConversationBlocks(
       type: "section",
       text: {
         type: "mrkdwn",
-        text: "Contact non identifie (payload illisible ou numero masque).",
+        text: "Contact non identifié (payload illisible ou numéro masqué).",
       },
     });
   }
@@ -249,7 +249,7 @@ export function buildInboundOnInactiveConversationBlocks(
       type: "section",
       text: {
         type: "mrkdwn",
-        text: "*Desabonnement detecte dans le texte.* Appliquer STOP si besoin.",
+        text: "*Désabonnement détecté dans le texte.* Appliquer STOP si besoin.",
       },
     });
   }

@@ -120,7 +120,7 @@ function buildDigestBlocks(params: {
       type: "header",
       text: {
         type: "plain_text",
-        text: "Vague d'alertes orphelines (synthese 1min)",
+        text: "Vague d'alertes orphelines (synthèse 1min)",
         emoji: false,
       },
     },
@@ -128,7 +128,7 @@ function buildDigestBlocks(params: {
       type: "section",
       text: {
         type: "mrkdwn",
-        text: `*Reason* : \`${params.reason}\`\n*Alertes comptabilisees dans la minute* : *${params.suppressed}+*\n\nLes alertes individuelles sont supprimees pour eviter l'inondation du canal. Les SMS correspondants restent persistes dans \`inbound_messages_orphans/\` et un audit \`inbound_on_inactive_conversation\` est pose pour chacun.`,
+        text: `*Reason* : \`${params.reason}\`\n*Alertes comptabilisées dans la minute* : *${params.suppressed}+*\n\nLes alertes individuelles sont supprimées pour éviter l'inondation du canal. Les SMS correspondants restent persistés dans \`inbound_messages_orphans/\` et un audit \`inbound_on_inactive_conversation\` est posé pour chacun.`,
       },
     },
     {
@@ -251,7 +251,7 @@ export async function sendInboundOnInactiveConversationNotification(
   // de la reason (toujours scrubber-safe par construction : pas de PII).
   const fallbackText =
     decision.kind === "send_digest"
-      ? `Vague d'alertes orphelines ${input.reason} (synthese)`
+      ? `Vague d'alertes orphelines ${input.reason} (synthèse)`
       : HEADERS_BY_REASON[input.reason];
 
   const client = getSlackClient();

@@ -259,7 +259,21 @@ export const MessageErrorSchema = z.object({
 export const MessageSchema = z.object({
   direction: z.enum(["outbound", "inbound"]),
   body: z.string().min(1).max(BODY_MAX_LENGTH),
-  status: z.enum(["draft", "queued", "sending", "sent", "delivered", "failed", "received"]),
+  status: z.enum([
+    "draft",
+    "queued",
+    "sending",
+    "sent",
+    "delivered",
+    "failed",
+    "received",
+    // R5-Point4+5 PR-NO-DROPPED-SMS : statuts terminaux manuels.
+    // Validation Zod etendue pour accepter les docs post-cleanup. Cf.
+    // src/types/message.ts::MessageStatus pour les garanties
+    // d'exclusion (rate-limit, monitor, listRecentMessages).
+    "abandoned",
+    "duplicate",
+  ]),
   channel: z.enum(["sms", "whatsapp"]),
   externalId: z.string().optional(),
   externalReceiver: z.string().optional(),
@@ -305,6 +319,10 @@ export const MessageSchema = z.object({
   sentAt: TimestampLike.optional(),
   deliveredAt: TimestampLike.optional(),
   receivedAt: TimestampLike.optional(),
+  // R5-Point4+5 PR-NO-DROPPED-SMS : champs liés aux statuts terminaux manuels.
+  abandonedAt: TimestampLike.optional(),
+  abandonReason: z.enum(["stale_pre_launch_test_cleanup"]).optional(),
+  duplicateOf: z.string().optional(),
   error: MessageErrorSchema.optional(),
 });
 
@@ -1774,11 +1792,19 @@ export async function listRecentMessages(
 
   const parsed = snap.docs.map((doc) => _parseMessageOrThrow(doc.data(), conversationId, doc.id));
 
-  // Exclusion des drafts (S9.3.3a) — un draft n'a pas été envoyé au PS.
-  const nonDrafts = parsed.filter((msg) => msg.status !== "draft");
+  // Exclusion des drafts (S9.3.3a) + statuts terminaux manuels R5
+  // (abandoned, duplicate). Ces 3 statuts ne doivent JAMAIS entrer dans
+  // l'historique passé a Claude :
+  //   - draft     : jamais envoye au PS (n'a pas eu lieu).
+  //   - abandoned : stale cleanup R5-Point4, n'a jamais ete envoye.
+  //   - duplicate : R5-Point5, SMS deja represente par l'original dans
+  //                 l'historique. Le re-inclure duplique l'echange.
+  const historyEligible = parsed.filter(
+    (msg) => msg.status !== "draft" && msg.status !== "abandoned" && msg.status !== "duplicate",
+  );
 
   // Inverse pour ordre chronologique CROISSANT (plus ancien en premier).
-  return nonDrafts.reverse().map((msg) => ({
+  return historyEligible.reverse().map((msg) => ({
     direction: msg.direction,
     body: msg.body,
   }));
@@ -2022,13 +2048,23 @@ export async function updateMessageStatus(input: UpdateMessageStatusInput): Prom
       return;
     }
 
-    // ── Status `draft` / `received` ne transitionnent PAS via cette fct ────
+    // ── Status `draft` / `received` / `abandoned` / `duplicate` ne
+    // transitionnent PAS via cette fct ────────────────────────────────────
     // `draft → queued` est géré par `commitDraftToQueued` S9.4.1 (logique
     // compliance + bump compteurs). `received` est terminal inbound.
-    // Refus explicite — la table ne contient pas ces sources.
-    if (current.status === "draft" || current.status === "received") {
+    // R5-Point4+5 : `abandoned` et `duplicate` sont des statuts terminaux
+    // MANUELS (scripts/close-stale-orphans.mjs + close-duplicate-inbound.mjs).
+    // Immuables. Aucune transition entrante ni sortante possible via
+    // `updateMessageStatus` → preuve structurelle qu'un message ne peut
+    // JAMAIS redevenir envoyable après bascule manuelle.
+    if (
+      current.status === "draft" ||
+      current.status === "received" ||
+      current.status === "abandoned" ||
+      current.status === "duplicate"
+    ) {
       throw new ValidationError({
-        message: `updateMessageStatus refuses transition from "${current.status}" (use commitDraftToQueued for drafts; inbound 'received' is terminal)`,
+        message: `updateMessageStatus refuses transition from "${current.status}" (use commitDraftToQueued for drafts; 'received'/'abandoned'/'duplicate' are terminal)`,
         context: {
           conversationId: input.conversationId,
           messageId: input.messageId,

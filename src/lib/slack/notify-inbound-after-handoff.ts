@@ -122,7 +122,7 @@ export async function sendInboundAfterHandoffNotification(
   // (notifications mobiles pauvres, screen readers). JAMAIS de PII
   // dedans — juste un resume neutre discriminant la variante.
   const fallbackText = input.isOptOut
-    ? "Demande d'arret (STOP) a traiter"
+    ? "Demande d'arrêt (STOP) à traiter"
     : "Nouveau message d'un lead";
 
   const client = getSlackClient();
