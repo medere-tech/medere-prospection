@@ -38,7 +38,56 @@ export type MessageStatus =
   | "sent" // accusé OVH (job accepté)
   | "delivered" // OVH a confirmé la délivrance au destinataire
   | "failed" // échec d'envoi (erreur OVH / numéro invalide)
-  | "received"; // message entrant (inbound)
+  | "received" // message entrant (inbound)
+  /**
+   * **R5-Point4 PR-NO-DROPPED-SMS** : statut terminal pour les messages
+   * stale pré-launch (drafts/queued jamais envoyés OVH, détectés par
+   * `monitor-orphan-messages` depuis juillet). Marqué par le script
+   * `scripts/close-stale-orphans.mjs` (manuel, --apply, snapshot tmp/,
+   * audit `manual_override` avec preuve OVH).
+   *
+   * Garanties structurelles :
+   *   - EXCLU de `RATE_LIMIT_COUNTED_STATUSES` (whitelist) → non compté
+   *     contre le plafond rate-limit 3 SMS/30j (`listRecentOutbound` filtre).
+   *   - EXCLU de `monitor-orphan-messages` qui ne scanne que
+   *     `draft|queued` (`monitor-orphan-messages.ts:247,257`) → plus de
+   *     signal répétitif.
+   *   - EXCLU de `listRecentMessages` (filtre explicite dans ce fichier
+   *     — pas d'historique Claude pour un message qui n'a jamais été
+   *     envoyé au PS).
+   *   - PAS DE TRANSITION depuis `abandoned` : terminal, immuable. Aucune
+   *     fonction du projet ne peut faire `status: "sending"` sur un doc
+   *     `abandoned` (le pipeline send-reply/send-first-sms query par
+   *     `status: "queued"` avant transition).
+   *
+   * Champs liés OBLIGATOIRES à l'écriture :
+   *   - `abandonedAt`     : Timestamp serveur de la bascule.
+   *   - `abandonReason`   : enum fermé `"stale_pre_launch_test_cleanup"`
+   *                         (plus de valeurs futures : chaque bascule
+   *                         manuelle doit documenter son contexte).
+   */
+  | "abandoned"
+  /**
+   * **R5-Point5 PR-NO-DROPPED-SMS** : statut terminal pour les docs
+   * inbound dupliqués pré-BUG-DEDUP-RACE fix (PR #48). Marqué par le
+   * script `scripts/close-duplicate-inbound.mjs`.
+   *
+   * Garanties structurelles :
+   *   - EXCLU de `listRecentMessages` (filtre explicite).
+   *   - EXCLU des calculs intent / reply-volume (reply-volume lit via
+   *     `listRecentOutbound` qui ne voit que les outbounds + whitelist
+   *     statuts → un inbound `duplicate` n'y entre jamais).
+   *   - EXCLU des affichages de conversation (le dashboard filtrera
+   *     `status !== "duplicate"` en S10+).
+   *
+   * Champs liés OBLIGATOIRES à l'écriture :
+   *   - `duplicateOf`     : messageId de l'ORIGINAL (createdAt le plus
+   *                         ancien avec le même `externalId`). Pointe
+   *                         vers le doc qui doit rester lisible.
+   *   - `abandonedAt`     : Timestamp bascule (champ partagé avec
+   *                         `abandoned` pour un lifecycle terminal unifié).
+   */
+  | "duplicate";
 
 export type MessageChannel = "sms" | "whatsapp";
 
@@ -169,6 +218,30 @@ export interface Message {
   sentAt?: Timestamp;
   deliveredAt?: Timestamp;
   receivedAt?: Timestamp;
+
+  /**
+   * R5-Point4+5 PR-NO-DROPPED-SMS : timestamp de bascule vers un statut
+   * terminal manuel (`abandoned` ou `duplicate`). Posé via
+   * `FieldValue.serverTimestamp()` par les scripts
+   * `close-stale-orphans.mjs` et `close-duplicate-inbound.mjs`.
+   * Immuable après écriture.
+   */
+  abandonedAt?: Timestamp;
+
+  /**
+   * R5-Point4 PR-NO-DROPPED-SMS : enum fermé des raisons autorisées pour
+   * `status: "abandoned"`. Toute nouvelle raison exige une extension
+   * explicite ici — pas de valeur libre pour éviter les abus de la bascule.
+   */
+  abandonReason?: "stale_pre_launch_test_cleanup";
+
+  /**
+   * R5-Point5 PR-NO-DROPPED-SMS : messageId de l'ORIGINAL quand ce doc
+   * est marqué `status: "duplicate"`. Pointe vers le `conversations/{convId}/
+   * messages/{originalId}` qui conserve la preuve forensic. Même conv
+   * forcément (le dédup se fait intra-conversation).
+   */
+  duplicateOf?: string;
 
   error?: MessageError;
 }

@@ -43,9 +43,9 @@ import { getCoreEnv } from "@/lib/security/env";
 import { logger } from "@/lib/utils/logger";
 
 /**
- * Fallback utilisé quand `NEXT_PUBLIC_APP_URL` est absent. URL Vercel prod
- * fixe. DOIT rester strictement égal à `slack-handoff.ts::DASHBOARD_URL_FALLBACK`
- * (sentinelle test anti-drift).
+ * Fallback utilisé UNIQUEMENT en dev et en test quand `NEXT_PUBLIC_APP_URL`
+ * est absent. En production (`NODE_ENV === "production"`), `getCoreEnv()`
+ * throw `ConfigError` au démarrage si la var manque (R4-Point3 PR-NO-DROPPED-SMS).
  */
 export const DASHBOARD_URL_FALLBACK = "https://medere-prospection.vercel.app";
 
@@ -76,16 +76,40 @@ export function getDashboardConversationUrl(
   conversationId: string,
   deps: GetDashboardConversationUrlDeps = {},
 ): string {
-  const read = deps.getBaseUrl ?? (() => getCoreEnv().NEXT_PUBLIC_APP_URL);
+  return `${resolveDashboardBase(deps.getBaseUrl, "getDashboardConversationUrl")}/conversations/${encodeURIComponent(conversationId)}`;
+}
+
+/**
+ * R4-Point3 PR-NO-DROPPED-SMS : URL unique pour la future vue admin
+ * orphelins. Avant R4, chaque caller la construisait inline :
+ *   - `route.ts:211-214` : `buildOrphansDashboardUrl()` locale.
+ * On centralise ici pour que les deux usages (webhook W3/W4/W5/W6 +
+ * `handleInactiveInbound` dans le pipeline) partagent la même source.
+ */
+export function getDashboardOrphansUrl(deps: GetDashboardConversationUrlDeps = {}): string {
+  return `${resolveDashboardBase(deps.getBaseUrl, "getDashboardOrphansUrl")}/admin/orphan-inbounds`;
+}
+
+/**
+ * Résout la base URL dashboard. Centralise la logique de fallback entre
+ * les 2 constructeurs (`conversation` + `orphans`). Si
+ * `NEXT_PUBLIC_APP_URL` est absente :
+ *   - en PROD : `getCoreEnv()` throw `ConfigError` AVANT d'arriver ici
+ *     (R4-Point3 décision Déthié : var required en production).
+ *   - en dev/test : fallback Vercel + `logger.warn` (comportement legacy).
+ */
+function resolveDashboardBase(
+  getBaseUrl: GetDashboardConversationUrlDeps["getBaseUrl"],
+  op: string,
+): string {
+  const read = getBaseUrl ?? (() => getCoreEnv().NEXT_PUBLIC_APP_URL);
   const raw = read();
-  const base = raw !== undefined && raw !== "" ? raw.replace(/\/+$/, "") : DASHBOARD_URL_FALLBACK;
-  if (raw === undefined || raw === "") {
-    // Observabilité : surface une config partielle sans bloquer la notif.
-    // Aucune PII dans ce log — juste le fait que le fallback est utilisé.
-    logger.warn(
-      { op: "getDashboardConversationUrl" },
-      "[dashboard-url] NEXT_PUBLIC_APP_URL missing — using Vercel fallback",
-    );
+  if (raw !== undefined && raw !== "") {
+    return raw.replace(/\/+$/, "");
   }
-  return `${base}/conversations/${encodeURIComponent(conversationId)}`;
+  logger.warn(
+    { op },
+    "[dashboard-url] NEXT_PUBLIC_APP_URL missing — using Vercel fallback (dev/test)",
+  );
+  return DASHBOARD_URL_FALLBACK;
 }

@@ -152,6 +152,124 @@ function scrubString(value: string): string {
   return value.replace(EMAIL_REGEX, EMAIL_PLACEHOLDER).replace(PHONE_REGEX, PHONE_PLACEHOLDER);
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// R4-Point2 PR-NO-DROPPED-SMS : exemption par clé + format + anti-segment FR
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * Whitelist stricte des clés techniques dont la valeur est un IDENTIFIANT
+ * applicatif, PAS un numéro de téléphone. Pour chaque clé, un VALIDATOR
+ * de format strict qui définit ce qu'un vrai ID peut être. Si clé ∈ map
+ * ET valeur matche le validator ET aucun segment ne match un numéro FR
+ * (cf. `containsFrenchPhoneSegment`), on bypass `scrubString`.
+ *
+ * Sinon → scrub normal (PHONE_REGEX + EMAIL_REGEX).
+ *
+ * ⚠️ Ces IDs sont écrits en clair dans les logs forensic — ils DOIVENT
+ * rester lisibles. Les clés PII (`PII_KEYS`) restent prioritaires et
+ * remplacent la valeur par `[REDACTED]` via `redact.paths` Pino.
+ */
+const TECHNICAL_ID_KEYS: ReadonlyMap<string, RegExp> = new Map([
+  // hubspotId numérique OU sentinelles tests `hs_...`.
+  //
+  // R4-Point2-fix PR-NO-DROPPED-SMS : regex élargie pour accepter `.`, `:`
+  // et espace comme séparateurs. Un vrai contactId n'en contient jamais,
+  // mais permettre la validation à cette classe large laisse la
+  // NORMALISATION + ANTI-NUMERO décider en aval : un numéro FR formaté
+  // (`06-12-34-56-78`, `06.12.34.56.78`, `06 12 34 56 78`) est capté par
+  // `containsFrenchPhoneNumber`, un ID technique arbitraire sans numéro
+  // (`"127.0.0.1"`, `"1.2.3"`) passe en bypass sans leak.
+  ["contactId", /^(hs_)?[A-Za-z0-9][A-Za-z0-9_.\-: ]{0,63}$/],
+  ["hubspotId", /^[0-9]{1,30}$/],
+  // conversationId = `${contactId}_${campaignId}` : regex élargie (idem contactId).
+  ["conversationId", /^(hs_)?[A-Za-z0-9][A-Za-z0-9_.\-: ]{0,100}$/],
+  // Firestore auto-ID OU oih_... hash + chunks underscore.
+  ["messageId", /^(oih_[a-f0-9_]{32,}|[A-Za-z0-9]{20})$/],
+  ["draftMessageId", /^[A-Za-z0-9]{20}$/],
+  ["duplicateOfMessageId", /^(oih_[a-f0-9_]{32,}|[A-Za-z0-9]{20})$/],
+  ["orphanDocId", /^(oih_[a-f0-9_]{32,}|orphan_[a-z_]+_[a-f0-9]{8})$/],
+  // Slack ts : "1234567890.XXXX..." - 10 digits + "." + 1 à 10 décimales
+  ["slackTs", /^[0-9]{10}\.[0-9]{1,10}$/],
+  ["ts", /^[0-9]{10}\.[0-9]{1,10}$/],
+  // Slack IDs
+  ["assignedTo", /^U[A-Z0-9]+$/],
+  ["slackUserId", /^U[A-Z0-9]+$/],
+  ["slackChannel", /^[CDGT][A-Z0-9]+$/],
+  // Inngest event IDs — scrubber-safe (events.ts:49-73 interdit déjà PII)
+  ["eventId", /^[A-Za-z0-9][A-Za-z0-9._-]{0,100}$/],
+  // Fingerprints djb2 (8 chars hex)
+  ["ovhMessageIdFingerprint", /^[a-f0-9]{8}$/],
+  ["phoneFingerprint", /^[a-f0-9]{8}$/],
+  ["contactIdFingerprint", /^[a-f0-9]{8}$/],
+  // Campaign ID slug
+  ["campaignId", /^[a-z0-9][a-z0-9-]{0,80}$/i],
+  // Phone hashes (préfixe `hph_` prouve que ce n'est pas un vrai numéro)
+  ["phoneHash", /^hph_[A-Za-z0-9_-]+$/],
+]);
+
+/**
+ * Règle anti-segment numéro FR (R4-Point2 PR-NO-DROPPED-SMS décision scellée).
+ *
+ * Même si la clé matche TECHNICAL_ID_KEYS, on refuse le bypass si la valeur
+ * contient un segment (découpé sur `_`, `.`, `-`, `:`) qui match un vrai
+ * numéro français. Protège contre :
+ *   - `"0612345678"` posé par erreur sous `contactId`.
+ *   - `"33612345678"` (E.164 sans +) sous `conversationId`.
+ *   - `"sms.reply.0612345678"` sous `eventId`.
+ *   - `"0612345678_campagne"` sous `conversationId`.
+ */
+/**
+ * R4-Point2-fix PR-NO-DROPPED-SMS : chercher un numéro FR N'IMPORTE OÙ
+ * dans la valeur normalisée, délimité par des non-chiffres (ou début/fin
+ * de chaîne). Les 3 alternances ciblent le national FR (10 digits),
+ * l'E.164 sans + (11 digits) et le préfixe 00+33 (13 digits).
+ */
+const FRENCH_PHONE_ANYWHERE_REGEX = /(^|\D)(0[1-9]\d{8}|33[1-9]\d{8}|0033[1-9]\d{8})(\D|$)/;
+
+/**
+ * R4-Point2-fix : normalise la valeur en SUPPRIMANT uniquement les
+ * séparateurs situés ENTRE DEUX CHIFFRES. Capte les formats courants d'un
+ * numéro FR formaté : `06-12-34-56-78`, `06.12.34.56.78`, `06 12 34 56 78`,
+ * `06:12:34:56:78`. Préserve les séparateurs structurels :
+ *   - `hubspotId_campaignId` : `_` entre chiffre et lettre → reste.
+ *   - `sms.reply.oih_abcd` : `.` et `_` entre lettres → restent.
+ *   - `1792422107.910000` : `.` entre deux chiffres → supprimé, mais la
+ *     concaténation `1792422107910000` ne match aucun pattern FR
+ *     (commence par `1`, pas `0`/`33`/`0033`).
+ */
+function normalizeInterDigitSeparators(value: string): string {
+  return value.replace(/(?<=\d)[-_.: ](?=\d)/g, "");
+}
+
+/**
+ * `true` si la valeur, après normalisation, contient un numéro FR
+ * (national, E.164 sans +, ou préfixe 00+33) délimité par des non-chiffres.
+ * Déclenche un REFUS DE BYPASS → la valeur sera scrubbée par PHONE_REGEX
+ * en aval. Nom conservé pour cohérence historique (découverte initiale
+ * via split, désormais via normalisation + anywhere-match).
+ */
+function containsFrenchPhoneSegment(value: string): boolean {
+  const normalized = normalizeInterDigitSeparators(value);
+  return FRENCH_PHONE_ANYWHERE_REGEX.test(normalized);
+}
+
+/**
+ * Décide si une paire `(key, value)` string doit bypasser le scrub par
+ * valeur. Trois conditions cumulatives :
+ *   1. `key` ∈ `TECHNICAL_ID_KEYS`.
+ *   2. `value` matche le validator strict de la clé.
+ *   3. `value` ne contient AUCUN segment numéro FR (anti-leak humain).
+ *
+ * @internal exposé pour tests sentinelles.
+ */
+export function shouldBypassScrubForTechnicalId(key: string, value: string): boolean {
+  const validator = TECHNICAL_ID_KEYS.get(key);
+  if (validator === undefined) return false;
+  if (!validator.test(value)) return false;
+  if (containsFrenchPhoneSegment(value)) return false;
+  return true;
+}
+
 /**
  * Scrub récursif : strings → `scrubString` ; arrays → map récursif ;
  * objets ordinaires → tous les champs récursivement.
@@ -169,7 +287,17 @@ function scrubValue(value: unknown): unknown {
   if (Array.isArray(value)) return value.map(scrubValue);
   if (value !== null && typeof value === "object") {
     const out: Record<string, unknown> = {};
-    for (const [k, v] of Object.entries(value)) out[k] = scrubValue(v);
+    for (const [k, v] of Object.entries(value)) {
+      // R4-Point2 : bypass scrub par valeur si la paire (clé, valeur)
+      // matche un identifiant technique strict ET aucun segment ne
+      // ressemble à un numéro FR. Les clés PII_KEYS restent prioritaires
+      // via redact.paths (traité en amont par Pino, pas par scrubValue).
+      if (typeof v === "string" && shouldBypassScrubForTechnicalId(k, v)) {
+        out[k] = v;
+      } else {
+        out[k] = scrubValue(v);
+      }
+    }
     return out;
   }
   return value;

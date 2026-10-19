@@ -54,9 +54,10 @@ import { addOrphanInboundIdempotent } from "@/lib/firestore/orphan-inbounds";
 import { getInngestClient } from "@/lib/inngest/client";
 import { smsReplyReceived } from "@/lib/inngest/events";
 import { parseIncomingOvhSms } from "@/lib/ovh/parse-incoming";
-import { getCoreEnv, getOvhEnv, getSlackEnv } from "@/lib/security/env";
+import { getOvhEnv, getSlackEnv } from "@/lib/security/env";
 import { createRateLimiter } from "@/lib/security/rate-limit";
 import { verifyOvhWebhookToken } from "@/lib/security/webhook-signatures";
+import { getDashboardOrphansUrl } from "@/lib/slack/dashboard-url";
 import { sendInboundOnInactiveConversationNotification } from "@/lib/slack/notify-inbound-on-inactive-conversation";
 import { ValidationError } from "@/lib/utils/errors";
 import { logger } from "@/lib/utils/logger";
@@ -208,10 +209,10 @@ async function readRawPayloadWithPreserved(req: NextRequest): Promise<RawPayload
  * lien pointe vers une vue de triage admin (a creer en S11+ — pour
  * l'instant, un placeholder stable qui ne crashe pas Slack).
  */
-function buildOrphansDashboardUrl(): string {
-  const base = getCoreEnv().NEXT_PUBLIC_APP_URL ?? "https://medere-prospection.vercel.app";
-  return `${base.replace(/\/+$/, "")}/admin/orphan-inbounds`;
-}
+// R4-Point3 PR-NO-DROPPED-SMS : construction d'URL unique déléguée au
+// helper partagé `getDashboardOrphansUrl` (dashboard-url.ts). Supprime le
+// doublon de fallback hardcodé. `NEXT_PUBLIC_APP_URL` est désormais
+// REQUIRED en production (ConfigError à `getCoreEnv()`).
 
 /**
  * Notification canal orphelins pour les cas parse_failed / enqueue_failed.
@@ -246,7 +247,7 @@ async function notifyOrphanChannelBestEffort(params: {
       reason: params.reason,
       wasOptOut: params.wasOptOut,
       lastInboundBody: params.lastInboundBody,
-      dashboardUrl: buildOrphansDashboardUrl(),
+      dashboardUrl: getDashboardOrphansUrl(),
       includeHereMention: true,
       orphanDocId: params.orphanDocId,
       ...(params.phoneLast4 !== undefined ? { phoneLast4: params.phoneLast4 } : {}),

@@ -38,18 +38,18 @@ describe("buildHandoffBlocks — DM (isOrphan=false)", () => {
     expect(blocks[4]).toMatchObject({ type: "context" });
   });
 
-  it("header : titre '🎯 Lead intéressé'", () => {
+  it("header : titre 'Lead intéressé' (R4-Point1 : plus d'emoji, accents conservés)", () => {
     const blocks = buildHandoffBlocks(BASE_INPUT);
     expect(blocks[0]).toMatchObject({
       type: "header",
-      text: { type: "plain_text", text: "🎯 Lead intéressé", emoji: true },
+      text: { type: "plain_text", text: "Lead intéressé", emoji: false },
     });
   });
 
   it("section contexte : prénom en gras + spécialité + ville, PAS de <!here>", () => {
     const blocks = buildHandoffBlocks(BASE_INPUT);
     const text = (blocks[1] as { text: { text: string } }).text.text;
-    expect(text).toBe("*Marie* — Chirurgien-dentiste\n📍 Paris");
+    expect(text).toBe("*Marie* — Chirurgien-dentiste\nParis");
     expect(text).not.toContain("<!here>");
     expect(text).not.toContain("<!channel>");
   });
@@ -92,11 +92,11 @@ describe("buildHandoffBlocks — DM (isOrphan=false)", () => {
 describe("buildHandoffBlocks — orphelin (isOrphan=true)", () => {
   const ORPHAN_INPUT: HandoffInput = { ...BASE_INPUT, isOrphan: true };
 
-  it("header : titre '❓ Lead non attribué à traiter'", () => {
+  it("header : titre 'Lead non attribué à traiter' (R4-Point1 : plus d'emoji)", () => {
     const blocks = buildHandoffBlocks(ORPHAN_INPUT);
     expect(blocks[0]).toMatchObject({
       type: "header",
-      text: { type: "plain_text", text: "❓ Lead non attribué à traiter", emoji: true },
+      text: { type: "plain_text", text: "Lead non attribué à traiter", emoji: false },
     });
   });
 
@@ -105,7 +105,7 @@ describe("buildHandoffBlocks — orphelin (isOrphan=true)", () => {
     const text = (blocks[1] as { text: { text: string } }).text.text;
     expect(text).toContain("<!here>");
     expect(text).toContain("*Marie* — Chirurgien-dentiste");
-    expect(text).toContain("📍 Paris");
+    expect(text).toContain("Paris");
   });
 
   it("PAS de <!channel> ni de mention @user (D8 — ping large uniquement)", () => {

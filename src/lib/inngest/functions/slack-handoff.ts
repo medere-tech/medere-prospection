@@ -172,6 +172,7 @@ import { getContactOwnerId } from "@/lib/hubspot/contacts";
 import { getInngestClient } from "@/lib/inngest/client";
 import { handoffRequested } from "@/lib/inngest/events";
 import { getCoreEnv, getSlackEnv } from "@/lib/security/env";
+import { getDashboardConversationUrl } from "@/lib/slack/dashboard-url";
 import { sendHandoffNotification } from "@/lib/slack/notify-handoff";
 import { ConfigError, ConflictError, NotFoundError } from "@/lib/utils/errors";
 import type { HandoffUnassignedPayload, HandoffUnassignedReason } from "@/types/audit-log";
@@ -457,15 +458,13 @@ export async function slackHandoffHandler(
         })();
 
   // ── Step 6 — slack-notify (throw propage → Inngest retry) ─────────────
-  const dashboardBase = _getDashboardBaseUrl();
-  if (dashboardBase === undefined || dashboardBase === "") {
-    logger.warn("[slack-handoff] NEXT_PUBLIC_APP_URL missing — using Vercel fallback", {
-      eventId: event.id,
-    });
-  }
-  const dashboardBaseResolved =
-    dashboardBase !== undefined && dashboardBase !== "" ? dashboardBase : DASHBOARD_URL_FALLBACK;
-  const dashboardUrl = `${dashboardBaseResolved}/conversations/${conversationId}`;
+  // R4-Point3 PR-NO-DROPPED-SMS : délégation unique au helper partagé
+  // `getDashboardConversationUrl` (dashboard-url.ts). Fallback Vercel +
+  // warning géré en interne. NEXT_PUBLIC_APP_URL est désormais required
+  // en production (ConfigError à `getCoreEnv()`).
+  const dashboardUrl = getDashboardConversationUrl(conversationId, {
+    getBaseUrl: _getDashboardBaseUrl,
+  });
 
   const notifyResult = await step.run("slack-notify", async () => {
     return _sendHandoffNotification({

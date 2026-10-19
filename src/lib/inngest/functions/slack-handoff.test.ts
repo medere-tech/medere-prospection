@@ -858,7 +858,13 @@ describe("dashboardUrl — env vs fallback (D5)", () => {
     );
   });
 
-  it("NEXT_PUBLIC_APP_URL absent → fallback Vercel + logger.warn", async () => {
+  it("NEXT_PUBLIC_APP_URL absent → fallback Vercel (warn délégué au logger global dans dashboard-url.ts)", async () => {
+    // R4-Point3 PR-NO-DROPPED-SMS : la construction d'URL est désormais
+    // centralisée dans `getDashboardConversationUrl` (dashboard-url.ts).
+    // Le warn fallback est émis par le logger GLOBAL (@/lib/utils/logger),
+    // pas par `ctx.logger`. Le warn global est testé par
+    // `dashboard-url.test.ts` (existant). Ici on vérifie uniquement
+    // l'URL finale.
     const ctx = makeFakeCtx();
     const deps = makeDeps({ getDashboardBaseUrl: () => undefined });
 
@@ -868,10 +874,6 @@ describe("dashboardUrl — env vs fallback (D5)", () => {
       expect.objectContaining({
         dashboardUrl: "https://medere-prospection.vercel.app/conversations/hs-contact-123_camp-a",
       }),
-    );
-    expect(ctx.logger.warn).toHaveBeenCalledWith(
-      expect.stringContaining("NEXT_PUBLIC_APP_URL missing"),
-      expect.any(Object),
     );
   });
 

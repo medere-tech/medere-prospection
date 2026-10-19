@@ -75,14 +75,14 @@ describe("buildInboundAfterHandoffBlocks — variante STOP (isOptOut=true)", () 
   it("header distinct", () => {
     const blocks = buildInboundAfterHandoffBlocks(STOP_INPUT);
     const header = blocks[0] as { text: { text: string } };
-    expect(header.text.text).toBe("Demande d'arret (STOP) sur un lead que vous suivez");
+    expect(header.text.text).toBe("Demande d'arrêt (STOP) sur un lead que vous suivez");
   });
 
   it("bloc d'action explicite 'Ne plus recontacter.'", () => {
     const blocks = buildInboundAfterHandoffBlocks(STOP_INPUT);
     const serialized = JSON.stringify(blocks);
     expect(serialized).toContain("Ne plus recontacter");
-    expect(serialized).toContain("Le consentement a ete retire (STOP).");
+    expect(serialized).toContain("Le consentement a été retiré (STOP).");
   });
 
   it("variante STOP : structure (header + identite + body + action + lien + footer = 6 blocks)", () => {
