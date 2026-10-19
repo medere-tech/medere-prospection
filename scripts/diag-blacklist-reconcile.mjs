@@ -47,7 +47,7 @@ import { getFirestore, Timestamp } from "firebase-admin/firestore";
 import { getContactByPhone } from "../src/lib/firestore/contacts.ts";
 import { listConversationIdsByContact } from "../src/lib/firestore/conversations.ts";
 import { getOvhClient } from "../src/lib/ovh/client.ts";
-import { getOvhEnv } from "../src/lib/security/env.ts";
+import { getFirebaseEnv, getOvhEnv } from "../src/lib/security/env.ts";
 import { toE164 } from "../src/lib/utils/phone.ts";
 import { scrubOvhErrorMessage } from "./_lib/ovh-scrub.mjs";
 
@@ -78,20 +78,30 @@ import { scrubOvhErrorMessage } from "./_lib/ovh-scrub.mjs";
 // ─────────────────────────────────────────────────────────────────────────────
 
 function initFirebaseAdminOrDie() {
-  const projectId = process.env.FIREBASE_PROJECT_ID;
-  const clientEmail = process.env.FIREBASE_CLIENT_EMAIL;
-  const rawKey = process.env.FIREBASE_PRIVATE_KEY;
-  if (!projectId || !clientEmail || !rawKey) {
-    console.error(
-      "Env manquant : FIREBASE_PROJECT_ID / FIREBASE_CLIENT_EMAIL / FIREBASE_PRIVATE_KEY",
-    );
+  let env;
+  try {
+    env = getFirebaseEnv();
+  } catch (err) {
+    const msg = err && err.message ? err.message : String(err);
+    console.error("Env invalide ou manquant (validation getFirebaseEnv) :");
+    console.error(`  ${msg}`);
+    console.error("");
+    console.error("Noms attendus (identiques a l'app, cf. src/lib/security/env.ts) :");
+    console.error("  - FIREBASE_PROJECT_ID");
+    console.error("  - FIREBASE_CLIENT_EMAIL");
+    console.error("  - FIREBASE_PRIVATE_KEY");
     process.exit(2);
   }
-  const privateKey = rawKey.replace(/\\n/g, "\n");
   if (getApps().length === 0) {
-    initializeApp({ credential: cert({ projectId, clientEmail, privateKey }) });
+    initializeApp({
+      credential: cert({
+        projectId: env.FIREBASE_PROJECT_ID,
+        clientEmail: env.FIREBASE_CLIENT_EMAIL,
+        privateKey: env.FIREBASE_PRIVATE_KEY,
+      }),
+    });
   }
-  return { db: getFirestore(), projectId };
+  return { db: getFirestore(), projectId: env.FIREBASE_PROJECT_ID };
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
