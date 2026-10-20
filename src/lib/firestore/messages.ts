@@ -2116,6 +2116,16 @@ export async function updateMessageStatus(input: UpdateMessageStatusInput): Prom
 
     tx.update(messageRef, update);
 
+    // ── Bump conv.updatedAt pour signaler la mutation à la vue
+    //    conversation (VUE-CONVERSATION PR1 — polling économique) ──
+    // L'endpoint `/api/admin/conversations/[id]/version` sert de check
+    // léger pour React Query : si `conv.updatedAt` ne bouge pas quand
+    // le statut d'un message change (DLR OVH queued→sent→delivered),
+    // le fil n'est jamais rafraîchi. On touche donc `conv.updatedAt`
+    // dans la MÊME tx que l'update message — atomique, pas de trou.
+    const convRef = getAdminDb().collection(CONVERSATIONS_COLLECTION).doc(input.conversationId);
+    tx.update(convRef, { updatedAt: now });
+
     // ── Audit `sms_failed` DANS la tx pour transition VERS `failed` ────────
     // Posé UNE FOIS au passage `from ≠ failed → failed`. Le no-op idempotent
     // (failed → failed) est court-circuité plus haut, donc pas de double-audit.

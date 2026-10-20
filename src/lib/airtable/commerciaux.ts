@@ -216,6 +216,43 @@ export async function resolveCommercialByOwnerId(ownerId: string): Promise<Comme
   return commercial;
 }
 
+/**
+ * Résout un `slack_user_id` (format `U...`) en `Commercial | null`
+ * (VUE-CONVERSATION PR1). Lookup inverse de `resolveCommercialByOwnerId`.
+ *
+ * Retourne `null` si :
+ *   - `slackUserId` normalisé est vide, OU
+ *   - aucune ligne Airtable n'a ce `slack_user_id`.
+ *
+ * Retourne `{ slackUserId, name, active }` sinon. Même source cache que
+ * `resolveCommercialByOwnerId` (TTL 5 min, module-level) — pas de
+ * round-trip Airtable supplémentaire après le premier.
+ *
+ * ⚠️ `name` peut être `""` si la ligne Airtable n'a pas de `hubspot_name`.
+ * Le caller UI doit replier sur un libellé générique ("un autre commercial")
+ * dans ce cas.
+ *
+ * Propage `ExternalServiceError` / `ConfigError` du client — même contrat
+ * que `resolveCommercialByOwnerId`.
+ */
+export async function resolveCommercialBySlackUserId(
+  slackUserId: string,
+): Promise<Commercial | null> {
+  const normalized = normalizeId(slackUserId);
+  if (normalized === "") return null;
+
+  const map = await getCommerciauxMap();
+  // Scan linéaire : la table Commerciaux est bornée (~18 lignes aujourd'hui,
+  // cf. `commerciaux.ts:21-27`). Pas de 2e index pour éviter de dupliquer
+  // le cache + l'invalider deux fois.
+  for (const commercial of map.values()) {
+    if (commercial.slackUserId === normalized) {
+      return commercial;
+    }
+  }
+  return null;
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Test hook
 // ─────────────────────────────────────────────────────────────────────────────
