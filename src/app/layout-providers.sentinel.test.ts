@@ -71,6 +71,22 @@ const NUQS_ADAPTER_IMPORT_PATTERN =
 /** Pattern JSX — accepte les attributs/props éventuels sur la balise. */
 const NUQS_ADAPTER_JSX_PATTERN = /<NuqsAdapter(\s|>)/;
 
+/**
+ * Pattern import pour `QueryProvider` (VUE-CONVERSATION PR1.13 — bug prod
+ * dpl_5wTNCuBzQdjPM9t3Cg2oQqZeBZLs).
+ *
+ * `conversation-detail-client.tsx` utilise `useQuery` de react-query qui
+ * REQUIERT un `<QueryClientProvider>` parent. Sans le provider, react-query
+ * throw au runtime :
+ *   "No QueryClient set, use QueryClientProvider to set one"
+ *   → /admin/conversations/[id] cassée.
+ */
+const QUERY_PROVIDER_IMPORT_PATTERN =
+  /import\s*\{[^}]*\bQueryProvider\b[^}]*\}\s*from\s*["']@\/components\/providers\/query-provider["']/;
+
+/** Pattern JSX — accepte attributs/props éventuels. */
+const QUERY_PROVIDER_JSX_PATTERN = /<QueryProvider(\s|>)/;
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Tests
 // ─────────────────────────────────────────────────────────────────────────────
@@ -126,6 +142,50 @@ describe("Sentinelle NuqsAdapter dans root layout (S10.1.11-NUQS-ADAPTER-001)", 
     }
   });
 
+  it("importe `QueryProvider` depuis `@/components/providers/query-provider` (VUE-CONVERSATION PR1.13)", () => {
+    const content = readFileSync(LAYOUT_PATH, "utf-8");
+    if (!QUERY_PROVIDER_IMPORT_PATTERN.test(content)) {
+      throw new Error(
+        [
+          "Sentinelle VUE-CONVERSATION PR1.13-QUERY-PROVIDER — import manquant.",
+          "",
+          "`src/app/layout.tsx` doit importer QueryProvider :",
+          '  import { QueryProvider } from "@/components/providers/query-provider";',
+          "",
+          "Rationale : src/app/admin/conversations/[id]/conversation-detail-client.tsx",
+          "utilise `useQuery` de @tanstack/react-query, qui REQUIERT un",
+          "`<QueryClientProvider>` parent. Sans ce provider, react-query throw :",
+          '  "No QueryClient set, use QueryClientProvider to set one"',
+          "→ /admin/conversations/[id] cassée (bug prod",
+          "dpl_5wTNCuBzQdjPM9t3Cg2oQqZeBZLs).",
+          "",
+          "Les tests Vitest wrappent eux-mêmes dans un QueryClientProvider local",
+          "→ ne couvrent PAS l'absence du provider en prod.",
+        ].join("\n"),
+      );
+    }
+  });
+
+  it("wrappe les children avec une balise JSX `<QueryProvider>` (VUE-CONVERSATION PR1.13)", () => {
+    const content = readFileSync(LAYOUT_PATH, "utf-8");
+    if (!QUERY_PROVIDER_JSX_PATTERN.test(content)) {
+      throw new Error(
+        [
+          "Sentinelle VUE-CONVERSATION PR1.13-QUERY-PROVIDER — balise manquante.",
+          "",
+          "`src/app/layout.tsx` doit wrapper children avec <QueryProvider> :",
+          "  <QueryProvider>",
+          "    {children}",
+          "    <Toaster ... />",
+          "  </QueryProvider>",
+          "",
+          "L'import seul ne suffit pas — le composant doit être effectivement",
+          "mount dans l'arbre React.",
+        ].join("\n"),
+      );
+    }
+  });
+
   it("les regex de détection matchent le pattern canonique (sanity)", () => {
     // Import groupé
     expect(
@@ -148,10 +208,37 @@ describe("Sentinelle NuqsAdapter dans root layout (S10.1.11-NUQS-ADAPTER-001)", 
       NUQS_ADAPTER_IMPORT_PATTERN.test('import { NuqsAdapter } from "nuqs/adapters/next/pages"'),
     ).toBe(false);
 
-    // JSX
+    // JSX NuqsAdapter
     expect(NUQS_ADAPTER_JSX_PATTERN.test("<NuqsAdapter>")).toBe(true);
     expect(NUQS_ADAPTER_JSX_PATTERN.test("<NuqsAdapter someprop={x}>")).toBe(true);
     expect(NUQS_ADAPTER_JSX_PATTERN.test("<NuqsAdapter />")).toBe(true);
     expect(NUQS_ADAPTER_JSX_PATTERN.test("<NuqsAdapterMock>")).toBe(false);
+
+    // QueryProvider — import groupé
+    expect(
+      QUERY_PROVIDER_IMPORT_PATTERN.test(
+        'import { QueryProvider } from "@/components/providers/query-provider";',
+      ),
+    ).toBe(true);
+    // QueryProvider — single quotes
+    expect(
+      QUERY_PROVIDER_IMPORT_PATTERN.test(
+        "import { QueryProvider } from '@/components/providers/query-provider';",
+      ),
+    ).toBe(true);
+    // Faux-positifs à éviter
+    expect(
+      QUERY_PROVIDER_IMPORT_PATTERN.test('import { QueryProvider } from "@tanstack/react-query";'),
+    ).toBe(false);
+    expect(
+      QUERY_PROVIDER_IMPORT_PATTERN.test(
+        'import { QueryClientProvider } from "@/components/providers/query-provider";',
+      ),
+    ).toBe(false);
+
+    // JSX QueryProvider
+    expect(QUERY_PROVIDER_JSX_PATTERN.test("<QueryProvider>")).toBe(true);
+    expect(QUERY_PROVIDER_JSX_PATTERN.test("<QueryProvider someprop={x}>")).toBe(true);
+    expect(QUERY_PROVIDER_JSX_PATTERN.test("<QueryProviderMock>")).toBe(false);
   });
 });

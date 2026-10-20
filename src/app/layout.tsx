@@ -6,6 +6,7 @@ import type { Metadata } from "next";
 import { Geist, Geist_Mono } from "next/font/google";
 import { NuqsAdapter } from "nuqs/adapters/next/app";
 
+import { QueryProvider } from "@/components/providers/query-provider";
 import { ThemeProvider } from "@/components/theme-provider";
 import { Toaster } from "@/components/ui/sonner";
 import { TooltipProvider } from "@/components/ui/tooltip";
@@ -51,10 +52,21 @@ export default function RootLayout({
                 Toutes les tests UI mockent nuqs → ne couvrent pas l'absence
                 d'adapter. Garde-fou : sentinelle filesystem
                 src/app/layout-providers.sentinel.test.ts.
+
+                VUE-CONVERSATION PR1.13 : QueryProvider REQUIS pour tout
+                composant client qui utilise `useQuery` / `useMutation` /
+                `useQueryClient` de @tanstack/react-query (actuellement :
+                src/app/admin/conversations/[id]/conversation-detail-client.tsx).
+                Sans ce provider, react-query throw au runtime :
+                  "No QueryClient set, use QueryClientProvider to set one"
+                → /admin/conversations/[id] cassée (bug prod
+                dpl_5wTNCuBzQdjPM9t3Cg2oQqZeBZLs). Même sentinelle filesystem.
               */}
               <NuqsAdapter>
-                {children}
-                <Toaster richColors closeButton />
+                <QueryProvider>
+                  {children}
+                  <Toaster richColors closeButton />
+                </QueryProvider>
               </NuqsAdapter>
             </TooltipProvider>
           </ThemeProvider>
