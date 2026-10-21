@@ -279,9 +279,23 @@ const upstashEnvSchema = z.object({
   UPSTASH_REDIS_REST_TOKEN: z.string().min(1),
 });
 
+// M-2 security-reviewer PR1.14.1 : regex stricte sur `CLERK_SECRET_KEY`
+// pour verrouiller le refus `sk_live_` dans scripts/setup-e2e-clerk-users.mjs.
+// Un préfixe bidon `sk_foo_...` passait auparavant la validation env
+// (`startsWith("sk_")`) et tombait sur la branche `sk_?_` du script, qui
+// sautait le garde `ALLOW_E2E_ON_LIVE_CLERK` avant d'être rejeté par
+// Clerk API. Désormais le mode (`test` | `live`) est obligatoire dès
+// la lecture d'env, et toute clé malformée fail-fast au boot.
+// Clerk utilise un suffixe strictement alphanumérique (vérifié sur une
+// clé réelle : prefix sk_test_, len 50, zéro caractère non-alnum).
 const clerkEnvSchema = z.object({
   NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY: z.string().startsWith("pk_"),
-  CLERK_SECRET_KEY: z.string().startsWith("sk_"),
+  CLERK_SECRET_KEY: z
+    .string()
+    .regex(
+      /^sk_(test|live)_[A-Za-z0-9]+$/,
+      "CLERK_SECRET_KEY must match sk_(test|live)_[A-Za-z0-9]+",
+    ),
 });
 
 /**

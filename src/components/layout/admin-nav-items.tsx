@@ -102,14 +102,22 @@ export function AdminNavItems({
           // On utilise `role="link"` + `aria-disabled="true"` + `tabIndex={-1}`
           // pour rester hors tab order tout en informant les AT qu'il s'agit
           // d'un lien futur désactivé.
+          //
+          // PR1.14 : infobulle accessible unifiée. Le label parlé devient
+          // "<label>, disponible prochainement" via `aria-label` — plus
+          // concis et déterministe que `title+aria-describedby`, et surtout
+          // sans mention technique ("hors scope PR1") lue par JAWS/NVDA.
+          // Le `title` HTML sert d'infobulle visuelle au hover souris.
+          const comingSoonLabel = `${item.label}, disponible prochainement`;
           return (
             <span
               key={item.href}
               role="link"
               aria-disabled="true"
               tabIndex={-1}
+              aria-label={comingSoonLabel}
+              title="Disponible prochainement"
               className={baseClasses}
-              title="Bientôt disponible"
             >
               <Icon className="size-4 shrink-0" aria-hidden />
               <span className="flex-1">{item.label}</span>

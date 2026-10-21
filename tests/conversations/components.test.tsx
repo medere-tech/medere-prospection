@@ -247,9 +247,16 @@ describe("ConversationHeader", () => {
     expect(screen.getByText("Dentiste")).toBeInTheDocument();
     expect(screen.getByText("Paris")).toBeInTheDocument();
     expect(screen.getByText("Intéressé")).toBeInTheDocument();
-    // Pas de téléphone affiché (bouton désactivé)
-    const phoneButton = screen.getByRole("button", { name: /Afficher le numéro/ });
+    // Pas de téléphone affiché (bouton désactivé, aligné sur pattern grisé sidebar
+    // PR1.14 : aria-label = "<label>, disponible prochainement", badge "Bientôt",
+    // plus aucune mention "hors scope PR1" lue par un lecteur d'écran).
+    const phoneButton = screen.getByRole("button", {
+      name: "Afficher le numéro, disponible prochainement",
+    });
     expect(phoneButton).toBeDisabled();
+    expect(phoneButton.getAttribute("aria-label")).not.toMatch(/hors scope|PR1/i);
+    // Badge « Bientôt » adjacent au bouton
+    expect(screen.getByText("Bientôt")).toBeInTheDocument();
   });
 
   it("contact sans nom : fallback 'Contact sans nom'", () => {

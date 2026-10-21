@@ -68,6 +68,7 @@
     "zod": "^4.4.3"
   },
   "devDependencies": {
+    "@clerk/testing": "^2.2.47",
     "@firebase/rules-unit-testing": "^4.0.1",
     "@playwright/test": "^1.60.0",
     "@tailwindcss/postcss": "^4",

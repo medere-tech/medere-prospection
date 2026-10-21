@@ -20,7 +20,7 @@ export default async function AdminLayout({ children }: { children: React.ReactN
   const { role, firstName, lastName } = await requireRole("commercial");
 
   return (
-    <div className="flex min-h-screen w-full bg-background">
+    <div className="flex min-h-dvh w-full bg-background">
       {/* F-04 fix : skip-to-content visible AU FOCUS clavier — permet à
           Vanessa (clavier Bluetooth iPad) et lecteurs d'écran de sauter
           la sidebar/header pour atteindre le contenu en 1 tab. */}

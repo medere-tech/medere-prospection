@@ -39,7 +39,10 @@
 import { useQuery } from "@tanstack/react-query";
 import { useEffect, useRef, useState } from "react";
 
-import { ConversationAdminBanner } from "@/components/conversations/conversation-admin-banner";
+import {
+  ConversationAdminBanner,
+  shouldShowAdminBanner,
+} from "@/components/conversations/conversation-admin-banner";
 import { ConversationError } from "@/components/conversations/conversation-error";
 import { ConversationHeader } from "@/components/conversations/conversation-header";
 import { ConversationLoading } from "@/components/conversations/conversation-loading";
@@ -135,7 +138,12 @@ export function ConversationDetailClient({ conversationId, initialData, viewerRo
     staleTime: VERSION_STALE_TIME_MS,
     refetchInterval: VERSION_POLL_INTERVAL_MS,
     refetchIntervalInBackground: false,
-    refetchOnWindowFocus: true,
+    // PR1.14.1 — `refetchOnWindowFocus: false` : garantit un poll
+    // STRICTEMENT périodique (30s) sans surchauffe en cas de bascule
+    // d'onglets rapide. Baseline attendue sur 95s = 3-4 polls, pas 7.
+    // Trade-off UX : retour sur l'onglet n'actualise pas instantanément,
+    // mais la fraîcheur <30s reste garantie par refetchInterval.
+    refetchOnWindowFocus: false,
     retry: 2,
   });
 
@@ -200,13 +208,13 @@ export function ConversationDetailClient({ conversationId, initialData, viewerRo
 
   if (!data) return <ConversationLoading />;
 
-  const isAdminViewingNonMine = viewerRole === "admin" && !data.viewerIsOwner;
+  const showAdminBanner = shouldShowAdminBanner(viewerRole, data.viewerIsOwner);
 
   return (
     <div className="flex flex-col gap-6">
       <ConversationHeader contact={data.contact} intent={data.intent} />
 
-      {isAdminViewingNonMine ? (
+      {showAdminBanner ? (
         <ConversationAdminBanner assignedToName={data.handoff?.assignedToName ?? null} />
       ) : null}
 

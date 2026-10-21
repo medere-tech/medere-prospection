@@ -4,7 +4,11 @@ import { defineConfig } from "vitest/config";
 
 /**
  * Config Vitest "default" — tests qui n'ont PAS besoin de l'emulator.
- * - Tourne en `pool: threads` (défaut Vitest), parallèle, rapide.
+ * - Forcé en `pool: "threads"` (PR1.14.1) : le défaut Vitest 4 est
+ *   `"forks"` et crée des `child_process.spawn` qui échouent par rafales
+ *   sur Windows (verrou AV sur `C:\Users\...\node_modules\vitest\` ou
+ *   timeout `vitest-pool-runner`). En threads : zéro worker crash observé
+ *   sur une suite de 2367 tests (vs 7 crashes en forks).
  * - Utilisée par `npm test`, `npm run test:watch`, et le hook pre-push.
  *
  * Les tests Firestore vivent dans une config SÉPARÉE
@@ -25,6 +29,7 @@ export default defineConfig({
     environment: "node",
     passWithNoTests: true,
     unstubEnvs: true,
+    pool: "threads",
     /**
      * S10.1.7 — testTimeout 15s (vs défaut Vitest 4 = 5000ms). Les tests
      * UI React 19 + base-ui imports (DropdownMenu, Tooltip, Dialog) +
@@ -50,6 +55,10 @@ export default defineConfig({
       // qui exige un emulator up + un projectId distinct. Exécutés via
       // `npm run test:firestore-rules` (config dédiée).
       "tests/firestore-rules/**",
+      // Specs Playwright (PR1.14.1) — Vitest les ramasserait via le glob
+      // `**/*.spec.ts` et planterait sur `test.describe()` (@playwright/test
+      // vs @vitest/test différents). Les specs tournent via `npm run test:e2e`.
+      "tests/e2e/**",
       "node_modules/**",
       "dist/**",
       ".next/**",

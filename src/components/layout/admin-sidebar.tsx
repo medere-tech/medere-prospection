@@ -24,9 +24,17 @@ export function AdminSidebar({
   return (
     <aside
       aria-label="Barre latérale admin"
-      className="hidden w-60 shrink-0 border-r border-sidebar-border bg-sidebar text-sidebar-foreground md:flex md:flex-col"
+      // PR1.14 : sidebar sticky plein viewport + flex column.
+      //   - `sticky top-0 h-dvh` : la barre colle en haut et occupe la
+      //     hauteur dynamique du viewport (iOS Safari compris, barre d'URL
+      //     dynamique). Garantit que profil/déconnexion restent visibles.
+      //   - La zone nav est `flex-1 min-h-0 overflow-y-auto` → scroll
+      //     interne si beaucoup d'items, sans jamais pousser le pied hors
+      //     viewport (sans `min-h-0`, flex-1 déborde le parent).
+      //   - Le pied est `shrink-0` → jamais compressé.
+      className="sticky top-0 hidden h-dvh w-60 shrink-0 border-r border-sidebar-border bg-sidebar text-sidebar-foreground md:flex md:flex-col"
     >
-      <div className="flex h-14 items-center border-b border-sidebar-border px-4">
+      <div className="flex h-14 shrink-0 items-center border-b border-sidebar-border px-4">
         <Link
           href="/admin/contacts"
           className="flex items-center gap-2 font-heading text-base font-semibold tracking-tight focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring rounded-sm"
@@ -36,11 +44,11 @@ export function AdminSidebar({
         </Link>
       </div>
 
-      <div className="flex-1 overflow-y-auto">
+      <div className="min-h-0 flex-1 overflow-y-auto">
         <AdminNavItems role={role} />
       </div>
 
-      <div className="border-t border-sidebar-border p-3">
+      <div className="shrink-0 border-t border-sidebar-border p-3">
         <UserMenuClient role={role} firstName={firstName} lastName={lastName} />
       </div>
     </aside>

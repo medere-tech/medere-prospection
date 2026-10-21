@@ -4,11 +4,14 @@
  * Affiche : civilité + prénom + nom + spécialité + ville. Zéro PII
  * numéro ni email (strippés par `sanitize.ts`).
  *
- * Le bouton « Afficher le numéro » N'EST PAS DANS CETTE PR (prévu PR3,
- * endpoint audité `contact_phone_accessed`). Un placeholder cliquable
- * désactivé est présent pour indiquer la future interaction.
+ * Le bouton « Afficher le numéro » devient fonctionnel en PR3 (endpoint
+ * audité `contact_phone_accessed`). D'ici là il est grisé avec badge
+ * « Bientôt », aligné sur le pattern des items sidebar non fonctionnels
+ * (décision produit PR1.14 : cibles visibles, jamais masquées).
  */
 import { MapPin, Phone, Stethoscope } from "lucide-react";
+
+import { Badge } from "@/components/ui/badge";
 
 import type { ContactHeaderProps, ConversationDisplayIntent } from "./types";
 
@@ -61,16 +64,20 @@ export function ConversationHeader({ contact, intent }: Props) {
         </div>
       </div>
 
-      {/* Placeholder "Afficher le numéro" désactivé (PR3) */}
+      {/* "Afficher le numéro" — grisé jusqu'à PR3 (endpoint audité). */}
       <div className="flex items-center gap-2">
         <button
           type="button"
           disabled
-          aria-label="Afficher le numéro — fonctionnalité à venir (hors scope PR1)"
-          className="inline-flex items-center gap-2 rounded-md border border-border bg-card px-3 py-2 text-sm text-muted-foreground opacity-60"
+          aria-label="Afficher le numéro, disponible prochainement"
+          title="Disponible prochainement"
+          className="inline-flex cursor-not-allowed items-center gap-2 rounded-md border border-border bg-card px-3 py-2 text-sm text-muted-foreground opacity-60"
         >
           <Phone className="h-4 w-4" aria-hidden="true" />
           Afficher le numéro
+          <Badge variant="outline" className="text-[10px] uppercase tracking-wide">
+            Bientôt
+          </Badge>
         </button>
       </div>
     </header>

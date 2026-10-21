@@ -258,3 +258,83 @@ describe("requireRole — extraction slackUserId (VUE-CONVERSATION PR0)", () => 
     await expect(requireRole("commercial")).rejects.toBeInstanceOf(ForbiddenError);
   });
 });
+
+describe("requireRole — testAccount en prod (PR1.14.1 défense en profondeur)", () => {
+  it("REFUSE un compte testAccount=true quand VERCEL_ENV=production (claim boolean)", async () => {
+    const prev = process.env.VERCEL_ENV;
+    process.env.VERCEL_ENV = "production";
+    try {
+      mocks.auth.mockResolvedValue({
+        userId: "user_e2e_admin",
+        sessionClaims: { role: "admin", testAccount: true },
+      });
+      await expect(requireRole("admin")).rejects.toBeInstanceOf(ForbiddenError);
+    } finally {
+      if (prev === undefined) delete process.env.VERCEL_ENV;
+      else process.env.VERCEL_ENV = prev;
+    }
+  });
+
+  it("REFUSE un compte testAccount='true' quand VERCEL_ENV=production (claim stringifié)", async () => {
+    const prev = process.env.VERCEL_ENV;
+    process.env.VERCEL_ENV = "production";
+    try {
+      mocks.auth.mockResolvedValue({
+        userId: "user_e2e_admin",
+        sessionClaims: { role: "admin", testAccount: "true" },
+      });
+      await expect(requireRole("admin")).rejects.toBeInstanceOf(ForbiddenError);
+    } finally {
+      if (prev === undefined) delete process.env.VERCEL_ENV;
+      else process.env.VERCEL_ENV = prev;
+    }
+  });
+
+  it("accepte un compte testAccount=true en VERCEL_ENV=preview (staging/test environnement)", async () => {
+    const prev = process.env.VERCEL_ENV;
+    process.env.VERCEL_ENV = "preview";
+    try {
+      mocks.auth.mockResolvedValue({
+        userId: "user_e2e_admin",
+        sessionClaims: { role: "admin", testAccount: true },
+      });
+      const ctx = await requireRole("admin");
+      expect(ctx.role).toBe("admin");
+    } finally {
+      if (prev === undefined) delete process.env.VERCEL_ENV;
+      else process.env.VERCEL_ENV = prev;
+    }
+  });
+
+  it("accepte un compte testAccount=false même en VERCEL_ENV=production (compte réel)", async () => {
+    const prev = process.env.VERCEL_ENV;
+    process.env.VERCEL_ENV = "production";
+    try {
+      mocks.auth.mockResolvedValue({
+        userId: "user_dethie",
+        sessionClaims: { role: "admin", testAccount: false },
+      });
+      const ctx = await requireRole("admin");
+      expect(ctx.role).toBe("admin");
+    } finally {
+      if (prev === undefined) delete process.env.VERCEL_ENV;
+      else process.env.VERCEL_ENV = prev;
+    }
+  });
+
+  it("accepte un claim testAccount absent (comptes réels historiques sans le claim)", async () => {
+    const prev = process.env.VERCEL_ENV;
+    process.env.VERCEL_ENV = "production";
+    try {
+      mocks.auth.mockResolvedValue({
+        userId: "user_dethie",
+        sessionClaims: { role: "admin" },
+      });
+      const ctx = await requireRole("admin");
+      expect(ctx.role).toBe("admin");
+    } finally {
+      if (prev === undefined) delete process.env.VERCEL_ENV;
+      else process.env.VERCEL_ENV = prev;
+    }
+  });
+});

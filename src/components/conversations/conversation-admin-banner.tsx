@@ -10,6 +10,26 @@ interface Props {
   assignedToName: string | null;
 }
 
+/**
+ * Règle de visibilité de la bannière, extraite en helper pur pour que la
+ * logique soit testable sans monter tout le wrapper client
+ * `ConversationDetailClient` (qui dépend de React Query, du routing,
+ * etc.). La bannière doit apparaître ssi un admin consulte une conv
+ * qu'il ne suit pas lui-même.
+ *
+ * Table de vérité :
+ *   admin  + !isOwner → true   (le cas visé — superviseur sur conv d'un autre)
+ *   admin  +  isOwner → false  (admin sur sa propre conv — pas de supervision)
+ *   commercial + !isOwner → false  (ne devrait pas arriver, blocké en 403 — fail-safe)
+ *   commercial +  isOwner → false  (cas nominal commercial sur sa conv)
+ */
+export function shouldShowAdminBanner(
+  viewerRole: "admin" | "commercial",
+  viewerIsOwner: boolean,
+): boolean {
+  return viewerRole === "admin" && !viewerIsOwner;
+}
+
 export function ConversationAdminBanner({ assignedToName }: Props) {
   const label = assignedToName ?? "un autre commercial";
   return (

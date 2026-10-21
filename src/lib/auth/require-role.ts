@@ -28,8 +28,18 @@
  *       "role":         "{{user.public_metadata.role}}",
  *       "firstName":    "{{user.first_name}}",
  *       "lastName":     "{{user.last_name}}",
- *       "slackUserId":  "{{user.public_metadata.slackUserId}}"
+ *       "slackUserId":  "{{user.public_metadata.slackUserId}}",
+ *       "testAccount":  "{{user.public_metadata.testAccount}}"
  *     }
+ *
+ *   `testAccount` est posé par `scripts/setup-e2e-clerk-users.mjs` sur
+ *   les comptes du harnais Playwright (`e2e-commercial`,
+ *   `e2e-commercial-owner`, `e2e-admin`). En production (`VERCEL_ENV ===
+ *   "production"`), tout `testAccount === true` est refusé par
+ *   `requireRole` → impossible pour un compte test de s'authentifier
+ *   contre le dashboard prod même si quelqu'un a provisionné les comptes
+ *   dans Clerk live par erreur (défense en profondeur du refus
+ *   `sk_live_` du script). Cf. finding M1 security-reviewer PR1.14.1.
  *
  *   Chaque utilisateur Clerk doit avoir `publicMetadata.role` ∈
  *   `{"admin", "commercial"}`. Si absent ou mal formé, l'utilisateur est
@@ -114,6 +124,17 @@ const SessionClaimsSchema = z.object({
     .union([z.string().regex(SLACK_USER_ID_REGEX), z.literal("")])
     .optional()
     .transform((v) => (v === "" || v === undefined ? undefined : v)),
+  /**
+   * PR1.14.1 — flag posé par `scripts/setup-e2e-clerk-users.mjs` sur les
+   * comptes du harnais Playwright. En prod, `requireRole` refuse tout
+   * compte avec `testAccount === true`. Clerk sérialise un boolean
+   * publicMetadata en `true`/`false` chaîne via le JWT template ; on
+   * tolère les deux formats et on normalise en boolean.
+   */
+  testAccount: z
+    .union([z.boolean(), z.literal("true"), z.literal("false"), z.literal("")])
+    .optional()
+    .transform((v) => v === true || v === "true"),
 });
 
 /** Contexte utilisateur retourné par `requireRole`. */
@@ -184,7 +205,20 @@ export async function requireRole(required: Role): Promise<RoleContext> {
     });
   }
 
-  const { role, firstName, lastName, slackUserId } = parsed.data;
+  const { role, firstName, lastName, slackUserId, testAccount } = parsed.data;
+
+  // PR1.14.1 — défense en profondeur : un compte test ne peut JAMAIS
+  // s'authentifier contre le dashboard prod. Garantit que si quelqu'un
+  // provisionne `e2e-admin` / `e2e-commercial-owner` dans Clerk live par
+  // erreur (le script refuse par défaut, mais garde-fou en couche app),
+  // ces comptes restent inoffensifs.
+  if (testAccount && process.env.VERCEL_ENV === "production") {
+    throw new ForbiddenError({
+      message: `requireRole: testAccount=true refusé en VERCEL_ENV=production (userId=${userId})`,
+      clientMessage: "Compte de test non autorisé en production.",
+      context: { userId },
+    });
+  }
 
   // Hiérarchie : admin couvre tout, commercial couvre uniquement commercial.
   const allowed = role === "admin" || role === required;
