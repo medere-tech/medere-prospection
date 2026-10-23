@@ -28,6 +28,7 @@
 import { config } from "dotenv";
 config({ path: ".env.local" });
 
+import { countFromResult } from "../src/lib/firestore/check-indexes-count.ts";
 import { QUERY_FORMS } from "../src/lib/firestore/conversation-list-query-forms.ts";
 import { getFirebaseEnv } from "../src/lib/security/env.ts";
 
@@ -69,20 +70,10 @@ const results = [];
 for (const form of QUERY_FORMS) {
   try {
     const r = await form.run();
-    // Compte sans AFFICHER le contenu des documents (contrat PR2a).
-    let count = 0;
-    if (r && typeof r === "object") {
-      if ("conversations" in r && Array.isArray(r.conversations)) {
-        count = r.conversations.length;
-      } else if ("topConversationId" in r) {
-        count = r.topConversationId ? 1 : 0;
-      } else {
-        // get*ByContactId retourne Conversation | null
-        count = r ? 1 : 0;
-      }
-    } else if (typeof r === "number") {
-      count = r;
-    }
+    // Discrimination par TYPE Firestore (QuerySnapshot/DocumentSnapshot/...),
+    // extraite dans `check-indexes-count.ts` pour être couverte par tests
+    // unitaires. Jamais d'affichage du contenu — seulement un count.
+    const count = countFromResult(r);
     results.push({ label: form.label, category: form.category, status: "OK", count });
     process.stdout.write(`  ✓ ${form.label}  (count=${count})\n`);
   } catch (err) {

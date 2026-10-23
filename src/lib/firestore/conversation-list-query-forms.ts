@@ -31,6 +31,12 @@
 import { Timestamp } from "firebase-admin/firestore";
 
 import { getAdminDb } from "@/lib/firestore/admin";
+import {
+  backfillConversationsRef,
+  queryBackfillContact,
+  queryBackfillLastHumanOutbound,
+  queryBackfillLastMessage,
+} from "@/lib/firestore/backfill-conversation-list-fields";
 import { normalizeContactNameSearch } from "@/lib/firestore/conversation-list-fields";
 import {
   ADMIN_TABS,
@@ -207,55 +213,35 @@ function buildVersionForms(): QueryForm[] {
 }
 
 /**
- * Formes du script `scripts/backfill-conversation-list-fields.mjs`.
- * Chaque forme reproduit UNE requête Firestore que le backfill émet.
- * `fichier:ligne` dans les labels pour tracer la source.
+ * Formes du backfill. Chaque forme appelle EXACTEMENT la même fonction
+ * que `computeBackfillUpdatesForConversation` utilise au runtime —
+ * jamais de requête recopiée à la main. Si le backfill change sa
+ * query (ex: ajout d'un filtre), le script la verra automatiquement.
  */
 function buildBackfillForms(): QueryForm[] {
   const probeConvId = `${PROBE_CONTACT_ID}_${PROBE_CAMPAIGN_ID}`;
   return [
     {
-      // backfill-conversation-list-fields.mjs:122 — scan global
       label: "backfill.conversations.scan",
       category: "backfill",
-      run: () => getAdminDb().collection("conversations").limit(1).get(),
+      // Même ref que `backfill-conversation-list-fields.ts::backfillConversationsRef`.
+      run: () => backfillConversationsRef(getAdminDb()).limit(1).get(),
     },
     {
-      // backfill-conversation-list-fields.mjs:134 — lookup contact
       label: "backfill.contacts.lookup",
       category: "backfill",
-      run: () => getAdminDb().collection("contacts").doc(PROBE_CONTACT_ID).get(),
+      run: () => queryBackfillContact(getAdminDb(), PROBE_CONTACT_ID),
     },
     {
-      // backfill-conversation-list-fields.mjs:174 — sous-collection
-      // messages, dernier doc par createdAt desc. Single-field auto.
       label: "backfill.messages.last",
       category: "backfill",
-      run: () =>
-        getAdminDb()
-          .collection("conversations")
-          .doc(probeConvId)
-          .collection("messages")
-          .orderBy("createdAt", "desc")
-          .limit(1)
-          .get(),
+      run: () => queryBackfillLastMessage(getAdminDb(), probeConvId),
     },
     {
-      // backfill-conversation-list-fields.mjs:201 — sous-collection
-      // messages, dernier outbound humain. Requiert composite
-      // (direction asc, generatedBy asc, createdAt desc) côté messages.
+      // Requiert composite `(direction, generatedBy, createdAt desc)` sur messages.
       label: "backfill.messages.last-human-outbound",
       category: "backfill",
-      run: () =>
-        getAdminDb()
-          .collection("conversations")
-          .doc(probeConvId)
-          .collection("messages")
-          .where("direction", "==", "outbound")
-          .where("generatedBy", "==", "human")
-          .orderBy("createdAt", "desc")
-          .limit(1)
-          .get(),
+      run: () => queryBackfillLastHumanOutbound(getAdminDb(), probeConvId),
     },
   ];
 }

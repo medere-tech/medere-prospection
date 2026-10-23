@@ -23,6 +23,66 @@ import {
   normalizeContactNameSearch,
 } from "@/lib/firestore/conversation-list-fields";
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Query helpers — point unique utilisé par `computeBackfillUpdatesForConversation`
+// (ci-dessous) ET par `scripts/check-conversation-list-indexes.mjs` via
+// `conversation-list-query-forms.ts`. Interdit de recopier ces requêtes
+// ailleurs : la règle est "même fonction partout" pour qu'un drift
+// (ex: ajout d'un filtre dans l'une mais pas l'autre) casse le build.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/** `db.collection("conversations").doc(convId).collection("messages").orderBy("createdAt","desc").limit(1).get()`. */
+export function queryBackfillLastMessage(
+  db: FirebaseFirestore.Firestore,
+  convId: string,
+): Promise<FirebaseFirestore.QuerySnapshot> {
+  return db
+    .collection("conversations")
+    .doc(convId)
+    .collection("messages")
+    .orderBy("createdAt", "desc")
+    .limit(1)
+    .get();
+}
+
+/**
+ * `db.collection("conversations").doc(convId).collection("messages").where("direction","==","outbound").where("generatedBy","==","human").orderBy("createdAt","desc").limit(1).get()`.
+ *
+ * ⚠️ Requiert le composite index `(direction, generatedBy, createdAt desc)`
+ * sur la collection `messages` (portée COLLECTION). Vérifié en prod par
+ * `scripts/check-conversation-list-indexes.mjs` sous le label
+ * `backfill.messages.last-human-outbound`.
+ */
+export function queryBackfillLastHumanOutbound(
+  db: FirebaseFirestore.Firestore,
+  convId: string,
+): Promise<FirebaseFirestore.QuerySnapshot> {
+  return db
+    .collection("conversations")
+    .doc(convId)
+    .collection("messages")
+    .where("direction", "==", "outbound")
+    .where("generatedBy", "==", "human")
+    .orderBy("createdAt", "desc")
+    .limit(1)
+    .get();
+}
+
+/** `db.collection("contacts").doc(contactId).get()`. */
+export function queryBackfillContact(
+  db: FirebaseFirestore.Firestore,
+  contactId: string,
+): Promise<FirebaseFirestore.DocumentSnapshot> {
+  return db.collection("contacts").doc(contactId).get();
+}
+
+/** `db.collection("conversations")` — ref brute, le caller choisit `.get()` ou `.limit(n).get()`. */
+export function backfillConversationsRef(
+  db: FirebaseFirestore.Firestore,
+): FirebaseFirestore.CollectionReference {
+  return db.collection("conversations");
+}
+
 export interface BackfillConvResult {
   /** Clés de `updates` dans leur ordre de pose. */
   posed: string[];
@@ -67,7 +127,7 @@ export async function computeBackfillUpdatesForConversation(
   // ── Lecture contact ──────────────────────────────────────────────────
   if (needContactFields) {
     try {
-      const cSnap = await db.collection("contacts").doc(String(conv.contactId)).get();
+      const cSnap = await queryBackfillContact(db, String(conv.contactId));
       if (cSnap.exists) {
         const raw = (cSnap.data() ?? {}) as Record<string, unknown>;
         if (!conv.contactDisplayName) {
@@ -111,13 +171,7 @@ export async function computeBackfillUpdatesForConversation(
   // ── Dernier message (preview) — SKIP si une lecture précédente a échoué ──
   if (readErrors.length === 0 && !conv.lastMessagePreview) {
     try {
-      const lastMsgSnap = await db
-        .collection("conversations")
-        .doc(convId)
-        .collection("messages")
-        .orderBy("createdAt", "desc")
-        .limit(1)
-        .get();
+      const lastMsgSnap = await queryBackfillLastMessage(db, convId);
       if (!lastMsgSnap.empty) {
         const m = lastMsgSnap.docs[0]!.data();
         const direction = m.direction === "outbound" ? "outbound" : "inbound";
@@ -143,15 +197,7 @@ export async function computeBackfillUpdatesForConversation(
   // ── Dernier outbound humain — SKIP si une lecture précédente a échoué ──
   if (readErrors.length === 0 && !conv.lastHumanOutboundAt) {
     try {
-      const lastHumanSnap = await db
-        .collection("conversations")
-        .doc(convId)
-        .collection("messages")
-        .where("direction", "==", "outbound")
-        .where("generatedBy", "==", "human")
-        .orderBy("createdAt", "desc")
-        .limit(1)
-        .get();
+      const lastHumanSnap = await queryBackfillLastHumanOutbound(db, convId);
       if (!lastHumanSnap.empty) {
         const t = lastHumanSnap.docs[0]!.data().createdAt;
         if (t instanceof Timestamp) {
