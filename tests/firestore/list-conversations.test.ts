@@ -54,29 +54,43 @@ interface SeedConv {
     | "blocked";
   intent: "INTERESSE" | "NEUTRE" | "OBJECTION" | "STOP" | "unknown";
   assignedTo: string | null;
+  /**
+   * `lastInboundMs` reste la clé historique d'entrée du helper (PR0),
+   * mais le tri de la liste est désormais sur `lastMessageAt` (PR2a).
+   * Par défaut, `lastMessageAt` = `lastInboundMs` (compat PR0) et
+   * `inboundCount` = 1 (seed d'une conv qui a reçu au moins un inbound).
+   * Pour simuler une conv sortant-seul, passer `onlyOutbound: true` :
+   * `lastInboundAt` n'est pas posé, `inboundCount = 0`, `lastMessageAt`
+   * reçoit `lastInboundMs` comme horodatage du sortant.
+   */
   lastInboundMs: number;
+  onlyOutbound?: boolean;
 }
 
 async function seedConv(c: SeedConv) {
   const db = getAdminDb();
-  await db
-    .collection(COLLECTION)
-    .doc(c.id)
-    .set({
-      contactId: c.contactId,
-      campaignId: c.campaignId,
-      channel: "sms",
-      status: c.status,
-      intent: c.intent,
-      messageCount: 1,
-      outboundCount: 1,
-      inboundCount: 1,
-      followupCount: 0,
-      assignedTo: c.assignedTo,
-      lastInboundAt: Timestamp.fromMillis(c.lastInboundMs),
-      createdAt: Timestamp.fromMillis(c.lastInboundMs - 1000),
-      updatedAt: Timestamp.fromMillis(c.lastInboundMs),
-    });
+  const base: Record<string, unknown> = {
+    contactId: c.contactId,
+    campaignId: c.campaignId,
+    channel: "sms",
+    status: c.status,
+    intent: c.intent,
+    messageCount: 1,
+    outboundCount: 1,
+    followupCount: 0,
+    assignedTo: c.assignedTo,
+    lastMessageAt: Timestamp.fromMillis(c.lastInboundMs),
+    createdAt: Timestamp.fromMillis(c.lastInboundMs - 1000),
+    updatedAt: Timestamp.fromMillis(c.lastInboundMs),
+  };
+  if (c.onlyOutbound) {
+    base.inboundCount = 0;
+    base.lastOutboundAt = Timestamp.fromMillis(c.lastInboundMs);
+  } else {
+    base.inboundCount = 1;
+    base.lastInboundAt = Timestamp.fromMillis(c.lastInboundMs);
+  }
+  await db.collection(COLLECTION).doc(c.id).set(base);
 }
 
 describe("listConversations* — persist emulator (VUE-CONVERSATION PR0)", () => {
@@ -95,7 +109,7 @@ describe("listConversations* — persist emulator (VUE-CONVERSATION PR0)", () =>
   // listConversations (sans filtre assignedTo)
   // ─────────────────────────────────────────────────────────────────────────
 
-  it("listConversations — ordre lastInboundAt desc", async () => {
+  it("listConversations — ordre lastMessageAt desc (PR2a)", async () => {
     await seedConv({
       id: "c1_x",
       contactId: "c1",
@@ -128,6 +142,70 @@ describe("listConversations* — persist emulator (VUE-CONVERSATION PR0)", () =>
     expect(res.conversations.map((c) => c.conversationId)).toEqual(["c1_x", "c3_x", "c2_x"]);
     expect(res.hasMore).toBe(false);
     expect(res.nextCursor).toBeNull();
+  });
+
+  // ─────────────────────────────────────────────────────────────────────────
+  // PR2a — preuve que le tri `lastMessageAt desc` embarque les sortant-seul
+  // ─────────────────────────────────────────────────────────────────────────
+
+  it("PR2a — conversation sans aucun inbound (sortant-seul) apparaît", async () => {
+    // Avant PR2a (tri `lastInboundAt desc`), ce doc aurait été invisible
+    // car `lastInboundAt` est absent → Firestore l'exclut d'un `orderBy`.
+    // Après PR2a (tri `lastMessageAt desc`), il apparaît : `lastMessageAt`
+    // est bumpé à CHAQUE message, dont le premier sortant.
+    await seedConv({
+      id: "c_outbound_only",
+      contactId: "cOO",
+      campaignId: "x",
+      status: "active",
+      intent: "unknown",
+      assignedTo: null,
+      lastInboundMs: 1_700_000_050_000,
+      onlyOutbound: true,
+    });
+    await seedConv({
+      id: "c_with_inbound",
+      contactId: "cWI",
+      campaignId: "x",
+      status: "in_dialogue",
+      intent: "INTERESSE",
+      assignedTo: null,
+      lastInboundMs: 1_700_000_200_000,
+    });
+
+    const res = await listConversations();
+    const ids = res.conversations.map((c) => c.conversationId);
+    // Les 2 docs apparaissent, dans l'ordre `lastMessageAt desc`.
+    expect(ids).toEqual(["c_with_inbound", "c_outbound_only"]);
+  });
+
+  it("PR2a — mutation : si on remet `orderBy('lastInboundAt','desc')` les sortant-seul disparaissent", async () => {
+    // Documente le piège : si quelqu'un rebranche l'ordering sur
+    // `lastInboundAt`, le doc sortant-seul (sans `lastInboundAt`) sera
+    // exclu silencieusement par Firestore → régression invisible.
+    // On vérifie ici qu'une query directe sur `lastInboundAt` perd le doc,
+    // ce qui prouve que notre choix `lastMessageAt` est bien le correctif.
+    await seedConv({
+      id: "c_outbound_only",
+      contactId: "cOO",
+      campaignId: "x",
+      status: "active",
+      intent: "unknown",
+      assignedTo: null,
+      lastInboundMs: 1_700_000_050_000,
+      onlyOutbound: true,
+    });
+    const db = getAdminDb();
+    const legacySnap = await db
+      .collection(COLLECTION)
+      .orderBy("lastInboundAt", "desc")
+      .limit(10)
+      .get();
+    expect(legacySnap.docs.map((d) => d.id)).not.toContain("c_outbound_only");
+
+    // Avec le tri PR2a (via la fonction publique), le doc est bien là.
+    const pr2a = await listConversations();
+    expect(pr2a.conversations.map((c) => c.conversationId)).toContain("c_outbound_only");
   });
 
   it("listConversations — filtre status", async () => {
@@ -362,6 +440,10 @@ describe("listConversations* — persist emulator (VUE-CONVERSATION PR0)", () =>
         inboundCount: 1,
         followupCount: 0,
         assignedTo: null,
+        // PR2a : la liste trie sur `lastMessageAt` → le seed doit le poser
+        // sinon le doc est exclu de l'orderBy (Firestore filtre les docs
+        // dont le champ est absent).
+        lastMessageAt: Timestamp.fromMillis(1_700_000_000_000),
         lastInboundAt: Timestamp.fromMillis(1_700_000_000_000),
         createdAt: Timestamp.fromMillis(1_700_000_000_000),
         updatedAt: Timestamp.fromMillis(1_700_000_000_000),

@@ -70,11 +70,20 @@ import { z } from "zod";
 
 import { getAdminDb } from "@/lib/firestore/admin";
 import { appendAuditLogTx } from "@/lib/firestore/audit-log";
+import {
+  computeContactDisplayName,
+  normalizeContactNameSearch,
+} from "@/lib/firestore/conversation-list-fields";
 import { assertSlackUserId } from "@/lib/slack/slack-user-id";
 import { ConflictError, InternalError, NotFoundError, ValidationError } from "@/lib/utils/errors";
 import { logger } from "@/lib/utils/logger";
 import { shortFingerprint } from "@/lib/utils/short-fingerprint";
-import type { Conversation, ConversationStatus, Intent } from "@/types/conversation";
+import type {
+  Conversation,
+  ConversationLastMessagePreview,
+  ConversationStatus,
+  Intent,
+} from "@/types/conversation";
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Constantes & helper public
@@ -267,6 +276,28 @@ export const ConversationSchema = z.object({
   nextActionType: z.enum(["followup_3d", "followup_7d", "archive", "none"]).optional(),
   followupCount: z.number().int().nonnegative(),
   summary: z.string().optional(),
+
+  // PR2a — dénormalisations pour la liste `/admin/conversations`.
+  // Tous OPTIONNELS → les docs pré-PR2a passent la validation sans
+  // backfill. Le backfill `scripts/backfill-conversation-list-fields.mjs`
+  // les pose a posteriori. Les points d'écriture (createConversation,
+  // _bumpConversationCountersTx, updateContact propagation) les écrivent
+  // dans la MÊME transaction que l'écriture existante.
+  contactDisplayName: z.string().optional(),
+  contactNameSearch: z.string().optional(),
+  contactSpecialty: z.string().optional(),
+  contactCity: z.string().optional(),
+  campaignName: z.string().optional(),
+  lastMessagePreview: z
+    .object({
+      direction: z.enum(["inbound", "outbound"]),
+      authorKind: z.enum(["contact", "ai", "human"]),
+      text: z.string().max(140),
+      at: TimestampLike,
+    })
+    .optional(),
+  lastHumanOutboundAt: TimestampLike.optional(),
+
   createdAt: TimestampLike,
   updatedAt: TimestampLike,
 });
@@ -356,6 +387,19 @@ export function _bumpConversationCountersTx(
   conv: Conversation,
   direction: "outbound" | "inbound",
   now: Timestamp,
+  /**
+   * PR2a — dénormalisation pour la liste. Si fourni, pose
+   * `lastMessagePreview` DANS LA MÊME `tx.update` que le bump counters
+   * (zéro écriture additionnelle). Si `preview.authorKind === "human"`
+   * et direction outbound, pose aussi `lastHumanOutboundAt`.
+   *
+   * Les callers (`addInbound`, `addOutbound`, `send-reply`) qui
+   * disposent du texte du message passent `preview`. Les callers legacy
+   * qui ne l'ont pas (ex: compteurs purs) l'omettent — les champs
+   * dénormalisés restent inchangés sur le doc. Les docs anciens sans
+   * `lastMessagePreview` restent valides (champ Zod `.optional()`).
+   */
+  preview?: ConversationLastMessagePreview,
 ): void {
   const isOutbound = direction === "outbound";
   const updates: Record<string, unknown> = {
@@ -370,6 +414,13 @@ export function _bumpConversationCountersTx(
   // pour les jobs de relance (followup_3d / followup_7d).
   if (!conv.firstMessageAt) {
     updates.firstMessageAt = now;
+  }
+  // PR2a — dénormalisation message
+  if (preview !== undefined) {
+    updates.lastMessagePreview = preview;
+    if (preview.authorKind === "human" && preview.direction === "outbound") {
+      updates.lastHumanOutboundAt = preview.at;
+    }
   }
   tx.update(ref, updates);
 }
@@ -500,6 +551,43 @@ export async function getOrCreateInitialConversation(
   const ref = getAdminDb().collection(CONVERSATIONS_COLLECTION).doc(conversationId);
   const now = Timestamp.now();
 
+  // PR2a — dénormalisation initiale pour la liste `/admin/conversations`.
+  // Lecture BRUTE du contact (pas via `getContact` pour éviter un cycle
+  // d'import conversations.ts ↔ contacts.ts). Si le contact est absent
+  // ou partiel, on dégrade proprement — le backfill
+  // `scripts/backfill-conversation-list-fields.mjs` posera les champs
+  // manquants. `campaignName` n'est PAS posé ici (pas d'appel externe
+  // HubSpot en création — payé par le backfill et par un hook futur).
+  let contactDenorm: Partial<
+    Pick<
+      Conversation,
+      "contactDisplayName" | "contactNameSearch" | "contactSpecialty" | "contactCity"
+    >
+  > = {};
+  try {
+    const contactSnap = await getAdminDb().collection("contacts").doc(contactId).get();
+    if (contactSnap.exists) {
+      const raw = contactSnap.data() ?? {};
+      const firstName = typeof raw.firstName === "string" ? raw.firstName : "";
+      const lastName = typeof raw.lastName === "string" ? raw.lastName : "";
+      const civilite = typeof raw.civilite === "string" ? raw.civilite : undefined;
+      const speciality = typeof raw.speciality === "string" ? raw.speciality : undefined;
+      const city = typeof raw.city === "string" ? raw.city : undefined;
+      const displayName = computeContactDisplayName({ civilite, firstName, lastName });
+      contactDenorm = {
+        ...(displayName.length > 0 && { contactDisplayName: displayName }),
+        ...(firstName.length + lastName.length > 0 && {
+          contactNameSearch: normalizeContactNameSearch(`${firstName} ${lastName}`),
+        }),
+        ...(speciality && speciality.length > 0 && { contactSpecialty: speciality }),
+        ...(city && city.length > 0 && { contactCity: city }),
+      };
+    }
+  } catch {
+    // Lecture best-effort — n'empêche pas la création de la conversation.
+    // Le backfill posera les champs manquants.
+  }
+
   const doc: Conversation = {
     contactId,
     campaignId,
@@ -513,6 +601,7 @@ export async function getOrCreateInitialConversation(
     // VUE-CONVERSATION PR0 — dénormalisation. `null` explicite (vs undefined)
     // pour permettre `where("assignedTo", "==", null)` sur l'onglet « À traiter ».
     assignedTo: null,
+    ...contactDenorm,
     createdAt: now,
     updatedAt: now,
   };
@@ -1425,30 +1514,43 @@ export const LIST_CONVERSATIONS_DEFAULT_LIMIT = 25;
 export const LIST_CONVERSATIONS_MAX_LIMIT = 100;
 
 /**
+ * Statuts conversation (source unique utilisée aussi par `statusIn`).
+ */
+const ConversationStatusEnum = z.enum([
+  "active",
+  "awaiting_reply",
+  "in_dialogue",
+  "qualified",
+  "handed_off",
+  "closed",
+  "opted_out",
+  "blocked",
+]);
+
+/**
  * Filtres passables aux fonctions `listConversations*`. Whitelist stricte :
- *   - `status`  : enum fermé `ConversationStatus`.
- *   - `intent`  : enum fermé `Intent`.
+ *   - `status`             : enum fermé `ConversationStatus` (égalité).
+ *   - `statusIn`           : jusqu'à 10 valeurs (limite Firestore `in[]`),
+ *                            utilisé par les onglets de la liste
+ *                            (ex: `en_cours` = 4 statuts non terminaux).
+ *   - `intent`             : enum fermé `Intent`.
+ *   - `campaignId`         : filtre serveur par campagne (dénormalisé).
+ *   - `contactNameSearch`  : préfixe normalisé (lower + accents strippés)
+ *                            pour la recherche par nom en liste.
  *
- * Les filtres de plage (dates) sont volontairement OMIS du MVP VUE-CONVERSATION
- * PR0 : la query avec un `.where("lastInboundAt", ">=", ...)` + `orderBy`
- * exige un index composite spécifique par combinaison. On ajoutera à la
- * demande (PR2 UI) quand on saura quelles plages sont effectivement
- * utilisées — minimise la combinatoire d'index.
+ * Les filtres de plage (dates) restent OMIS : la combinatoire d'index
+ * exploserait. On ajoutera à la demande quand une plage sera réellement
+ * utilisée côté UI.
+ *
+ * ⚠️ `status` et `statusIn` sont EXCLUSIFS côté code (si les deux sont
+ * fournis, `statusIn` l'emporte). Caller propre : passer l'un OU l'autre.
  */
 const ListConversationsFiltersSchema = z.object({
-  status: z
-    .enum([
-      "active",
-      "awaiting_reply",
-      "in_dialogue",
-      "qualified",
-      "handed_off",
-      "closed",
-      "opted_out",
-      "blocked",
-    ])
-    .optional(),
+  status: ConversationStatusEnum.optional(),
+  statusIn: z.array(ConversationStatusEnum).min(1).max(10).optional(),
   intent: z.enum(["INTERESSE", "NEUTRE", "OBJECTION", "STOP", "unknown"]).optional(),
+  campaignId: z.string().min(1).max(80).optional(),
+  contactNameSearch: z.string().min(1).max(80).optional(),
 });
 
 export type ListConversationsFilters = z.input<typeof ListConversationsFiltersSchema>;
@@ -1458,6 +1560,19 @@ const ListConversationsInputSchema = z.object({
   limit: z.number().int().min(1).max(LIST_CONVERSATIONS_MAX_LIMIT).optional(),
   /** docId `${contactId}_${campaignId}` opaque du dernier doc de la page précédente. */
   cursor: z.string().min(1).optional(),
+  /**
+   * ⚠️ `@internal` — réservé au script `scripts/check-conversation-list-indexes.mjs`.
+   * Les 3 routes publiques ne passent JAMAIS ce champ (seul `cursor` opaque
+   * est accepté par leur Zod). Permet d'injecter un `startAfter(...values)`
+   * basé sur les valeurs des champs du tri plutôt que sur un document
+   * existant → le script peut probler le path d'index SANS avoir à seeder
+   * ou retrouver un doc réel.
+   *
+   * EXCLUSIF avec `cursor` : si les deux sont fournis, `cursor` l'emporte
+   * (compat ascendante — route handler peut déborder sur `startAfterValues`
+   * sans casser).
+   */
+  startAfterValues: z.array(z.unknown()).optional(),
 });
 
 export type ListConversationsInput = z.input<typeof ListConversationsInputSchema>;
@@ -1474,40 +1589,113 @@ export interface ListConversationsOutput {
  * (`listConversations`, `listConversationsByAssignee`,
  * `listUnassignedConversations`).
  *
- * ⚠️ ORDERING — on trie TOUJOURS par `lastInboundAt desc`, NULLS LAST.
- * Firestore ne supporte pas `NULLS LAST` nativement : un doc sans
- * `lastInboundAt` n'apparaît PAS dans le résultat de `.orderBy(...)`. On
- * accepte cette sémantique MVP : les conversations qui n'ont pas encore
- * reçu d'inbound (`lastInboundAt === undefined`) ne figurent pas dans la
- * liste — c'est cohérent avec un dashboard « conversations avec activité ».
+ * ⚠️ ORDERING — on trie TOUJOURS par `lastMessageAt desc` (PR2a).
+ *
+ * Avant PR2a, l'ordre était `lastInboundAt desc` : une conversation avec
+ * UNIQUEMENT un sortant (premier SMS envoyé, pas encore de réponse) ne
+ * figurait pas dans la liste puisque Firestore exclut d'un orderBy les
+ * documents dont le champ est absent. Résultat : les commerciaux ne
+ * voyaient PAS les conversations qu'ils venaient de démarrer.
+ *
+ * `lastMessageAt` est bumpé par `_bumpConversationCountersTx` à CHAQUE
+ * message (inbound ET outbound) → une conversation apparaît dès le
+ * premier SMS envoyé. Les conversations fraîchement créées sans aucun
+ * message (`lastMessageAt` undefined) n'apparaissent pas, ce qui reste
+ * la bonne sémantique « liste des conversations avec activité ».
  */
-async function buildListConversationsQuery(options: {
-  filters?: ListConversationsFilters;
-  limit: number;
-  cursor?: string;
-  assigneeFilter?:
-    | { kind: "none" }
-    | { kind: "specific"; slackUserId: string }
-    | { kind: "unassigned" };
-}): Promise<FirebaseFirestore.Query> {
-  let q: FirebaseFirestore.Query = getAdminDb().collection(CONVERSATIONS_COLLECTION);
+type AssigneeFilter =
+  | { kind: "none" }
+  | { kind: "specific"; slackUserId: string }
+  | { kind: "unassigned" };
 
-  // Filtre assignedTo d'abord (plus sélectif en général).
-  const assigneeFilter = options.assigneeFilter ?? { kind: "none" };
+function applyConversationFilters(
+  base: FirebaseFirestore.Query,
+  filters: ListConversationsFilters | undefined,
+  assigneeFilter: AssigneeFilter,
+): FirebaseFirestore.Query {
+  let q = base;
   if (assigneeFilter.kind === "specific") {
     q = q.where("assignedTo", "==", assigneeFilter.slackUserId);
   } else if (assigneeFilter.kind === "unassigned") {
     q = q.where("assignedTo", "==", null);
   }
-
-  if (options.filters?.status !== undefined) {
-    q = q.where("status", "==", options.filters.status);
+  if (filters?.statusIn !== undefined && filters.statusIn.length > 0) {
+    q = q.where("status", "in", filters.statusIn);
+  } else if (filters?.status !== undefined) {
+    q = q.where("status", "==", filters.status);
   }
-  if (options.filters?.intent !== undefined) {
-    q = q.where("intent", "==", options.filters.intent);
+  if (filters?.intent !== undefined) {
+    q = q.where("intent", "==", filters.intent);
   }
+  if (filters?.campaignId !== undefined) {
+    q = q.where("campaignId", "==", filters.campaignId);
+  }
+  if (filters?.contactNameSearch !== undefined && filters.contactNameSearch.length > 0) {
+    const q0 = filters.contactNameSearch;
+    q = q.where("contactNameSearch", ">=", q0).where("contactNameSearch", "<", q0 + "");
+  }
+  return q;
+}
 
-  q = q.orderBy("lastInboundAt", "desc");
+/**
+ * Applique filtres + orderBy. Partagé entre `countConversations` et
+ * `buildListConversationsQuery` → les deux chemins utilisent LE MÊME
+ * composite index. Avant cette factorisation, les counts n'avaient pas
+ * d'orderBy et exigeaient des composites séparés (doublement du nombre
+ * d'index requis). Vérifié en prod via
+ * `scripts/check-conversation-list-indexes.mjs` : OK sur tous les combos
+ * aujourd'hui — un divergence future casserait le script immédiatement.
+ */
+function applyConversationFiltersAndOrderBy(
+  base: FirebaseFirestore.Query,
+  filters: ListConversationsFilters | undefined,
+  assigneeFilter: AssigneeFilter,
+): FirebaseFirestore.Query {
+  let q = applyConversationFilters(base, filters, assigneeFilter);
+  // Firestore impose que la 1re `orderBy` porte sur le champ en inégalité.
+  // En recherche préfixe, on ouvre par asc sur `contactNameSearch`, puis
+  // on affine par `lastMessageAt` desc en secondaire. Compromis assumé :
+  // les résultats de recherche sont alphabétiques, pas en récence pure.
+  if (filters?.contactNameSearch !== undefined && filters.contactNameSearch.length > 0) {
+    q = q.orderBy("contactNameSearch", "asc").orderBy("lastMessageAt", "desc");
+  } else {
+    q = q.orderBy("lastMessageAt", "desc");
+  }
+  return q;
+}
+
+/**
+ * Compte les conversations correspondant aux filtres (count aggregation
+ * Firestore — 1 lecture facturée). Partagé par les compteurs d'onglets.
+ *
+ * ⚠️ ORDERING ALIGNÉ SUR LA LISTE (PR2a — vérification prod) : la query
+ * applique le MÊME `orderBy` que la liste pour réutiliser les mêmes
+ * composite indexes. Firestore `count()` accepte un `orderBy` (il filtre
+ * la même population que la liste correspondante). Prouvé emulator :
+ * `tests/firestore/pr2a-firestore-capabilities.test.ts` → `count aligné
+ * sur list`.
+ */
+export async function countConversations(options: {
+  filters?: ListConversationsFilters;
+  assigneeFilter?: AssigneeFilter;
+}): Promise<number> {
+  const base = getAdminDb().collection(CONVERSATIONS_COLLECTION);
+  const assigneeFilter = options.assigneeFilter ?? { kind: "none" };
+  const q = applyConversationFiltersAndOrderBy(base, options.filters, assigneeFilter);
+  const snap = await q.count().get();
+  return snap.data().count;
+}
+
+async function buildListConversationsQuery(options: {
+  filters?: ListConversationsFilters;
+  limit: number;
+  cursor?: string;
+  startAfterValues?: unknown[];
+  assigneeFilter?: AssigneeFilter;
+}): Promise<FirebaseFirestore.Query> {
+  const base = getAdminDb().collection(CONVERSATIONS_COLLECTION);
+  const assigneeFilter = options.assigneeFilter ?? { kind: "none" };
+  let q = applyConversationFiltersAndOrderBy(base, options.filters, assigneeFilter);
 
   if (options.cursor !== undefined) {
     const cursorSnap = await getAdminDb()
@@ -1521,6 +1709,12 @@ async function buildListConversationsQuery(options: {
       });
     }
     q = q.startAfter(cursorSnap);
+  } else if (options.startAfterValues !== undefined && options.startAfterValues.length > 0) {
+    // Chemin `@internal` : utilisé par le script de vérification d'index.
+    // Les valeurs doivent correspondre, dans l'ordre, aux orderBy ci-dessus
+    // (soit `[lastMessageAt]` hors recherche, soit `[contactNameSearch,
+    // lastMessageAt]` en mode recherche).
+    q = q.startAfter(...options.startAfterValues);
   }
 
   return q.limit(options.limit + 1);
@@ -1550,22 +1744,20 @@ async function executeListQuery(
 }
 
 /**
- * Liste PAGINÉE des conversations, triées `lastInboundAt desc`. Admin
- * seulement : la vue conversation respecte le RBAC via `requireRole`
+ * Liste PAGINÉE des conversations, triées `lastMessageAt desc` (PR2a).
+ * Admin seulement : la vue conversation respecte le RBAC via `requireRole`
  * côté route handler (403 commercial sur onglet « Toutes »).
  *
  * ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
  * INDEX FIRESTORE REQUIS
  *
- *   - Query sans filtres : `orderBy("lastInboundAt", "desc")` — single-field
- *     auto.
- *   - Query filtre `status` seul : composite `status + lastInboundAt desc`.
- *   - Query filtre `intent` seul : composite `intent + lastInboundAt desc`.
- *   - Query filtre `status + intent` : composite
- *     `status + intent + lastInboundAt desc`.
+ *   La liste exhaustive est dans `firestore.indexes.json`. Chaque forme
+ *   de requête des 3 routes est prouvée en prod par
+ *   `scripts/check-conversation-list-indexes.mjs` (l'emulator N'enforce
+ *   PAS les composite indexes — seul le run contre la vraie base le fait).
+ *   Lancer ce script après tout changement d'index.
  *
- * Ajoutés dans `firestore.indexes.json` (VUE-CONVERSATION PR0). Déployer
- * via `npm run firebase:deploy:indexes` avant runtime Firestore Cloud.
+ * Déployer via `npm run firebase:deploy:indexes` avant runtime Cloud.
  *
  * @throws ValidationError si input invalide ou cursor inexistant.
  * @throws ValidationError si un doc est corrompu (Zod fail).
@@ -1587,10 +1779,10 @@ export async function listConversations(
     });
   }
 
-  const { filters, limit: requestedLimit, cursor } = parsed.data;
+  const { filters, limit: requestedLimit, cursor, startAfterValues } = parsed.data;
   const limit = requestedLimit ?? LIST_CONVERSATIONS_DEFAULT_LIMIT;
 
-  const q = await buildListConversationsQuery({ filters, limit, cursor });
+  const q = await buildListConversationsQuery({ filters, limit, cursor, startAfterValues });
   return executeListQuery(q, limit);
 }
 
@@ -1603,11 +1795,12 @@ export async function listConversations(
  * INDEX FIRESTORE REQUIS
  *
  *   - Query filtre `assignedTo` seul : composite
- *     `assignedTo + lastInboundAt desc`.
- *   - Query filtre `assignedTo + status` : composite
- *     `assignedTo + status + lastInboundAt desc`.
+ *     `assignedTo + lastMessageAt desc` (PR2a).
+ *   - Query filtre `assignedTo + status` (`==` ou `in[]`) : composite
+ *     `assignedTo + status + lastMessageAt desc` (PR2a).
+ *   - Query recherche préfixe + assignedTo : `assignedTo + contactNameSearch asc + lastMessageAt desc`.
  *
- * Ajoutés dans `firestore.indexes.json` (VUE-CONVERSATION PR0).
+ * Ajoutés dans `firestore.indexes.json`.
  *
  * @throws ValidationError si input invalide, slackUserId mal formé,
  *                         ou cursor inexistant.
@@ -1632,13 +1825,14 @@ export async function listConversationsByAssignee(
     });
   }
 
-  const { filters, limit: requestedLimit, cursor } = parsed.data;
+  const { filters, limit: requestedLimit, cursor, startAfterValues } = parsed.data;
   const limit = requestedLimit ?? LIST_CONVERSATIONS_DEFAULT_LIMIT;
 
   const q = await buildListConversationsQuery({
     filters,
     limit,
     cursor,
+    startAfterValues,
     assigneeFilter: { kind: "specific", slackUserId },
   });
   return executeListQuery(q, limit);
@@ -1652,7 +1846,7 @@ export async function listConversationsByAssignee(
  * INDEX FIRESTORE REQUIS
  *
  *   Même composite que `listConversationsByAssignee` :
- *   `assignedTo + lastInboundAt desc` (le filtre `== null` utilise le
+ *   `assignedTo + lastMessageAt desc` (le filtre `== null` utilise le
  *   même index que `== slackUserId`).
  *
  * ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━

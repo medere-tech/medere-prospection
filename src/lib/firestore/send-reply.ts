@@ -167,6 +167,7 @@ import { preSendCheckWithAuditTx } from "@/lib/compliance/pre-send-check-with-au
 import { RATE_LIMIT_WINDOW_DAYS as COMPLIANCE_RATE_LIMIT_WINDOW_DAYS } from "@/lib/compliance/rate-limits";
 import { getAdminDb } from "@/lib/firestore/admin";
 import { appendAuditLog, appendAuditLogTx } from "@/lib/firestore/audit-log";
+import { buildLastMessagePreview } from "@/lib/firestore/conversation-list-fields";
 import {
   _bumpConversationCountersTx,
   _parseConversationOrThrow,
@@ -444,7 +445,18 @@ export async function commitDraftToQueued(
       // `_bumpConversationCountersTx` bumpe `messageCount` + `outboundCount`
       // + `lastMessageAt` + `lastOutboundAt` + pose `firstMessageAt` si
       // absent. Cf. conversations.ts:300 pour le détail.
-      _bumpConversationCountersTx(tx, convRef, convInTx, "outbound", now);
+      //
+      // PR2a — dénormalisation preview. `send-reply` traite UNIQUEMENT des
+      // drafts IA (invariant ligne 353 : `draft.generatedBy === "ai"` exigé).
+      // Le pipeline "envoi humain" (futur) ouvrira son propre point d'écriture
+      // avec `authorKind: "human"` + bump `lastHumanOutboundAt`.
+      const preview = buildLastMessagePreview({
+        direction: "outbound",
+        authorKind: "ai",
+        text: draft.body,
+        at: now,
+      });
+      _bumpConversationCountersTx(tx, convRef, convInTx, "outbound", now, preview);
 
       // ── 8. Audit sms_sent (RÉUTILISATION arbitrage Q-B5) ────────────────
       // Forensic narratif sur le même `messageId` :

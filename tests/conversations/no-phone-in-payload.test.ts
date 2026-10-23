@@ -27,6 +27,11 @@ import {
   sanitizeMessageForBubble,
 } from "@/components/conversations/sanitize";
 import type { ConversationDetailProps } from "@/components/conversations/types";
+// PR2a — source unique de regex PII (partagée avec logger + routes
+// `/api/admin/conversations*` + sanitize `lastMessagePreview.text`).
+// Avant PR2a, ce fichier redéfinissait les 4 regexes inline → 2 nettoyeurs.
+// Désormais un seul : `src/lib/utils/pii-scrubber.ts`.
+import { containsEmail, containsFrenchPhoneNumber } from "@/lib/utils/pii-scrubber";
 import type { AuditLog } from "@/types/audit-log";
 import type { Contact } from "@/types/contact";
 import type { Conversation } from "@/types/conversation";
@@ -139,11 +144,11 @@ function makeAuditEntry(): AuditLog & { docId: string } {
 
 function assertNoPhoneInJson(payload: unknown, label: string) {
   const json = JSON.stringify(payload);
-  // E.164 brut + national + 0033 format OVH + email
-  expect(json, `${label} ne doit pas contenir +33...`).not.toMatch(/\+33\d{9}/);
-  expect(json, `${label} ne doit pas contenir 0033...`).not.toMatch(/\b0033\d{9}\b/);
-  expect(json, `${label} ne doit pas contenir 0[1-9]...`).not.toMatch(/\b0[1-9]\d{8}\b/);
-  expect(json, `${label} ne doit pas contenir d'email`).not.toMatch(/@[a-z0-9.-]+\.[a-z]{2,}/i);
+  // PR2a — délègue à pii-scrubber (source unique). `containsFrenchPhoneNumber`
+  // couvre E.164 (+33...), national (0X...) et format OVH (0033...) via
+  // `normalizeInterDigitSeparators` + `FRENCH_PHONE_ANYWHERE_REGEX`.
+  expect(containsFrenchPhoneNumber(json), `${label} ne doit pas contenir de numéro FR`).toBe(false);
+  expect(containsEmail(json), `${label} ne doit pas contenir d'email`).toBe(false);
 }
 
 describe("Sentinelle PR1 — zero PII dans la payload RSC", () => {
@@ -218,8 +223,9 @@ describe("Sentinelle PR1 — zero PII dans la payload RSC", () => {
       contact: { phone: { e164: E164_LEAK } },
     };
     const json = JSON.stringify(regressionPayload);
-    expect(json).toMatch(/\+33\d{9}/);
-    // La sentinelle ci-dessus échouerait sur ce payload — c'est le but.
+    // Via pii-scrubber (source unique) — prouve que la sentinelle attraperait
+    // la régression. Avant PR2a : regex inline `/\+33\d{9}/`.
+    expect(containsFrenchPhoneNumber(json)).toBe(true);
   });
 
   it("sanitize tolère les patterns inattendus sans crasher", () => {
@@ -241,7 +247,8 @@ describe("Sentinelle PR1 — zero PII dans la payload RSC", () => {
   it("patterns 0033 FR international (format OVH) ne passent pas non plus", () => {
     const payload = { field: `receiver=${DOMESTIC_INTL_LEAK}` };
     const json = JSON.stringify(payload);
-    // La sentinelle doit détecter 0033\d{9}
-    expect(json).toMatch(/\b0033\d{9}\b/);
+    // Via pii-scrubber (source unique) : `containsFrenchPhoneNumber` normalise
+    // les séparateurs inter-chiffres puis cherche l'alternance `0033[1-9]\d{8}`.
+    expect(containsFrenchPhoneNumber(json)).toBe(true);
   });
 });

@@ -50,27 +50,11 @@
 import pino from "pino";
 
 import { maskPhone } from "./phone";
+import { containsFrenchPhoneNumber, scrubPiiFromText } from "./pii-scrubber";
 
 export type AppLogger = pino.Logger;
 
 const REDACTED = "[REDACTED]";
-const PHONE_PLACEHOLDER = "[PHONE]";
-const EMAIL_PLACEHOLDER = "[EMAIL]";
-
-/**
- * Détecte un numéro de téléphone international ou national FR avec les
- * séparateurs réels rencontrés en prod : espaces, points, tirets, parenthèses.
- *   +33612345678 / +33 6 12 34 56 78 / +33-6-12-34-56-78 / +33.6.12.34.56.78
- *   +33(0)612345678 / 0612345678 (national sans +33)
- *
- * Compromis assumé : possibles false positives sur des suites de chiffres
- * longues purement décoratives (ex: certains IDs externes > 9 chiffres avec
- * séparateurs). On préfère sur-scrubber qu'oublier un numéro réel.
- */
-const PHONE_REGEX = /\+?\d[\d\s.\-()]{6,18}\d/g;
-
-/** RFC 5322 simplifié — suffisant pour la détection courante. */
-const EMAIL_REGEX = /[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,24}/g;
 
 /**
  * Liste blanche : noms de clés dont la valeur est intégralement redactée
@@ -147,9 +131,12 @@ const REDACT_PATHS = [
  * Scrub par VALEUR sur une string. Email scruber appliqué en premier (un
  * email peut contenir des chiffres dans le local part — on évite que la
  * regex phone le mange).
+ *
+ * Délégué à `pii-scrubber.ts` depuis PR2a (source unique de vérité pour
+ * les regex PII). Même sémantique que l'ancienne implémentation locale.
  */
 function scrubString(value: string): string {
-  return value.replace(EMAIL_REGEX, EMAIL_PLACEHOLDER).replace(PHONE_REGEX, PHONE_PLACEHOLDER);
+  return scrubPiiFromText(value);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -219,38 +206,17 @@ const TECHNICAL_ID_KEYS: ReadonlyMap<string, RegExp> = new Map([
  *   - `"0612345678_campagne"` sous `conversationId`.
  */
 /**
- * R4-Point2-fix PR-NO-DROPPED-SMS : chercher un numéro FR N'IMPORTE OÙ
- * dans la valeur normalisée, délimité par des non-chiffres (ou début/fin
- * de chaîne). Les 3 alternances ciblent le national FR (10 digits),
- * l'E.164 sans + (11 digits) et le préfixe 00+33 (13 digits).
- */
-const FRENCH_PHONE_ANYWHERE_REGEX = /(^|\D)(0[1-9]\d{8}|33[1-9]\d{8}|0033[1-9]\d{8})(\D|$)/;
-
-/**
- * R4-Point2-fix : normalise la valeur en SUPPRIMANT uniquement les
- * séparateurs situés ENTRE DEUX CHIFFRES. Capte les formats courants d'un
- * numéro FR formaté : `06-12-34-56-78`, `06.12.34.56.78`, `06 12 34 56 78`,
- * `06:12:34:56:78`. Préserve les séparateurs structurels :
- *   - `hubspotId_campaignId` : `_` entre chiffre et lettre → reste.
- *   - `sms.reply.oih_abcd` : `.` et `_` entre lettres → restent.
- *   - `1792422107.910000` : `.` entre deux chiffres → supprimé, mais la
- *     concaténation `1792422107910000` ne match aucun pattern FR
- *     (commence par `1`, pas `0`/`33`/`0033`).
- */
-function normalizeInterDigitSeparators(value: string): string {
-  return value.replace(/(?<=\d)[-_.: ](?=\d)/g, "");
-}
-
-/**
- * `true` si la valeur, après normalisation, contient un numéro FR
- * (national, E.164 sans +, ou préfixe 00+33) délimité par des non-chiffres.
- * Déclenche un REFUS DE BYPASS → la valeur sera scrubbée par PHONE_REGEX
- * en aval. Nom conservé pour cohérence historique (découverte initiale
- * via split, désormais via normalisation + anywhere-match).
+ * `true` si la valeur, après normalisation inter-chiffres, contient un
+ * numéro FR (national, E.164 sans +, ou préfixe 00+33) délimité par des
+ * non-chiffres. Déclenche un REFUS DE BYPASS → la valeur sera scrubbée
+ * par `PHONE_REGEX` en aval. Nom conservé pour cohérence historique
+ * (découverte initiale via split, désormais via normalisation +
+ * anywhere-match).
+ *
+ * Délégué à `pii-scrubber.containsFrenchPhoneNumber` depuis PR2a.
  */
 function containsFrenchPhoneSegment(value: string): boolean {
-  const normalized = normalizeInterDigitSeparators(value);
-  return FRENCH_PHONE_ANYWHERE_REGEX.test(normalized);
+  return containsFrenchPhoneNumber(value);
 }
 
 /**
