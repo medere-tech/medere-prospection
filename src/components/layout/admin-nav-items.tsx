@@ -36,8 +36,7 @@ export const ADMIN_NAV_ITEMS: readonly AdminNavItem[] = [
     href: "/admin/conversations",
     label: "Conversations",
     icon: MessageSquare,
-    enabled: false,
-    comingSoon: true,
+    enabled: true,
   },
   {
     href: "/admin/campaigns",

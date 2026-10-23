@@ -232,31 +232,9 @@ describe("listConversations* — persist emulator (VUE-CONVERSATION PR0)", () =>
     expect(res.conversations.map((c) => c.conversationId)).toEqual(["c1_x"]);
   });
 
-  it("listConversations — filtre intent + status combinés", async () => {
-    await seedConv({
-      id: "c1_x",
-      contactId: "c1",
-      campaignId: "x",
-      status: "in_dialogue",
-      intent: "INTERESSE",
-      assignedTo: null,
-      lastInboundMs: 1_700_000_000_000,
-    });
-    await seedConv({
-      id: "c2_x",
-      contactId: "c2",
-      campaignId: "x",
-      status: "in_dialogue",
-      intent: "NEUTRE",
-      assignedTo: null,
-      lastInboundMs: 1_700_000_100_000,
-    });
-
-    const res = await listConversations({
-      filters: { status: "in_dialogue", intent: "INTERESSE" },
-    });
-    expect(res.conversations.map((c) => c.conversationId)).toEqual(["c1_x"]);
-  });
+  // PR2b-1 — ancien test `filtre intent + status combinés` retiré :
+  // `filters.intent` n'est plus accepté par `ListConversationsFiltersSchema`
+  // (aucun caller ne l'utilisait, aucun index composite ne le soutenait).
 
   it("listConversations — pagination cursor", async () => {
     for (let i = 0; i < 5; i++) {

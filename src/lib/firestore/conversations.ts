@@ -1545,10 +1545,16 @@ const ConversationStatusEnum = z.enum([
  * ⚠️ `status` et `statusIn` sont EXCLUSIFS côté code (si les deux sont
  * fournis, `statusIn` l'emporte). Caller propre : passer l'un OU l'autre.
  */
+// PR2b-1 — `intent` retiré : aucun caller (route /list, /counts, /version,
+// check-indexes) ne le passait. Grep file:line prouvé avant retrait :
+//   `src/lib/firestore/conversations.ts:1627` (seul lecteur, utilisé QUE
+//   par ce schéma) — aucun autre import. Index Firestore `(intent, …)`
+//   déjà absent de `firestore.indexes.json` → pas d'index orphelin. Test
+//   `tests/firestore/list-conversations.test.ts` qui l'exerçait est
+//   également supprimé.
 const ListConversationsFiltersSchema = z.object({
   status: ConversationStatusEnum.optional(),
   statusIn: z.array(ConversationStatusEnum).min(1).max(10).optional(),
-  intent: z.enum(["INTERESSE", "NEUTRE", "OBJECTION", "STOP", "unknown"]).optional(),
   campaignId: z.string().min(1).max(80).optional(),
   contactNameSearch: z.string().min(1).max(80).optional(),
 });
@@ -1624,9 +1630,7 @@ function applyConversationFilters(
   } else if (filters?.status !== undefined) {
     q = q.where("status", "==", filters.status);
   }
-  if (filters?.intent !== undefined) {
-    q = q.where("intent", "==", filters.intent);
-  }
+  // PR2b-1 — `filters.intent` retiré (cf. ListConversationsFiltersSchema).
   if (filters?.campaignId !== undefined) {
     q = q.where("campaignId", "==", filters.campaignId);
   }

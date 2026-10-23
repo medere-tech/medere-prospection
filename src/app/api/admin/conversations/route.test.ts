@@ -253,6 +253,106 @@ describe("GET /api/admin/conversations (PR2a)", () => {
     expect(body.items[0].waitingForHumanReply).toBe(true);
   });
 
+  it("waitingForHumanReply — cas limite: aucun entrant → false", async () => {
+    const { Timestamp } = await import("firebase-admin/firestore");
+    okAdmin();
+    mockList.mockResolvedValueOnce({
+      conversations: [
+        {
+          conversationId: "c_no_inbound",
+          contactId: "c",
+          campaignId: "x",
+          channel: "sms",
+          status: "active",
+          intent: "unknown",
+          messageCount: 1,
+          outboundCount: 1,
+          inboundCount: 0,
+          followupCount: 0,
+          assignedTo: "UVANESSA999",
+          lastInboundAt: undefined, // AUCUN entrant
+          lastOutboundAt: Timestamp.fromMillis(1_700_000_000_000),
+          lastMessageAt: Timestamp.fromMillis(1_700_000_000_000),
+          lastHumanOutboundAt: undefined,
+          createdAt: Timestamp.fromMillis(0),
+          updatedAt: Timestamp.fromMillis(1_700_000_000_000),
+        },
+      ],
+      nextCursor: null,
+      hasMore: false,
+    });
+    const res = await GET(new Request("http://x/api/admin/conversations"));
+    const body = await res.json();
+    expect(body.items[0].waitingForHumanReply).toBe(false);
+  });
+
+  it("waitingForHumanReply — cas limite: aucun envoi humain + 1 entrant → true", async () => {
+    const { Timestamp } = await import("firebase-admin/firestore");
+    okAdmin();
+    mockList.mockResolvedValueOnce({
+      conversations: [
+        {
+          conversationId: "c_no_human",
+          contactId: "c",
+          campaignId: "x",
+          channel: "sms",
+          status: "in_dialogue",
+          intent: "INTERESSE",
+          messageCount: 2,
+          outboundCount: 1,
+          inboundCount: 1,
+          followupCount: 0,
+          assignedTo: "UVANESSA999",
+          lastInboundAt: Timestamp.fromMillis(1_700_000_200_000),
+          lastOutboundAt: Timestamp.fromMillis(1_700_000_100_000),
+          lastMessageAt: Timestamp.fromMillis(1_700_000_200_000),
+          lastHumanOutboundAt: undefined, // AUCUN envoi humain
+          createdAt: Timestamp.fromMillis(0),
+          updatedAt: Timestamp.fromMillis(1_700_000_200_000),
+        },
+      ],
+      nextCursor: null,
+      hasMore: false,
+    });
+    const res = await GET(new Request("http://x/api/admin/conversations"));
+    const body = await res.json();
+    expect(body.items[0].waitingForHumanReply).toBe(true);
+  });
+
+  it("waitingForHumanReply — cas limite: égalité stricte des dates → false (comparaison > stricte)", async () => {
+    const { Timestamp } = await import("firebase-admin/firestore");
+    okAdmin();
+    const sameMs = 1_700_000_000_000;
+    mockList.mockResolvedValueOnce({
+      conversations: [
+        {
+          conversationId: "c_tie",
+          contactId: "c",
+          campaignId: "x",
+          channel: "sms",
+          status: "in_dialogue",
+          intent: "INTERESSE",
+          messageCount: 2,
+          outboundCount: 1,
+          inboundCount: 1,
+          followupCount: 0,
+          assignedTo: "UVANESSA999",
+          lastInboundAt: Timestamp.fromMillis(sameMs),
+          lastOutboundAt: Timestamp.fromMillis(sameMs),
+          lastMessageAt: Timestamp.fromMillis(sameMs),
+          lastHumanOutboundAt: Timestamp.fromMillis(sameMs),
+          createdAt: Timestamp.fromMillis(0),
+          updatedAt: Timestamp.fromMillis(sameMs),
+        },
+      ],
+      nextCursor: null,
+      hasMore: false,
+    });
+    const res = await GET(new Request("http://x/api/admin/conversations"));
+    const body = await res.json();
+    expect(body.items[0].waitingForHumanReply).toBe(false);
+  });
+
   it("payload — `waitingForHumanReply` false si lastHumanOutboundAt > lastInboundAt", async () => {
     const { Timestamp } = await import("firebase-admin/firestore");
     okAdmin();

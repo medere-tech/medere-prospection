@@ -141,7 +141,11 @@ export async function GET(req: Request): Promise<Response> {
 
     assertNoPhoneInPayload(payload);
 
-    return NextResponse.json(payload, { status: 200 });
+    // security-reviewer PR2b-1 M-1 — même défense en profondeur que /list.
+    return NextResponse.json(payload, {
+      status: 200,
+      headers: { "Cache-Control": "private, no-store, must-revalidate" },
+    });
   } catch (err) {
     if (err instanceof UnauthorizedError)
       return NextResponse.json({ error: "unauthorized" }, { status: 401 });
