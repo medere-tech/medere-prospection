@@ -14,13 +14,17 @@
  * ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
  * Comptes gérés (whitelist stricte — tout autre email → refusé)
  *
- *   1. e2e-commercial : role=commercial, slackUserId=UE2ECOMMERCIAL
- *   2. e2e-admin      : role=admin, PAS de slackUserId (test fallback)
+ *   1. e2e-commercial       : role=commercial, slackUserId=UE2ECOMMERCIAL
+ *   2. e2e-commercial-owner : role=commercial, slackUserId=U05UVHGBURX (Déthié)
+ *   3. e2e-admin            : role=admin, PAS de slackUserId (test fallback)
+ *   4. e2e-no-role          : PAS de role, PAS de slackUserId — PR1.14.2
+ *                             scénario S10 (page forbidden propre).
  *
- *   Les deux emails ont le suffixe local `+clerk_test` → mode test Clerk
- *   (code OTP figé `424242`, aucune livraison réelle). Les deux portent
+ *   Tous les emails ont le suffixe local `+clerk_test` → mode test Clerk
+ *   (code OTP figé `424242`, aucune livraison réelle). Tous portent
  *   `publicMetadata.testAccount = true` → la base de code peut filtrer
- *   dans un audit "tous les users prod sauf ceux-là".
+ *   dans un audit "tous les users prod sauf ceux-là", et le cleanup
+ *   script refuse de supprimer un user sans ce flag.
  *
  * ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
  * Garde-fous (jamais compromis — compte Déthié intouchable)
@@ -117,6 +121,21 @@ const E2E_USERS = /** @type {const} */ ([
       // Pas de slackUserId : couvre le cas admin sans mapping Slack.
     },
   },
+  {
+    // PR1.14.2 — 4ᵉ compte pour le scénario S10 : page de refus propre
+    // (`src/app/admin/forbidden.tsx`). publicMetadata SANS role ni
+    // slackUserId → `requireRole` throw ForbiddenError → `forbidden()`.
+    // On garde `testAccount: true` pour :
+    //   - permettre au cleanup script de le supprimer (garde-fou interne),
+    //   - garantir le refus en VERCEL_ENV=production (défense en profondeur).
+    key: "no-role",
+    emailLocal: "e2e-no-role",
+    firstName: "E2E",
+    lastName: "NoRole",
+    publicMetadata: {
+      testAccount: true,
+    },
+  },
 ]);
 
 function buildEmail(local) {
@@ -130,7 +149,8 @@ function isWhitelistedEmail(email) {
   return (
     localPart === "e2e-commercial" ||
     localPart === "e2e-commercial-owner" ||
-    localPart === "e2e-admin"
+    localPart === "e2e-admin" ||
+    localPart === "e2e-no-role"
   );
 }
 
@@ -138,6 +158,19 @@ function logAction(verb, email, extra) {
   // Jamais d'ID Clerk ni de token ici — uniquement l'email whitelisté.
   const suffix = extra ? ` ${extra}` : "";
   console.log(`  [${APPLY ? "APPLY" : "DRY  "}] ${verb} ${email}${suffix}`);
+}
+
+/**
+ * PR1.14.2 — libellé du résumé en dry-run. "created"/"updated" sont les
+ * actions au passé (déjà exécutées) ; en dry-run on affiche ce qui
+ * SERAIT fait au prochain --apply.
+ */
+function describeAction(action, isDryRun) {
+  if (!isDryRun) return action;
+  if (action === "created") return "serait créé";
+  if (action === "updated") return "serait mis à jour";
+  if (action === "noop") return "déjà à jour (aucun changement)";
+  return action;
 }
 
 async function findUserByEmail(clerk, email) {
@@ -180,7 +213,7 @@ async function provisionUser(clerk, spec) {
   }
 
   if (!existing) {
-    logAction("CREATE", email, `role=${spec.publicMetadata.role}`);
+    logAction("CREATE", email, `role=${spec.publicMetadata.role ?? "(absent)"}`);
     if (APPLY) {
       await clerk.users.createUser({
         emailAddress: [email],
@@ -205,7 +238,7 @@ async function provisionUser(clerk, spec) {
     return { key: spec.key, email, action: "noop" };
   }
 
-  logAction("UPDATE", email, `role=${spec.publicMetadata.role}`);
+  logAction("UPDATE", email, `role=${spec.publicMetadata.role ?? "(absent)"}`);
   if (APPLY) {
     await clerk.users.updateUser(existing.id, {
       firstName: spec.firstName,
@@ -279,13 +312,13 @@ async function main() {
   console.log("");
   console.log("Résumé :");
   for (const r of results) {
-    console.log(`  - ${r.key.padEnd(10)} ${r.email}  →  ${r.action}`);
+    console.log(`  - ${r.key.padEnd(10)} ${r.email}  →  ${describeAction(r.action, !APPLY)}`);
   }
   console.log("");
 
   if (!APPLY) {
     console.log("Dry-run terminé. Pour exécuter :");
-    console.log("  node scripts/setup-e2e-clerk-users.mjs --apply");
+    console.log("  npx tsx scripts/setup-e2e-clerk-users.mjs --apply");
   } else {
     console.log("Apply terminé. Les sign-in tokens sont générés par le harnais Playwright,");
     console.log("JAMAIS stockés sur disque (clerkSetup injecte un token court dans");

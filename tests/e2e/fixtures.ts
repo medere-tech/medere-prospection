@@ -24,6 +24,9 @@ const DOMAIN = process.env.E2E_EMAIL_DOMAIN ?? "example.com";
 export const E2E_EMAIL_COMMERCIAL = `e2e-commercial+clerk_test@${DOMAIN}`;
 export const E2E_EMAIL_COMMERCIAL_OWNER = `e2e-commercial-owner+clerk_test@${DOMAIN}`;
 export const E2E_EMAIL_ADMIN = `e2e-admin+clerk_test@${DOMAIN}`;
+// PR1.14.2 — compte sans role ni slackUserId, pour tester la page de
+// refus propre (`src/app/admin/forbidden.tsx`) via le scénario S10.
+export const E2E_EMAIL_NO_ROLE = `e2e-no-role+clerk_test@${DOMAIN}`;
 
 export const CONV_ID_ADMIN_NON_OWNER = process.env.E2E_CONV_ID_FOR_ADMIN_NON_OWNER ?? null;
 export const CONV_ID_INEXISTANT = process.env.E2E_CONV_ID_INEXISTANT ?? "inexistant-pr1-test";
@@ -107,6 +110,7 @@ interface Fixtures {
   signInAsCommercial: () => Promise<void>;
   signInAsCommercialOwner: () => Promise<void>;
   signInAsAdmin: () => Promise<void>;
+  signInAsNoRole: () => Promise<void>;
 }
 
 // Nommer `provide` (et non `use`) le callback de setup Playwright
@@ -122,6 +126,9 @@ export const test = base.extend<Fixtures>({
   },
   signInAsAdmin: async ({ page }, provide) => {
     await provide(() => signInAs(page, E2E_EMAIL_ADMIN));
+  },
+  signInAsNoRole: async ({ page }, provide) => {
+    await provide(() => signInAs(page, E2E_EMAIL_NO_ROLE));
   },
 });
 

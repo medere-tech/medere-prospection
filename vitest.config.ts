@@ -1,8 +1,22 @@
 import os from "node:os";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
 
 import react from "@vitejs/plugin-react";
 import tsconfigPaths from "vite-tsconfig-paths";
 import { defineConfig } from "vitest/config";
+
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+
+/**
+ * PR1.14.2 — alias `server-only` vers un stub vide pour vitest.
+ * Cf. `tests/mocks/server-only.ts` : le package npm `server-only` throw
+ * hors contexte Next.js serveur. On neutralise UNIQUEMENT dans cette
+ * config vitest (pas dans next.config.ts), donc le build Next.js
+ * continue de rejeter tout `"use client"` qui importerait un fichier
+ * marqué `import "server-only"` (ex. `src/lib/auth/require-role.ts`).
+ */
+const serverOnlyStubPath = path.resolve(__dirname, "tests/mocks/server-only.ts");
 
 /**
  * S10.1.8 — plafonne les workers vitest à la moitié des coeurs.
@@ -53,6 +67,12 @@ const vitestMaxWorkers = Math.max(2, Math.floor(os.cpus().length / 2));
  */
 export default defineConfig({
   plugins: [tsconfigPaths(), react()],
+  resolve: {
+    alias: {
+      // PR1.14.2 — cf. commentaire `serverOnlyStubPath` en tête de fichier.
+      "server-only": serverOnlyStubPath,
+    },
+  },
   test: {
     globals: true,
     environment: "node",

@@ -7,8 +7,12 @@
  * transfert. Si résolution Slack ID → nom échoue (contact Airtable
  * inactif, HS Airtable), fallback générique « un autre commercial ».
  *
- * Zéro PII : aucun email, aucun numéro, uniquement le prénom + nom
- * public (data Airtable, pas CRM).
+ * PII minimale employé interne — nom professionnel du commercial Médéré,
+ * source Airtable RH, affiché à un autre commercial Médéré authentifié
+ * pour permettre la demande de transfert interne. Base légale : intérêt
+ * légitime de l'employeur à faciliter la collaboration équipe (RGPD
+ * Art. 6.1.f). Pas de donnée patient ni de PII externe (ni email, ni
+ * téléphone, ni source CRM — Airtable RH uniquement).
  */
 import { ShieldOff } from "lucide-react";
 import Link from "next/link";

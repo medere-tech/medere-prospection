@@ -12,14 +12,18 @@ import { expect, test } from "./fixtures";
 test.describe("Layout admin — PR1.14", () => {
   test.skip(({ browserName }) => browserName !== "chromium", "Firefox/Webkit non visés PR1.14");
 
-  test("S7 — pas de scroll horizontal sur /admin/contacts aux 3 viewports", async ({
+  test("S7 — pas de scroll horizontal sur /admin/contacts", async ({
     page,
     signInAsAdmin,
     viewport,
   }) => {
     await signInAsAdmin();
     await page.goto("/admin/contacts");
-    await page.waitForLoadState("networkidle");
+    // On attend un élément stable précis : le <h1>Contacts</h1> servi
+    // par `src/app/admin/contacts/contacts-page-client.tsx:157`.
+    // `networkidle` ne tombe jamais : le polling /version toutes les 30s
+    // et les requêtes Clerk gardent le réseau "actif".
+    await expect(page.getByRole("heading", { name: "Contacts", level: 1 })).toBeVisible();
     // scrollWidth doit ≤ innerWidth + 1 (tolérance subpixel navigateur).
     const { scrollWidth, innerWidth } = await page.evaluate(() => ({
       scrollWidth: document.documentElement.scrollWidth,
@@ -40,10 +44,13 @@ test.describe("Layout admin — PR1.14", () => {
     await page.goto("/admin/contacts");
 
     // Sur mobile <768 (390), la sidebar est cachée (hidden md:flex). On ouvre
-    // le drawer pour inspecter les mêmes items.
+    // le drawer pour inspecter les mêmes items. Le bouton porte
+    // `aria-label="Ouvrir le menu"` (admin-header.tsx:88) — on matche
+    // en exact pour éviter de capturer "Ouvrir la palette de commandes".
     const isMobile = (viewport?.width ?? 1440) < 768;
     if (isMobile) {
-      const trigger = page.getByRole("button", { name: /ouvrir le menu|menu/i });
+      const trigger = page.getByRole("button", { name: "Ouvrir le menu", exact: true });
+      await expect(trigger).toBeVisible();
       await trigger.click();
     }
 
@@ -85,7 +92,8 @@ test.describe("Layout admin — PR1.14", () => {
     );
     await signInAsAdmin();
     await page.goto("/admin/contacts");
-    const trigger = page.getByRole("button", { name: /ouvrir le menu|menu/i });
+    // Bouton hamburger — aria-label exact (admin-header.tsx:88).
+    const trigger = page.getByRole("button", { name: "Ouvrir le menu", exact: true });
     await expect(trigger).toBeVisible();
     await trigger.click();
     // Le drawer est un dialog Radix
@@ -94,8 +102,8 @@ test.describe("Layout admin — PR1.14", () => {
     // Echap ferme
     await page.keyboard.press("Escape");
     await expect(dialog).toBeHidden();
-    // Focus revient sur le trigger
+    // Focus revient sur le trigger (aria-label strict).
     const focused = await page.evaluate(() => document.activeElement?.getAttribute("aria-label"));
-    expect(focused).toMatch(/ouvrir le menu|menu/i);
+    expect(focused).toBe("Ouvrir le menu");
   });
 });

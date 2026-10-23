@@ -26,20 +26,27 @@ import {
 test.describe("Détail conversation — lecture seule", () => {
   test.skip(({ browserName }) => browserName !== "chromium", "Firefox/Webkit non visés PR1.14");
 
-  test("S1 — slug superflu redirigé en 308 vers l'URL canonique", async ({
+  test("S1 — `/conversations/<id>` renvoie 308 vers `/admin/conversations/<id>`", async ({
     page,
-    signInAsAdmin,
   }) => {
     test.skip(
       !CONV_ID_ADMIN_NON_OWNER,
       "E2E_CONV_ID_FOR_ADMIN_NON_OWNER non fourni — scénario S1 ignoré",
     );
-    await signInAsAdmin();
-    const url = `/admin/conversations/${CONV_ID_ADMIN_NON_OWNER}/anything-slug`;
-    const resp = await page.goto(url);
-    expect(resp?.status()).toBe(200);
-    expect(page.url()).toContain(`/admin/conversations/${CONV_ID_ADMIN_NON_OWNER}`);
-    expect(page.url()).not.toContain("/anything-slug");
+    // La route `src/app/conversations/[id]/page.tsx` est PUBLIQUE côté
+    // middleware (pass-through) et renvoie 308 via `permanentRedirect`.
+    // On lit le statut sur la réponse de redirection elle-même
+    // (`maxRedirects: 0`) — `page.goto` suivrait le 308 et masquerait
+    // le vrai code. Pas de session Clerk nécessaire : la cible 308 (sous
+    // `/admin/*`) sera protégée par le middleware MAIS on arrête AVANT.
+    const url = `/conversations/${CONV_ID_ADMIN_NON_OWNER}`;
+    const resp = await page.request.get(url, { maxRedirects: 0 });
+    expect(resp.status(), `GET ${url} doit renvoyer 308`).toBe(308);
+    const location = resp.headers()["location"];
+    expect(location, "en-tête Location manquant sur la 308").toBeTruthy();
+    expect(location).toContain(
+      `/admin/conversations/${encodeURIComponent(CONV_ID_ADMIN_NON_OWNER!)}`,
+    );
   });
 
   test("S2 — commercial titulaire (U05UVHGBURX) : vue complète, pas de bannière admin, zéro numéro", async ({
@@ -79,8 +86,12 @@ test.describe("Détail conversation — lecture seule", () => {
     await signInAsCommercial();
     const resp = await page.goto(`/admin/conversations/${CONV_ID_ADMIN_NON_OWNER}`);
     expect([200, 403]).toContain(resp?.status() ?? 0);
-    // Texte 403 présent
-    await expect(page.getByText(/pas assignée|accès refusé|403/i)).toBeVisible();
+    // Texte 403 réel du composant `ConversationNotMine`
+    // (`src/components/conversations/conversation-not-mine.tsx:29,33`).
+    await expect(
+      page.getByRole("heading", { name: /Conversation suivie par un collègue/i, level: 1 }),
+    ).toBeVisible();
+    await expect(page.getByText(/suivie par .+ Demandez-lui/i)).toBeVisible();
     // Aucun contenu de la conversation : pas de MessageThread, pas de header
     // contact, pas de bannière admin.
     await expect(page.getByRole("log")).toHaveCount(0);

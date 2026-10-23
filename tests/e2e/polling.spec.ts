@@ -45,6 +45,10 @@ test.describe("Polling économique — mesure horodatée", () => {
       !CONV_ID_ADMIN_NON_OWNER,
       "E2E_CONV_ID_FOR_ADMIN_NON_OWNER non fourni — scénario S6 ignoré",
     );
+    // 95s de mesure + 40s pause onglet caché + ~20s pour sign-in Clerk,
+    // navigation et assertions. Le défaut Playwright (30s) ne couvre que
+    // le sign-in.
+    test.setTimeout(95_000 + 40_000 + 20_000);
     installApiPhoneSentinel(page);
 
     const rows: RequestRow[] = [];

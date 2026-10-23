@@ -1,5 +1,5 @@
 /**
- * CLEANUP-E2E-CLERK-USERS — supprime les 3 comptes Clerk provisionnés
+ * CLEANUP-E2E-CLERK-USERS — supprime les 4 comptes Clerk provisionnés
  * par `scripts/setup-e2e-clerk-users.mjs`.
  *
  * ⚠ LANCEMENT : importe `getClerkEnv` depuis un module `.ts`
@@ -14,6 +14,7 @@
  *   1. e2e-commercial       — role=commercial, slackUserId=UE2ECOMMERCIAL
  *   2. e2e-commercial-owner — role=commercial, slackUserId=U05UVHGBURX (Déthié)
  *   3. e2e-admin            — role=admin
+ *   4. e2e-no-role          — PAS de role, PAS de slackUserId (S10 forbidden)
  *
  * ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
  * Garde-fous (jamais compromis — compte Déthié intouchable)
@@ -69,6 +70,7 @@ const E2E_LOCAL_PARTS = /** @type {const} */ ([
   "e2e-commercial",
   "e2e-commercial-owner",
   "e2e-admin",
+  "e2e-no-role",
 ]);
 
 function buildEmail(local) {
