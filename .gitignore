@@ -14,6 +14,9 @@
 /coverage
 /playwright-report/
 /test-results/
+# Clerk testing — storageState utilisateur (contient le token de session
+# Clerk). JAMAIS COMMIT (régénéré à chaque run).
+tests/e2e/.auth/
 
 # next.js
 /.next/

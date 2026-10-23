@@ -77,9 +77,11 @@ ou pour un commercial :
 ```
 
 - `role` : obligatoire, `"admin"` ou `"commercial"`.
-- `slackUserId` : optionnel pour admin (Déthié, Harry, Justine n'ont pas
-  de compte Slack Médéré). Obligatoire pour commercial si on veut
-  l'onglet « Mes conversations » peuplé. Format `U` suivi de majuscules
+- `slackUserId` : recommandé pour tous (admin Déthié = `U05UVHGBURX`,
+  et chaque commercial avec son ID Slack du workspace Médéré).
+  Techniquement optionnel pour un admin qui n'aurait pas de compte
+  Slack ; obligatoire pour un commercial si on veut l'onglet
+  « Mes conversations » peuplé. Format `U` suivi de majuscules
   et chiffres (ex: `U05UVHGBURX`).
 
 **Toute autre valeur** de `role` (`"superadmin"`, `""`, `null`, absente)
@@ -118,7 +120,8 @@ par email. Garde-fous :
   email (ambiguïté) ;
 - refuse d'écraser un `slackUserId` existant sans `--force-overwrite`.
 
-Pré-requis env : `CLERK_SECRET_KEY`, `AIRTABLE_API_KEY`, `AIRTABLE_BASE_ID`.
+Pré-requis env (noms identiques à l'app, cf. `src/lib/security/env.ts`) :
+`CLERK_SECRET_KEY`, `AIRTABLE_PAT`, `AIRTABLE_BASE_ID`, `AIRTABLE_COMMERCIAUX_TABLE_ID`.
 
 ---
 

@@ -1,10 +1,57 @@
+import os from "node:os";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
+
 import react from "@vitejs/plugin-react";
 import tsconfigPaths from "vite-tsconfig-paths";
 import { defineConfig } from "vitest/config";
 
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+
+/**
+ * PR1.14.2 — alias `server-only` vers un stub vide pour vitest.
+ * Cf. `tests/mocks/server-only.ts` : le package npm `server-only` throw
+ * hors contexte Next.js serveur. On neutralise UNIQUEMENT dans cette
+ * config vitest (pas dans next.config.ts), donc le build Next.js
+ * continue de rejeter tout `"use client"` qui importerait un fichier
+ * marqué `import "server-only"` (ex. `src/lib/auth/require-role.ts`).
+ */
+const serverOnlyStubPath = path.resolve(__dirname, "tests/mocks/server-only.ts");
+
+/**
+ * S10.1.8 — plafonne les workers vitest à la moitié des coeurs.
+ *
+ * Défaut Vitest 4 en `pool: "threads"` = `maxWorkers = os.cpus().length`.
+ * Sur un poste 8 coeurs / 8 Go RAM (le poste prod chef de projet), 8 threads
+ * qui chargent chacun jsdom + React 19 + base-ui (+ firebase-admin pour
+ * `preview-dialog.test.tsx`) en `isolate: true` dépassent la RAM dispo quand
+ * le reste de l'OS prend déjà ~7 Go (IDE, Chrome, GHD...). Les workers
+ * basculent en swap, ne répondent plus au health-check du pool runner, et
+ * Vitest log "Failed to start threads worker ... Timeout waiting for worker
+ * to respond" sur les fichiers jsdom les plus lourds (observé 5 crashes sur
+ * les 8 fichiers `@vitest-environment jsdom` au pre-push du b14fa52).
+ *
+ * Preuve de la contention même sans crash : ratio import_cumule / wall =
+ * ~4x sur 3 runs consecutifs de `.husky/pre-push` -> les 8 workers se
+ * contendent CPU et memoire. Reduction a `cpus/2` double la marge RAM par
+ * worker (demarrage jsdom ~400-600 Mo) sans toucher a l'isolation ni au
+ * testTimeout.
+ *
+ * NB Vitest 4 : seul `maxWorkers` est exposé au top de `InlineConfig`
+ * (pas de `minWorkers` top-level, qui n'existe qu'en forks via
+ * `poolOptions.forks` typologiquement cassé). On s'en passe : le pool
+ * Tinypool des threads demarre a 0 workers et scale a la demande jusqu'au
+ * plafond, donc pas besoin de forcer un `minWorkers`.
+ */
+const vitestMaxWorkers = Math.max(2, Math.floor(os.cpus().length / 2));
+
 /**
  * Config Vitest "default" — tests qui n'ont PAS besoin de l'emulator.
- * - Tourne en `pool: threads` (défaut Vitest), parallèle, rapide.
+ * - Forcé en `pool: "threads"` (PR1.14.1) : le défaut Vitest 4 est
+ *   `"forks"` et crée des `child_process.spawn` qui échouent par rafales
+ *   sur Windows (verrou AV sur `C:\Users\...\node_modules\vitest\` ou
+ *   timeout `vitest-pool-runner`). En threads : zéro worker crash observé
+ *   sur une suite de 2367 tests (vs 7 crashes en forks).
  * - Utilisée par `npm test`, `npm run test:watch`, et le hook pre-push.
  *
  * Les tests Firestore vivent dans une config SÉPARÉE
@@ -20,11 +67,20 @@ import { defineConfig } from "vitest/config";
  */
 export default defineConfig({
   plugins: [tsconfigPaths(), react()],
+  resolve: {
+    alias: {
+      // PR1.14.2 — cf. commentaire `serverOnlyStubPath` en tête de fichier.
+      "server-only": serverOnlyStubPath,
+    },
+  },
   test: {
     globals: true,
     environment: "node",
     passWithNoTests: true,
     unstubEnvs: true,
+    pool: "threads",
+    // S10.1.8 — cf. commentaire `vitestMaxWorkers` en tête de fichier.
+    maxWorkers: vitestMaxWorkers,
     /**
      * S10.1.7 — testTimeout 15s (vs défaut Vitest 4 = 5000ms). Les tests
      * UI React 19 + base-ui imports (DropdownMenu, Tooltip, Dialog) +
@@ -50,6 +106,10 @@ export default defineConfig({
       // qui exige un emulator up + un projectId distinct. Exécutés via
       // `npm run test:firestore-rules` (config dédiée).
       "tests/firestore-rules/**",
+      // Specs Playwright (PR1.14.1) — Vitest les ramasserait via le glob
+      // `**/*.spec.ts` et planterait sur `test.describe()` (@playwright/test
+      // vs @vitest/test différents). Les specs tournent via `npm run test:e2e`.
+      "tests/e2e/**",
       "node_modules/**",
       "dist/**",
       ".next/**",

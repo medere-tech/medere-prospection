@@ -28,8 +28,18 @@
  *       "role":         "{{user.public_metadata.role}}",
  *       "firstName":    "{{user.first_name}}",
  *       "lastName":     "{{user.last_name}}",
- *       "slackUserId":  "{{user.public_metadata.slackUserId}}"
+ *       "slackUserId":  "{{user.public_metadata.slackUserId}}",
+ *       "testAccount":  "{{user.public_metadata.testAccount}}"
  *     }
+ *
+ *   `testAccount` est posé par `scripts/setup-e2e-clerk-users.mjs` sur
+ *   les comptes du harnais Playwright (`e2e-commercial`,
+ *   `e2e-commercial-owner`, `e2e-admin`). En production (`VERCEL_ENV ===
+ *   "production"`), tout `testAccount === true` est refusé par
+ *   `requireRole` → impossible pour un compte test de s'authentifier
+ *   contre le dashboard prod même si quelqu'un a provisionné les comptes
+ *   dans Clerk live par erreur (défense en profondeur du refus
+ *   `sk_live_` du script). Cf. finding M1 security-reviewer PR1.14.1.
  *
  *   Chaque utilisateur Clerk doit avoir `publicMetadata.role` ∈
  *   `{"admin", "commercial"}`. Si absent ou mal formé, l'utilisateur est
@@ -68,6 +78,16 @@
  *   et un `statusCode` (401 / 403). Cf. CLAUDE.md "Sécurité §5 — Erreurs
  *   jamais renvoyées au client".
  */
+// S10.1.8 — ceinture + bretelles (security-reviewer M-2, PR1.14.2) :
+// empêche toute importation accidentelle depuis un Client Component. Le
+// build Next.js throw si un fichier `"use client"` importe (directement
+// ou transitivement) ce module. Protection complémentaire du poisoning
+// implicite via `@clerk/nextjs/server` ci-dessous.
+//
+// Côté vitest, `server-only` est aliasé vers `tests/mocks/server-only.ts`
+// (stub vide) — cf. `vitest.config.ts::resolve.alias`.
+import "server-only";
+
 import { auth } from "@clerk/nextjs/server";
 import { z } from "zod";
 
@@ -80,6 +100,37 @@ import { logger } from "@/lib/utils/logger";
 
 /** Rôle applicatif. Aligné sur `firestore.rules::hasRole(...)`. */
 export type Role = "admin" | "commercial";
+
+/**
+ * SENTINELLE — liste exacte des claims attendus par ce code depuis le
+ * JWT template Clerk (dashboard → Sessions → Customize session token).
+ *
+ * Le template Clerk doit émettre EXACTEMENT ces 5 clés et pas d'autres :
+ *
+ *   {
+ *     "role":        "{{user.public_metadata.role}}",
+ *     "firstName":   "{{user.first_name}}",
+ *     "lastName":    "{{user.last_name}}",
+ *     "slackUserId": "{{user.public_metadata.slackUserId}}",
+ *     "testAccount": {{user.public_metadata.testAccount}}
+ *   }
+ *
+ * ⚠ `testAccount` est intentionnellement SANS guillemets dans le template
+ *   pour que Clerk préserve le type JSON natif (boolean) depuis
+ *   publicMetadata. Les 4 autres sont des chaînes (ou null si metadata
+ *   absent). Le Zod `SessionClaimsSchema` ci-dessous reflète ces types.
+ *
+ * Cette constante est utilisée par `clerk-jwt-template.test.ts` pour
+ * détecter tout drift : si un claim est ajouté au template sans mettre
+ * à jour `SessionClaimsSchema` (ou l'inverse), le test échoue.
+ */
+export const EXPECTED_CLERK_JWT_CLAIMS = [
+  "role",
+  "firstName",
+  "lastName",
+  "slackUserId",
+  "testAccount",
+] as const satisfies readonly string[];
 
 /**
  * Zod schema strict — TOUT autre rôle (`"superadmin"`, `""`, `null`,
@@ -101,19 +152,57 @@ const SLACK_USER_ID_REGEX = /^U[A-Z0-9]+$/;
  * / `slackUserId` optionnels (Clerk les remplit si le compte les a — sinon
  * `undefined`, on dégrade gracieusement côté UI).
  *
- * Note sur le claim transforme : Clerk JWT templates remplacent
- * `{{user.public_metadata.slackUserId}}` par la chaîne vide si le metadata
- * est absent. Zod `optional()` ne suffit donc pas — on tolère également
- * `""` et on le normalise en `undefined` via `.transform()`.
+ * ⚠ PR1.14.2 (fix FAIT 1) — null-safety des claims optionnels.
+ *   Clerk JWT templates remplacent `{{user.public_metadata.X}}` par :
+ *     - la chaîne vide `""` si X est explicitement présent et vaut `""`
+ *     - **`null`** si X est absent de publicMetadata (comportement
+ *       documenté Clerk, pour conserver un JSON valide)
+ *   Un `.optional()` seul laisse Zod rejeter `null`, ce qui bloquait tout
+ *   admin sans `slackUserId` (le user `e2e-admin` et par symétrie Déthié
+ *   / Harry / Justine qui n'ont pas de compte Slack Médéré) :
+ *     "requireRole: invalid sessionClaims (role missing or malformed)"
+ *   On accepte explicitement `null` et on le normalise en `undefined` via
+ *   `.transform()` pour tous les claims optionnels (`firstName`,
+ *   `lastName`, `slackUserId`, `testAccount`). `role` reste strict —
+ *   c'est l'invariant sécuritaire : pas de role = pas d'accès.
  */
 const SessionClaimsSchema = z.object({
   role: RoleSchema,
-  firstName: z.string().min(1).optional(),
-  lastName: z.string().min(1).optional(),
+  firstName: z
+    .string()
+    .min(1)
+    .nullish()
+    .transform((v) => v ?? undefined),
+  lastName: z
+    .string()
+    .min(1)
+    .nullish()
+    .transform((v) => v ?? undefined),
   slackUserId: z
-    .union([z.string().regex(SLACK_USER_ID_REGEX), z.literal("")])
+    .union([z.string().regex(SLACK_USER_ID_REGEX), z.literal(""), z.null()])
     .optional()
-    .transform((v) => (v === "" || v === undefined ? undefined : v)),
+    .transform((v) => (v === "" || v === null || v === undefined ? undefined : v)),
+  /**
+   * PR1.14.1 — flag posé par `scripts/setup-e2e-clerk-users.mjs` sur les
+   * comptes du harnais Playwright. En prod, `requireRole` refuse tout
+   * compte avec `testAccount === true`.
+   *
+   * ⚠ PR1.14.2 — fail-closed strict. Le JWT template Clerk émet ce claim
+   *   SANS guillemets (cf. `EXPECTED_CLERK_JWT_CLAIMS` ci-dessus) → le
+   *   type natif boolean est préservé par Clerk. On accepte UNIQUEMENT :
+   *     - `true`         (compte test provisionné)
+   *     - `false`        (compte réel qui a eu testAccount=false pour une raison)
+   *     - `null`         (metadata absent — compte réel historique)
+   *     - `undefined`    (claim absent du JWT — compte historique sans ce claim)
+   *   Toute autre valeur (`"true"`, `"TRUE"`, `1`, `"yes"`, `{}`, ...) fait
+   *   échouer Zod → ForbiddenError (fail-closed). Garantit qu'un
+   *   changement d'API Clerk ou une tentative de bypass ne peut pas
+   *   neutraliser silencieusement la garde `testAccount && production`.
+   */
+  testAccount: z
+    .union([z.boolean(), z.null()])
+    .optional()
+    .transform((v) => v === true),
 });
 
 /** Contexte utilisateur retourné par `requireRole`. */
@@ -184,7 +273,20 @@ export async function requireRole(required: Role): Promise<RoleContext> {
     });
   }
 
-  const { role, firstName, lastName, slackUserId } = parsed.data;
+  const { role, firstName, lastName, slackUserId, testAccount } = parsed.data;
+
+  // PR1.14.1 — défense en profondeur : un compte test ne peut JAMAIS
+  // s'authentifier contre le dashboard prod. Garantit que si quelqu'un
+  // provisionne `e2e-admin` / `e2e-commercial-owner` dans Clerk live par
+  // erreur (le script refuse par défaut, mais garde-fou en couche app),
+  // ces comptes restent inoffensifs.
+  if (testAccount && process.env.VERCEL_ENV === "production") {
+    throw new ForbiddenError({
+      message: `requireRole: testAccount=true refusé en VERCEL_ENV=production (userId=${userId})`,
+      clientMessage: "Compte de test non autorisé en production.",
+      context: { userId },
+    });
+  }
 
   // Hiérarchie : admin couvre tout, commercial couvre uniquement commercial.
   const allowed = role === "admin" || role === required;

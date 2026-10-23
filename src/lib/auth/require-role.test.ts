@@ -204,6 +204,29 @@ describe("requireRole — extraction firstName/lastName", () => {
     });
     await expect(requireRole("admin")).rejects.toBeInstanceOf(ForbiddenError);
   });
+
+  // PR1.14.2 — fix FAIT 1 : null-safety sur firstName/lastName.
+  it("normalise firstName=null en undefined (Clerk JWT emet null si metadata absent)", async () => {
+    mocks.auth.mockResolvedValue({
+      userId: "user_abc",
+      sessionClaims: { role: "admin", firstName: null, lastName: "Faye" },
+    });
+    await expect(requireRole("admin")).resolves.toMatchObject({
+      firstName: undefined,
+      lastName: "Faye",
+    });
+  });
+
+  it("normalise lastName=null en undefined", async () => {
+    mocks.auth.mockResolvedValue({
+      userId: "user_abc",
+      sessionClaims: { role: "admin", firstName: "Déthié", lastName: null },
+    });
+    await expect(requireRole("admin")).resolves.toMatchObject({
+      firstName: "Déthié",
+      lastName: undefined,
+    });
+  });
 });
 
 describe("requireRole — extraction slackUserId (VUE-CONVERSATION PR0)", () => {
@@ -256,5 +279,188 @@ describe("requireRole — extraction slackUserId (VUE-CONVERSATION PR0)", () => 
       sessionClaims: { role: "commercial", slackUserId: "U05-UVHG" },
     });
     await expect(requireRole("commercial")).rejects.toBeInstanceOf(ForbiddenError);
+  });
+
+  // PR1.14.2 — fix FAIT 1 : Clerk JWT template émet `null` pour un
+  // shortcode `{{user.public_metadata.slackUserId}}` dont le metadata est
+  // absent. Avant le fix, Zod rejetait `null` → tout admin sans
+  // slackUserId était bloqué 403 (`e2e-admin`, Déthié, Harry, Justine).
+  it("normalise `null` en undefined (admin sans publicMetadata.slackUserId, cas réel user_3L0hWVeHTxDmumIZ7GozNU3LgU5)", async () => {
+    mocks.auth.mockResolvedValue({
+      userId: "user_e2e_admin",
+      sessionClaims: { role: "admin", slackUserId: null },
+    });
+    const ctx = await requireRole("admin");
+    expect(ctx.slackUserId).toBeUndefined();
+  });
+});
+
+describe("requireRole — testAccount en prod (PR1.14.1 défense en profondeur)", () => {
+  it("REFUSE un compte testAccount=true quand VERCEL_ENV=production (claim boolean)", async () => {
+    const prev = process.env.VERCEL_ENV;
+    process.env.VERCEL_ENV = "production";
+    try {
+      mocks.auth.mockResolvedValue({
+        userId: "user_e2e_admin",
+        sessionClaims: { role: "admin", testAccount: true },
+      });
+      await expect(requireRole("admin")).rejects.toBeInstanceOf(ForbiddenError);
+    } finally {
+      if (prev === undefined) delete process.env.VERCEL_ENV;
+      else process.env.VERCEL_ENV = prev;
+    }
+  });
+
+  // PR1.14.2 fail-closed strict : "true" (string) n'est PLUS accepté par
+  // Zod. Le JWT template Clerk émet un boolean natif (sans guillemets).
+  // Toute string → échec Zod → ForbiddenError pour sessionClaims invalid.
+  it("REFUSE un claim testAccount='true' string (fail-closed Zod — JWT template boolean attendu)", async () => {
+    mocks.auth.mockResolvedValue({
+      userId: "user_abc",
+      sessionClaims: { role: "admin", testAccount: "true" },
+    });
+    await expect(requireRole("admin")).rejects.toBeInstanceOf(ForbiddenError);
+    expect(mocks.warn).toHaveBeenCalled();
+  });
+
+  it("REFUSE un claim testAccount=1 (number)", async () => {
+    mocks.auth.mockResolvedValue({
+      userId: "user_abc",
+      sessionClaims: { role: "admin", testAccount: 1 },
+    });
+    await expect(requireRole("admin")).rejects.toBeInstanceOf(ForbiddenError);
+  });
+
+  it("REFUSE un claim testAccount='TRUE' (majuscules — pas en pattern Clerk JSON)", async () => {
+    mocks.auth.mockResolvedValue({
+      userId: "user_abc",
+      sessionClaims: { role: "admin", testAccount: "TRUE" },
+    });
+    await expect(requireRole("admin")).rejects.toBeInstanceOf(ForbiddenError);
+  });
+
+  it("REFUSE un claim testAccount='yes'", async () => {
+    mocks.auth.mockResolvedValue({
+      userId: "user_abc",
+      sessionClaims: { role: "admin", testAccount: "yes" },
+    });
+    await expect(requireRole("admin")).rejects.toBeInstanceOf(ForbiddenError);
+  });
+
+  it("REFUSE un claim testAccount={} (objet)", async () => {
+    mocks.auth.mockResolvedValue({
+      userId: "user_abc",
+      sessionClaims: { role: "admin", testAccount: {} },
+    });
+    await expect(requireRole("admin")).rejects.toBeInstanceOf(ForbiddenError);
+  });
+
+  it("accepte un compte testAccount=true en VERCEL_ENV=preview (staging/test environnement)", async () => {
+    const prev = process.env.VERCEL_ENV;
+    process.env.VERCEL_ENV = "preview";
+    try {
+      mocks.auth.mockResolvedValue({
+        userId: "user_e2e_admin",
+        sessionClaims: { role: "admin", testAccount: true },
+      });
+      const ctx = await requireRole("admin");
+      expect(ctx.role).toBe("admin");
+    } finally {
+      if (prev === undefined) delete process.env.VERCEL_ENV;
+      else process.env.VERCEL_ENV = prev;
+    }
+  });
+
+  it("accepte un compte testAccount=false même en VERCEL_ENV=production (compte réel)", async () => {
+    const prev = process.env.VERCEL_ENV;
+    process.env.VERCEL_ENV = "production";
+    try {
+      mocks.auth.mockResolvedValue({
+        userId: "user_dethie",
+        sessionClaims: { role: "admin", testAccount: false },
+      });
+      const ctx = await requireRole("admin");
+      expect(ctx.role).toBe("admin");
+    } finally {
+      if (prev === undefined) delete process.env.VERCEL_ENV;
+      else process.env.VERCEL_ENV = prev;
+    }
+  });
+
+  it("accepte un claim testAccount absent (comptes réels historiques sans le claim)", async () => {
+    const prev = process.env.VERCEL_ENV;
+    process.env.VERCEL_ENV = "production";
+    try {
+      mocks.auth.mockResolvedValue({
+        userId: "user_dethie",
+        sessionClaims: { role: "admin" },
+      });
+      const ctx = await requireRole("admin");
+      expect(ctx.role).toBe("admin");
+    } finally {
+      if (prev === undefined) delete process.env.VERCEL_ENV;
+      else process.env.VERCEL_ENV = prev;
+    }
+  });
+
+  // PR1.14.2 — fix FAIT 1 : null-safety sur testAccount (Clerk JWT emet null
+  // si le metadata est absent plutot que de supprimer la clé).
+  it("accepte testAccount=null et le normalise en false (comptes reels sans le claim)", async () => {
+    const prev = process.env.VERCEL_ENV;
+    process.env.VERCEL_ENV = "production";
+    try {
+      mocks.auth.mockResolvedValue({
+        userId: "user_dethie",
+        sessionClaims: { role: "admin", testAccount: null },
+      });
+      const ctx = await requireRole("admin");
+      expect(ctx.role).toBe("admin");
+    } finally {
+      if (prev === undefined) delete process.env.VERCEL_ENV;
+      else process.env.VERCEL_ENV = prev;
+    }
+  });
+});
+
+// PR1.14.2 — fix FAIT 1 : cas reel (user_3L0hWVeHTxDmumIZ7GozNU3LgU5
+// = e2e-admin) qui bloquait tous les scenarios signInAsAdmin. On rejoue
+// le payload JWT exact tel que Clerk l'emet pour un admin sans
+// slackUserId : TOUTES les cles optionnelles arrivent `null`.
+describe("requireRole — reproduction cas reel e2e-admin (FAIT 1)", () => {
+  it("accepte un admin dont tous les champs optionnels sont null (slackUserId, firstName, lastName)", async () => {
+    mocks.auth.mockResolvedValue({
+      userId: "user_e2e_admin",
+      sessionClaims: {
+        role: "admin",
+        firstName: null,
+        lastName: null,
+        slackUserId: null,
+        testAccount: true,
+      },
+    });
+    const ctx = await requireRole("admin");
+    expect(ctx).toEqual({
+      userId: "user_e2e_admin",
+      role: "admin",
+      firstName: undefined,
+      lastName: undefined,
+      slackUserId: undefined,
+    });
+    expect(mocks.warn).not.toHaveBeenCalled();
+  });
+
+  it("meme cas, hierarchie : admin sur requireRole('commercial') passe", async () => {
+    mocks.auth.mockResolvedValue({
+      userId: "user_e2e_admin",
+      sessionClaims: {
+        role: "admin",
+        firstName: null,
+        lastName: null,
+        slackUserId: null,
+        testAccount: true,
+      },
+    });
+    const ctx = await requireRole("commercial");
+    expect(ctx.role).toBe("admin");
   });
 });

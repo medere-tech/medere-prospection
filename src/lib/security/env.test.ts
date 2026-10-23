@@ -636,6 +636,52 @@ describe("getClerkEnv", () => {
     });
     expect(() => getClerkEnv()).toThrow(ConfigError);
   });
+
+  // M-2 security-reviewer PR1.14.1 — regex stricte sur CLERK_SECRET_KEY :
+  // le mode (test|live) doit être explicite, le suffixe strictement alnum.
+  // Verrouille le refus `sk_live_` du setup script en empêchant un prefix
+  // bidon (`sk_foo_...`) de tomber dans la branche `sk_?_` qui sautait
+  // la garde `ALLOW_E2E_ON_LIVE_CLERK`.
+
+  it("accepte sk_live_... (prod) — mode live explicite", () => {
+    setEnv({
+      NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY: "pk_live_fake",
+      CLERK_SECRET_KEY: "sk_live_fake",
+    });
+    expect(getClerkEnv().CLERK_SECRET_KEY).toBe("sk_live_fake");
+  });
+
+  it("throws si SECRET_KEY a un mode bidon (sk_foo_...) — M-2", () => {
+    setEnv({
+      NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY: "pk_test_fake",
+      CLERK_SECRET_KEY: "sk_foo_bar",
+    });
+    expect(() => getClerkEnv()).toThrow(ConfigError);
+  });
+
+  it("throws si SECRET_KEY a un suffixe vide (sk_test_)", () => {
+    setEnv({
+      NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY: "pk_test_fake",
+      CLERK_SECRET_KEY: "sk_test_",
+    });
+    expect(() => getClerkEnv()).toThrow(ConfigError);
+  });
+
+  it("throws si SECRET_KEY contient un caractère non-alphanumérique dans le suffixe", () => {
+    setEnv({
+      NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY: "pk_test_fake",
+      CLERK_SECRET_KEY: "sk_test_abc-123",
+    });
+    expect(() => getClerkEnv()).toThrow(ConfigError);
+  });
+
+  it("throws si SECRET_KEY contient un espace", () => {
+    setEnv({
+      NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY: "pk_test_fake",
+      CLERK_SECRET_KEY: "sk_test_abc 123",
+    });
+    expect(() => getClerkEnv()).toThrow(ConfigError);
+  });
 });
 
 // ─────────────────────────────────────────────────────────────────────────────

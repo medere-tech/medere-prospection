@@ -90,6 +90,22 @@ const nextConfig: NextConfig = {
       },
     ];
   },
+  /**
+   * PR1.14.2 — active les auth interrupts stabilisés depuis Next 15.1 :
+   * `forbidden()` et `unauthorized()` depuis `next/navigation` + les
+   * fichiers `forbidden.tsx` / `unauthorized.tsx` colocalisés.
+   *
+   * Utilisé par `src/app/admin/layout.tsx` : quand `requireRole` throw
+   * ForbiddenError (role absent/invalide dans le JWT), on appelle
+   * `forbidden()` qui déclenche le rendu de `src/app/admin/forbidden.tsx`
+   * avec un vrai statut HTTP 403 (plutôt qu'une page 500 brute).
+   *
+   * Encore sous `experimental` en Next 16.2.x — stable fonctionnellement.
+   * Référence : https://nextjs.org/docs/app/api-reference/config/next-config-js/authInterrupts
+   */
+  experimental: {
+    authInterrupts: true,
+  },
 };
 
 export default nextConfig;
