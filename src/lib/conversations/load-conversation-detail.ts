@@ -64,6 +64,52 @@ export type LoadConversationDetailResult =
   | { kind: "error"; code: string };
 
 /**
+ * PR1.14.2 (fix S5) — un admin n'est "owner" d'une conversation que si
+ * son `slackUserId` coïncide avec `handoff.assignedTo`. Avant ce fix,
+ * `viewerIsOwner` renvoyait `true` pour TOUT admin (`isAdmin || …`),
+ * ce qui cachait la bannière « Mode admin » à l'admin qui consulte une
+ * conv assignée à quelqu'un d'autre — exactement l'inverse de l'intention.
+ *
+ * ⚠ **Règle stricte** (durcie PR1.14.2 2026-10-23) :
+ *   `true` **UNIQUEMENT** si les deux arguments sont des chaînes NON
+ *   VIDES et égales. Toute valeur `null`, `undefined`, `""` (ou autre
+ *   non-string au runtime) force `false`. Protège contre le cas pervers
+ *   où un viewer sans slackUserId configuré (chaîne vide côté Firestore
+ *   ou absence côté metadata Clerk) viendrait "matcher" une conv sans
+ *   handoff (`""` === `""` → true accidentel).
+ *
+ * Table de vérité étendue :
+ *   (undefined, undefined)       → false
+ *   (null,      null)            → false
+ *   (undefined, null)            → false
+ *   ("",        "")              → false   ← PROTÈGE ce cas pervers
+ *   (undefined, "U123")          → false
+ *   ("U123",    null)            → false
+ *   ("U123",    "")              → false
+ *   ("",        "U123")          → false
+ *   ("U123",    "U456")          → false
+ *   ("U123",    "U123")          → true
+ *
+ * Signature élargie à `string | null | undefined` des DEUX côtés pour
+ * refléter la réalité runtime (Firestore peut retourner `null` ou champ
+ * absent, Clerk JWT peut émettre `null` ou `""` quand metadata absent).
+ *
+ * Garanti pur, testable sans mocker Firestore/Airtable.
+ */
+function isNonEmptyString(v: unknown): v is string {
+  return typeof v === "string" && v.length > 0;
+}
+
+export function computeViewerIsOwner(
+  viewerSlackUserId: string | null | undefined,
+  assignedToSlack: string | null | undefined,
+): boolean {
+  if (!isNonEmptyString(viewerSlackUserId)) return false;
+  if (!isNonEmptyString(assignedToSlack)) return false;
+  return viewerSlackUserId === assignedToSlack;
+}
+
+/**
  * Charge et sanitize une conversation pour affichage dashboard.
  *
  * @param conversationId  docId Firestore composite `${contactId}_${campaignId}`.
@@ -152,8 +198,7 @@ export async function loadConversationDetail(
       contact: sanitizeContactForHeader(contact),
       messages: sanitizedMessages,
       journal,
-      viewerIsOwner:
-        isAdmin || (viewer.slackUserId !== undefined && viewer.slackUserId === assignedToSlack),
+      viewerIsOwner: computeViewerIsOwner(viewer.slackUserId, assignedToSlack),
     };
 
     return { kind: "ok", data };

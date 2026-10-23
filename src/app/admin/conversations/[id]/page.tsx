@@ -11,11 +11,12 @@
  * `externalReceiver` (strippés par `sanitize.ts`). Sentinelle test
  * `tests/scripts/no-phone-in-payload.test.ts`.
  */
-import { notFound } from "next/navigation";
+import { forbidden, notFound } from "next/navigation";
 
 import { ConversationNotMine } from "@/components/conversations/conversation-not-mine";
-import { requireRole } from "@/lib/auth/require-role";
+import { requireRole, type RoleContext } from "@/lib/auth/require-role";
 import { loadConversationDetail } from "@/lib/conversations/load-conversation-detail";
+import { ForbiddenError } from "@/lib/utils/errors";
 
 import { ConversationDetailClient } from "./conversation-detail-client";
 
@@ -26,7 +27,20 @@ interface Params {
 export const dynamic = "force-dynamic";
 
 export default async function ConversationDetailPage({ params }: { params: Promise<Params> }) {
-  const { role, slackUserId } = await requireRole("commercial");
+  // PR1.14.2 — layout et page s'exécutent EN PARALLÈLE. Si le layout
+  // catch ForbiddenError et appelle `forbidden()`, la page peut avoir
+  // déjà démarré son propre `requireRole` et throw aussi. Sans ce
+  // try/catch, Next log l'erreur de la page comme une "vraie" erreur
+  // applicative. On intercepte localement pour que l'issue soit la même
+  // des deux côtés : `forbidden()` → rendu `src/app/forbidden.tsx`.
+  let ctx: RoleContext;
+  try {
+    ctx = await requireRole("commercial");
+  } catch (err) {
+    if (err instanceof ForbiddenError) forbidden();
+    throw err;
+  }
+  const { role, slackUserId } = ctx;
   const { id } = await params;
 
   const result = await loadConversationDetail(id, { role, slackUserId });

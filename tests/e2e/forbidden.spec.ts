@@ -1,5 +1,5 @@
 /**
- * Scénario S10 PR1.14.2 — page de refus propre `/admin/forbidden`.
+ * Scénario S10 PR1.14.2 — page de refus propre `src/app/forbidden.tsx`.
  *
  * ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
  * Compte utilisé : `e2e-no-role+clerk_test@...`
@@ -7,7 +7,10 @@
  *   publicMetadata = { testAccount: true } — pas de role, pas de slackUserId.
  *   → `requireRole("commercial")` du layout `/admin` throw `ForbiddenError`
  *     → le layout catch et appelle `forbidden()` depuis `next/navigation`
- *     → Next.js rend `src/app/admin/forbidden.tsx` avec HTTP 403.
+ *     → Next.js remonte au segment parent et rend `src/app/forbidden.tsx`
+ *       (pas `src/app/admin/forbidden.tsx` qui est au même niveau que le
+ *       layout qui a thrown — cf. convention Next 16).
+ *     → Statut HTTP 403.
  *
  * Contrat vérifié :
  *   - Statut HTTP 403 (vrai code — pas 200 avec composant 403, pas 500 brut)

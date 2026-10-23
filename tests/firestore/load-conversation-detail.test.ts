@@ -183,13 +183,29 @@ describe("loadConversationDetail — persist emulator (VUE-CONVERSATION PR1)", (
     expect(res.kind).toBe("not_found");
   });
 
-  it("ok admin : voit la conv même sans slackUserId titulaire", async () => {
+  it("ok admin SANS slackUserId sur conv assignée : viewerIsOwner=false (bannière Mode admin affichée)", async () => {
+    // PR1.14.2 fix S5 — un admin n'est owner QUE s'il est réellement
+    // titulaire (slackUserId === assignedToSlack). L'ancien comportement
+    // `isAdmin || ...` renvoyait toujours true, ce qui cachait la bannière.
     await seed({ withHandoff: true });
     const res = await loadConversationDetail(CONV_ID, { role: "admin", slackUserId: undefined });
     expect(res.kind).toBe("ok");
     if (res.kind !== "ok") throw new Error();
-    expect(res.data.viewerIsOwner).toBe(true); // admin = owner par convention
+    expect(res.data.viewerIsOwner).toBe(false);
     expect(res.data.handoff?.assignedToSlackId).toBe(OWNER_SLACK);
+  });
+
+  it("ok admin AVEC slackUserId = assignedToSlack : viewerIsOwner=true (admin réellement titulaire)", async () => {
+    // PR1.14.2 fix S5 — un admin qui est aussi le titulaire Slack d'une
+    // conv doit être marqué owner (pas de bannière Mode admin inutile).
+    await seed({ withHandoff: true });
+    const res = await loadConversationDetail(CONV_ID, {
+      role: "admin",
+      slackUserId: OWNER_SLACK,
+    });
+    expect(res.kind).toBe("ok");
+    if (res.kind !== "ok") throw new Error();
+    expect(res.data.viewerIsOwner).toBe(true);
   });
 
   it("ok commercial titulaire : voit sa propre conv", async () => {

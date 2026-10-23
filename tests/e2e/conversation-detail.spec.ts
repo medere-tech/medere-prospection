@@ -105,7 +105,12 @@ test.describe("Détail conversation — lecture seule", () => {
     await signInAsAdmin();
     const resp = await page.goto(`/admin/conversations/${CONV_ID_INEXISTANT}`);
     expect([200, 404]).toContain(resp?.status() ?? 0);
-    await expect(page.getByText(/introuvable|404|n'existe pas/i)).toBeVisible();
+    // Cible le heading <h1>Conversation introuvable</h1> du composant
+    // `not-found.tsx:15`. L'ancien `getByText(/introuvable|404|n'existe pas/i)`
+    // matchait h1 + <p> → strict mode violation 2 éléments.
+    await expect(
+      page.getByRole("heading", { name: /Conversation introuvable/i, level: 1 }),
+    ).toBeVisible();
   });
 
   test("S5 — admin sur A : bannière 'Mode admin' visible, zéro numéro", async ({
