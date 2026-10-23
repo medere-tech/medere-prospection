@@ -119,6 +119,9 @@ const EXPECTED_AUDIT_ACTIONS: ReadonlySet<AuditAction> = new Set<AuditAction>([
   // TRANSVERSE
   "compliance_check",
   "status_changed",
+  // PR2a — dénormalisation liste /admin/conversations
+  "conversation_denorm_propagated",
+  "backfill_conversation_list_fields",
 ]);
 
 describe("ACTIONS whitelist — sentinelle anti-drift TS ↔ runtime (S9.1)", () => {

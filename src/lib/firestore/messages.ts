@@ -114,6 +114,7 @@ import { type OutboundMessageRecord } from "@/lib/compliance/rate-limits";
 import { confirmAlreadyExistsByReread, isAlreadyExistsError } from "@/lib/firestore/_idempotent";
 import { getAdminDb } from "@/lib/firestore/admin";
 import { appendAuditLogTx } from "@/lib/firestore/audit-log";
+import { buildLastMessagePreview } from "@/lib/firestore/conversation-list-fields";
 import {
   _bumpConversationCountersTx,
   _parseConversationOrThrow,
@@ -738,7 +739,20 @@ export async function addOutboundInTx(
   };
   tx.create(messageRef, messageDoc);
 
-  _bumpConversationCountersTx(tx, convRef, conv, "outbound", now);
+  // PR2a — dénormalisation pour la liste `/admin/conversations`.
+  // `generatedBy` sépare "ai" (Claude), "human" (envoi commercial direct)
+  // et "system" (pipelines internes, ex. first-sms). On mappe "system" sur
+  // "ai" pour l'affichage liste (un commercial voit "Léa" dans les deux
+  // cas). Seul "human" bumpe aussi `lastHumanOutboundAt` (cf.
+  // `_bumpConversationCountersTx`).
+  const authorKind: "ai" | "human" = input.generatedBy === "human" ? "human" : "ai";
+  const preview = buildLastMessagePreview({
+    direction: "outbound",
+    authorKind,
+    text: input.body,
+    at: now,
+  });
+  _bumpConversationCountersTx(tx, convRef, conv, "outbound", now, preview);
 
   appendAuditLogTx(tx, {
     actorId: "system",
@@ -859,7 +873,14 @@ export async function addInbound(conversationId: string, input: AddInboundInput)
     };
     tx.create(messageRef, messageDoc);
 
-    _bumpConversationCountersTx(tx, convRef, conv, "inbound", now);
+    // PR2a — dénormalisation preview inbound (authorKind="contact").
+    const preview = buildLastMessagePreview({
+      direction: "inbound",
+      authorKind: "contact",
+      text: input.body,
+      at: now,
+    });
+    _bumpConversationCountersTx(tx, convRef, conv, "inbound", now, preview);
 
     appendAuditLogTx(tx, {
       actorId: "system",
@@ -985,7 +1006,14 @@ export async function addInboundIdempotent(
       // dans conversations.ts.
       tx.create(messageRef, messageDoc);
 
-      _bumpConversationCountersTx(tx, convRef, conv, "inbound", now);
+      // PR2a — dénormalisation preview inbound (authorKind="contact").
+      const preview = buildLastMessagePreview({
+        direction: "inbound",
+        authorKind: "contact",
+        text: input.body,
+        at: now,
+      });
+      _bumpConversationCountersTx(tx, convRef, conv, "inbound", now, preview);
 
       appendAuditLogTx(tx, {
         actorId: "system",

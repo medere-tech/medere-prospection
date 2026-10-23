@@ -224,7 +224,17 @@ export type AuditAction =
   | "role_changed"
   // ── TRANSVERSE ─────────────────────────────────────────────────────────
   | "compliance_check"
-  | "status_changed";
+  | "status_changed"
+  // ── PR2a — dénormalisation liste `/admin/conversations` ───────────────
+  // Posé par `propagateContactDenormToConversations` quand un contact
+  // modifie `firstName`/`lastName`/`civilite`/`speciality`/`city` et que
+  // la copie sur conversations devient obsolète. Payload = `{ contactId,
+  // fieldsUpdated: string[] }` — scrubber-safe (noms de champs seulement).
+  | "conversation_denorm_propagated"
+  // Posé par `scripts/backfill-conversation-list-fields.mjs` pour chaque
+  // conversation touchée par le backfill PR2a. Payload = `{ fieldsPosed:
+  // string[] }` — scrubber-safe.
+  | "backfill_conversation_list_fields";
 
 export type AuditActorType = "system" | "ai" | "human";
 

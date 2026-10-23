@@ -58,6 +58,28 @@ export interface ConversationHandoff {
   notes?: string;
 }
 
+/**
+ * Qui a écrit le dernier message. PR2a : alimente l'extrait affiché en
+ * liste et sert à dériver « Le médecin attend une réponse ».
+ *   - `contact` : SMS entrant du PS
+ *   - `ai`      : SMS sortant généré par Claude (automatique)
+ *   - `human`   : SMS sortant envoyé manuellement par un commercial
+ */
+export type MessageAuthorKind = "contact" | "ai" | "human";
+
+/**
+ * Dénormalisation du dernier message pour l'affichage LISTE
+ * (`/admin/conversations`). Jamais de PII numéro — texte passé par le
+ * sanitize PR1 + tronqué.
+ */
+export interface ConversationLastMessagePreview {
+  direction: "inbound" | "outbound";
+  authorKind: MessageAuthorKind;
+  /** Texte tronqué (≤ 140 chars), scrubbé des numéros FR. */
+  text: string;
+  at: Timestamp;
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Document Firestore
 // ─────────────────────────────────────────────────────────────────────────────
@@ -111,6 +133,39 @@ export interface Conversation {
 
   /** Résumé court généré pour le commercial lors du hand-off. */
   summary?: string;
+
+  // ───────────────────────────────────────────────────────────────────────
+  // PR2a — dénormalisations pour la liste `/admin/conversations`
+  //
+  // Toutes OPTIONNELLES → les docs anciens (pré-PR2a) restent valides sans
+  // backfill. Le backfill `scripts/backfill-conversation-list-fields.mjs`
+  // les pose a posteriori. Les points d'écriture (`createConversation`,
+  // `_bumpConversationCountersTx`, `updateContactStatus` propagation)
+  // les écrivent dans la même transaction que l'écriture existante — zéro
+  // changement de comportement du pipeline SMS.
+  // ───────────────────────────────────────────────────────────────────────
+
+  /** `${civilite ?? ""} ${firstName} ${lastName}` trim. Ex: `Dr Dethie Faye`. */
+  contactDisplayName?: string;
+  /**
+   * Nom normalisé pour recherche préfixe (accents retirés, lower, trim).
+   * Query PR2b : `where("contactNameSearch", ">=", q).where(... "<=", q + "")`.
+   */
+  contactNameSearch?: string;
+  contactSpecialty?: string;
+  contactCity?: string;
+  /** Nom lisible de la campagne (HubSpot list name, dénormalisé via cache). */
+  campaignName?: string;
+  /** Dernier message pour affichage en liste. Scrubbé + tronqué. */
+  lastMessagePreview?: ConversationLastMessagePreview;
+  /**
+   * Timestamp du dernier message outbound envoyé par un HUMAIN (pas par
+   * l'IA Claude). Permet de dériver le signal « le médecin attend une
+   * réponse » = `lastInboundAt > lastHumanOutboundAt` (le PS a répondu
+   * depuis la dernière intervention humaine, ou aucune intervention humaine
+   * et un inbound existe).
+   */
+  lastHumanOutboundAt?: Timestamp;
 
   createdAt: Timestamp;
   updatedAt: Timestamp;
