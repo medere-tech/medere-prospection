@@ -28,20 +28,29 @@
 import { config } from "dotenv";
 config({ path: ".env.local" });
 
-import { getAdminDb } from "../src/lib/firestore/admin.ts";
 import { QUERY_FORMS } from "../src/lib/firestore/conversation-list-query-forms.ts";
+import { getFirebaseEnv } from "../src/lib/security/env.ts";
 
-// Résout le vrai projectId depuis le SDK Admin (seul source de vérité :
-// `FIRESTORE_PROJECT_ID` est historiquement absent côté backend —
-// Firebase Admin lit `GOOGLE_APPLICATION_CREDENTIALS`, `FIREBASE_CONFIG`,
-// ou le service account JSON injecté par `admin.ts`). Fallback explicite
-// si le SDK ne l'expose pas (ne devrait pas arriver, log diagnostique).
-const db = getAdminDb();
-const projectId =
-  db.app?.options?.projectId ??
-  process.env.FIRESTORE_PROJECT_ID ??
-  process.env.GOOGLE_CLOUD_PROJECT ??
-  "(unknown — SDK admin n'a pas exposé projectId)";
+// Résout le projectId à la MÊME source que `admin.ts` l'utilise pour
+// initialiser le SDK :
+//   - Mode emulator (`FIRESTORE_EMULATOR_HOST` présent) → `GCLOUD_PROJECT`
+//     ou `"medere-test"` (admin.ts:89).
+//   - Prod → `getFirebaseEnv().FIREBASE_PROJECT_ID` (admin.ts:95-99,
+//     validé par `firebaseEnvSchema` à env.ts:252).
+// Pourquoi pas `getAdminDb().app.options.projectId` : en prod, le projectId
+// est passé via `cert({...})`, pas dans `initializeApp(options)` → la
+// propriété `options.projectId` reste `undefined` (vérifié sur le run
+// précédent qui affichait "(non défini)").
+function resolveProjectId() {
+  const emulatorHost = process.env.FIRESTORE_EMULATOR_HOST;
+  if (typeof emulatorHost === "string" && emulatorHost.length > 0) {
+    return process.env.GCLOUD_PROJECT ?? "medere-test";
+  }
+  const env = getFirebaseEnv();
+  return env.FIREBASE_PROJECT_ID;
+}
+
+const projectId = resolveProjectId();
 
 console.log("");
 console.log("─".repeat(72));

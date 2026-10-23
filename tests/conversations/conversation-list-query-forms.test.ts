@@ -67,6 +67,15 @@ const EXPECTED_LEGACY_LABELS = [
   "legacy.getLatestConversationByContactId",
 ];
 
+const EXPECTED_BACKFILL_LABELS = [
+  "backfill.conversations.scan",
+  "backfill.contacts.lookup",
+  "backfill.messages.last",
+  "backfill.messages.last-human-outbound",
+];
+
+const EXPECTED_PROPAGATE_LABELS = ["propagate.by-contact-id"];
+
 describe("QUERY_FORMS — couverture des 3 routes + legacy (PR2a)", () => {
   const actualLabels = new Set(QUERY_FORMS.map((f) => f.label));
 
@@ -104,7 +113,19 @@ describe("QUERY_FORMS — couverture des 3 routes + legacy (PR2a)", () => {
     }
   });
 
-  it("totalise exactement 28+28+28+7+3 = 94 formes (pas de duplicat, pas d'orphelin)", () => {
+  it("couvre les 4 requêtes du backfill (scan + contact + messages × 2)", () => {
+    for (const label of EXPECTED_BACKFILL_LABELS) {
+      expect(actualLabels.has(label), `backfill : missing form "${label}"`).toBe(true);
+    }
+  });
+
+  it("couvre la requête de propagate-contact-denorm", () => {
+    for (const label of EXPECTED_PROPAGATE_LABELS) {
+      expect(actualLabels.has(label), `propagate : missing form "${label}"`).toBe(true);
+    }
+  });
+
+  it("totalise exactement 28+28+28+7+3+4+1 = 99 formes (pas de duplicat, pas d'orphelin)", () => {
     // Détecte un oubli d'orphelin : si quelqu'un ajoute une forme à
     // QUERY_FORMS sans mettre à jour les dimensions attendues, ce total
     // change et le test tombe.
@@ -113,7 +134,9 @@ describe("QUERY_FORMS — couverture des 3 routes + legacy (PR2a)", () => {
       expectedListAndCountsAndCursorLabels("list.cursor").length + // 28
       expectedListAndCountsAndCursorLabels("counts").length + // 28
       expectedVersionLabels().length + // 7
-      EXPECTED_LEGACY_LABELS.length; // 3
+      EXPECTED_LEGACY_LABELS.length + // 3
+      EXPECTED_BACKFILL_LABELS.length + // 4
+      EXPECTED_PROPAGATE_LABELS.length; // 1
     expect(QUERY_FORMS.length).toBe(expectedCount);
     // Zéro doublon.
     expect(actualLabels.size).toBe(QUERY_FORMS.length);
@@ -121,7 +144,15 @@ describe("QUERY_FORMS — couverture des 3 routes + legacy (PR2a)", () => {
 
   it("chaque forme a une catégorie non-nulle (invariant structurel)", () => {
     for (const f of QUERY_FORMS) {
-      expect(["list", "list-cursor", "counts", "version", "legacy"]).toContain(f.category);
+      expect([
+        "list",
+        "list-cursor",
+        "counts",
+        "version",
+        "legacy",
+        "backfill",
+        "propagate",
+      ]).toContain(f.category);
     }
   });
 });

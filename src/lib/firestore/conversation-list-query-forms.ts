@@ -30,6 +30,7 @@
  */
 import { Timestamp } from "firebase-admin/firestore";
 
+import { getAdminDb } from "@/lib/firestore/admin";
 import { normalizeContactNameSearch } from "@/lib/firestore/conversation-list-fields";
 import {
   ADMIN_TABS,
@@ -57,8 +58,8 @@ export const PROBE_CONTACT_ID = "zzz_probe_contact_check_indexes";
 export interface QueryForm {
   /** Label unique, lu par le test de couverture (anti-drift). */
   label: string;
-  /** Catégorie — "list" | "list-cursor" | "counts" | "version" | "legacy". */
-  category: "list" | "list-cursor" | "counts" | "version" | "legacy";
+  /** Catégorie — "list" | "list-cursor" | "counts" | "version" | "legacy" | "backfill" | "propagate". */
+  category: "list" | "list-cursor" | "counts" | "version" | "legacy" | "backfill" | "propagate";
   /** Exécute la requête (lecture seule). Peut lever FAILED_PRECONDITION. */
   run: () => Promise<unknown>;
 }
@@ -205,6 +206,80 @@ function buildVersionForms(): QueryForm[] {
   return forms;
 }
 
+/**
+ * Formes du script `scripts/backfill-conversation-list-fields.mjs`.
+ * Chaque forme reproduit UNE requête Firestore que le backfill émet.
+ * `fichier:ligne` dans les labels pour tracer la source.
+ */
+function buildBackfillForms(): QueryForm[] {
+  const probeConvId = `${PROBE_CONTACT_ID}_${PROBE_CAMPAIGN_ID}`;
+  return [
+    {
+      // backfill-conversation-list-fields.mjs:122 — scan global
+      label: "backfill.conversations.scan",
+      category: "backfill",
+      run: () => getAdminDb().collection("conversations").limit(1).get(),
+    },
+    {
+      // backfill-conversation-list-fields.mjs:134 — lookup contact
+      label: "backfill.contacts.lookup",
+      category: "backfill",
+      run: () => getAdminDb().collection("contacts").doc(PROBE_CONTACT_ID).get(),
+    },
+    {
+      // backfill-conversation-list-fields.mjs:174 — sous-collection
+      // messages, dernier doc par createdAt desc. Single-field auto.
+      label: "backfill.messages.last",
+      category: "backfill",
+      run: () =>
+        getAdminDb()
+          .collection("conversations")
+          .doc(probeConvId)
+          .collection("messages")
+          .orderBy("createdAt", "desc")
+          .limit(1)
+          .get(),
+    },
+    {
+      // backfill-conversation-list-fields.mjs:201 — sous-collection
+      // messages, dernier outbound humain. Requiert composite
+      // (direction asc, generatedBy asc, createdAt desc) côté messages.
+      label: "backfill.messages.last-human-outbound",
+      category: "backfill",
+      run: () =>
+        getAdminDb()
+          .collection("conversations")
+          .doc(probeConvId)
+          .collection("messages")
+          .where("direction", "==", "outbound")
+          .where("generatedBy", "==", "human")
+          .orderBy("createdAt", "desc")
+          .limit(1)
+          .get(),
+    },
+  ];
+}
+
+/**
+ * Formes émises par `propagate-contact-denorm.ts`.
+ */
+function buildPropagateForms(): QueryForm[] {
+  return [
+    {
+      // propagate-contact-denorm.ts:88 — `where("contactId","==",X)`.
+      // Single-field auto, aucun composite requis.
+      label: "propagate.by-contact-id",
+      category: "propagate",
+      run: () =>
+        getAdminDb()
+          .collection("conversations")
+          .where("contactId", "==", PROBE_CONTACT_ID)
+          .limit(1)
+          .get(),
+    },
+  ];
+}
+
 function buildLegacyForms(): QueryForm[] {
   // Pré-existants PR0 : trois lookups par contact qui émettent des queries
   // `where("contactId","==",X).where("status","in",[...])`. L'index
@@ -228,11 +303,13 @@ function buildLegacyForms(): QueryForm[] {
   ];
 }
 
-/** Catalogue complet (concat des 5 catégories). */
+/** Catalogue complet (concat des 7 catégories). */
 export const QUERY_FORMS: ReadonlyArray<QueryForm> = [
   ...buildListForms(),
   ...buildListCursorForms(),
   ...buildCountForms(),
   ...buildVersionForms(),
   ...buildLegacyForms(),
+  ...buildBackfillForms(),
+  ...buildPropagateForms(),
 ];
