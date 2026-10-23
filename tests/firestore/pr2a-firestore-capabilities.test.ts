@@ -204,6 +204,7 @@ describe("Firestore capabilities (PR2a preuve emulator)", () => {
 
 import {
   _parseConversationOrThrow,
+  countConversations,
   listConversations,
   setHandoff,
 } from "@/lib/firestore/conversations";
@@ -662,5 +663,126 @@ describe("PR2a /version — updatedAt bougé par changement de statut (sans nouv
     // `lastMessageAt` est STABLE → prouve pourquoi `/version` ne peut PAS
     // être basé dessus.
     expect(afterMsgMs).toBe(beforeMsgMs);
+  });
+
+  // ───────────────────────────────────────────────────────────────────
+  // PR2a — counts alignés sur list (même orderBy → mêmes index)
+  // ───────────────────────────────────────────────────────────────────
+
+  it("count aligné sur list : docs sans lastMessageAt exclus (PR2a)", async () => {
+    const db = getAdminDb();
+    const t0 = 1_700_000_900_000;
+    // 2 docs AVEC lastMessageAt
+    for (const id of ["cnt_with_1", "cnt_with_2"]) {
+      await db
+        .collection(COLLECTION)
+        .doc(id)
+        .set({
+          contactId: id,
+          campaignId: "cnt",
+          channel: "sms",
+          status: "active",
+          intent: "unknown",
+          messageCount: 1,
+          outboundCount: 1,
+          inboundCount: 0,
+          followupCount: 0,
+          assignedTo: null,
+          lastMessageAt: Timestamp.fromMillis(t0),
+          createdAt: Timestamp.fromMillis(t0 - 1000),
+          updatedAt: Timestamp.fromMillis(t0),
+        });
+    }
+    // 1 doc SANS lastMessageAt (seed-only, pas de message)
+    await db
+      .collection(COLLECTION)
+      .doc("cnt_without_lm")
+      .set({
+        contactId: "cnt_without_lm",
+        campaignId: "cnt",
+        channel: "sms",
+        status: "active",
+        intent: "unknown",
+        messageCount: 0,
+        outboundCount: 0,
+        inboundCount: 0,
+        followupCount: 0,
+        assignedTo: null,
+        // lastMessageAt volontairement ABSENT
+        createdAt: Timestamp.fromMillis(t0 - 1000),
+        updatedAt: Timestamp.fromMillis(t0),
+      });
+
+    const listed = await listConversations({ limit: 100, filters: { campaignId: "cnt" } });
+    const counted = await countConversations({ filters: { campaignId: "cnt" } });
+
+    // Les deux voient 2 docs — jamais le doc sans lastMessageAt.
+    expect(listed.conversations.length).toBe(2);
+    expect(counted).toBe(2);
+    expect(listed.conversations.map((c) => c.conversationId).sort()).toEqual([
+      "cnt_with_1",
+      "cnt_with_2",
+    ]);
+  });
+
+  it("count aligné sur list en mode recherche : même population exclue (PR2a)", async () => {
+    const db = getAdminDb();
+    const t0 = 1_700_000_950_000;
+    // 2 docs avec contactNameSearch "dupo..." et lastMessageAt
+    for (const [id, name] of [
+      ["qsrch_1", "dupont jean"],
+      ["qsrch_2", "dupond alain"],
+    ] as const) {
+      await db
+        .collection(COLLECTION)
+        .doc(id)
+        .set({
+          contactId: id,
+          campaignId: "qsrch",
+          channel: "sms",
+          status: "active",
+          intent: "unknown",
+          messageCount: 1,
+          outboundCount: 1,
+          inboundCount: 0,
+          followupCount: 0,
+          assignedTo: null,
+          contactNameSearch: name,
+          lastMessageAt: Timestamp.fromMillis(t0),
+          createdAt: Timestamp.fromMillis(t0 - 1000),
+          updatedAt: Timestamp.fromMillis(t0),
+        });
+    }
+    // 1 doc HORS préfixe
+    await db
+      .collection(COLLECTION)
+      .doc("qsrch_out")
+      .set({
+        contactId: "qsrch_out",
+        campaignId: "qsrch",
+        channel: "sms",
+        status: "active",
+        intent: "unknown",
+        messageCount: 1,
+        outboundCount: 1,
+        inboundCount: 0,
+        followupCount: 0,
+        assignedTo: null,
+        contactNameSearch: "martin paul",
+        lastMessageAt: Timestamp.fromMillis(t0),
+        createdAt: Timestamp.fromMillis(t0 - 1000),
+        updatedAt: Timestamp.fromMillis(t0),
+      });
+
+    const listed = await listConversations({
+      limit: 100,
+      filters: { campaignId: "qsrch", contactNameSearch: "dupo" },
+    });
+    const counted = await countConversations({
+      filters: { campaignId: "qsrch", contactNameSearch: "dupo" },
+    });
+
+    expect(listed.conversations.length).toBe(2);
+    expect(counted).toBe(2);
   });
 });

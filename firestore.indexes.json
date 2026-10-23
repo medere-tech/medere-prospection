@@ -113,6 +113,65 @@
       "collectionGroup": "conversations",
       "queryScope": "COLLECTION",
       "fields": [
+        { "fieldPath": "status", "order": "ASCENDING" },
+        { "fieldPath": "contactNameSearch", "order": "ASCENDING" },
+        { "fieldPath": "lastMessageAt", "order": "DESCENDING" }
+      ]
+    },
+    {
+      "collectionGroup": "conversations",
+      "queryScope": "COLLECTION",
+      "fields": [
+        { "fieldPath": "assignedTo", "order": "ASCENDING" },
+        { "fieldPath": "status", "order": "ASCENDING" },
+        { "fieldPath": "contactNameSearch", "order": "ASCENDING" },
+        { "fieldPath": "lastMessageAt", "order": "DESCENDING" }
+      ]
+    },
+    {
+      "collectionGroup": "conversations",
+      "queryScope": "COLLECTION",
+      "fields": [
+        { "fieldPath": "campaignId", "order": "ASCENDING" },
+        { "fieldPath": "contactNameSearch", "order": "ASCENDING" },
+        { "fieldPath": "lastMessageAt", "order": "DESCENDING" }
+      ]
+    },
+    {
+      "collectionGroup": "conversations",
+      "queryScope": "COLLECTION",
+      "fields": [
+        { "fieldPath": "campaignId", "order": "ASCENDING" },
+        { "fieldPath": "status", "order": "ASCENDING" },
+        { "fieldPath": "contactNameSearch", "order": "ASCENDING" },
+        { "fieldPath": "lastMessageAt", "order": "DESCENDING" }
+      ]
+    },
+    {
+      "collectionGroup": "conversations",
+      "queryScope": "COLLECTION",
+      "fields": [
+        { "fieldPath": "assignedTo", "order": "ASCENDING" },
+        { "fieldPath": "campaignId", "order": "ASCENDING" },
+        { "fieldPath": "contactNameSearch", "order": "ASCENDING" },
+        { "fieldPath": "lastMessageAt", "order": "DESCENDING" }
+      ]
+    },
+    {
+      "collectionGroup": "conversations",
+      "queryScope": "COLLECTION",
+      "fields": [
+        { "fieldPath": "assignedTo", "order": "ASCENDING" },
+        { "fieldPath": "campaignId", "order": "ASCENDING" },
+        { "fieldPath": "status", "order": "ASCENDING" },
+        { "fieldPath": "contactNameSearch", "order": "ASCENDING" },
+        { "fieldPath": "lastMessageAt", "order": "DESCENDING" }
+      ]
+    },
+    {
+      "collectionGroup": "conversations",
+      "queryScope": "COLLECTION",
+      "fields": [
         { "fieldPath": "assignedTo", "order": "ASCENDING" },
         { "fieldPath": "updatedAt", "order": "DESCENDING" }
       ]

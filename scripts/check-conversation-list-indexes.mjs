@@ -28,9 +28,20 @@
 import { config } from "dotenv";
 config({ path: ".env.local" });
 
+import { getAdminDb } from "../src/lib/firestore/admin.ts";
 import { QUERY_FORMS } from "../src/lib/firestore/conversation-list-query-forms.ts";
 
-const projectId = process.env.FIRESTORE_PROJECT_ID ?? "(non défini)";
+// Résout le vrai projectId depuis le SDK Admin (seul source de vérité :
+// `FIRESTORE_PROJECT_ID` est historiquement absent côté backend —
+// Firebase Admin lit `GOOGLE_APPLICATION_CREDENTIALS`, `FIREBASE_CONFIG`,
+// ou le service account JSON injecté par `admin.ts`). Fallback explicite
+// si le SDK ne l'expose pas (ne devrait pas arriver, log diagnostique).
+const db = getAdminDb();
+const projectId =
+  db.app?.options?.projectId ??
+  process.env.FIRESTORE_PROJECT_ID ??
+  process.env.GOOGLE_CLOUD_PROJECT ??
+  "(unknown — SDK admin n'a pas exposé projectId)";
 
 console.log("");
 console.log("─".repeat(72));
@@ -41,7 +52,7 @@ console.log(`  Formes à vérifier : ${QUERY_FORMS.length}`);
 console.log("─".repeat(72));
 console.log("");
 
-/** @typedef {{ label: string, category: string, status: "OK"|"SKIP"|"FAIL", count?: number, note?: string, error?: string, indexLink?: string | null }} FormResult */
+/** @typedef {{ label: string, category: string, status: "OK"|"FAIL", count?: number, error?: string, indexLink?: string | null }} FormResult */
 
 /** @type {FormResult[]} */
 const results = [];
@@ -51,15 +62,8 @@ for (const form of QUERY_FORMS) {
     const r = await form.run();
     // Compte sans AFFICHER le contenu des documents (contrat PR2a).
     let count = 0;
-    let note;
     if (r && typeof r === "object") {
-      if ("__skip__" in r) {
-        note = String(r.__skip__);
-        results.push({ label: form.label, category: form.category, status: "SKIP", note });
-        process.stdout.write(`  ∘ ${form.label}  — SKIP (${note})\n`);
-        continue;
-      }
-      if (typeof r === "object" && "conversations" in r && Array.isArray(r.conversations)) {
+      if ("conversations" in r && Array.isArray(r.conversations)) {
         count = r.conversations.length;
       } else if ("topConversationId" in r) {
         count = r.topConversationId ? 1 : 0;
@@ -89,34 +93,26 @@ for (const form of QUERY_FORMS) {
 }
 
 const fails = results.filter((r) => r.status === "FAIL");
-const skips = results.filter((r) => r.status === "SKIP");
 const oks = results.filter((r) => r.status === "OK");
 
 console.log("");
 console.log("─".repeat(72));
-console.log(
-  `Résumé : ${results.length} forme(s) — OK=${oks.length}  SKIP=${skips.length}  FAIL=${fails.length}`,
-);
+console.log(`Résumé : ${results.length} forme(s) — OK=${oks.length}  FAIL=${fails.length}`);
 
 if (fails.length > 0) {
   console.log("");
-  console.log("Index manquants (ouvrir les liens Firebase ci-dessous pour les créer) :");
+  console.log(
+    "Index manquants (déduire le composite depuis la requête, PAS cliquer sur le lien) :",
+  );
   for (const f of fails) {
     console.log(`  - ${f.label}`);
-    if (f.indexLink) console.log(`      ↳ ${f.indexLink}`);
+    if (f.indexLink) console.log(`      ↳ (lien console à titre indicatif) ${f.indexLink}`);
   }
   console.log("");
-  console.log("Après création dans la console Firebase, mirrorer dans");
-  console.log("`firestore.indexes.json` puis `npm run firebase:deploy:indexes`.");
+  console.log("Source de vérité : `firestore.indexes.json`. Déduire le composite");
+  console.log("depuis les égalités de la requête → `contactNameSearch asc` si");
+  console.log("recherche → `lastMessageAt desc`. Puis `npm run firebase:deploy:indexes`.");
   process.exit(1);
-}
-
-if (skips.length > 0) {
-  console.log("");
-  console.log("SKIPs = formes dont la variante sans curseur a déjà couvert l'index requis");
-  console.log(
-    "(curseur = ajout d'un `startAfter(doc)` sur la même orderBy, mêmes champs filtrés).",
-  );
 }
 
 console.log("");

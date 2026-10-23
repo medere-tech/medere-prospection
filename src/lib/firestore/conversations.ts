@@ -1560,6 +1560,19 @@ const ListConversationsInputSchema = z.object({
   limit: z.number().int().min(1).max(LIST_CONVERSATIONS_MAX_LIMIT).optional(),
   /** docId `${contactId}_${campaignId}` opaque du dernier doc de la page précédente. */
   cursor: z.string().min(1).optional(),
+  /**
+   * ⚠️ `@internal` — réservé au script `scripts/check-conversation-list-indexes.mjs`.
+   * Les 3 routes publiques ne passent JAMAIS ce champ (seul `cursor` opaque
+   * est accepté par leur Zod). Permet d'injecter un `startAfter(...values)`
+   * basé sur les valeurs des champs du tri plutôt que sur un document
+   * existant → le script peut probler le path d'index SANS avoir à seeder
+   * ou retrouver un doc réel.
+   *
+   * EXCLUSIF avec `cursor` : si les deux sont fournis, `cursor` l'emporte
+   * (compat ascendante — route handler peut déborder sur `startAfterValues`
+   * sans casser).
+   */
+  startAfterValues: z.array(z.unknown()).optional(),
 });
 
 export type ListConversationsInput = z.input<typeof ListConversationsInputSchema>;
@@ -1625,8 +1638,42 @@ function applyConversationFilters(
 }
 
 /**
+ * Applique filtres + orderBy. Partagé entre `countConversations` et
+ * `buildListConversationsQuery` → les deux chemins utilisent LE MÊME
+ * composite index. Avant cette factorisation, les counts n'avaient pas
+ * d'orderBy et exigeaient des composites séparés (doublement du nombre
+ * d'index requis). Vérifié en prod via
+ * `scripts/check-conversation-list-indexes.mjs` : OK sur tous les combos
+ * aujourd'hui — un divergence future casserait le script immédiatement.
+ */
+function applyConversationFiltersAndOrderBy(
+  base: FirebaseFirestore.Query,
+  filters: ListConversationsFilters | undefined,
+  assigneeFilter: AssigneeFilter,
+): FirebaseFirestore.Query {
+  let q = applyConversationFilters(base, filters, assigneeFilter);
+  // Firestore impose que la 1re `orderBy` porte sur le champ en inégalité.
+  // En recherche préfixe, on ouvre par asc sur `contactNameSearch`, puis
+  // on affine par `lastMessageAt` desc en secondaire. Compromis assumé :
+  // les résultats de recherche sont alphabétiques, pas en récence pure.
+  if (filters?.contactNameSearch !== undefined && filters.contactNameSearch.length > 0) {
+    q = q.orderBy("contactNameSearch", "asc").orderBy("lastMessageAt", "desc");
+  } else {
+    q = q.orderBy("lastMessageAt", "desc");
+  }
+  return q;
+}
+
+/**
  * Compte les conversations correspondant aux filtres (count aggregation
  * Firestore — 1 lecture facturée). Partagé par les compteurs d'onglets.
+ *
+ * ⚠️ ORDERING ALIGNÉ SUR LA LISTE (PR2a — vérification prod) : la query
+ * applique le MÊME `orderBy` que la liste pour réutiliser les mêmes
+ * composite indexes. Firestore `count()` accepte un `orderBy` (il filtre
+ * la même population que la liste correspondante). Prouvé emulator :
+ * `tests/firestore/pr2a-firestore-capabilities.test.ts` → `count aligné
+ * sur list`.
  */
 export async function countConversations(options: {
   filters?: ListConversationsFilters;
@@ -1634,7 +1681,7 @@ export async function countConversations(options: {
 }): Promise<number> {
   const base = getAdminDb().collection(CONVERSATIONS_COLLECTION);
   const assigneeFilter = options.assigneeFilter ?? { kind: "none" };
-  const q = applyConversationFilters(base, options.filters, assigneeFilter);
+  const q = applyConversationFiltersAndOrderBy(base, options.filters, assigneeFilter);
   const snap = await q.count().get();
   return snap.data().count;
 }
@@ -1643,24 +1690,12 @@ async function buildListConversationsQuery(options: {
   filters?: ListConversationsFilters;
   limit: number;
   cursor?: string;
+  startAfterValues?: unknown[];
   assigneeFilter?: AssigneeFilter;
 }): Promise<FirebaseFirestore.Query> {
   const base = getAdminDb().collection(CONVERSATIONS_COLLECTION);
   const assigneeFilter = options.assigneeFilter ?? { kind: "none" };
-  let q = applyConversationFilters(base, options.filters, assigneeFilter);
-
-  // Firestore impose que la 1re `orderBy` porte sur le champ en inégalité.
-  // En recherche préfixe, on ouvre par asc sur `contactNameSearch`, puis
-  // on affine par `lastMessageAt` desc en secondaire. Compromis assumé :
-  // les résultats de recherche sont alphabétiques, pas en récence pure.
-  if (
-    options.filters?.contactNameSearch !== undefined &&
-    options.filters.contactNameSearch.length > 0
-  ) {
-    q = q.orderBy("contactNameSearch", "asc").orderBy("lastMessageAt", "desc");
-  } else {
-    q = q.orderBy("lastMessageAt", "desc");
-  }
+  let q = applyConversationFiltersAndOrderBy(base, options.filters, assigneeFilter);
 
   if (options.cursor !== undefined) {
     const cursorSnap = await getAdminDb()
@@ -1674,6 +1709,12 @@ async function buildListConversationsQuery(options: {
       });
     }
     q = q.startAfter(cursorSnap);
+  } else if (options.startAfterValues !== undefined && options.startAfterValues.length > 0) {
+    // Chemin `@internal` : utilisé par le script de vérification d'index.
+    // Les valeurs doivent correspondre, dans l'ordre, aux orderBy ci-dessus
+    // (soit `[lastMessageAt]` hors recherche, soit `[contactNameSearch,
+    // lastMessageAt]` en mode recherche).
+    q = q.startAfter(...options.startAfterValues);
   }
 
   return q.limit(options.limit + 1);
@@ -1708,19 +1749,15 @@ async function executeListQuery(
  * côté route handler (403 commercial sur onglet « Toutes »).
  *
  * ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
- * INDEX FIRESTORE REQUIS (listés + prouvés dans
- * `tests/firestore/pr2a-firestore-capabilities.test.ts`)
+ * INDEX FIRESTORE REQUIS
  *
- *   - Query sans filtre : `orderBy("lastMessageAt", "desc")` — single-field
- *     auto.
- *   - Query filtre `status` (`==` ou `in[]`) : composite
- *     `status + lastMessageAt desc`.
- *   - Query filtre `campaignId` : `campaignId + lastMessageAt desc`.
- *   - Query filtre `campaignId + status` : `campaignId + status + lastMessageAt desc`.
- *   - Query recherche préfixe nom : `contactNameSearch asc + lastMessageAt desc`.
+ *   La liste exhaustive est dans `firestore.indexes.json`. Chaque forme
+ *   de requête des 3 routes est prouvée en prod par
+ *   `scripts/check-conversation-list-indexes.mjs` (l'emulator N'enforce
+ *   PAS les composite indexes — seul le run contre la vraie base le fait).
+ *   Lancer ce script après tout changement d'index.
  *
- * Ajoutés dans `firestore.indexes.json`. Déployer via
- * `npm run firebase:deploy:indexes` avant runtime Firestore Cloud.
+ * Déployer via `npm run firebase:deploy:indexes` avant runtime Cloud.
  *
  * @throws ValidationError si input invalide ou cursor inexistant.
  * @throws ValidationError si un doc est corrompu (Zod fail).
@@ -1742,10 +1779,10 @@ export async function listConversations(
     });
   }
 
-  const { filters, limit: requestedLimit, cursor } = parsed.data;
+  const { filters, limit: requestedLimit, cursor, startAfterValues } = parsed.data;
   const limit = requestedLimit ?? LIST_CONVERSATIONS_DEFAULT_LIMIT;
 
-  const q = await buildListConversationsQuery({ filters, limit, cursor });
+  const q = await buildListConversationsQuery({ filters, limit, cursor, startAfterValues });
   return executeListQuery(q, limit);
 }
 
@@ -1788,13 +1825,14 @@ export async function listConversationsByAssignee(
     });
   }
 
-  const { filters, limit: requestedLimit, cursor } = parsed.data;
+  const { filters, limit: requestedLimit, cursor, startAfterValues } = parsed.data;
   const limit = requestedLimit ?? LIST_CONVERSATIONS_DEFAULT_LIMIT;
 
   const q = await buildListConversationsQuery({
     filters,
     limit,
     cursor,
+    startAfterValues,
     assigneeFilter: { kind: "specific", slackUserId },
   });
   return executeListQuery(q, limit);

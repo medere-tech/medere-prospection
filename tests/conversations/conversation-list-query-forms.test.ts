@@ -6,7 +6,7 @@
  * (plus les lookups legacy par contactId).
  *
  * ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
- * Pourquoi
+ * Pourquoi (et sa limite)
  *
  *   Si un dev ajoute un filtre (ex. un nouvel onglet `priorite`, ou un
  *   paramètre `segmentId`) à une route sans l'ajouter au catalogue, la
@@ -16,6 +16,14 @@
  *   Le test re-dérive les combinaisons depuis les dimensions SOURCES
  *   (`ADMIN_TABS`/`COMMERCIAL_TABS` du module tabs partagé), pas depuis
  *   la liste `QUERY_FORMS` elle-même → anti-tautologie.
+ *
+ *   ⚠ LIMITE EXPLICITE : ce test prouve seulement que CHAQUE combinaison
+ *   est référencée. Il NE prouve PAS qu'un composite index EXISTE en prod
+ *   pour chacune — l'emulator Firestore n'enforce pas les composite
+ *   indexes. Pour cette preuve, il faut lancer
+ *   `npx tsx scripts/check-conversation-list-indexes.mjs` CONTRE LA VRAIE
+ *   BASE après tout changement d'index ou de query. Checklist :
+ *   `scripts/README.md`.
  */
 import { describe, expect, it } from "vitest";
 

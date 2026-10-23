@@ -28,6 +28,8 @@
  *   AUCUNE écriture, AUCUN side effect. Les probes utilisent des IDs
  *   qui ne risquent pas d'exister en prod (`UPROBE…`, `zzz-probe-…`).
  */
+import { Timestamp } from "firebase-admin/firestore";
+
 import { normalizeContactNameSearch } from "@/lib/firestore/conversation-list-fields";
 import {
   ADMIN_TABS,
@@ -118,6 +120,15 @@ function buildListForms(): QueryForm[] {
   return forms;
 }
 
+/**
+ * Timestamp "distant futur" utilisé pour `startAfter(lastMessageAt)` : garantit
+ * zéro résultat (`desc` → aucun doc ≥ 3000-01-01), mais Firestore DOIT quand
+ * même exécuter le plan de requête → l'index est bien probé.
+ */
+const FUTURE_TIMESTAMP = Timestamp.fromDate(new Date("3000-01-01T00:00:00Z"));
+/** Même principe pour `contactNameSearch asc` : chaîne au-delà de tout nom réel. */
+const AFTER_ANY_NAME = "zzzzzzzzzzzzzzzzzzzzzzzzzzzzzz";
+
 function buildListCursorForms(): QueryForm[] {
   const forms: QueryForm[] = [];
   for (const { role, tabs } of ROLES) {
@@ -126,26 +137,24 @@ function buildListCursorForms(): QueryForm[] {
       for (const hasCampaign of [false, true] as const) {
         for (const hasQ of [false, true] as const) {
           const filters = buildFilters(tab, hasCampaign, hasQ);
+          // `startAfterValues` DOIT matcher, dans l'ordre, les orderBy
+          // appliqués par `buildListConversationsQuery` :
+          //   - hors recherche : `[lastMessageAt]`
+          //   - en recherche   : `[contactNameSearch, lastMessageAt]`
+          const startAfterValues = hasQ ? [AFTER_ANY_NAME, FUTURE_TIMESTAMP] : [FUTURE_TIMESTAMP];
           forms.push({
             label: listCursorLabel(role, tab, hasCampaign, hasQ),
             category: "list-cursor",
-            run: async () => {
-              // Récupère un doc existant pour l'utiliser comme cursor réel.
-              // Si la query de base est vide, on retourne un marqueur `SKIP`
-              // — le script l'affichera sans incrémenter les échecs (la
-              // forme sans cursor couvre déjà l'index requis).
-              const base =
-                assignedTo !== null
-                  ? await listConversationsByAssignee(assignedTo, { limit: 1, filters })
-                  : await listConversations({ limit: 1, filters });
-              if (base.conversations.length === 0) {
-                return { __skip__: "no base doc for cursor probe" };
-              }
-              const cursor = base.conversations[0]!.conversationId;
-              return assignedTo !== null
-                ? listConversationsByAssignee(assignedTo, { limit: 1, filters, cursor })
-                : listConversations({ limit: 1, filters, cursor });
-            },
+            // `startAfter(values)` → aucune lecture préalable de doc,
+            // zéro SKIP. L'index requis est strictement le même que la
+            // variante sans cursor, mais on vérifie quand même que
+            // Firestore accepte le `startAfter(...values)` sur le même
+            // plan de requête (anti-régression si une évolution du query
+            // builder cassait la combinaison).
+            run: async () =>
+              assignedTo !== null
+                ? listConversationsByAssignee(assignedTo, { limit: 1, filters, startAfterValues })
+                : listConversations({ limit: 1, filters, startAfterValues }),
           });
         }
       }
