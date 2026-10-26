@@ -24,6 +24,7 @@ import { AlertTriangle, CheckCircle2, ShieldAlert, UserCheck } from "lucide-reac
 import { cn } from "@/lib/utils";
 import { formatDateParis } from "@/lib/utils/format-paris";
 
+import { CONVERSATION_STATUS_BANNER_TEXTS } from "./status-labels";
 import type { ConversationDisplayStatus, HandoffDisplayProps } from "./types";
 
 interface Props {
@@ -48,7 +49,7 @@ export function ConversationStatusBanner({ status, handoff, contactOptedOut }: P
         variant="destructive"
         icon={<ShieldAlert className="h-4 w-4" aria-hidden="true" />}
       >
-        Contact désabonné : aucune sollicitation SMS sans nouveau consentement explicite.
+        {CONVERSATION_STATUS_BANNER_TEXTS.opted_out}
       </Banner>
     );
   }
@@ -60,7 +61,7 @@ export function ConversationStatusBanner({ status, handoff, contactOptedOut }: P
         variant="destructive"
         icon={<AlertTriangle className="h-4 w-4" aria-hidden="true" />}
       >
-        Contact bloqué : ne pas recontacter par SMS.
+        {CONVERSATION_STATUS_BANNER_TEXTS.blocked}
       </Banner>
     );
   }
@@ -72,7 +73,7 @@ export function ConversationStatusBanner({ status, handoff, contactOptedOut }: P
         variant="muted"
         icon={<CheckCircle2 className="h-4 w-4" aria-hidden="true" />}
       >
-        Conversation clôturée.
+        {CONVERSATION_STATUS_BANNER_TEXTS.closed}
       </Banner>
     );
   }

@@ -389,6 +389,13 @@ describe("<ConversationsPageClient />", () => {
         initialCommerciaux={null}
       />,
     );
+    // Attend la fin des mises à jour React (useEffect fetchs + setStates)
+    // AVANT d'asserter l'absence du dropdown — évite l'avertissement
+    // "not wrapped in act(...)" sur `setListState`/`setCountsState` qui
+    // s'exécutent après le render synchrone.
+    await screen.findAllByText("Aucune conversation à traiter.", undefined, {
+      timeout: 2000,
+    });
     expect(screen.queryByLabelText(/Filtrer par commercial/)).toBeNull();
   });
 });

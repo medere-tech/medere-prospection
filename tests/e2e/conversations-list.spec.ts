@@ -55,8 +55,10 @@ test.describe("Liste conversations — lecture seule", () => {
     const toutes = tabs.filter({ hasText: "Toutes" });
     await expect(toutes.getByText(/^1$/)).toBeVisible();
 
-    // Onglet "A traiter" vide → phrase utile.
-    await expect(page.getByText("Aucune conversation à traiter.")).toBeVisible();
+    // Onglet "A traiter" vide → phrase utile (role=status, UN SEUL dans le DOM).
+    await expect(
+      page.getByRole("status").filter({ hasText: "Aucune conversation à traiter." }),
+    ).toBeVisible();
 
     // Clôturées : A visible.
     await cloturees.click();
@@ -90,8 +92,10 @@ test.describe("Liste conversations — lecture seule", () => {
 
     // Autre commercial fictif → aucune ligne.
     await page.goto("/admin/conversations?tab=toutes&assignedTo=UDOESNOTEXIST");
-    // Phrase utile du bloc "Toutes" (vide).
-    await expect(page.getByText(/Aucune conversation/).first()).toBeVisible();
+    // Phrase utile du bloc "Toutes" (vide). L'empty state est rendu
+    // UNE SEULE fois (rôle=status, hors des variantes desktop/mobile) →
+    // pas de collision strict mode, pas de `.first()` nécessaire.
+    await expect(page.getByRole("status").filter({ hasText: /Aucune conversation/ })).toBeVisible();
   });
 
   // ────────────────────────────────────────────────────────────────────
@@ -135,7 +139,7 @@ test.describe("Liste conversations — lecture seule", () => {
     });
     await signInAsCommercial();
     await page.goto("/admin/conversations?tab=toutes");
-    await expect(page.getByText(/Aucune conversation/).first()).toBeVisible();
+    await expect(page.getByRole("status").filter({ hasText: /Aucune conversation/ })).toBeVisible();
     // L'ID de A ne doit figurer NI dans le DOM NI dans aucune réponse.
     const body = await page.locator("body").innerText();
     expect(body).not.toContain(CONV_ID_ADMIN_NON_OWNER!);
@@ -241,6 +245,21 @@ test.describe("Liste conversations — lecture seule", () => {
     page,
     signInAsAdmin,
   }) => {
+    // Déterministe aux 3 tailles (desktop/tablet/mobile) :
+    //
+    // 1er run : sur desktop, `expect(tab).toBeVisible()` succédait AVANT
+    // que les 2 useEffects de `conversations-page-client.tsx` (lignes
+    // 193-200 pour la liste, 203-210 pour les counts) n'aient émis
+    // leurs fetchs. `apiCalls.length` était donc 0 → test fail.
+    // Sur mobile/tablette, l'hydratation est plus lente (CSS + JS plus
+    // lourds à instancier), les fetchs arrivaient AVANT la visibility
+    // → test passait. Cette asymétrie n'était pas un bug applicatif
+    // mais une FENÊTRE D'OBSERVATION mal choisie dans le test.
+    //
+    // Correction : on attend EXPLICITEMENT les 2 réponses API via
+    // `page.waitForResponse` AVANT de prélever `initialCount`. Cela
+    // vérifie que les 2 fetchs SONT bien émis au chargement — ce que
+    // le test voulait dire au départ.
     const consoleErrors: string[] = [];
     page.on("console", (msg) => {
       if (msg.type() === "error") consoleErrors.push(msg.text());
@@ -251,12 +270,23 @@ test.describe("Liste conversations — lecture seule", () => {
       if (u.includes("/api/admin/conversations")) apiCalls.push(u);
     });
     await signInAsAdmin();
-    await page.goto("/admin/conversations?tab=toutes");
+    // Lance la navigation ET attend les 2 réponses attendues en parallèle.
+    const [, ,] = await Promise.all([
+      page.waitForResponse(
+        (r) => /\/api\/admin\/conversations\?/.test(r.url()) && r.request().method() === "GET",
+      ),
+      page.waitForResponse(
+        (r) =>
+          /\/api\/admin\/conversations\/counts\?/.test(r.url()) && r.request().method() === "GET",
+      ),
+      page.goto("/admin/conversations?tab=toutes"),
+    ]);
     await expect(page.getByRole("tab", { name: /Toutes/ })).toBeVisible();
-    // Au chargement : exactement 2 appels (liste + counts).
+
+    // À ce stade on A VU les 2 fetchs → initialCount est stable.
     const initialCount = apiCalls.length;
     expect(initialCount).toBeGreaterThanOrEqual(2);
-    // Attente 3s sans action → aucun appel supplémentaire (pas de polling PR2b-1).
+    // Attente 3 s sans action → aucun appel supplémentaire (pas de polling PR2b-1).
     await page.waitForTimeout(3000);
     expect(apiCalls.length).toBe(initialCount);
     // Zéro erreur console.
@@ -270,16 +300,44 @@ test.describe("Liste conversations — lecture seule", () => {
   test("L10 — lien 'Conversations' actif dans la barre latérale sur la liste et sur le détail", async ({
     page,
     signInAsAdmin,
+    viewport,
   }) => {
     test.skip(!CONV_ID_ADMIN_NON_OWNER, "E2E_CONV_ID_FOR_ADMIN_NON_OWNER manquant");
+
+    // Même pattern que `layout.spec.ts` S8 : sur mobile < 768 px la
+    // sidebar est cachée (`hidden md:flex`) → le lien "Conversations"
+    // vit dans un drawer qu'il faut OUVRIR via le bouton `Ouvrir le menu`
+    // AVANT d'asserter `aria-current`. Sur desktop/tablette, la sidebar
+    // est visible dans le DOM principal.
+    const isMobile = (viewport?.width ?? 1440) < 768;
+
+    async function assertConversationsNavActive() {
+      let scope: ReturnType<typeof page.locator>;
+      if (isMobile) {
+        const trigger = page.getByRole("button", { name: "Ouvrir le menu", exact: true });
+        await expect(trigger).toBeVisible();
+        await trigger.click();
+        scope = page.getByRole("dialog");
+        await expect(scope).toBeVisible();
+      } else {
+        scope = page.getByRole("complementary", { name: /Barre latérale admin/i });
+        await expect(scope).toBeVisible();
+      }
+      const navLink = scope.getByRole("link", { name: /^Conversations$/ });
+      await expect(navLink).toHaveAttribute("aria-current", "page");
+      if (isMobile) {
+        // Referme le drawer pour ne pas laisser le dialog ouvert.
+        await page.keyboard.press("Escape");
+      }
+    }
+
     await signInAsAdmin();
     await page.goto("/admin/conversations");
-    // Le lien de la nav sidebar porte aria-current="page" quand actif.
-    const navLink = page.getByRole("link", { name: /^Conversations$/ });
-    await expect(navLink).toHaveAttribute("aria-current", "page");
+    await assertConversationsNavActive();
 
-    // Idem sur la page détail.
+    // Idem sur la page détail (même règle de pathname matching dans
+    // `admin-nav-items.tsx:82`).
     await page.goto(`/admin/conversations/${CONV_ID_ADMIN_NON_OWNER}`);
-    await expect(navLink).toHaveAttribute("aria-current", "page");
+    await assertConversationsNavActive();
   });
 });

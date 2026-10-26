@@ -16,7 +16,7 @@ import type { ColumnDef } from "@tanstack/react-table";
 import { ConversationStatusBadge } from "@/components/conversations/conversation-status-badge";
 import { Badge } from "@/components/ui/badge";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
-import { formatDateTimeParis } from "@/lib/utils/format-paris";
+import { formatDateTimeParis, formatRelativeToParis } from "@/lib/utils/format-paris";
 
 import type { ConversationListItem } from "./types";
 
@@ -30,27 +30,6 @@ export interface ConversationsTableMeta {
   commercialNameBySlackId: Map<string, string>;
   viewerSlackUserId: string | null;
   role: "admin" | "commercial";
-}
-
-function formatRelative(iso: string | null): string {
-  if (!iso) return "—";
-  const d = new Date(iso);
-  if (Number.isNaN(d.getTime())) return "—";
-  const diffMs = Date.now() - d.getTime();
-  const sec = Math.floor(diffMs / 1000);
-  if (sec < 60) return "à l'instant";
-  const min = Math.floor(sec / 60);
-  if (min < 60) return `il y a ${min} min`;
-  const h = Math.floor(min / 60);
-  if (h < 24) return `il y a ${h} h`;
-  const days = Math.floor(h / 24);
-  if (days < 7) return `il y a ${days} j`;
-  // Au-delà de 7 jours : date courte Paris (ex. "15 oct.").
-  return d.toLocaleDateString("fr-FR", {
-    day: "numeric",
-    month: "short",
-    timeZone: "Europe/Paris",
-  });
 }
 
 function authorLabel(preview: ConversationListItem["lastMessagePreview"]): string {
@@ -112,7 +91,7 @@ export const conversationColumns: ColumnDef<ConversationListItem>[] = [
       return (
         <Tooltip>
           <TooltipTrigger
-            render={<span className="text-sm tabular-nums">{formatRelative(iso)}</span>}
+            render={<span className="text-sm tabular-nums">{formatRelativeToParis(iso)}</span>}
           />
           <TooltipContent side="top">{formatDateTimeParis(new Date(iso))}</TooltipContent>
         </Tooltip>

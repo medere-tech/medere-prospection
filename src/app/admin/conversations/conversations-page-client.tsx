@@ -275,109 +275,22 @@ export function ConversationsPageClient({
           </Button>
         </div>
 
-        {/* Desktop ≥ md — table */}
+        {/* État vide et erreur rendus UNE SEULE FOIS, hors des deux
+            variantes CSS (desktop table / mobile cartes). Évite la
+            duplication qui faisait tomber Playwright en strict mode
+            (empty state présent dans les 2 conteneurs CSS-switchés
+            simultanément dans le DOM). */}
         <div
           id="conversations-panel"
           role="tabpanel"
           aria-labelledby={`tab-${activeTab}`}
-          className="hidden md:block"
+          className="contents"
         >
-          <div className="rounded-md border overflow-x-auto">
-            <Table>
-              <TableHeader>
-                {table.getHeaderGroups().map((hg) => (
-                  <TableRow key={hg.id}>
-                    {hg.headers.map((h) => (
-                      <TableHead key={h.id}>
-                        {h.isPlaceholder
-                          ? null
-                          : flexRender(h.column.columnDef.header, h.getContext())}
-                      </TableHead>
-                    ))}
-                  </TableRow>
-                ))}
-              </TableHeader>
-              <TableBody aria-live="polite" aria-busy={listState.kind === "loading"}>
-                {listState.kind === "loading" &&
-                  Array.from({ length: 5 }).map((_, idx) => (
-                    <TableRow key={`skel-${idx}`}>
-                      <TableCell colSpan={CONVERSATION_COLUMN_COUNT}>
-                        <Skeleton className="h-8 w-full" />
-                      </TableCell>
-                    </TableRow>
-                  ))}
-                {listState.kind === "error" && (
-                  <TableRow>
-                    <TableCell colSpan={CONVERSATION_COLUMN_COUNT}>
-                      <div className="flex flex-col items-center gap-2 py-8 text-sm">
-                        <span className="font-medium text-destructive">
-                          Impossible de charger les conversations ({listState.status})
-                        </span>
-                        <span className="text-muted-foreground">{listState.message}</span>
-                        <Button
-                          type="button"
-                          variant="outline"
-                          size="sm"
-                          onClick={() => setRefreshKey((k) => k + 1)}
-                        >
-                          Réessayer
-                        </Button>
-                      </div>
-                    </TableCell>
-                  </TableRow>
-                )}
-                {listState.kind === "success" && items.length === 0 && (
-                  <TableRow>
-                    <TableCell colSpan={CONVERSATION_COLUMN_COUNT}>
-                      <div className="flex flex-col items-center gap-1 py-8 text-sm text-muted-foreground">
-                        <span className="font-medium text-foreground">{emptyCopy.title}</span>
-                        <span>{emptyCopy.hint}</span>
-                      </div>
-                    </TableCell>
-                  </TableRow>
-                )}
-                {listState.kind === "success" &&
-                  items.length > 0 &&
-                  table.getRowModel().rows.map((row) => (
-                    <TableRow key={row.id} className="relative">
-                      {/* Lien NATIF Next couvrant toute la ligne — Ctrl+clic
-                          et Entrée fonctionnent sans aucun gestionnaire JS.
-                          Placé en premier (dans la 1re cellule) pour que
-                          le focus clavier atterrisse dessus en premier. */}
-                      {row.getVisibleCells().map((cell, idx) => (
-                        <TableCell key={cell.id} className={idx === 0 ? "relative" : undefined}>
-                          {idx === 0 && (
-                            <Link
-                              href={`/admin/conversations/${encodeURIComponent(row.original.conversationId)}`}
-                              className="absolute inset-0 z-10 focus-visible:ring-2 focus-visible:ring-ring"
-                              aria-label={`Ouvrir la conversation de ${row.original.contactDisplayName ?? "ce médecin"}`}
-                            >
-                              <span className="sr-only">
-                                Ouvrir la conversation de{" "}
-                                {row.original.contactDisplayName ?? "ce médecin"}
-                              </span>
-                            </Link>
-                          )}
-                          <span className="relative z-0">
-                            {flexRender(cell.column.columnDef.cell, cell.getContext())}
-                          </span>
-                        </TableCell>
-                      ))}
-                    </TableRow>
-                  ))}
-              </TableBody>
-            </Table>
-          </div>
-        </div>
-
-        {/* Mobile < md — cartes */}
-        <div className="flex flex-col gap-3 md:hidden" aria-live="polite">
-          {listState.kind === "loading" &&
-            Array.from({ length: 3 }).map((_, idx) => (
-              <Skeleton key={`skel-m-${idx}`} className="h-24 w-full rounded-lg" />
-            ))}
           {listState.kind === "error" && (
-            <div className="flex flex-col items-center gap-2 rounded-md border p-6 text-sm">
+            <div
+              role="alert"
+              className="flex flex-col items-center gap-2 rounded-md border p-6 text-sm"
+            >
               <span className="font-medium text-destructive">
                 Impossible de charger les conversations ({listState.status})
               </span>
@@ -393,26 +306,99 @@ export function ConversationsPageClient({
             </div>
           )}
           {listState.kind === "success" && items.length === 0 && (
-            <div className="flex flex-col items-center gap-1 rounded-md border p-6 text-center text-sm">
-              <span className="font-medium">{emptyCopy.title}</span>
+            <div
+              role="status"
+              aria-live="polite"
+              className="flex flex-col items-center gap-1 rounded-md border p-6 text-center text-sm"
+            >
+              <span className="font-medium text-foreground">{emptyCopy.title}</span>
               <span className="text-muted-foreground">{emptyCopy.hint}</span>
             </div>
           )}
-          {listState.kind === "success" &&
-            items.length > 0 &&
-            items.map((it) => (
-              <ConversationRowCard
-                key={it.conversationId}
-                item={it}
-                campaignName={
-                  it.campaignName ?? campaignNameById.get(it.campaignId) ?? it.campaignId
-                }
-                commercialName={
-                  it.assignedTo ? (commercialNameBySlackId.get(it.assignedTo) ?? null) : null
-                }
-                isViewerOwner={it.assignedTo !== null && it.assignedTo === viewerSlackUserId}
-              />
-            ))}
+
+          {/* Desktop ≥ md — table. Rendue UNIQUEMENT quand on a des lignes
+              ou pendant le loading (skeleton table). */}
+          {(listState.kind === "loading" || (listState.kind === "success" && items.length > 0)) && (
+            <div className="hidden md:block">
+              <div className="rounded-md border overflow-x-auto">
+                <Table>
+                  <TableHeader>
+                    {table.getHeaderGroups().map((hg) => (
+                      <TableRow key={hg.id}>
+                        {hg.headers.map((h) => (
+                          <TableHead key={h.id}>
+                            {h.isPlaceholder
+                              ? null
+                              : flexRender(h.column.columnDef.header, h.getContext())}
+                          </TableHead>
+                        ))}
+                      </TableRow>
+                    ))}
+                  </TableHeader>
+                  <TableBody aria-live="polite" aria-busy={listState.kind === "loading"}>
+                    {listState.kind === "loading" &&
+                      Array.from({ length: 5 }).map((_, idx) => (
+                        <TableRow key={`skel-${idx}`}>
+                          <TableCell colSpan={CONVERSATION_COLUMN_COUNT}>
+                            <Skeleton className="h-8 w-full" />
+                          </TableCell>
+                        </TableRow>
+                      ))}
+                    {listState.kind === "success" &&
+                      items.length > 0 &&
+                      table.getRowModel().rows.map((row) => (
+                        <TableRow key={row.id} className="relative">
+                          {row.getVisibleCells().map((cell, idx) => (
+                            <TableCell key={cell.id} className={idx === 0 ? "relative" : undefined}>
+                              {idx === 0 && (
+                                <Link
+                                  href={`/admin/conversations/${encodeURIComponent(row.original.conversationId)}`}
+                                  className="absolute inset-0 z-10 focus-visible:ring-2 focus-visible:ring-ring"
+                                  aria-label={`Ouvrir la conversation de ${row.original.contactDisplayName ?? "ce médecin"}`}
+                                >
+                                  <span className="sr-only">
+                                    Ouvrir la conversation de{" "}
+                                    {row.original.contactDisplayName ?? "ce médecin"}
+                                  </span>
+                                </Link>
+                              )}
+                              <span className="relative z-0">
+                                {flexRender(cell.column.columnDef.cell, cell.getContext())}
+                              </span>
+                            </TableCell>
+                          ))}
+                        </TableRow>
+                      ))}
+                  </TableBody>
+                </Table>
+              </div>
+            </div>
+          )}
+
+          {/* Mobile < md — cartes. Même règle que la table. */}
+          {(listState.kind === "loading" || (listState.kind === "success" && items.length > 0)) && (
+            <div className="flex flex-col gap-3 md:hidden" aria-live="polite">
+              {listState.kind === "loading" &&
+                Array.from({ length: 3 }).map((_, idx) => (
+                  <Skeleton key={`skel-m-${idx}`} className="h-24 w-full rounded-lg" />
+                ))}
+              {listState.kind === "success" &&
+                items.length > 0 &&
+                items.map((it) => (
+                  <ConversationRowCard
+                    key={it.conversationId}
+                    item={it}
+                    campaignName={
+                      it.campaignName ?? campaignNameById.get(it.campaignId) ?? it.campaignId
+                    }
+                    commercialName={
+                      it.assignedTo ? (commercialNameBySlackId.get(it.assignedTo) ?? null) : null
+                    }
+                    isViewerOwner={it.assignedTo !== null && it.assignedTo === viewerSlackUserId}
+                  />
+                ))}
+            </div>
+          )}
         </div>
 
         <div className="flex items-center justify-between gap-2">

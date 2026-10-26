@@ -42,3 +42,26 @@ export const CONVERSATION_STATUS_BADGE_VARIANT: Record<
   opted_out: "destructive",
   blocked: "destructive",
 };
+
+/**
+ * Phrases LONGUES affichées par `conversation-status-banner.tsx` (vue
+ * détail, PR1). Partagées ici pour qu'un changement de wording se
+ * propage automatiquement à toute UI qui affiche un statut (badge court
+ * + bandeau long = même source).
+ *
+ * `handed_off` est OMIS car la bannière compose dynamiquement
+ * `"Repris par {name}{dateLabel}. Léa reste muette."` — le wording
+ * s'adapte à `handoff.assignedToName`. Les 3 autres sont des phrases
+ * fixes affichées telles quelles.
+ *
+ * ⚠️ NE PAS confondre avec les textes Slack
+ * `src/lib/slack/format-inbound-on-inactive-conversation.ts:85-89` :
+ * ceux-là sont CONTEXTUELS (ex. `closed → "le contact a réécrit"`) et
+ * n'ont pas vocation à partager la même source.
+ */
+export const CONVERSATION_STATUS_BANNER_TEXTS: Record<"opted_out" | "blocked" | "closed", string> =
+  {
+    opted_out: "Contact désabonné : aucune sollicitation SMS sans nouveau consentement explicite.",
+    blocked: "Contact bloqué : ne pas recontacter par SMS.",
+    closed: "Conversation clôturée.",
+  };
