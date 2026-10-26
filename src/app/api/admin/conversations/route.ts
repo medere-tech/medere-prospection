@@ -37,6 +37,7 @@
  *   d'un sanitize à l'écriture), la route retourne 500 côté serveur
  *   plutôt que de leaker un numéro.
  */
+import type { Timestamp } from "firebase-admin/firestore";
 import { NextResponse } from "next/server";
 import { z } from "zod";
 
@@ -170,31 +171,49 @@ export async function GET(req: Request): Promise<Response> {
       ? await listConversationsByAssignee(effectiveAssignedTo, listInput)
       : await listConversations(listInput);
 
-    // Payload défensive — champs minimaux pour la liste. La route détail
-    // `/api/admin/conversations/[id]` reste la source pour la vue complète.
+    // Payload défensive — ISO strings côté serveur plutôt que
+    // Timestamps bruts (évite le piège `{_seconds,_nanoseconds}` côté
+    // client lors du JSON.stringify par défaut de firebase-admin).
+    const tsToIso = (t: Timestamp | null | undefined): string | null => {
+      if (!t) return null;
+      try {
+        return t.toDate().toISOString();
+      } catch {
+        return null;
+      }
+    };
     const items = result.conversations.map((c) => ({
       conversationId: c.conversationId,
       campaignId: c.campaignId,
       status: c.status,
       intent: c.intent,
       assignedTo: c.assignedTo ?? null,
-      lastMessageAt: c.lastMessageAt ?? null,
-      lastInboundAt: c.lastInboundAt ?? null,
-      lastOutboundAt: c.lastOutboundAt ?? null,
-      lastHumanOutboundAt: c.lastHumanOutboundAt ?? null,
+      lastMessageAtIso: tsToIso(c.lastMessageAt as Timestamp | undefined),
+      lastInboundAtIso: tsToIso(c.lastInboundAt as Timestamp | undefined),
+      lastOutboundAtIso: tsToIso(c.lastOutboundAt as Timestamp | undefined),
+      lastHumanOutboundAtIso: tsToIso(c.lastHumanOutboundAt as Timestamp | undefined),
       inboundCount: c.inboundCount,
       outboundCount: c.outboundCount,
       contactDisplayName: c.contactDisplayName ?? null,
       contactSpecialty: c.contactSpecialty ?? null,
       contactCity: c.contactCity ?? null,
       campaignName: c.campaignName ?? null,
-      lastMessagePreview: c.lastMessagePreview ?? null,
+      lastMessagePreview: c.lastMessagePreview
+        ? {
+            direction: c.lastMessagePreview.direction,
+            authorKind: c.lastMessagePreview.authorKind,
+            text: c.lastMessagePreview.text,
+            atIso: tsToIso(c.lastMessagePreview.at as Timestamp | undefined),
+          }
+        : null,
       // Signal « le médecin attend une réponse » dérivé serveur :
       //   true si un inbound existe depuis la dernière intervention humaine
       //   (ou si aucune intervention humaine et un inbound existe).
       waitingForHumanReply: Boolean(
         c.lastInboundAt &&
-        (!c.lastHumanOutboundAt || c.lastInboundAt.toMillis() > c.lastHumanOutboundAt.toMillis()),
+        (!c.lastHumanOutboundAt ||
+          (c.lastInboundAt as Timestamp).toMillis() >
+            (c.lastHumanOutboundAt as Timestamp).toMillis()),
       ),
     }));
 
@@ -215,7 +234,15 @@ export async function GET(req: Request): Promise<Response> {
 
     assertNoPhoneInPayload(payload);
 
-    return NextResponse.json(payload, { status: 200 });
+    // security-reviewer PR2b-1 M-1 — défense en profondeur : interdit à
+    // tout proxy/CDN/cache navigateur de retenir une réponse qui porte
+    // des PII pro (nom, ville, spécialité) et un identifiant commercial
+    // (slackUserId). `dynamic = "force-dynamic"` empêche le cache
+    // serveur Next, pas le cache HTTP.
+    return NextResponse.json(payload, {
+      status: 200,
+      headers: { "Cache-Control": "private, no-store, must-revalidate" },
+    });
   } catch (err) {
     if (err instanceof UnauthorizedError)
       return NextResponse.json({ error: "unauthorized" }, { status: 401 });

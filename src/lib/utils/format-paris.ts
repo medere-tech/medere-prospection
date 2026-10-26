@@ -115,6 +115,38 @@ export function formatDateTimeParis(value: unknown): string {
 }
 
 /**
+ * Formatte une date relative à `now` en français familier.
+ *
+ *   - < 1 min  → `"à l'instant"`
+ *   - < 1 h    → `"il y a N min"`
+ *   - < 24 h   → `"il y a N h"`
+ *   - < 7 j    → `"il y a N j"`
+ *   - ≥ 7 j    → date courte Paris style `"15 oct."`
+ *
+ * Utilisé par la colonne « Date » de `/admin/conversations` (PR2b-1).
+ * `now` est injectable pour les tests.
+ */
+export function formatRelativeToParis(value: unknown, now: Date = new Date()): string {
+  const d = toDateOrNull(value);
+  if (d === null) return "—";
+  const diffMs = now.getTime() - d.getTime();
+  const sec = Math.floor(diffMs / 1000);
+  if (sec < 60) return "à l'instant";
+  const min = Math.floor(sec / 60);
+  if (min < 60) return `il y a ${min} min`;
+  const h = Math.floor(min / 60);
+  if (h < 24) return `il y a ${h} h`;
+  const days = Math.floor(h / 24);
+  if (days < 7) return `il y a ${days} j`;
+  // Au-delà de 7 jours : date courte Paris (ex: "15 oct.").
+  return new Intl.DateTimeFormat("fr-FR", {
+    day: "numeric",
+    month: "short",
+    timeZone: PARIS_TZ,
+  }).format(d);
+}
+
+/**
  * Retourne la "clé jour" `YYYY-MM-DD` d'une date dans la timezone
  * Europe/Paris, utilisée pour grouper les messages par jour dans le fil.
  * Préserve la cohérence entre 2 messages à 23:50 et 00:10 heure Paris

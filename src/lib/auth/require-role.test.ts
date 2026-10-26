@@ -464,3 +464,124 @@ describe("requireRole — reproduction cas reel e2e-admin (FAIT 1)", () => {
     expect(ctx.role).toBe("admin");
   });
 });
+
+// ─────────────────────────────────────────────────────────────────────────────
+// requireRoleOrForbidden — PR2b-1 round 3
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// Prouve qu'un refus de rôle (`e2e-no-role` sur /admin/conversations) :
+//   - appelle `forbidden()` de `next/navigation` (sentinel Next 403)
+//   - NE throw PAS `ForbiddenError` au caller (c'est `forbidden()` qui
+//     throw son propre sentinel, intercepté en amont par Next)
+//   - NE journalise AUCUNE erreur applicative via `logger.error`
+//     (le `logger.warn` interne de `requireRole` reste autorisé — c'est
+//     une sentinelle de config, pas une erreur runtime).
+//
+// Mutation (voir dernier test) : si on retire le try/catch de
+// `requireRoleOrForbidden` et qu'on laisse `requireRole` throw tel
+// quel, le test "forbidden() appelé" tombe.
+
+const navMock = vi.hoisted(() => ({ forbidden: vi.fn() }));
+vi.mock("next/navigation", () => ({
+  forbidden: navMock.forbidden,
+}));
+
+describe("requireRoleOrForbidden — refus silent côté Next (PR2b-1)", () => {
+  beforeEach(() => {
+    navMock.forbidden.mockReset();
+    navMock.forbidden.mockImplementation(() => {
+      // Mimique le sentinel réel : throw un objet non-ForbiddenError
+      // que Next intercepte en amont. Pas un `throw new ForbiddenError`.
+      const sentinel = new Error("NEXT_FORBIDDEN_SENTINEL");
+      (sentinel as unknown as { digest: string }).digest = "NEXT_FORBIDDEN";
+      throw sentinel;
+    });
+  });
+
+  it("sessionClaims invalides → `forbidden()` appelé, 0 appel à logger.error", async () => {
+    const { requireRoleOrForbidden } = await import("./require-role");
+    const { logger } = await import("@/lib/utils/logger");
+    const errorSpy = vi.spyOn(logger, "error").mockImplementation(() => undefined);
+    mocks.auth.mockResolvedValue({
+      userId: "user_no_role",
+      sessionClaims: null,
+    });
+
+    await expect(requireRoleOrForbidden("commercial")).rejects.toMatchObject({
+      digest: "NEXT_FORBIDDEN",
+    });
+    expect(navMock.forbidden).toHaveBeenCalledTimes(1);
+    expect(errorSpy).not.toHaveBeenCalled();
+    errorSpy.mockRestore();
+  });
+
+  it("rôle insuffisant (commercial sur `admin`) → `forbidden()`, 0 logger.error", async () => {
+    const { requireRoleOrForbidden } = await import("./require-role");
+    const { logger } = await import("@/lib/utils/logger");
+    const errorSpy = vi.spyOn(logger, "error").mockImplementation(() => undefined);
+    mocks.auth.mockResolvedValue({
+      userId: "user_commercial",
+      sessionClaims: {
+        role: "commercial",
+        firstName: "V",
+        lastName: "R",
+        slackUserId: "UVANESSA",
+        testAccount: false,
+      },
+    });
+
+    await expect(requireRoleOrForbidden("admin")).rejects.toMatchObject({
+      digest: "NEXT_FORBIDDEN",
+    });
+    expect(navMock.forbidden).toHaveBeenCalledTimes(1);
+    expect(errorSpy).not.toHaveBeenCalled();
+    errorSpy.mockRestore();
+  });
+
+  it("session absente → `UnauthorizedError` propagée (middleware Clerk doit catcher amont)", async () => {
+    const { requireRoleOrForbidden } = await import("./require-role");
+    mocks.auth.mockResolvedValue({ userId: null, sessionClaims: null });
+
+    await expect(requireRoleOrForbidden("commercial")).rejects.toMatchObject({
+      name: "UnauthorizedError",
+    });
+    expect(navMock.forbidden).not.toHaveBeenCalled();
+  });
+
+  it("happy path (admin sur commercial) → retourne RoleContext, 0 appel forbidden()", async () => {
+    const { requireRoleOrForbidden } = await import("./require-role");
+    mocks.auth.mockResolvedValue({
+      userId: "user_admin",
+      sessionClaims: {
+        role: "admin",
+        firstName: "Déthié",
+        lastName: "Faye",
+        slackUserId: "U05UVHGBURX",
+        testAccount: false,
+      },
+    });
+    const ctx = await requireRoleOrForbidden("commercial");
+    expect(ctx.role).toBe("admin");
+    expect(ctx.userId).toBe("user_admin");
+    expect(navMock.forbidden).not.toHaveBeenCalled();
+  });
+
+  it("MUTATION : si on retire le try/catch, ForbiddenError remonte au caller (Next log applicatif)", async () => {
+    // Simule la mutation (code AVANT PR2b-1 round 3) : on appelle
+    // directement `requireRole`. L'exception `ForbiddenError` remonte
+    // AU CALLER, donc à Next qui la log comme erreur applicative
+    // (observé sur preview a86724a — `Error: requireRole: invalid
+    // sessionClaims ...` dans les logs Vercel).
+    const { requireRole } = await import("./require-role");
+    const { ForbiddenError } = await import("@/lib/utils/errors");
+    mocks.auth.mockResolvedValue({
+      userId: "user_no_role",
+      sessionClaims: null,
+    });
+    await expect(requireRole("commercial")).rejects.toBeInstanceOf(ForbiddenError);
+    // `forbidden()` n'est PAS appelé → c'est exactement le bug qu'on
+    // corrige. La preuve inverse : `requireRoleOrForbidden` ci-dessus
+    // appelle bien `forbidden()`.
+    expect(navMock.forbidden).not.toHaveBeenCalled();
+  });
+});

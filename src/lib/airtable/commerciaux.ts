@@ -263,6 +263,30 @@ export async function resolveCommercialBySlackUserId(
  * round-trip Airtable non désiré. Pattern cohérent avec les autres
  * back-doors du repo (`__setOvhClientForTests`, etc.).
  */
+/**
+ * Liste tous les commerciaux dotés d'un `slack_user_id` (format `U...`),
+ * triés par nom lisible. Partage le cache module-level 5 min — zéro
+ * round-trip supplémentaire après le premier appel.
+ *
+ * PR2b-1 : utilisé par `/admin/conversations` pour alimenter la liste
+ * déroulante « Filtrer par commercial » (admin uniquement). Les lignes
+ * `active=false` sont incluses — un admin peut vouloir filtrer sur un
+ * commercial inactif pour auditer ses conversations historiques.
+ *
+ * Propage `ExternalServiceError` / `ConfigError` — même contrat que
+ * `resolveCommercialByOwnerId` ; le caller SSR doit fallback vers
+ * `[]` + afficher le filtre vide si Airtable est down.
+ */
+export async function listCommerciauxForFilter(): Promise<Commercial[]> {
+  const map = await getCommerciauxMap();
+  const out: Commercial[] = [];
+  for (const c of map.values()) {
+    if (c.slackUserId !== "") out.push(c);
+  }
+  out.sort((a, b) => a.name.localeCompare(b.name, "fr"));
+  return out;
+}
+
 export function clearCommerciauxCache(): void {
   if (process.env.NODE_ENV !== "test") {
     throw new Error("clearCommerciauxCache called outside of tests");
