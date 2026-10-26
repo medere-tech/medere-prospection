@@ -65,6 +65,7 @@ function makeDetail(): ConversationDetailProps {
     status: "handed_off",
     intent: "INTERESSE",
     campaignId: "camp1",
+    campaignName: null,
     createdAtIso: "2026-10-19T10:00:00.000Z",
     updatedAtIso: "2026-10-19T10:05:00.000Z",
     lastInboundAtIso: "2026-10-19T10:05:00.000Z",

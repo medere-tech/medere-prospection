@@ -86,7 +86,17 @@ export function StatusFilter({ onChange }: StatusFilterProps) {
       */}
       <Select value={status ?? "ready"} onValueChange={handleChange}>
         <SelectTrigger id="status-filter" aria-label="Filtrer par statut">
-          <SelectValue placeholder="Prêt à envoyer" />
+          {/* PR2b-2 P1 — Base UI SelectValue sans render prop affiche la
+              value brute ("ready" au lieu de "Prêt à envoyer"). Le map FR
+              couvre les 7 ContactStatus ; une value hors-liste (route
+              applique le default serveur `"ready"`) tombe sur le fallback
+              défensif. */}
+          <SelectValue>
+            {(value: unknown) => {
+              const s = typeof value === "string" && isContactStatus(value) ? value : "ready";
+              return STATUS_LABEL_FR[s];
+            }}
+          </SelectValue>
         </SelectTrigger>
         <SelectContent>
           {CONTACT_STATUS_VALUES.map((s) => (

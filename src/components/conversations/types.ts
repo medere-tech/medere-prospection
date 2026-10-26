@@ -106,7 +106,13 @@ export interface ConversationDetailProps {
   contactId: string;
   status: ConversationDisplayStatus;
   intent: ConversationDisplayIntent;
+  /** docId Firestore `hubspot-list-${listId}`. Jamais affiché brut dans
+   * l'UI — toujours passé par `campaignDisplayLabel`. */
   campaignId: string;
+  /** Libellé humain pré-résolu côté serveur via la map HubSpot. `null`
+   * si la campagne a disparu de HubSpot entre le seed et l'affichage —
+   * l'UI tombera alors sur `CAMPAIGN_UNKNOWN_LABEL`. Jamais l'id brut. */
+  campaignName: string | null;
   createdAtIso: string;
   /**
    * `conv.updatedAt` en ISO 8601. Exposé côté payload RSC pour que la

@@ -69,6 +69,100 @@ export function assertNoFrenchPhone(text: string, context: string): void {
 }
 
 /**
+ * Patterns d'identifiants techniques qui ne devraient JAMAIS être visibles
+ * dans l'UI admin — PR2b-2 P1. Si l'un apparaît dans `document.body.innerText`,
+ * c'est que le trigger d'un Select / une ligne / une puce rend l'id brut
+ * au lieu du libellé humain résolu.
+ *
+ *   - `\bU[A-Z0-9]{8,}\b` : Slack userId (U… en majuscules, 9+ chars).
+ *   - `\bhubspot-list-\d+\b` : HubSpot list id canonique Médéré.
+ */
+const TECHNICAL_ID_PATTERNS: readonly RegExp[] = [
+  /\bU[A-Z0-9]{8,}\b/,
+  // security-reviewer PR2b-2 LOW : Slack Enterprise Grid IDs commencent
+  // par `W`. Médéré n'y est pas aujourd'hui mais filet trivial.
+  /\bW[A-Z0-9]{8,}\b/,
+  /\bhubspot-list-\d+\b/,
+  // security-reviewer PR2b-2 LOW : Clerk user IDs — défense si l'UI
+  // commence à exposer un compte Clerk directement.
+  /\buser_[A-Za-z0-9]{20,}\b/,
+];
+
+/**
+ * Pattern snake_case style `AuditAction` (`backfill_conversation_list_fields`,
+ * `handoff_unassigned`, …). SÉPARÉ de `TECHNICAL_ID_PATTERNS` car il peut
+ * matcher du contenu légitime écrit par un médecin dans un SMS entrant
+ * (ex. `jean_dupont@…`). On l'applique UNIQUEMENT sur l'UI hors fil des
+ * messages (hors `role="log"`) via `assertNoAuditActionCode`.
+ */
+const AUDIT_ACTION_CODE_PATTERN = /\b[a-z]{3,}(?:_[a-z]+){1,}\b/;
+
+export function assertNoTechnicalId(text: string, context: string): void {
+  for (const re of TECHNICAL_ID_PATTERNS) {
+    pwExpect(
+      text,
+      `Identifiant technique visible (${re}) dans : ${context}. Vérifier le trigger du Select ou le fallback de rendu.`,
+    ).not.toMatch(re);
+  }
+}
+
+/**
+ * Scope restreint : à appeler sur `innerText` d'un extrait du DOM qui
+ * EXCLUT le fil des messages (`role="log"`). Pour obtenir cet extrait,
+ * utiliser `innerTextWithoutMessageThread(page)` ci-dessous.
+ */
+export function assertNoAuditActionCode(text: string, context: string): void {
+  pwExpect(
+    text,
+    `Code snake_case brut visible dans : ${context}. Vérifier le libellé d'audit (sanitize.ts).`,
+  ).not.toMatch(AUDIT_ACTION_CODE_PATTERN);
+}
+
+/**
+ * Retourne le texte VISIBLE à l'écran, AVEC le fil des messages retiré.
+ *
+ * ⚠️ R3-P2 fix (régression) : on ne clone PAS le DOM. Un clone détaché
+ * n'a pas de layout → `innerText` s'y comporte comme `textContent` et
+ * expose `<script>`, `<style>`, et les éléments cachés. La sentinelle
+ * `assertNoAuditActionCode` matchait alors du JS compilé Next.js et des
+ * clés i18n Clerk (ex. `form_password_validation_failed`), déclenchant
+ * un faux positif sur les 3 tailles.
+ *
+ * La logique miroir pure (tests jsdom) vit dans
+ * `tests/e2e/_helpers/visible-text.ts`. Toute évolution ici doit être
+ * répliquée là-bas pour que le filet soit vérifiable sans Playwright.
+ */
+export async function innerTextWithoutMessageThread(page: Page): Promise<string> {
+  return page.evaluate(() => {
+    const HIDDEN_TAGS = new Set(["SCRIPT", "STYLE", "NOSCRIPT", "TEMPLATE"]);
+    const parts: string[] = [];
+    const walk = (el: Element): void => {
+      if (HIDDEN_TAGS.has(el.tagName)) return;
+      if (el.matches('[role="log"]')) return;
+      // `checkVisibility()` renvoie `true` quand l'élément a un box
+      // model et n'est pas masqué (`display:none`, `visibility:hidden`,
+      // ancêtre caché, etc.). Fallback générique pour les anciennes
+      // versions Chromium : accepter l'élément.
+      const isVisible =
+        typeof (el as Element & { checkVisibility?: () => boolean }).checkVisibility === "function"
+          ? (el as Element & { checkVisibility: () => boolean }).checkVisibility()
+          : true;
+      if (!isVisible) return;
+      for (const node of Array.from(el.childNodes)) {
+        if (node.nodeType === 3) {
+          const text = (node.nodeValue ?? "").replace(/\s+/g, " ");
+          if (text.trim().length > 0) parts.push(text);
+        } else if (node.nodeType === 1) {
+          walk(node as Element);
+        }
+      }
+    };
+    walk(document.body);
+    return parts.join(" ").replace(/\s+/g, " ").trim();
+  });
+}
+
+/**
  * Installe un listener réseau sur `/api/admin/conversations/*` qui
  * échoue immédiatement si une réponse contient un numéro FR. C'est le
  * vrai filet de sécurité anti-régression côté backend.

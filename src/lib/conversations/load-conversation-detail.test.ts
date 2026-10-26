@@ -5,9 +5,26 @@
  * slackUserId était faussement marqué owner, cachant la bannière
  * « Mode admin » sur une conv qu'il ne suit pas.
  */
-import { describe, expect, it } from "vitest";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 
-import { computeViewerIsOwner } from "./load-conversation-detail";
+vi.mock("@/lib/campaigns/campaigns-cache", () => ({
+  getCachedSmsCampaigns: vi.fn(),
+  campaignNameByListIdFrom: (list: Array<{ listId: string; name: string }>) => {
+    const m = new Map<string, string>();
+    for (const c of list) m.set(c.listId, c.name);
+    return m;
+  },
+}));
+
+vi.mock("@/lib/utils/logger", () => ({
+  logger: { debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn() },
+}));
+
+import { getCachedSmsCampaigns } from "@/lib/campaigns/campaigns-cache";
+
+import { computeViewerIsOwner, resolveCampaignNameServerSide } from "./load-conversation-detail";
+
+const mockGetCachedSmsCampaigns = vi.mocked(getCachedSmsCampaigns);
 
 describe("computeViewerIsOwner — fix S5", () => {
   it("admin SANS slackUserId sur conv assignée → false (jamais owner)", () => {
@@ -82,5 +99,71 @@ describe("computeViewerIsOwner — règle stricte (deux chaînes non vides et é
   });
   it('("U123", "") → false (assigné vide)', () => {
     expect(computeViewerIsOwner("U123", "")).toBe(false);
+  });
+});
+
+/**
+ * Tests `resolveCampaignNameServerSide` — PR2b-2 round 3 R3-P1.
+ *
+ * Verrouille la cascade :
+ *   1) copie dénormalisée Firestore → identité,
+ *   2) sinon cache HubSpot → nom résolu,
+ *   3) sinon null (jamais l'id brut).
+ *
+ * Mutation testing : retirer la branche cache HubSpot ferait tomber le
+ * cas "campaignName absent mais présent côté HubSpot → nom résolu". Le
+ * défaut production R3 est exactement ce cas (A sans campaignName
+ * dénormalisé mais hubspot-list-6081 dans HubSpot).
+ */
+describe("resolveCampaignNameServerSide (R3-P1)", () => {
+  const CAMPAIGNS = [
+    {
+      listId: "6081",
+      name: "SMS Dentistes IDF",
+      size: 10,
+      processingType: "MANUAL",
+      createdAt: "2026-05-29T12:00:00.000Z",
+    },
+  ];
+
+  beforeEach(() => {
+    mockGetCachedSmsCampaigns.mockReset();
+  });
+
+  it("campaignName dénormalisé présent → identité (évite round-trip HubSpot)", async () => {
+    const name = await resolveCampaignNameServerSide("hubspot-list-6081", "Nom cache figé");
+    expect(name).toBe("Nom cache figé");
+    expect(mockGetCachedSmsCampaigns).not.toHaveBeenCalled();
+  });
+
+  it("campaignName dénormalisé vide → trim+fallback cache HubSpot", async () => {
+    mockGetCachedSmsCampaigns.mockResolvedValue(CAMPAIGNS);
+    const name = await resolveCampaignNameServerSide("hubspot-list-6081", "   ");
+    expect(name).toBe("SMS Dentistes IDF");
+  });
+
+  it("REGRESSION R3-P1 — campaignName undefined (cas A réel) + id dans HubSpot → vrai nom résolu", async () => {
+    mockGetCachedSmsCampaigns.mockResolvedValue(CAMPAIGNS);
+    const name = await resolveCampaignNameServerSide("hubspot-list-6081", undefined);
+    expect(name).toBe("SMS Dentistes IDF");
+    expect(name).not.toMatch(/hubspot-list-/);
+  });
+
+  it("campaignName absent + id absent de HubSpot → null (jamais l'id brut)", async () => {
+    mockGetCachedSmsCampaigns.mockResolvedValue(CAMPAIGNS);
+    const name = await resolveCampaignNameServerSide("hubspot-list-999999", undefined);
+    expect(name).toBeNull();
+  });
+
+  it("HubSpot down (cache throw) → null, pas d'exception propagée (dégradation gracieuse)", async () => {
+    mockGetCachedSmsCampaigns.mockRejectedValue(new Error("HubSpot 503"));
+    const name = await resolveCampaignNameServerSide("hubspot-list-6081", undefined);
+    expect(name).toBeNull();
+  });
+
+  it("campaignId au format court '6081' est aussi reconnu via le helper central", async () => {
+    mockGetCachedSmsCampaigns.mockResolvedValue(CAMPAIGNS);
+    const name = await resolveCampaignNameServerSide("6081", undefined);
+    expect(name).toBe("SMS Dentistes IDF");
   });
 });

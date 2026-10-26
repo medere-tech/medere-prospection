@@ -197,6 +197,7 @@ describe("Sentinelle PR1 — zero PII dans la payload RSC", () => {
       status: sanitizeConversationStatus(conv),
       intent: sanitizeConversationIntent(conv),
       campaignId: conv.campaignId,
+      campaignName: conv.campaignName ?? null,
       createdAtIso: conv.createdAt.toDate().toISOString(),
       updatedAtIso: conv.updatedAt.toDate().toISOString(),
       lastInboundAtIso: conv.lastInboundAt?.toDate().toISOString() ?? null,

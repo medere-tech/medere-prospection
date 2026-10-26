@@ -13,6 +13,7 @@
  */
 import { Clock, FileText, Hash, Inbox, Mail, UserCheck } from "lucide-react";
 
+import { campaignDisplayLabel } from "@/lib/campaigns/campaign-id";
 import { formatDateTimeParis } from "@/lib/utils/format-paris";
 
 import type { ConversationDetailProps, JournalEntryProps } from "./types";
@@ -39,7 +40,12 @@ export function ConversationSidePanel({ data }: Props) {
           <MetaRow
             icon={<Hash className="h-3.5 w-3.5" />}
             label="Campagne"
-            value={data.campaignId}
+            // PR2b-2 round 3 — JAMAIS `data.campaignId` brut (`hubspot-list-6081`
+            // était affiché avant). On privilégie la copie dénormalisée
+            // `campaignName`. Si absente, `campaignDisplayLabel` tombe sur
+            // "Campagne inconnue" (map vide côté détail, pas de refetch
+            // HubSpot pour éviter un round-trip SSR).
+            value={campaignDisplayLabel(data.campaignId, data.campaignName, new Map())}
           />
           <MetaRow
             icon={<Clock className="h-3.5 w-3.5" />}

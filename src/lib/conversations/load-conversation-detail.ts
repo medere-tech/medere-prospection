@@ -51,6 +51,8 @@ import type {
   MessageProps,
 } from "@/components/conversations/types";
 import { resolveCommercialBySlackUserId } from "@/lib/airtable/commerciaux";
+import { resolveCampaignName } from "@/lib/campaigns/campaign-id";
+import { campaignNameByListIdFrom, getCachedSmsCampaigns } from "@/lib/campaigns/campaigns-cache";
 import { listAuditLogByTarget } from "@/lib/firestore/audit-log";
 import { getContact } from "@/lib/firestore/contacts";
 import { getConversation } from "@/lib/firestore/conversations";
@@ -107,6 +109,37 @@ export function computeViewerIsOwner(
   if (!isNonEmptyString(viewerSlackUserId)) return false;
   if (!isNonEmptyString(assignedToSlack)) return false;
   return viewerSlackUserId === assignedToSlack;
+}
+
+/**
+ * PR2b-2 round 3 R3-P1 — résout le nom lisible de la campagne côté
+ * serveur. Priorité à la copie dénormalisée Firestore ; sinon on consulte
+ * le cache mémoire 5 min des listes HubSpot (même source que la page
+ * liste). En cas d'échec HubSpot : retourne `null` → l'UI dégradée
+ * affichera "Campagne inconnue", jamais l'id brut.
+ *
+ * Pur / safe à appeler : ne throw pas (catch interne), ne log pas de PII.
+ */
+export async function resolveCampaignNameServerSide(
+  campaignId: string,
+  denormalizedName: string | undefined,
+): Promise<string | null> {
+  if (typeof denormalizedName === "string" && denormalizedName.trim().length > 0) {
+    return denormalizedName;
+  }
+  try {
+    const campaigns = await getCachedSmsCampaigns();
+    const map = campaignNameByListIdFrom(campaigns);
+    return resolveCampaignName(campaignId, map);
+  } catch (err) {
+    // Dégradation gracieuse : si HubSpot est down, le détail reste
+    // affichable et l'UI tombera sur "Campagne inconnue".
+    logger.warn(
+      { campaignId, errName: err instanceof Error ? err.name : "unknown" },
+      "[load-conversation-detail] HubSpot campaign cache miss — fallback null",
+    );
+    return null;
+  }
 }
 
 /**
@@ -182,6 +215,15 @@ export async function loadConversationDetail(
       status: sanitizeConversationStatus(conv),
       intent: sanitizeConversationIntent(conv),
       campaignId: conv.campaignId,
+      // PR2b-2 round 3 R3-P1 — résolution côté serveur avec cascade :
+      //   1) `conv.campaignName` dénormalisé Firestore (quand backfill PR2a
+      //      l'a posé — pas garanti ; conversation A par exemple ne l'a pas).
+      //   2) Sinon : map HubSpot en cache 5 min (`getCachedSmsCampaigns`),
+      //      même source que la page liste → cohérence des libellés.
+      //   3) Sinon : `null` → l'UI tombe sur "Campagne inconnue" (plutôt
+      //      que l'id brut `hubspot-list-6081` qui apparaissait avant).
+      // HubSpot down → catch silencieux, dégradation gracieuse à null.
+      campaignName: await resolveCampaignNameServerSide(conv.campaignId, conv.campaignName),
       createdAtIso: conv.createdAt.toDate().toISOString(),
       // Expose `updatedAtIso` dans la payload RSC — permet au client
       // de calculer une signature SSR strictement identique à celle du

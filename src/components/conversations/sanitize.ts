@@ -15,7 +15,7 @@
 import type { Timestamp } from "firebase-admin/firestore";
 
 import { formatDateTimeParis } from "@/lib/utils/format-paris";
-import type { AuditLog } from "@/types/audit-log";
+import type { AuditAction, AuditLog } from "@/types/audit-log";
 import type { Contact } from "@/types/contact";
 import type { Conversation } from "@/types/conversation";
 import type { Message } from "@/types/message";
@@ -135,84 +135,86 @@ export function sanitizeHandoffForPanel(
 }
 
 /**
- * Transforme une entrée `AuditLog` en libellé lisible français pour le
- * journal du panneau. Zéro PII en sortie — le `payload` audit est déjà
- * scrubber-safe par construction (`detectPiiInPayload` runtime).
+ * Table COMPLÈTE des libellés FR du journal — PR2b-2 round 3.
+ *
+ *   - Type `Record<AuditAction, …>` : TS exige qu'une entrée existe pour
+ *     CHAQUE action du type (compile-time). L'ajout d'une nouvelle
+ *     `AuditAction` sans libellé ici fait échouer le build.
+ *   - Zéro PII en sortie — le `payload` audit est déjà scrubber-safe par
+ *     construction (`detectPiiInPayload` runtime).
+ *   - Un test sentinelle (`sanitize.test.ts`) interdit tout libellé qui
+ *     ressemble à du snake_case (regex) → une future action ne pourra
+ *     plus "fuiter" sous forme de code brut dans l'UI.
  */
+const ACTION_LABELS: Record<AuditAction, { label: string; kind: JournalEntryProps["kind"] }> = {
+  // SMS OUTBOUND
+  sms_sent: { label: "SMS envoyé", kind: "sms" },
+  sms_failed: { label: "Échec d'envoi SMS", kind: "sms" },
+  sms_provider_dispatched: { label: "SMS pris en charge par OVH", kind: "sms" },
+  send_blocked: { label: "Envoi bloqué (compliance)", kind: "other" },
+  // SMS INBOUND (S9.1 process-reply)
+  sms_received: { label: "SMS reçu du contact", kind: "sms" },
+  intent_classified: { label: "Intention classifiée", kind: "intent" },
+  reply_generated: { label: "Réponse IA générée", kind: "sms" },
+  reply_processed: { label: "Réponse traitée", kind: "sms" },
+  reply_dropped: { label: "SMS entrant écarté (doublon)", kind: "other" },
+  reply_draft_dropped: { label: "Brouillon de réponse écarté", kind: "sms" },
+  long_form_opt_out_candidate: { label: "Signal d'opt-out long format", kind: "opt_out" },
+  // CONVERSATION lifecycle
+  opt_out: { label: "Opt-out du contact (STOP)", kind: "opt_out" },
+  handoff: { label: "Hand-off vers un commercial", kind: "handoff" },
+  handoff_accepted: { label: "Hand-off accepté", kind: "handoff" },
+  handoff_unassigned: { label: "Hand-off orphelin (sans titulaire)", kind: "handoff" },
+  inbound_relayed_to_human: { label: "SMS entrant relayé au commercial", kind: "handoff" },
+  inbound_on_inactive_conversation: {
+    label: "SMS entrant sur conversation inactive",
+    kind: "other",
+  },
+  contact_phone_accessed: { label: "Numéro consulté", kind: "override" },
+  // CAMPAIGN / ADMIN
+  manual_override: { label: "Intervention manuelle (admin)", kind: "override" },
+  prompt_changed: { label: "Prompt IA modifié", kind: "other" },
+  campaign_started: { label: "Campagne démarrée", kind: "other" },
+  campaign_paused: { label: "Campagne en pause", kind: "other" },
+  campaign_completed: { label: "Campagne terminée", kind: "other" },
+  sms_send_initiated_by_admin: { label: "SMS déclenché par un admin", kind: "sms" },
+  // DATA
+  bloctel_imported: { label: "Bloctel importé", kind: "other" },
+  contact_deleted: { label: "Contact supprimé", kind: "other" },
+  contact_anonymized: { label: "Contact anonymisé", kind: "other" },
+  contact_imported_from_hubspot: { label: "Contact importé depuis HubSpot", kind: "other" },
+  contact_created: { label: "Contact créé", kind: "other" },
+  contact_import_skipped: { label: "Import contact ignoré", kind: "other" },
+  // AUTH
+  login: { label: "Connexion", kind: "other" },
+  role_changed: { label: "Rôle modifié", kind: "other" },
+  // TRANSVERSE
+  compliance_check: { label: "Contrôle compliance", kind: "other" },
+  status_changed: { label: "Changement de statut", kind: "other" },
+  // PR2a — dénormalisation liste `/admin/conversations`
+  conversation_denorm_propagated: {
+    label: "Résumé de conversation mis à jour",
+    kind: "other",
+  },
+  backfill_conversation_list_fields: {
+    label: "Rattrapage des champs de liste (admin)",
+    kind: "other",
+  },
+};
+
 function labelForAction(action: string): { label: string; kind: JournalEntryProps["kind"] } {
-  switch (action) {
-    case "handoff":
-      return { label: "Hand-off vers un commercial", kind: "handoff" };
-    case "handoff_accepted":
-      return { label: "Hand-off accepté", kind: "handoff" };
-    case "handoff_unassigned":
-      return { label: "Hand-off orphelin (sans titulaire)", kind: "handoff" };
-    case "inbound_relayed_to_human":
-      return { label: "SMS entrant relayé au commercial", kind: "handoff" };
-    case "inbound_on_inactive_conversation":
-      return { label: "SMS entrant sur conversation inactive", kind: "other" };
-    case "opt_out":
-      return { label: "Opt-out du contact (STOP)", kind: "opt_out" };
-    case "intent_classified":
-      return { label: "Intention classifiée", kind: "intent" };
-    case "reply_generated":
-      return { label: "Réponse IA générée", kind: "sms" };
-    case "reply_processed":
-      return { label: "Réponse traitée", kind: "sms" };
-    case "reply_dropped":
-      return { label: "SMS entrant écarté (doublon)", kind: "other" };
-    case "reply_draft_dropped":
-      return { label: "Brouillon de réponse écarté", kind: "sms" };
-    case "sms_sent":
-      return { label: "SMS envoyé", kind: "sms" };
-    case "sms_failed":
-      return { label: "Échec d'envoi SMS", kind: "sms" };
-    case "sms_provider_dispatched":
-      return { label: "SMS pris en charge par OVH", kind: "sms" };
-    case "sms_received":
-      return { label: "SMS reçu du contact", kind: "sms" };
-    case "sms_send_initiated_by_admin":
-      return { label: "SMS déclenché par un admin", kind: "sms" };
-    case "send_blocked":
-      return { label: "Envoi bloqué (compliance)", kind: "other" };
-    case "compliance_check":
-      return { label: "Contrôle compliance", kind: "other" };
-    case "contact_phone_accessed":
-      return { label: "Numéro consulté", kind: "override" };
-    case "contact_imported_from_hubspot":
-      return { label: "Contact importé depuis HubSpot", kind: "other" };
-    case "contact_created":
-      return { label: "Contact créé", kind: "other" };
-    case "contact_import_skipped":
-      return { label: "Import contact ignoré", kind: "other" };
-    case "contact_deleted":
-      return { label: "Contact supprimé", kind: "other" };
-    case "contact_anonymized":
-      return { label: "Contact anonymisé", kind: "other" };
-    case "manual_override":
-      return { label: "Intervention manuelle (admin)", kind: "override" };
-    case "status_changed":
-      return { label: "Changement de statut", kind: "other" };
-    case "prompt_changed":
-      return { label: "Prompt IA modifié", kind: "other" };
-    case "campaign_started":
-      return { label: "Campagne démarrée", kind: "other" };
-    case "campaign_paused":
-      return { label: "Campagne en pause", kind: "other" };
-    case "campaign_completed":
-      return { label: "Campagne terminée", kind: "other" };
-    case "long_form_opt_out_candidate":
-      return { label: "Signal d'opt-out long format", kind: "opt_out" };
-    case "bloctel_imported":
-      return { label: "Bloctel importé", kind: "other" };
-    case "login":
-      return { label: "Connexion", kind: "other" };
-    case "role_changed":
-      return { label: "Rôle modifié", kind: "other" };
-    default:
-      return { label: action, kind: "other" };
+  if (Object.prototype.hasOwnProperty.call(ACTION_LABELS, action) as boolean) {
+    return ACTION_LABELS[action as AuditAction];
   }
+  // Action inconnue au type TS (devrait être impossible — la whitelist Zod
+  // `ACTIONS` de `audit-log.ts` + le type `AuditAction` sont en égalité
+  // ensembliste via sentinelle anti-drift). Pas de leak de code brut.
+  return { label: "Action enregistrée", kind: "other" };
 }
+
+/** Exposé pour tests — permet au sentinelle de parcourir toutes les ACTIONS. */
+export const __labelForAction_FOR_TESTS = labelForAction;
+export const __ACTION_LABELS_FOR_TESTS = ACTION_LABELS;
 
 /**
  * Sanitize une liste d'entrées `audit_log` en entrées de journal (shape

@@ -1,23 +1,29 @@
 // @vitest-environment jsdom
 
 /**
- * Tests `<CampaignSelect />` (S10.1.5 Phase 6).
+ * Tests `<CampaignSelect />` (S10.1.5 Phase 6 + PR2b-2 P1).
  *
  * Couvre :
  *   - render avec campagnes → options visibles
  *   - helpers purs toCampaignId / fromCampaignId (round-trip + edge cases)
  *   - état vide (0 campagne) → message "Aucune campagne disponible"
+ *   - PR2b-2 P1 : trigger affiche TOUJOURS le nom de campagne, jamais
+ *     `hubspot-list-6081` ou `6081` brut ; cas "campagne inconnue" →
+ *     libellé explicite + bouton "Retirer le filtre campagne".
  */
 import "@testing-library/jest-dom/vitest";
 
 import { render, screen } from "@testing-library/react";
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-// Mock nuqs : useQueryState retourne [value, setter] standard.
-const setCampaignIdMock = vi.fn();
-vi.mock("nuqs", () => ({
-  useQueryState: vi.fn(() => [null, setCampaignIdMock]),
+// Mock nuqs : hoisted pour pouvoir muter via mockImplementation.
+const nuqsMock = vi.hoisted(() => ({
+  useQueryState: vi.fn(() => [null, vi.fn()] as [string | null, (v: string | null) => void]),
 }));
+vi.mock("nuqs", () => ({
+  useQueryState: nuqsMock.useQueryState,
+}));
+const setCampaignIdMock = vi.fn();
 
 import type { HubspotListInfo } from "@/lib/hubspot/lists";
 
@@ -48,6 +54,11 @@ const CAMPAIGNS: HubspotListInfo[] = [
 describe("CampaignSelect (S10.1.5 Phase 6)", () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    nuqsMock.useQueryState.mockImplementation(() => [null, setCampaignIdMock]);
+  });
+  afterEach(() => {
+    nuqsMock.useQueryState.mockReset();
+    nuqsMock.useQueryState.mockImplementation(() => [null, setCampaignIdMock]);
   });
 
   it("affiche le label 'Campagne HubSpot' et le placeholder par défaut (rien sélectionné)", () => {
@@ -91,6 +102,45 @@ describe("CampaignSelect (S10.1.5 Phase 6)", () => {
       for (const id of listIds) {
         expect(__fromCampaignId_FOR_TESTS(__toCampaignId_FOR_TESTS(id))).toBe(id);
       }
+    });
+  });
+
+  describe("Libellés affichés par le trigger (PR2b-2 P1)", () => {
+    it("état par défaut (URL vide) → 'Toutes les campagnes'", () => {
+      nuqsMock.useQueryState.mockImplementation(() => [null, vi.fn()]);
+      render(<CampaignSelect campaigns={CAMPAIGNS} />);
+      expect(screen.getByLabelText("Sélectionner une campagne")).toHaveTextContent(
+        "Toutes les campagnes",
+      );
+    });
+
+    it("ouvert avec ?campaignId=hubspot-list-200 → trigger affiche 'SMS Dentistes IDF', PAS l'id", () => {
+      nuqsMock.useQueryState.mockImplementation(() => ["hubspot-list-200", vi.fn()]);
+      render(<CampaignSelect campaigns={CAMPAIGNS} />);
+      const trigger = screen.getByLabelText("Sélectionner une campagne");
+      expect(trigger).toHaveTextContent("SMS Dentistes IDF");
+      expect(trigger).not.toHaveTextContent(/hubspot-list-200/);
+      expect(trigger).not.toHaveTextContent(/^\s*200\s*$/);
+    });
+
+    it("ouvert avec ?campaignId=hubspot-list-999999 (inconnu) → 'Campagne inconnue' + bouton 'Retirer le filtre campagne'", () => {
+      nuqsMock.useQueryState.mockImplementation(() => ["hubspot-list-999999", vi.fn()]);
+      render(<CampaignSelect campaigns={CAMPAIGNS} />);
+      expect(screen.getByLabelText("Sélectionner une campagne")).toHaveTextContent(
+        "Campagne inconnue",
+      );
+      expect(
+        screen.getByRole("button", { name: "Retirer le filtre campagne" }),
+      ).toBeInTheDocument();
+      expect(document.body.textContent ?? "").not.toMatch(/hubspot-list-999999/);
+    });
+
+    it("clic 'Retirer le filtre campagne' → setter appelé avec null", () => {
+      const setter = vi.fn();
+      nuqsMock.useQueryState.mockImplementation(() => ["hubspot-list-999999", setter]);
+      render(<CampaignSelect campaigns={CAMPAIGNS} />);
+      screen.getByRole("button", { name: "Retirer le filtre campagne" }).click();
+      expect(setter).toHaveBeenCalledWith(null);
     });
   });
 
