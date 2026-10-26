@@ -18,10 +18,12 @@
  * champs dénormalisés sur la base de prod.
  */
 import {
+  assertNoAuditActionCode,
   assertNoFrenchPhone,
   assertNoTechnicalId,
   CONV_ID_ADMIN_NON_OWNER,
   expect,
+  innerTextWithoutMessageThread,
   installApiPhoneSentinel,
   test,
 } from "./fixtures";
@@ -322,18 +324,35 @@ test.describe("Liste conversations — lecture seule", () => {
   // PR2b-2 — L11 à L17
   // ────────────────────────────────────────────────────────────────────
 
-  // L11 — filtre commercial : trigger affiche "Déthié Faye", pas U05UVHGBURX
-  test("L11 admin — filtre commercial affiche le NOM, pas le slackUserId", async ({
+  // L11 — filtre commercial : trigger affiche le vrai NOM du commercial
+  //       (lu depuis `/api/admin/commerciaux`), jamais le slackUserId.
+  //       Aucune valeur inventée dans ce test.
+  test("L11 admin — filtre commercial affiche le VRAI nom (lu depuis l'API), pas le slackUserId", async ({
     page,
     signInAsAdmin,
   }) => {
     await signInAsAdmin();
-    // Ouverture directe avec le filtre déjà sérialisé dans l'URL — c'est
-    // le vrai cas production (lien partagé, retour nav).
+
+    // Lire le vrai nom du titulaire U05UVHGBURX via l'API admin
+    // (lecture seule) — même pattern que L12 pour la campagne.
+    const commerciauxRes = await page.request.get("/api/admin/commerciaux");
+    expect(commerciauxRes.ok()).toBe(true);
+    const body = (await commerciauxRes.json()) as {
+      commerciaux: Array<{ slackUserId: string; name: string }>;
+    };
+    const titulaire = body.commerciaux.find((c) => c.slackUserId === "U05UVHGBURX");
+    expect(titulaire, "commercial U05UVHGBURX absent de /api/admin/commerciaux").toBeTruthy();
+    const expectedName = titulaire!.name;
+    expect(expectedName.length).toBeGreaterThan(0);
+    // Le nom retourné ne doit pas être un identifiant brut par sécurité.
+    expect(expectedName).not.toMatch(/^U[A-Z0-9]+$/);
+
+    // Ouverture directe avec le filtre déjà sérialisé dans l'URL — vrai
+    // cas prod (lien partagé, retour nav).
     await page.goto("/admin/conversations?tab=toutes&assignedTo=U05UVHGBURX");
     const trigger = page.getByLabel("Filtrer par commercial");
     await expect(trigger).toBeVisible();
-    await expect(trigger).toContainText("Déthié Faye");
+    await expect(trigger).toContainText(expectedName);
     await expect(trigger).not.toContainText("U05UVHGBURX");
   });
 
@@ -389,6 +408,18 @@ test.describe("Liste conversations — lecture seule", () => {
     await expect(contactTrigger).toBeVisible();
     await expect(contactTrigger).toContainText(expectedName);
     await expect(contactTrigger).not.toContainText(/hubspot-list-\d+/);
+
+    // 4) PAGE DÉTAIL (R3-P1) : panneau "Détails" affiche le vrai nom
+    //    de campagne même quand `conv.campaignName` dénormalisé est
+    //    absent (cas réel pour A). Résolution via cache HubSpot côté
+    //    serveur dans `load-conversation-detail`.
+    await page.goto(`/admin/conversations/${CONV_ID_ADMIN_NON_OWNER}`);
+    await expect(page.getByRole("heading", { level: 1 })).toBeVisible();
+    const sidePanel = page.getByRole("complementary", { name: /Détails de la conversation/i });
+    await expect(sidePanel).toBeVisible();
+    await expect(sidePanel).toContainText(expectedName);
+    await expect(sidePanel).not.toContainText(/hubspot-list-\d+/);
+    await expect(sidePanel).not.toContainText("Campagne inconnue");
   });
 
   // L13 — identifiant commercial inconnu dans l'URL
@@ -440,21 +471,31 @@ test.describe("Liste conversations — lecture seule", () => {
       ]);
       const body = await page.locator("body").innerText();
       assertNoTechnicalId(body, `L14 /admin/conversations?tab=${tab}`);
-      // Zéro "Campagne inconnue" partout : A existe en HubSpot, la map
-      // SSR est présente, donc l'ancienne régression (fallback →
-      // id brut puis → "Campagne inconnue") doit être impossible.
+      // Snake_case audit code (pas de fil messages sur la liste → body
+      // suffit, mais on garde la même mécanique pour cohérence).
+      assertNoAuditActionCode(
+        await innerTextWithoutMessageThread(page),
+        `L14 snake /admin/conversations?tab=${tab}`,
+      );
       expect(body).not.toContain("Campagne inconnue");
       if (tab === "toutes" || tab === "cloturees") {
         expect(body).toContain(campaignName!);
       }
     }
-    // Détail de A.
+    // Détail de A — fil des messages EXCLU pour le snake_case
+    // (un SMS entrant médecin peut contenir `jean_dupont@…`).
     await page.goto(`/admin/conversations/${CONV_ID_ADMIN_NON_OWNER}`);
     await expect(page.getByRole("heading", { level: 1 })).toBeVisible();
     assertNoTechnicalId(await page.locator("body").innerText(), "L14 détail A");
+    assertNoAuditActionCode(
+      await innerTextWithoutMessageThread(page),
+      "L14 snake détail A (hors fil messages)",
+    );
     // Page contacts.
     await page.goto("/admin/contacts");
-    assertNoTechnicalId(await page.locator("body").innerText(), "L14 /admin/contacts");
+    const contactsBody = await page.locator("body").innerText();
+    assertNoTechnicalId(contactsBody, "L14 /admin/contacts");
+    assertNoAuditActionCode(await innerTextWithoutMessageThread(page), "L14 snake /admin/contacts");
   });
 
   // L15 — recherche "dethie" + "DÉTHIÉ" + "zzz" + aucune requête par frappe
@@ -563,13 +604,24 @@ test.describe("Liste conversations — lecture seule", () => {
     await expect(banner).toBeHidden();
   });
 
-  // L17 — cadence : page ouverte 125s visible → ≤ 3 appels /version ;
-  //       hidden → 0 appel supplémentaire.
-  test("L17 cadence /version — ≤ 3 appels sur 125 s visible, 0 pendant hidden", async ({
+  // L17 — cadence : page ouverte 125 s visible → ≤ 3 appels /version ;
+  //       puis caché pendant > 1 intervalle → 0 appel supplémentaire.
+  //
+  // Budget de temps calculé :
+  //   signin Clerk       ~15 s (OTP + redirect)
+  //   initial load       ~5 s (SSR + hydratation + 2 fetchs réseau)
+  //   visibility window  125 s (brief : couvre 1 initial + 2 polls à 60 s)
+  //   hidden window      70 s (brief : "simplement dépasser un intervalle
+  //                      de 60 s" ; +10 s de marge pour que le prochain
+  //                      poll aurait eu lieu s'il n'était pas suspendu)
+  //   assertions + close ~5 s
+  //   -------------------------
+  //   total conservatif  ~220 s → test.setTimeout(240_000) pour marge x1.1
+  test("L17 cadence /version — ≤ 3 appels sur 125 s visible, 0 après > 60 s hidden", async ({
     page,
     signInAsAdmin,
   }) => {
-    test.setTimeout(180_000);
+    test.setTimeout(240_000);
     let versionCalls = 0;
     await page.route("**/api/admin/conversations/version*", async (route) => {
       versionCalls += 1;
@@ -582,13 +634,12 @@ test.describe("Liste conversations — lecture seule", () => {
     await signInAsAdmin();
     await page.goto("/admin/conversations?tab=toutes");
     await page.waitForFunction(() => true);
-    // Attend 125 s visibles.
+    // Visible : 125 s couvre 1 appel initial + 2 polls à 60 s = 3 au max.
     await page.waitForTimeout(125_000);
     expect(versionCalls).toBeLessThanOrEqual(3);
     expect(versionCalls).toBeGreaterThanOrEqual(1);
 
     const before = versionCalls;
-    // Simule onglet caché via `Object.defineProperty` sur document.
     await page.evaluate(() => {
       Object.defineProperty(document, "visibilityState", {
         configurable: true,
@@ -596,7 +647,9 @@ test.describe("Liste conversations — lecture seule", () => {
       });
       document.dispatchEvent(new Event("visibilitychange"));
     });
-    await page.waitForTimeout(80_000);
+    // Hidden : 70 s (> 1 intervalle de 60 s + marge de 10 s). Si le
+    // visibility guard du hook sautait, on verrait au moins 1 appel.
+    await page.waitForTimeout(70_000);
     expect(versionCalls).toBe(before);
   });
 

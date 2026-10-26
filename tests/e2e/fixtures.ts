@@ -88,6 +88,15 @@ const TECHNICAL_ID_PATTERNS: readonly RegExp[] = [
   /\buser_[A-Za-z0-9]{20,}\b/,
 ];
 
+/**
+ * Pattern snake_case style `AuditAction` (`backfill_conversation_list_fields`,
+ * `handoff_unassigned`, …). SÉPARÉ de `TECHNICAL_ID_PATTERNS` car il peut
+ * matcher du contenu légitime écrit par un médecin dans un SMS entrant
+ * (ex. `jean_dupont@…`). On l'applique UNIQUEMENT sur l'UI hors fil des
+ * messages (hors `role="log"`) via `assertNoAuditActionCode`.
+ */
+const AUDIT_ACTION_CODE_PATTERN = /\b[a-z]{3,}(?:_[a-z]+){1,}\b/;
+
 export function assertNoTechnicalId(text: string, context: string): void {
   for (const re of TECHNICAL_ID_PATTERNS) {
     pwExpect(
@@ -95,6 +104,31 @@ export function assertNoTechnicalId(text: string, context: string): void {
       `Identifiant technique visible (${re}) dans : ${context}. Vérifier le trigger du Select ou le fallback de rendu.`,
     ).not.toMatch(re);
   }
+}
+
+/**
+ * Scope restreint : à appeler sur `innerText` d'un extrait du DOM qui
+ * EXCLUT le fil des messages (`role="log"`). Pour obtenir cet extrait,
+ * utiliser `innerTextWithoutMessageThread(page)` ci-dessous.
+ */
+export function assertNoAuditActionCode(text: string, context: string): void {
+  pwExpect(
+    text,
+    `Code snake_case brut visible dans : ${context}. Vérifier le libellé d'audit (sanitize.ts).`,
+  ).not.toMatch(AUDIT_ACTION_CODE_PATTERN);
+}
+
+/**
+ * Retourne `document.body.innerText` AVEC le fil des messages retiré.
+ * Permet d'appliquer `assertNoAuditActionCode` sans faux positif d'un
+ * SMS entrant qui contient un underscore (ex. `jean_dupont@…`).
+ */
+export async function innerTextWithoutMessageThread(page: Page): Promise<string> {
+  return page.evaluate(() => {
+    const clone = document.body.cloneNode(true) as HTMLElement;
+    clone.querySelectorAll('[role="log"]').forEach((el) => el.remove());
+    return clone.innerText;
+  });
 }
 
 /**
