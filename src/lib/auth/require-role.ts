@@ -242,6 +242,49 @@ export interface RoleContext {
  *   publicMetadata.role absent/mal formé OU rôle insuffisant pour la
  *   ressource).
  */
+/**
+ * Même sémantique que `requireRole`, mais rend immédiatement la
+ * page 403 Next (`forbidden()` → `src/app/admin/forbidden.tsx`) quand
+ * les sessionClaims sont invalides OU que le rôle est insuffisant.
+ *
+ * ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ * Pourquoi ce helper existe
+ *
+ *   Dans un layout + page server-component Next 16, les deux
+ *   s'exécutent **en parallèle**. Si le layout catch `ForbiddenError`
+ *   et appelle `forbidden()`, mais que la page a aussi appelé
+ *   `requireRole` et throw → Next journalise l'erreur de la page
+ *   comme une "vraie" erreur applicative (vu dans Vercel logs à chaque
+ *   passage de `e2e-no-role` sur `/admin/conversations`).
+ *
+ *   Le pattern correct (déjà posé en PR1 à `admin/conversations/[id]/
+ *   page.tsx:36-41`) est de catcher localement et appeler `forbidden()`.
+ *   On factorise ici pour que TOUTE page admin future l'utilise sans
+ *   avoir à ré-écrire le try/catch : impossible d'oublier.
+ *
+ *   La fonction `forbidden()` throw un sentinel Next intercepté en
+ *   amont ; l'erreur applicative n'est jamais journalisée côté Vercel.
+ *
+ *   `UnauthorizedError` reste propagée inchangée : le middleware Clerk
+ *   est censé l'intercepter en amont sur `/admin/*` → redirect
+ *   `/sign-in`. Si on la voit remonter ici, c'est un bug de config
+ *   matcher qu'on veut rendre visible.
+ */
+export async function requireRoleOrForbidden(required: Role): Promise<RoleContext> {
+  // Import local pour éviter de polluer les imports top-level (ce
+  // module est aussi utilisé côté API routes où `next/navigation` ne
+  // doit pas être tiré).
+  const { forbidden } = await import("next/navigation");
+  try {
+    return await requireRole(required);
+  } catch (err) {
+    if (err instanceof ForbiddenError) {
+      forbidden();
+    }
+    throw err;
+  }
+}
+
 export async function requireRole(required: Role): Promise<RoleContext> {
   const { userId, sessionClaims } = await auth();
 

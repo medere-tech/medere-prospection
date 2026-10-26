@@ -224,18 +224,38 @@ test.describe("Liste conversations — lecture seule", () => {
   //  qui laisse la sentinelle courir sur toutes les actions)
   // ────────────────────────────────────────────────────────────────────
 
-  test("L8 — zéro numéro FR dans toutes les réponses `/api/admin/conversations*`", async ({
-    page,
-    signInAsAdmin,
-  }) => {
-    installApiPhoneSentinel(page);
-    await signInAsAdmin();
-    for (const tab of ["a_traiter", "en_cours", "cloturees", "toutes"]) {
-      await page.goto(`/admin/conversations?tab=${tab}`);
+  // ────────────────────────────────────────────────────────────────────
+  // L8 — un test par onglet (le run précédent chaînait 4 navigations
+  // dans un seul test de 30 s et timoutait sur desktop sous charge —
+  // d'autres tests desktop prenaient 15 à 27 s simultanément). Chaque
+  // sous-test attend la réponse `/api/admin/conversations` de SON
+  // onglet (pas `load`), ce qui garantit que la liste a bien été
+  // rendue avant la vérification DOM.
+  // ────────────────────────────────────────────────────────────────────
+
+  for (const tab of ["a_traiter", "en_cours", "cloturees", "toutes"] as const) {
+    test(`L8 ${tab} — zéro numéro FR dans la réponse API et dans le DOM`, async ({
+      page,
+      signInAsAdmin,
+    }) => {
+      installApiPhoneSentinel(page);
+      await signInAsAdmin();
+      // Attend la vraie réponse de liste de l'onglet demandé — plus
+      // sûr qu'un simple `load` (qui firerait avant que la fetch
+      // interne du client n'ait répondu).
+      await Promise.all([
+        page.waitForResponse(
+          (r) =>
+            r.url().includes(`/api/admin/conversations?`) &&
+            r.url().includes(`tab=${tab}`) &&
+            r.request().method() === "GET",
+        ),
+        page.goto(`/admin/conversations?tab=${tab}`),
+      ]);
       const body = await page.locator("body").innerText();
-      assertNoFrenchPhone(body, `L8 — body onglet ${tab}`);
-    }
-  });
+      assertNoFrenchPhone(body, `L8 ${tab} — body liste`);
+    });
+  }
 
   // ────────────────────────────────────────────────────────────────────
   // L9 — aucune erreur console + requêtes attendues + pas de polling

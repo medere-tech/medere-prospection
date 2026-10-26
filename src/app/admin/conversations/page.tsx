@@ -25,13 +25,19 @@
  *     commercial loggé, non envoyé (il n'y a pas de dropdown à alimenter).
  */
 import { listCommerciauxForFilter } from "@/lib/airtable/commerciaux";
-import { requireRole } from "@/lib/auth/require-role";
+import { requireRoleOrForbidden } from "@/lib/auth/require-role";
 import { listSmsLists } from "@/lib/hubspot/lists";
 
 import { ConversationsPageClient } from "./conversations-page-client";
 
 export default async function ConversationsPage() {
-  const { role, slackUserId } = await requireRole("commercial");
+  // Layout et page s'exécutent en parallèle. Sans ce helper, un refus
+  // de rôle (`e2e-no-role`) throw `ForbiddenError` depuis la page après
+  // que le layout a déjà appelé `forbidden()` → Next log l'erreur
+  // comme applicative (observé sur preview a86724a).
+  // `requireRoleOrForbidden` catche et appelle `forbidden()` sans trace
+  // Vercel. Même pattern que `/admin/conversations/[id]/page.tsx:36-41`.
+  const { role, slackUserId } = await requireRoleOrForbidden("commercial");
 
   // Deux fetchs SSR en parallèle. Si l'un throw :
   //   - HubSpot down → Next.js error boundary (page error.tsx)
