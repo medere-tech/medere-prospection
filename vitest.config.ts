@@ -1,4 +1,3 @@
-import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -19,33 +18,48 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const serverOnlyStubPath = path.resolve(__dirname, "tests/mocks/server-only.ts");
 
 /**
- * S10.1.8 — plafonne les workers vitest à la moitié des coeurs.
+ * PR2b-1 fix (25c0fd2) — plafond ferme à 2 workers Vitest.
  *
- * Défaut Vitest 4 en `pool: "threads"` = `maxWorkers = os.cpus().length`.
- * Sur un poste 8 coeurs / 8 Go RAM (le poste prod chef de projet), 8 threads
- * qui chargent chacun jsdom + React 19 + base-ui (+ firebase-admin pour
- * `preview-dialog.test.tsx`) en `isolate: true` dépassent la RAM dispo quand
- * le reste de l'OS prend déjà ~7 Go (IDE, Chrome, GHD...). Les workers
- * basculent en swap, ne répondent plus au health-check du pool runner, et
- * Vitest log "Failed to start threads worker ... Timeout waiting for worker
- * to respond" sur les fichiers jsdom les plus lourds (observé 5 crashes sur
- * les 8 fichiers `@vitest-environment jsdom` au pre-push du b14fa52).
+ * ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ * Cause racine prouvée (systematic-debugging Phase 1-3) :
  *
- * Preuve de la contention même sans crash : ratio import_cumule / wall =
- * ~4x sur 3 runs consecutifs de `.husky/pre-push` -> les 8 workers se
- * contendent CPU et memoire. Reduction a `cpus/2` double la marge RAM par
- * worker (demarrage jsdom ~400-600 Mo) sans toucher a l'isolation ni au
- * testTimeout.
+ *   `.husky/pre-push` échouait de façon récurrente sur Windows 8 Go avec
+ *   « Failed to start threads worker ... Timeout waiting for worker to
+ *    respond ». Les 2 pushs antérieurs tombaient toujours sur les mêmes
+ *   fichiers jsdom lourds (preview-dialog, conversations-page-client,
+ *   columns, query-provider-wraps-use-query).
  *
- * NB Vitest 4 : seul `maxWorkers` est exposé au top de `InlineConfig`
- * (pas de `minWorkers` top-level, qui n'existe qu'en forks via
- * `poolOptions.forks` typologiquement cassé). On s'en passe : le pool
- * Tinypool des threads demarre a 0 workers et scale a la demande jusqu'au
- * plafond, donc pas besoin de forcer un `minWorkers`.
- */
-const vitestMaxWorkers = Math.max(2, Math.floor(os.cpus().length / 2));
-
-/**
+ *   Hypothèse H1 (correctif précédent `cpus/2 = 4`) : contention RAM.
+ *   → Insuffisant : échecs encore observés machine libérée.
+ *
+ *   Hypothèse H3 (CONFIRMÉE) : contention `import` CPU + Windows
+ *   Defender real-time (vérifié : `Get-MpComputerStatus` →
+ *   RealTimeProtectionEnabled=True, OnAccessProtectionEnabled=True ;
+ *   ExclusionPath non lisible sans admin). Chaque worker Vitest charge
+ *   jsdom + React 19 + base-ui + firebase-admin → ~10-20 s d'import
+ *   scanné par l'AV. À 4 workers concurrents, Tinypool tue le worker
+ *   qui dépasse son health-check interne.
+ *
+ * ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ * Mesures (vitest run brut, machine normale avec Chrome actif) :
+ *
+ *                       baseline (4w)     M3bis (2w)       gain
+ *   wall médian         102.3 s            86.7 s           -15 %
+ *   import cumulé       256.7 s           109.3 s           -58 %
+ *   ratio import/wall   2.51              1.26              /2
+ *   .husky/pre-push     2 crashes /2      0 crash /5        ✓
+ *
+ * ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ * Décisions non prises par ce patch (volontairement) :
+ *   - Exclusion Defender `node_modules\` : décision opérationnelle de
+ *     Déthié. Gain estimé additionnel : -20 à -30 % sur import (étude
+ *     Microsoft Dev Drive 2024). Non appliqué sans sa validation.
+ *   - Augmentation `testTimeout` ou timeout Tinypool : interdit par
+ *     consigne, car ne traite pas la cause (contention).
+ *   - `isolate: false` : testé, casse 47 tests (mocks partagés entre
+ *     fichiers) et ne réduit pas le wall. Rejeté.
+ *
+ * ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
  * Config Vitest "default" — tests qui n'ont PAS besoin de l'emulator.
  * - Forcé en `pool: "threads"` (PR1.14.1) : le défaut Vitest 4 est
  *   `"forks"` et crée des `child_process.spawn` qui échouent par rafales
@@ -79,8 +93,13 @@ export default defineConfig({
     passWithNoTests: true,
     unstubEnvs: true,
     pool: "threads",
-    // S10.1.8 — cf. commentaire `vitestMaxWorkers` en tête de fichier.
-    maxWorkers: vitestMaxWorkers,
+    // [M3bis] maxWorkers=2 au lieu de cpus/2 (=4 sur 8-core). Réduit
+    // la contention de démarrage worker Tinypool sur machines Windows
+    // avec Defender real-time (chaque worker Vitest charge jsdom +
+    // React 19 + base-ui → ~10-20s d'import scanné par l'AV ; à 4
+    // workers simultanés, Tinypool tue le worker qui met trop à
+    // signaler "ready").
+    maxWorkers: 2,
     /**
      * S10.1.7 — testTimeout 15s (vs défaut Vitest 4 = 5000ms). Les tests
      * UI React 19 + base-ui imports (DropdownMenu, Tooltip, Dialog) +
