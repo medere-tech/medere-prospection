@@ -1,9 +1,9 @@
 "use client";
 
 /**
- * Orchestrateur client `/admin/conversations` (PR2b-1).
+ * Orchestrateur client `/admin/conversations` (PR2b-1 → PR2b-2).
  *
- * - URL state (nuqs) : `tab`, `assignedTo`, `campaignId`, `cursor`.
+ * - URL state (nuqs) : `tab`, `assignedTo`, `campaignId`, `cursor`, `q`.
  * - Fetchs manuels + AbortController (même pattern que /admin/contacts) :
  *   `/api/admin/conversations?...` et `/api/admin/conversations/counts?...`.
  * - Table TanStack Table v8 server-pagination (`manualPagination: true`).
@@ -12,8 +12,12 @@
  *   JavaScript seul.
  * - Mobile < md : rendu en cartes (`ConversationRowCard`). Même source
  *   d'information, pas de défilement horizontal.
- * - Rechargement : au retour sur l'onglet (`visibilitychange` → `document.hidden`
- *   false) + bouton Actualiser. Pas de polling (PR2b-2).
+ * - Recherche (PR2b-2 P2) : champ `ConversationsSearchInput` debouncé 300 ms,
+ *   min 2 chars, nuqs `?q=`. Indicateur "Trié par nom" + empty state dédié.
+ * - Bandeau "Nouvelles conversations" (PR2b-2 P3) : hook `useListVersionWatch`
+ *   polle `/api/admin/conversations/version` toutes les 60 s UNIQUEMENT
+ *   quand l'onglet est visible (0 appel sinon). Delta = `counts[tab]` courant
+ *   moins baseline. Clic « Afficher » reset cursor + refetch + ack baseline.
  */
 import { type ColumnDef, flexRender, getCoreRowModel, useReactTable } from "@tanstack/react-table";
 import Link from "next/link";
@@ -31,6 +35,7 @@ import {
   TableRow,
 } from "@/components/ui/table";
 import { TooltipProvider } from "@/components/ui/tooltip";
+import { campaignDisplayLabel } from "@/lib/campaigns/campaign-id";
 import type { HubspotListInfo } from "@/lib/hubspot/lists";
 
 import { CampaignSelect } from "../contacts/campaign-select";
@@ -41,6 +46,9 @@ import {
 } from "./columns";
 import { CommercialSelect } from "./commercial-select";
 import { ConversationRowCard } from "./conversation-row-card";
+import { ConversationsSearchInput, SEARCH_MIN_CHARS } from "./conversations-search-input";
+import { handleShowBanner } from "./handle-show-banner";
+import { RefreshBanner } from "./refresh-banner";
 import { DEFAULT_TAB, TAB_LABELS, TabsBar } from "./tabs-bar";
 import type { Tab } from "./types";
 import type {
@@ -51,6 +59,7 @@ import type {
   CountsFetchState,
   ListFetchState,
 } from "./types";
+import { useListVersionWatch } from "./use-list-version-watch";
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Fetch helpers (manuel — pattern identique à /admin/contacts)
@@ -62,6 +71,7 @@ async function fetchList(
     assignedTo: string | null;
     campaignId: string | null;
     cursor: string | null;
+    q: string | null;
   },
   signal: AbortSignal,
 ): Promise<ListFetchState> {
@@ -70,6 +80,7 @@ async function fetchList(
   if (params.assignedTo) search.set("assignedTo", params.assignedTo);
   if (params.campaignId) search.set("campaignId", params.campaignId);
   if (params.cursor) search.set("cursor", params.cursor);
+  if (params.q) search.set("q", params.q);
 
   try {
     const res = await fetch(`/api/admin/conversations?${search.toString()}`, {
@@ -162,12 +173,18 @@ export function ConversationsPageClient({
   const [assignedTo] = useQueryState("assignedTo");
   const [campaignId] = useQueryState("campaignId");
   const [cursor, setCursor] = useQueryState("cursor");
+  const [q] = useQueryState("q");
 
   const activeTab: Tab = (tab as Tab | null) ?? DEFAULT_TAB;
+  const searchMode = typeof q === "string" && q.trim().length >= SEARCH_MIN_CHARS;
 
   const [listState, setListState] = useState<ListFetchState>({ kind: "idle" });
   const [countsState, setCountsState] = useState<CountsFetchState>({ kind: "idle" });
   const [refreshKey, setRefreshKey] = useState(0);
+  const [banner, setBanner] = useState<{ visible: boolean; delta: number | null }>({
+    visible: false,
+    delta: null,
+  });
 
   const resetCursor = useCallback(() => {
     void setCursor(null);
@@ -177,11 +194,14 @@ export function ConversationsPageClient({
   useEffect(() => {
     const ac = new AbortController();
     setListState({ kind: "loading" });
-    void fetchList({ tab: activeTab, assignedTo, campaignId, cursor }, ac.signal).then((next) => {
+    void fetchList(
+      { tab: activeTab, assignedTo, campaignId, cursor, q: searchMode ? q : null },
+      ac.signal,
+    ).then((next) => {
       if (!ac.signal.aborted) setListState(next);
     });
     return () => ac.abort();
-  }, [activeTab, assignedTo, campaignId, cursor, refreshKey]);
+  }, [activeTab, assignedTo, campaignId, cursor, q, searchMode, refreshKey]);
 
   // Fetch compteurs
   useEffect(() => {
@@ -193,26 +213,77 @@ export function ConversationsPageClient({
     return () => ac.abort();
   }, [assignedTo, campaignId, refreshKey]);
 
-  // Rechargement au retour sur l'onglet (visibilitychange).
-  // Pas de polling — PR2b-2.
-  const lastHiddenAtRef = useRef<number | null>(null);
-  useEffect(() => {
-    const onVisibility = () => {
-      if (document.hidden) {
-        lastHiddenAtRef.current = Date.now();
-      } else if (lastHiddenAtRef.current !== null) {
-        lastHiddenAtRef.current = null;
-        setRefreshKey((k) => k + 1);
-      }
-    };
-    document.addEventListener("visibilitychange", onVisibility);
-    return () => document.removeEventListener("visibilitychange", onVisibility);
-  }, []);
+  // PR2b-2 P3 — polling /version 60 s uniquement quand onglet visible.
+  // Contrôle immédiat au retour sur l'onglet. Désactivé en mode recherche
+  // (/version ne prend ni `q` ni `campaignId` ; on ne veut pas de bandeau
+  // trompeur sur une sous-liste). Un commercial polle avec son propre
+  // slackUserId (serveur force toute façon le filtre). Un admin reflète
+  // le filtre UI.
+  const watchAssignedTo = role === "commercial" ? viewerSlackUserId : assignedTo;
+  const watch = useListVersionWatch({
+    tab: activeTab,
+    assignedTo: watchAssignedTo,
+    disabled: searchMode,
+  });
 
-  // Maps de résolution — passées à TanStack via meta
-  const campaignNameById = useMemo(() => {
+  // Baseline count pour calculer le `N` du bandeau.
+  const baselineCountRef = useRef<number | null>(null);
+  useEffect(() => {
+    // Reset quand les filtres changent — chaque combinaison a sa baseline.
+    baselineCountRef.current = null;
+    setBanner({ visible: false, delta: null });
+  }, [activeTab, assignedTo, campaignId, q]);
+
+  useEffect(() => {
+    if (
+      countsState.kind === "success" &&
+      baselineCountRef.current === null &&
+      typeof countsState.data[activeTab as keyof typeof countsState.data] === "number"
+    ) {
+      baselineCountRef.current = countsState.data[activeTab as keyof typeof countsState.data] ?? 0;
+    }
+  }, [countsState, activeTab]);
+
+  // Quand /version signale un changement → recompute delta via /counts.
+  useEffect(() => {
+    if (!watch.hasUpdate) return;
+    const ac = new AbortController();
+    void fetchCounts({ assignedTo, campaignId }, ac.signal).then((next) => {
+      if (ac.signal.aborted) return;
+      if (next.kind === "success" && baselineCountRef.current !== null) {
+        const newCount = next.data[activeTab as keyof typeof next.data] ?? 0;
+        const d = newCount - baselineCountRef.current;
+        setBanner({ visible: true, delta: d > 0 ? d : null });
+      } else {
+        setBanner({ visible: true, delta: null });
+      }
+    });
+    return () => ac.abort();
+    // On capture explicitement hasUpdate seul : fetchCounts est stable,
+    // les filtres bougent déjà baselineCountRef via l'autre effet.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [watch.hasUpdate]);
+
+  const handleShowBannerClick = useCallback(() => {
+    // Factorisé dans `handle-show-banner.ts` — testable par mutation.
+    handleShowBanner({
+      setCursor: (v) => void setCursor(v),
+      setRefreshKey,
+      setBanner,
+      resetBaseline: () => {
+        baselineCountRef.current = null;
+      },
+      acknowledge: watch.acknowledge,
+    });
+  }, [setCursor, watch]);
+
+  // Maps de résolution — passées à TanStack via meta.
+  // PR2b-2 round 2 — indexé par `listId` court (format HubSpot natif).
+  // La résolution côté cell/card passe par `resolveCampaignName` qui
+  // accepte les deux formats de `campaignId` (court ou canonique).
+  const campaignNameByListId = useMemo(() => {
     const m = new Map<string, string>();
-    for (const c of initialCampaigns) m.set(`hubspot-list-${c.listId}`, c.name);
+    for (const c of initialCampaigns) m.set(c.listId, c.name);
     return m;
   }, [initialCampaigns]);
 
@@ -227,7 +298,7 @@ export function ConversationsPageClient({
   const nextCursor = listState.kind === "success" ? listState.data.nextCursor : null;
 
   const tableMeta: ConversationsTableMeta = {
-    campaignNameById,
+    campaignNameByListId,
     commercialNameBySlackId,
     viewerSlackUserId,
     role,
@@ -264,6 +335,7 @@ export function ConversationsPageClient({
             <CommercialSelect commerciaux={initialCommerciaux} onChange={resetCursor} />
           )}
           <CampaignSelect campaigns={initialCampaigns} onChange={resetCursor} />
+          <ConversationsSearchInput onEffectiveChange={resetCursor} />
           <Button
             type="button"
             variant="outline"
@@ -274,6 +346,23 @@ export function ConversationsPageClient({
             Actualiser
           </Button>
         </div>
+
+        {searchMode && (
+          <div
+            role="status"
+            aria-live="polite"
+            className="rounded-md border border-dashed bg-muted/30 px-3 py-2 text-xs text-muted-foreground"
+          >
+            Recherche active : résultats <strong>triés par nom</strong> (A → Z) pour « {q?.trim()}{" "}
+            ».
+          </div>
+        )}
+
+        <RefreshBanner
+          visible={banner.visible}
+          delta={banner.delta}
+          onShow={handleShowBannerClick}
+        />
 
         {/* État vide et erreur rendus UNE SEULE FOIS, hors des deux
             variantes CSS (desktop table / mobile cartes). Évite la
@@ -311,8 +400,21 @@ export function ConversationsPageClient({
               aria-live="polite"
               className="flex flex-col items-center gap-1 rounded-md border p-6 text-center text-sm"
             >
-              <span className="font-medium text-foreground">{emptyCopy.title}</span>
-              <span className="text-muted-foreground">{emptyCopy.hint}</span>
+              {searchMode ? (
+                <>
+                  <span className="font-medium text-foreground">
+                    Aucun médecin ne correspond à « {q?.trim()} ».
+                  </span>
+                  <span className="text-muted-foreground">
+                    Essayez un préfixe plus court ou retirez les autres filtres.
+                  </span>
+                </>
+              ) : (
+                <>
+                  <span className="font-medium text-foreground">{emptyCopy.title}</span>
+                  <span className="text-muted-foreground">{emptyCopy.hint}</span>
+                </>
+              )}
             </div>
           )}
 
@@ -389,7 +491,10 @@ export function ConversationsPageClient({
                     key={it.conversationId}
                     item={it}
                     campaignName={
-                      it.campaignName ?? campaignNameById.get(it.campaignId) ?? it.campaignId
+                      // PR2b-2 round 2 — même fallback que la table
+                      // (`columns.tsx`) via `campaignDisplayLabel` :
+                      // 1 seule source du libellé "Campagne inconnue".
+                      campaignDisplayLabel(it.campaignId, it.campaignName, campaignNameByListId)
                     }
                     commercialName={
                       it.assignedTo ? (commercialNameBySlackId.get(it.assignedTo) ?? null) : null

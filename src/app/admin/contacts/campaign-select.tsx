@@ -12,6 +12,8 @@
  */
 import { useQueryState } from "nuqs";
 
+import { FilterUnknownNotice } from "@/components/filters/filter-unknown-notice";
+import { resolveFilterLabel } from "@/components/filters/filter-value-label";
 import {
   Select,
   SelectContent,
@@ -19,6 +21,7 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select";
+import { extractListId, toCanonicalCampaignId } from "@/lib/campaigns/campaign-id";
 import type { HubspotListInfo } from "@/lib/hubspot/lists";
 
 export interface CampaignSelectProps {
@@ -27,15 +30,10 @@ export interface CampaignSelectProps {
   onChange?: (campaignId: string | null) => void;
 }
 
-function toCampaignId(listId: string): string {
-  return `hubspot-list-${listId}`;
-}
-
-function fromCampaignId(campaignId: string | null): string | null {
-  if (!campaignId) return null;
-  const m = campaignId.match(/^hubspot-list-(\d+)$/);
-  return m ? (m[1] ?? null) : null;
-}
+// PR2b-2 round 2 — `toCampaignId` / `fromCampaignId` locaux supprimés,
+// remplacés par `toCanonicalCampaignId` / `extractListId` de
+// `@/lib/campaigns/campaign-id` (helper central réutilisé par
+// `conversations-page-client.tsx`, `columns.tsx`, et toute future route).
 
 /**
  * Handler pur (S10.1.7-M5 — extrait pour testabilité). Logique branche
@@ -55,17 +53,37 @@ export function handleCampaignChange(
     onChange?.(null);
     return;
   }
-  const next = toCampaignId(value);
+  const next = toCanonicalCampaignId(value);
+  if (next === null) {
+    // Entrée non reconnue (ni listId court, ni canonique) : on garde le
+    // comportement conservateur = reset du filtre plutôt que persister
+    // une valeur invalide dans l'URL.
+    void setCampaignId(null);
+    onChange?.(null);
+    return;
+  }
   void setCampaignId(next);
   onChange?.(next);
 }
 
 export function CampaignSelect({ campaigns, onChange }: CampaignSelectProps) {
   const [campaignId, setCampaignId] = useQueryState("campaignId");
-  const selectedListId = fromCampaignId(campaignId);
+  const selectedListId = extractListId(campaignId);
 
   const handleChange = (value: string | null) =>
     handleCampaignChange(value, setCampaignId, onChange);
+
+  // PR2b-2 P1 — Trigger affiche toujours le nom de la campagne, jamais
+  // l'identifiant brut (`hubspot-list-6081`). Cf. `commercial-select.tsx`
+  // pour la cause racine Base UI.
+  const label = resolveFilterLabel({
+    value: selectedListId,
+    items: campaigns,
+    keyOf: (c) => c.listId,
+    nameOf: (c) => c.name,
+    allLabel: "Toutes les campagnes",
+    unknownLabel: "Campagne inconnue",
+  });
 
   return (
     <div className="flex min-w-[220px] flex-col gap-1.5">
@@ -74,7 +92,7 @@ export function CampaignSelect({ campaigns, onChange }: CampaignSelectProps) {
       </label>
       <Select value={selectedListId ?? "__all__"} onValueChange={handleChange}>
         <SelectTrigger id="campaign-select" aria-label="Sélectionner une campagne">
-          <SelectValue placeholder="Toutes les campagnes" />
+          <SelectValue>{() => label.display}</SelectValue>
         </SelectTrigger>
         <SelectContent>
           <SelectItem value="__all__">Toutes les campagnes</SelectItem>
@@ -96,10 +114,19 @@ export function CampaignSelect({ campaigns, onChange }: CampaignSelectProps) {
           )}
         </SelectContent>
       </Select>
+      {!label.known && (
+        <FilterUnknownNotice
+          label="Retirer le filtre campagne"
+          onClear={() => handleChange(null)}
+        />
+      )}
     </div>
   );
 }
 
-// Exposés pour tests
-export const __toCampaignId_FOR_TESTS = toCampaignId;
-export const __fromCampaignId_FOR_TESTS = fromCampaignId;
+// Exposés pour tests — forward vers le helper central (préserve la
+// surface des anciens tests S10.1.5 sans dupliquer la logique).
+export const __toCampaignId_FOR_TESTS = (listId: string): string =>
+  toCanonicalCampaignId(listId) ?? "";
+export const __fromCampaignId_FOR_TESTS = (campaignId: string | null): string | null =>
+  extractListId(campaignId);

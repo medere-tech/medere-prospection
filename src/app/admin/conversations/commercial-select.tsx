@@ -13,6 +13,8 @@
  */
 import { useQueryState } from "nuqs";
 
+import { FilterUnknownNotice } from "@/components/filters/filter-unknown-notice";
+import { resolveFilterLabel } from "@/components/filters/filter-value-label";
 import {
   Select,
   SelectContent,
@@ -53,6 +55,18 @@ export function CommercialSelect({ commerciaux, onChange }: CommercialSelectProp
 
   const disabled = commerciaux === null;
 
+  // PR2b-2 P1 — Base UI `SelectValue` sans render prop `children` affiche
+  // la value brute (ici `slackUserId`). On passe un render prop qui mappe
+  // via le helper partagé → le trigger affiche TOUJOURS un libellé humain.
+  const label = resolveFilterLabel({
+    value: assignedTo,
+    items: commerciaux,
+    keyOf: (c) => c.slackUserId,
+    nameOf: (c) => c.name || "Commercial sans nom",
+    allLabel: disabled ? "Indisponible (Airtable)" : "Tous les commerciaux",
+    unknownLabel: "Commercial inconnu",
+  });
+
   return (
     <div className="flex min-w-[220px] flex-col gap-1.5">
       <label htmlFor="commercial-select" className="text-xs font-medium text-muted-foreground">
@@ -60,9 +74,7 @@ export function CommercialSelect({ commerciaux, onChange }: CommercialSelectProp
       </label>
       <Select value={assignedTo ?? "__all__"} onValueChange={handleChange} disabled={disabled}>
         <SelectTrigger id="commercial-select" aria-label="Filtrer par commercial">
-          <SelectValue
-            placeholder={disabled ? "Indisponible (Airtable)" : "Tous les commerciaux"}
-          />
+          <SelectValue>{() => label.display}</SelectValue>
         </SelectTrigger>
         <SelectContent>
           <SelectItem value="__all__">Tous les commerciaux</SelectItem>
@@ -72,7 +84,7 @@ export function CommercialSelect({ commerciaux, onChange }: CommercialSelectProp
             commerciaux.map((c) => (
               <SelectItem key={c.slackUserId} value={c.slackUserId}>
                 <span className="flex items-center gap-2">
-                  <span>{c.name || c.slackUserId}</span>
+                  <span>{c.name || "Commercial sans nom"}</span>
                   {!c.active && <span className="text-xs text-muted-foreground">(inactif)</span>}
                 </span>
               </SelectItem>
@@ -80,6 +92,12 @@ export function CommercialSelect({ commerciaux, onChange }: CommercialSelectProp
           )}
         </SelectContent>
       </Select>
+      {!label.known && !disabled && (
+        <FilterUnknownNotice
+          label="Retirer le filtre commercial"
+          onClear={() => handleChange(null)}
+        />
+      )}
     </div>
   );
 }

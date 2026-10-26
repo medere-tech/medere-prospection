@@ -69,6 +69,35 @@ export function assertNoFrenchPhone(text: string, context: string): void {
 }
 
 /**
+ * Patterns d'identifiants techniques qui ne devraient JAMAIS être visibles
+ * dans l'UI admin — PR2b-2 P1. Si l'un apparaît dans `document.body.innerText`,
+ * c'est que le trigger d'un Select / une ligne / une puce rend l'id brut
+ * au lieu du libellé humain résolu.
+ *
+ *   - `\bU[A-Z0-9]{8,}\b` : Slack userId (U… en majuscules, 9+ chars).
+ *   - `\bhubspot-list-\d+\b` : HubSpot list id canonique Médéré.
+ */
+const TECHNICAL_ID_PATTERNS: readonly RegExp[] = [
+  /\bU[A-Z0-9]{8,}\b/,
+  // security-reviewer PR2b-2 LOW : Slack Enterprise Grid IDs commencent
+  // par `W`. Médéré n'y est pas aujourd'hui mais filet trivial.
+  /\bW[A-Z0-9]{8,}\b/,
+  /\bhubspot-list-\d+\b/,
+  // security-reviewer PR2b-2 LOW : Clerk user IDs — défense si l'UI
+  // commence à exposer un compte Clerk directement.
+  /\buser_[A-Za-z0-9]{20,}\b/,
+];
+
+export function assertNoTechnicalId(text: string, context: string): void {
+  for (const re of TECHNICAL_ID_PATTERNS) {
+    pwExpect(
+      text,
+      `Identifiant technique visible (${re}) dans : ${context}. Vérifier le trigger du Select ou le fallback de rendu.`,
+    ).not.toMatch(re);
+  }
+}
+
+/**
  * Installe un listener réseau sur `/api/admin/conversations/*` qui
  * échoue immédiatement si une réponse contient un numéro FR. C'est le
  * vrai filet de sécurité anti-régression côté backend.

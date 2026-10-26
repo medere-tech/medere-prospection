@@ -13,8 +13,11 @@ import "@testing-library/jest-dom/vitest";
 import { render, screen } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
+const nuqsMock = vi.hoisted(() => ({
+  useQueryState: vi.fn(() => [null, vi.fn()] as [string | null, (v: string | null) => void]),
+}));
 vi.mock("nuqs", () => ({
-  useQueryState: vi.fn(() => [null, vi.fn()]),
+  useQueryState: nuqsMock.useQueryState,
 }));
 
 import { __isContactStatus_FOR_TESTS, handleStatusChange, StatusFilter } from "./status-filter";
@@ -25,9 +28,33 @@ describe("StatusFilter (S10.1.7-M4)", () => {
   });
 
   it("render → label 'Statut' + trigger ARIA accessible", () => {
+    nuqsMock.useQueryState.mockImplementation(() => [null, vi.fn()]);
     render(<StatusFilter />);
     expect(screen.getByText("Statut")).toBeInTheDocument();
     expect(screen.getByLabelText("Filtrer par statut")).toBeInTheDocument();
+  });
+
+  describe("Libellés affichés par le trigger (PR2b-2 P1)", () => {
+    it("URL vide → trigger affiche 'Prêt à envoyer' (default route-level 'ready'), PAS 'ready' brut", () => {
+      nuqsMock.useQueryState.mockImplementation(() => [null, vi.fn()]);
+      render(<StatusFilter />);
+      const trigger = screen.getByLabelText("Filtrer par statut");
+      expect(trigger).toHaveTextContent("Prêt à envoyer");
+      expect(trigger).not.toHaveTextContent(/\bready\b/);
+    });
+
+    it("ouvert avec ?status=opted_out → trigger affiche 'Opt-out STOP'", () => {
+      nuqsMock.useQueryState.mockImplementation(() => ["opted_out", vi.fn()]);
+      render(<StatusFilter />);
+      expect(screen.getByLabelText("Filtrer par statut")).toHaveTextContent("Opt-out STOP");
+      expect(screen.getByLabelText("Filtrer par statut")).not.toHaveTextContent("opted_out");
+    });
+
+    it("ouvert avec ?status=enriched → 'Enrichi'", () => {
+      nuqsMock.useQueryState.mockImplementation(() => ["enriched", vi.fn()]);
+      render(<StatusFilter />);
+      expect(screen.getByLabelText("Filtrer par statut")).toHaveTextContent("Enrichi");
+    });
   });
 
   describe("handleStatusChange (handler pur)", () => {

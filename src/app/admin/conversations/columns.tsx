@@ -16,6 +16,7 @@ import type { ColumnDef } from "@tanstack/react-table";
 import { ConversationStatusBadge } from "@/components/conversations/conversation-status-badge";
 import { Badge } from "@/components/ui/badge";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
+import { campaignDisplayLabel } from "@/lib/campaigns/campaign-id";
 import { formatDateTimeParis, formatRelativeToParis } from "@/lib/utils/format-paris";
 
 import type { ConversationListItem } from "./types";
@@ -26,7 +27,12 @@ import type { ConversationListItem } from "./types";
  * résolution (campagne, commercial) sans fetch par ligne.
  */
 export interface ConversationsTableMeta {
-  campaignNameById: Map<string, string>;
+  /**
+   * PR2b-2 round 2 — `listId` court HubSpot en clé (`"6081"`), aligné avec
+   * `HubspotListInfo.listId`. La résolution supporte les deux formats
+   * (`"6081"` ou `"hubspot-list-6081"`) via `resolveCampaignName`.
+   */
+  campaignNameByListId: Map<string, string>;
   commercialNameBySlackId: Map<string, string>;
   viewerSlackUserId: string | null;
   role: "admin" | "commercial";
@@ -61,8 +67,15 @@ export const conversationColumns: ColumnDef<ConversationListItem>[] = [
     cell: ({ row, table }) => {
       const r = row.original;
       const meta = table.options.meta as ConversationsTableMeta | undefined;
-      const resolved = meta?.campaignNameById.get(r.campaignId);
-      const label = r.campaignName ?? resolved ?? r.campaignId;
+      // PR2b-2 round 2 — un seul endroit du code porte le fallback
+      // "Campagne inconnue" (`campaignDisplayLabel`), partagé avec la
+      // carte mobile. Résolution robuste aux deux formats de
+      // `campaignId` ("6081" ou "hubspot-list-6081").
+      const label = campaignDisplayLabel(
+        r.campaignId,
+        r.campaignName,
+        meta?.campaignNameByListId ?? new Map(),
+      );
       return <span className="text-sm">{label}</span>;
     },
   },
