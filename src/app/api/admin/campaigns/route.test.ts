@@ -1,8 +1,16 @@
 /**
  * Tests GET /api/admin/campaigns (S10.1.5 Phase 1).
  *
- * Scope : route handler unit (mocks Clerk + listSmsLists). Vérifie
+ * Scope : route handler unit (mocks Clerk + campagnes-cache). Vérifie
  * auth/RBAC + happy path + propagation erreur HubSpot.
+ *
+ * PR2c tour 1 — on mocke `getCachedSmsCampaigns` du module cache unique
+ * (plutôt que `listSmsLists` directement) : la route n'appelle plus
+ * HubSpot en direct, elle passe par le cache module-scope 5 min partagé
+ * avec `/admin/contacts`, `/admin/conversations` et `load-conversation-
+ * detail.ts`. Les erreurs HubSpot que teste ce fichier remontent via la
+ * promesse que renvoie le cache (le TTL est invalidé en interne, cf.
+ * `campaigns-cache.ts:52-55`).
  */
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
@@ -18,8 +26,8 @@ vi.mock("@/lib/security/admin-rate-limit", () => ({
   applyAdminRateLimit: vi.fn(),
 }));
 
-vi.mock("@/lib/hubspot/lists", () => ({
-  listSmsLists: vi.fn(),
+vi.mock("@/lib/campaigns/campaigns-cache", () => ({
+  getCachedSmsCampaigns: vi.fn(),
 }));
 
 vi.mock("@/lib/utils/logger", () => ({
@@ -32,13 +40,13 @@ vi.mock("@/lib/utils/logger", () => ({
 }));
 
 import { requireRole } from "@/lib/auth/require-role";
-import { listSmsLists } from "@/lib/hubspot/lists";
+import { getCachedSmsCampaigns } from "@/lib/campaigns/campaigns-cache";
 import { applyAdminRateLimit } from "@/lib/security/admin-rate-limit";
 
 import { GET } from "./route";
 
 const mockRequireRole = vi.mocked(requireRole);
-const mockListSmsLists = vi.mocked(listSmsLists);
+const mockGetCachedSmsCampaigns = vi.mocked(getCachedSmsCampaigns);
 const mockApplyAdminRateLimit = vi.mocked(applyAdminRateLimit);
 
 const FAKE_CAMPAIGNS = [
@@ -87,18 +95,18 @@ describe("GET /api/admin/campaigns", () => {
       expect(res.headers.get("Retry-After")).toBe("7");
       const body = (await res.json()) as { error: { code: string } };
       expect(body.error.code).toBe("RATE_LIMITED");
-      expect(mockListSmsLists).not.toHaveBeenCalled();
+      expect(mockGetCachedSmsCampaigns).not.toHaveBeenCalled();
     });
 
     it("rate-limit appelé avec le Clerk userId extrait de requireRole", async () => {
-      mockListSmsLists.mockResolvedValue(FAKE_CAMPAIGNS);
+      mockGetCachedSmsCampaigns.mockResolvedValue(FAKE_CAMPAIGNS);
       await GET();
       expect(mockApplyAdminRateLimit).toHaveBeenCalledWith(expect.anything(), "user_admin_xxx");
     });
   });
 
   it("renvoie 200 + campaigns quand admin auth OK", async () => {
-    mockListSmsLists.mockResolvedValue(FAKE_CAMPAIGNS);
+    mockGetCachedSmsCampaigns.mockResolvedValue(FAKE_CAMPAIGNS);
 
     const res = await GET();
 
@@ -106,7 +114,10 @@ describe("GET /api/admin/campaigns", () => {
     const body = (await res.json()) as { campaigns: typeof FAKE_CAMPAIGNS };
     expect(body.campaigns).toHaveLength(2);
     expect(body.campaigns[0]?.listId).toBe("200");
-    expect(mockListSmsLists).toHaveBeenCalledWith("SMS");
+    // PR2c tour 1 — le cache module s'occupe de la searchQuery "SMS"
+    // en interne (campaigns-cache.ts:48). La route elle-même n'appelle
+    // qu'un `getCachedSmsCampaigns()` sans argument.
+    expect(mockGetCachedSmsCampaigns).toHaveBeenCalledWith();
   });
 
   it("renvoie 401 si UnauthorizedError throw", async () => {
@@ -115,7 +126,7 @@ describe("GET /api/admin/campaigns", () => {
     const res = await GET();
 
     expect(res.status).toBe(401);
-    expect(mockListSmsLists).not.toHaveBeenCalled();
+    expect(mockGetCachedSmsCampaigns).not.toHaveBeenCalled();
   });
 
   it("renvoie 403 si rôle insuffisant", async () => {
@@ -126,11 +137,11 @@ describe("GET /api/admin/campaigns", () => {
     const res = await GET();
 
     expect(res.status).toBe(403);
-    expect(mockListSmsLists).not.toHaveBeenCalled();
+    expect(mockGetCachedSmsCampaigns).not.toHaveBeenCalled();
   });
 
   it("renvoie 502 (ExternalServiceError statusCode) si listSmsLists throw AppError HubSpot", async () => {
-    mockListSmsLists.mockRejectedValue(
+    mockGetCachedSmsCampaigns.mockRejectedValue(
       new ExternalServiceError({
         message: "listSmsLists: HubSpot 401 unauthorized",
         context: { service: "hubspot", op: "listSmsLists" },
@@ -145,7 +156,7 @@ describe("GET /api/admin/campaigns", () => {
   });
 
   it("renvoie 500 générique si listSmsLists throw une erreur inattendue", async () => {
-    mockListSmsLists.mockRejectedValue(new Error("Network timeout"));
+    mockGetCachedSmsCampaigns.mockRejectedValue(new Error("Network timeout"));
 
     const res = await GET();
 

@@ -1,14 +1,16 @@
 /**
  * GET /api/admin/campaigns — liste les campagnes HubSpot (RBAC admin).
  *
- * Wrap `listSmsLists()` derrière l'auth Clerk admin pour que le client
- * dashboard `/admin/contacts` (S10.1.5) puisse refresh dynamiquement la
- * liste des campagnes sans tirer le SDK HubSpot dans le bundle client.
+ * Wrap `getCachedSmsCampaigns()` derrière l'auth Clerk admin pour que le
+ * client dashboard `/admin/contacts` (S10.1.5) puisse refresh dynamiquement
+ * la liste des campagnes sans tirer le SDK HubSpot dans le bundle client.
  *
- * Au SSR initial, la page `/admin/contacts/page.tsx` appelle `listSmsLists`
- * direct (server-side, plus rapide qu'un round-trip API) — cf. décision
- * S10.1.5-A1 override Phase 5. Cette route est utilisée pour les refetch
- * client-side ultérieurs (refresh manuel, future invalidation cache).
+ * Au SSR initial, les pages `/admin/contacts` et `/admin/conversations`
+ * utilisent le MÊME `getCachedSmsCampaigns()` — un seul cache 5 min partagé
+ * (PR2c tour 1 : source de vérité unique, miroir
+ * `load-conversation-detail.ts`). Cette route est le point d'entrée des
+ * refetch client-side (refresh manuel, future invalidation cache) ; elle
+ * bénéficie aussi du cache quand un SSR vient de tirer la liste.
  *
  * ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
  * Pattern identique S10.1.4.a/b/c — auth → safeParse (N/A ici, pas de
@@ -17,7 +19,7 @@
 import { NextResponse } from "next/server";
 
 import { requireRole } from "@/lib/auth/require-role";
-import { listSmsLists } from "@/lib/hubspot/lists";
+import { getCachedSmsCampaigns } from "@/lib/campaigns/campaigns-cache";
 import { applyAdminRateLimit } from "@/lib/security/admin-rate-limit";
 import { createRateLimiter } from "@/lib/security/rate-limit";
 import { AppError } from "@/lib/utils/errors";
@@ -47,7 +49,7 @@ export async function GET(): Promise<NextResponse> {
     const rateLimitResponse = await applyAdminRateLimit(campaignsListLimiter, userId);
     if (rateLimitResponse) return rateLimitResponse;
 
-    const campaigns = await listSmsLists("SMS");
+    const campaigns = await getCachedSmsCampaigns();
 
     return NextResponse.json({ campaigns });
   } catch (err) {

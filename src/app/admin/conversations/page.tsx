@@ -17,16 +17,17 @@
  * ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
  * Preload serveur (zéro appel HubSpot/Airtable par ligne)
  *
- *   - `campaigns` : `listSmsLists("SMS")` — identique à /admin/contacts.
- *     Cache HubSpot géré par le wrapper. Passé en prop → map locale
- *     côté client `campaignId → campaignName`.
+ *   - `campaigns` : `getCachedSmsCampaigns()` — cache 5 min partagé avec
+ *     `/admin/contacts`, `/api/admin/campaigns` et
+ *     `load-conversation-detail.ts` (PR2c tour 1 : source unique).
+ *     Passé en prop → map locale côté client `campaignId → campaignName`.
  *   - `commerciaux` : `listCommerciauxForFilter()` — Airtable cache 5 min.
  *     Alimente le dropdown « Commercial » (admin uniquement). Pour un
  *     commercial loggé, non envoyé (il n'y a pas de dropdown à alimenter).
  */
 import { listCommerciauxForFilter } from "@/lib/airtable/commerciaux";
 import { requireRoleOrForbidden } from "@/lib/auth/require-role";
-import { listSmsLists } from "@/lib/hubspot/lists";
+import { getCachedSmsCampaigns } from "@/lib/campaigns/campaigns-cache";
 
 import { ConversationsPageClient } from "./conversations-page-client";
 
@@ -45,7 +46,7 @@ export default async function ConversationsPage() {
   //     la liste de conversations reste accessible (le filtre commercial
   //     montrera un dropdown vide avec un placeholder "Indisponible").
   const [campaigns, commerciauxOrError] = await Promise.all([
-    listSmsLists("SMS"),
+    getCachedSmsCampaigns(),
     role === "admin" ? listCommerciauxForFilter().catch(() => null) : Promise.resolve(null),
   ]);
 
