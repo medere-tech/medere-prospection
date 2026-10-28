@@ -211,6 +211,27 @@ describe("Sentinelle PR2c tour 1 bis — un seul cache HubSpot campagnes", () =>
 
       const content = readFileSync(abs, "utf-8");
 
+      // ⚡ PR2c tour 2b bis — pré-filtre texte avant AST (perf).
+      //
+      // Faire tourner `ts.createSourceFile` sur CHAQUE .ts/.tsx de src/
+      // prenait ~30s en CI (observé pre-push hook, timeout 15s dépassé).
+      // On n'invoque donc l'AST QUE si le fichier contient au moins
+      // l'une des deux chaînes repères.
+      //
+      // 🔒 PREUVE DE COMPLÉTUDE DU PRÉ-FILTRE :
+      //   Tout import de `listSmsLists` depuis `@/lib/hubspot/lists`
+      //   (ou chemin relatif équivalent) — direct, aliasé OU namespace —
+      //   écrit littéralement DANS le fichier source :
+      //     - import direct  : `import { listSmsLists } from "..."` → "listSmsLists" ✓
+      //     - import aliasé  : `import { listSmsLists as X } from "..."` → "listSmsLists" ✓
+      //     - import namespace : `import * as X from "@/lib/hubspot/lists"` → "hubspot/lists" ✓
+      //   Un fichier qui ne contient NI `"listSmsLists"` NI `"hubspot/lists"`
+      //   ne peut PAS avoir un import value de ce symbole. Le pré-filtre
+      //   est donc une condition nécessaire sans réduire la garantie.
+      if (!content.includes("listSmsLists") && !content.includes("hubspot/lists")) {
+        continue;
+      }
+
       // (1) Inspection AST des imports — strict, catch les alias.
       violations.push(...findValueImportsOfListSmsLists(content, relPath));
 
