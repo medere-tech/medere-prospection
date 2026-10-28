@@ -39,6 +39,7 @@ import { logger } from "@/lib/utils/logger";
 
 import { getDashboardOrphanDetailUrl } from "./dashboard-url";
 import { sendInboundAfterHandoffNotification } from "./notify-inbound-after-handoff";
+import { resolveTargetKind } from "./orphan-notify-target";
 
 /**
  * Pur, sans I/O — résout la cible à utiliser pour une notif orphan.
@@ -63,17 +64,29 @@ export interface ResolveOrphanNotifyTargetInput {
 export function resolveOrphanNotifyTarget(
   input: ResolveOrphanNotifyTargetInput,
 ): OrphanNotifyTarget {
-  if (input.actorTestAccount) {
-    if (input.testChannelId !== undefined && input.testChannelId.length > 0) {
-      return { kind: "channel", channelId: input.testChannelId, reason: "test" };
-    }
-    // Fail-closed strict : jamais de repli vers un vrai destinataire.
-    return { kind: "none", reason: "test_channel_missing" };
+  // Logique partagée avec `describeAttachNotifyTargetForUi` via la
+  // fonction pure `resolveTargetKind` (bloc B — pas de duplication).
+  const kind = resolveTargetKind({
+    actorTestAccount: input.actorTestAccount,
+    assignedToSlackUserId: input.assignedToSlackUserId,
+    testChannelConfigured: input.testChannelId !== undefined && input.testChannelId.length > 0,
+  });
+  switch (kind) {
+    case "test_channel":
+      // `testChannelConfigured: true` ↔ `testChannelId` défini ET non-vide.
+      return { kind: "channel", channelId: input.testChannelId as string, reason: "test" };
+    case "test_channel_missing":
+      // Fail-closed strict : jamais de repli vers un vrai destinataire.
+      return { kind: "none", reason: "test_channel_missing" };
+    case "dm_titulaire":
+      return { kind: "dm", slackUserId: input.assignedToSlackUserId as string };
+    case "orphan_channel":
+      return {
+        kind: "channel",
+        channelId: input.orphanChannelId,
+        reason: "titulaire-absent",
+      };
   }
-  if (input.assignedToSlackUserId !== undefined && input.assignedToSlackUserId.length > 0) {
-    return { kind: "dm", slackUserId: input.assignedToSlackUserId };
-  }
-  return { kind: "channel", channelId: input.orphanChannelId, reason: "titulaire-absent" };
 }
 
 export interface OrphanAttachedNotifyInput {

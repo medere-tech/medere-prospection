@@ -249,6 +249,23 @@
       "queryScope": "COLLECTION",
       "fields": [
         { "fieldPath": "isTestFixture", "order": "ASCENDING" },
+        { "fieldPath": "receivedAt", "order": "DESCENDING" }
+      ]
+    },
+    {
+      "collectionGroup": "inbound_messages_orphans",
+      "queryScope": "COLLECTION",
+      "fields": [
+        { "fieldPath": "isTestFixture", "order": "ASCENDING" },
+        { "fieldPath": "reason", "order": "ASCENDING" },
+        { "fieldPath": "receivedAt", "order": "DESCENDING" }
+      ]
+    },
+    {
+      "collectionGroup": "inbound_messages_orphans",
+      "queryScope": "COLLECTION",
+      "fields": [
+        { "fieldPath": "isTestFixture", "order": "ASCENDING" },
         { "fieldPath": "processingState", "order": "ASCENDING" },
         { "fieldPath": "receivedAt", "order": "DESCENDING" }
       ]

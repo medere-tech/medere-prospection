@@ -12,8 +12,8 @@ import { NextResponse } from "next/server";
 import { z } from "zod";
 
 import { requireRole } from "@/lib/auth/require-role";
+import { enrichOrphanWithContact } from "@/lib/firestore/orphan-enrich";
 import { getOrphanInbound } from "@/lib/firestore/orphan-inbounds";
-import { sanitizeOrphanInboundForClient } from "@/lib/firestore/orphan-inbounds-sanitize";
 import { applyAdminRateLimit } from "@/lib/security/admin-rate-limit";
 import { createRateLimiter } from "@/lib/security/rate-limit";
 import { AppError } from "@/lib/utils/errors";
@@ -54,7 +54,8 @@ export async function GET(
       );
     }
 
-    return NextResponse.json({ orphan: sanitizeOrphanInboundForClient(view) });
+    const orphan = await enrichOrphanWithContact(view);
+    return NextResponse.json({ orphan });
   } catch (err) {
     if (err instanceof AppError) {
       logger.warn(err.toLogObject(), "[GET /api/admin/orphan-inbounds/:id] AppError");

@@ -43,6 +43,7 @@ export async function POST(
     await reopenOrphan({
       orphanDocId: parsedId.data,
       reopenedBy: ctx.userId,
+      actorTestAccount: ctx.testAccount,
     });
 
     return NextResponse.json({ ok: true });

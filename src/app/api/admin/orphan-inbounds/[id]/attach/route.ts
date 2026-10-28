@@ -103,11 +103,14 @@ export async function POST(
     }
 
     // Transaction unique : message + orphan + opt-out + audits.
+    // `actorTestAccount` provient du claim JWT (jamais d'un body client).
+    // Garde R-1 : la tx refuse si orphan.isTestFixture !== actorTestAccount.
     const result = await attachOrphanToConversation({
       orphanDocId: parsedId.data,
       conversationId: parsedBody.data.conversationId,
       attachedBy: ctx.userId,
       optOutConfirmed: parsedBody.data.optOutConfirmed,
+      actorTestAccount: ctx.testAccount,
     });
 
     // Enrichissement notif : firstName/speciality/city depuis le contact

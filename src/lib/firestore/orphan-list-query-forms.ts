@@ -27,6 +27,17 @@ export interface OrphanQueryForm {
 export const QUERY_FORMS: readonly OrphanQueryForm[] = [
   // ─── isTestFixture=false (vue réelle utilisateur admin) ───
   {
+    label: "list — isTestFixture=false, receivedAt desc (onglet « Tous » PR2c tour 2b)",
+    category: "list",
+    run: () =>
+      getAdminDb()
+        .collection(ORPHAN_INBOUNDS_COLLECTION)
+        .where("isTestFixture", "==", false)
+        .orderBy("receivedAt", "desc")
+        .limit(1)
+        .get(),
+  },
+  {
     label: "list — isTestFixture=false + processingState='pending', receivedAt desc",
     category: "list",
     run: () =>
@@ -86,6 +97,24 @@ export const QUERY_FORMS: readonly OrphanQueryForm[] = [
         .where("isTestFixture", "==", false)
         .where("processingState", "==", "pending")
         .where("reason", "==", "parse_failed")
+        .orderBy("receivedAt", "desc")
+        .limit(1)
+        .get(),
+  },
+
+  // ─── onglet « Tous » × motif (PR2c tour 2b bloc B — passe 2) ───
+  // L'onglet « Tous » omet `processingState` ; combiné à `reason`, la
+  // requête devient `isTestFixture + reason + receivedAt desc` → nouvel
+  // index composite requis.
+  {
+    label:
+      "list — isTestFixture=false + reason='no_conversation', receivedAt desc (onglet « Tous » × motif)",
+    category: "list",
+    run: () =>
+      getAdminDb()
+        .collection(ORPHAN_INBOUNDS_COLLECTION)
+        .where("isTestFixture", "==", false)
+        .where("reason", "==", "no_conversation")
         .orderBy("receivedAt", "desc")
         .limit(1)
         .get(),

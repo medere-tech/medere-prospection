@@ -22,6 +22,13 @@ export interface ConversationListItem {
   status: ConversationStatus;
   intent: Intent;
   assignedTo: string | null;
+  /**
+   * PR2c tour 2b bloc B — nom pro du titulaire résolu côté serveur
+   * (via `listCommerciauxForFilter`). `null` si pas de titulaire OU
+   * Airtable indisponible OU identifiant non reconnu. Consommé par
+   * le dialog d'attach des SMS orphelins pour la phrase de confirmation.
+   */
+  assignedToName: string | null;
   lastMessageAtIso: string | null;
   lastInboundAtIso: string | null;
   lastOutboundAtIso: string | null;

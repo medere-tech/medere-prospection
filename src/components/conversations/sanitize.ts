@@ -86,6 +86,18 @@ export function sanitizeMessageForBubble(
   const abandonReason =
     msg.abandonReason === "stale_pre_launch_test_cleanup" ? msg.abandonReason : undefined;
 
+  // PR2c tour 2b bloc B — origine orphan (rattachement manuel admin).
+  // Allow-list stricte sur le sous-objet : on NE copie QUE `phoneMatch`
+  // (l'`orphanId` interne n'est jamais exposé au client). Validation
+  // d'enum fermée.
+  const attachedFromOrphan = (() => {
+    const raw = msg.attachedFromOrphan;
+    if (!raw || typeof raw !== "object") return undefined;
+    const pm = raw.phoneMatch;
+    if (pm !== "match" && pm !== "mismatch" && pm !== "not_computable") return undefined;
+    return { phoneMatch: pm };
+  })();
+
   return {
     messageId: msg.messageId,
     direction: msg.direction,
@@ -101,6 +113,7 @@ export function sanitizeMessageForBubble(
     abandonReason,
     intent: msg.intent,
     commercialName,
+    ...(attachedFromOrphan !== undefined ? { attachedFromOrphan } : {}),
   };
 }
 

@@ -63,6 +63,7 @@ export async function POST(
       orphanDocId: parsedId.data,
       dismissReason: parsedBody.data.dismissReason,
       dismissedBy: ctx.userId,
+      actorTestAccount: ctx.testAccount,
     });
 
     return NextResponse.json({ ok: true });

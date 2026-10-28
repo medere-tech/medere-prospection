@@ -81,7 +81,7 @@ import { appendAuditLogTx } from "@/lib/firestore/audit-log";
 import { _parseContactOrThrow, markOptedOutInTx } from "@/lib/firestore/contacts";
 import { _parseConversationOrThrow } from "@/lib/firestore/conversations";
 import { addInboundInTx } from "@/lib/firestore/messages";
-import { ConflictError, NotFoundError, ValidationError } from "@/lib/utils/errors";
+import { ConflictError, ForbiddenError, NotFoundError, ValidationError } from "@/lib/utils/errors";
 import { hashPii, safeExternalIdHash, safePhoneHash } from "@/lib/utils/pii-detector";
 import type {
   InboundOnInactiveConversationReason,
@@ -557,19 +557,31 @@ export async function getOrphanInbound(
 // ─────────────────────────────────────────────────────────────────────────────
 
 /**
+ * Clé « tous » (page `/admin/orphan-inbounds`, onglet "Tous" PR2c tour 2b).
+ * Agrégat strict `pending + attached + dismissed` — jamais lu depuis une
+ * requête Firestore séparée pour garantir qu'il est TOUJOURS cohérent avec
+ * la somme des trois états.
+ */
+export type OrphanCountKey = OrphanProcessingState | "all";
+
+export type OrphanCounts = Record<OrphanCountKey, number>;
+
+/**
  * Compte le nombre d'orphans par `processingState`. Fait 3 count queries
  * Firestore (une par état). Les compteurs sont bornés : Firestore `count()`
- * retourne un entier (pas de surcoût de lecture par doc).
+ * retourne un entier (pas de surcoût de lecture par doc). Le compteur `all`
+ * est l'agrégat strict de ces 3 valeurs (jamais une 4e requête — garantit
+ * `all === pending + attached + dismissed` sans drift possible).
  *
  * Fail-closed `isTestFixture` identique à `listOrphanInbounds` : par défaut,
  * les fixtures ne sont PAS comptées. Un caller `testAccount` les inclut.
  */
 export async function countOrphanInboundsByState(options?: {
   includeTestFixtures?: boolean;
-}): Promise<Record<OrphanProcessingState, number>> {
+}): Promise<OrphanCounts> {
   const base = getAdminDb().collection(ORPHAN_INBOUNDS_COLLECTION);
   const states: readonly OrphanProcessingState[] = ["pending", "attached", "dismissed"];
-  const counts: Record<OrphanProcessingState, number> = {
+  const perState: Record<OrphanProcessingState, number> = {
     pending: 0,
     attached: 0,
     dismissed: 0,
@@ -581,10 +593,13 @@ export async function countOrphanInboundsByState(options?: {
         q = q.where("isTestFixture", "==", false);
       }
       const snap = await q.count().get();
-      counts[state] = snap.data().count;
+      perState[state] = snap.data().count;
     }),
   );
-  return counts;
+  return {
+    ...perState,
+    all: perState.pending + perState.attached + perState.dismissed,
+  };
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -629,6 +644,52 @@ export class OrphanProcessingStateConflict extends ConflictError {
       message: `orphan processingState transition rejected: expected "${args.expectedState}", got "${args.actualState}"`,
       context: { expectedState: args.expectedState, actualState: args.actualState },
       clientMessage: "Action impossible : cet orphelin est déjà dans un autre état.",
+    });
+  }
+}
+
+/**
+ * Garde fail-closed PR2c tour 2b bloc B (post security-reviewer R-1).
+ *
+ * Les previews et la prod partagent la MÊME base Firestore. Pour éviter
+ * qu'un compte réel agisse sur un doc test (ou l'inverse), chaque
+ * transition de mutation (`attach` / `dismiss` / `reopen`) exige que
+ * `orphan.isTestFixture === actorTestAccount`. Tout mismatch → cette
+ * erreur ; rien n'est écrit (la tx throw AVANT tout write).
+ *
+ * Côté client, elle apparaît comme un 403 avec un message générique
+ * (fail-closed : jamais confirmer l'existence d'un doc test à un
+ * compte réel).
+ */
+export class OrphanTestFixtureMismatchError extends ForbiddenError {
+  constructor(args: { orphanIsTestFixture: boolean; actorIsTestAccount: boolean }) {
+    super({
+      message: `orphan isTestFixture=${args.orphanIsTestFixture} does not match actor testAccount=${args.actorIsTestAccount}`,
+      context: {
+        orphanIsTestFixture: args.orphanIsTestFixture,
+        actorIsTestAccount: args.actorIsTestAccount,
+      },
+      // Message volontairement neutre (pas de confirmation d'existence).
+      clientMessage: "Action non autorisée sur cet orphelin.",
+    });
+  }
+}
+
+/**
+ * Guard interne — à appeler immédiatement après la lecture de l'orphan
+ * dans chaque transaction (`attach` / `dismiss` / `reopen`). Vérifie
+ * l'isolation stricte test ↔ réel. Un compte réel n'écrit JAMAIS sur
+ * une fixture ; un compte test n'écrit JAMAIS sur un doc réel.
+ */
+function assertActorMatchesOrphanFixture(
+  orphan: OrphanInboundDoc,
+  actorTestAccount: boolean,
+): void {
+  const orphanIsFixture = orphan.isTestFixture === true;
+  if (orphanIsFixture !== actorTestAccount) {
+    throw new OrphanTestFixtureMismatchError({
+      orphanIsTestFixture: orphanIsFixture,
+      actorIsTestAccount: actorTestAccount,
     });
   }
 }
@@ -683,6 +744,16 @@ export interface AttachOrphanInput {
    * `"admin_no"`.
    */
   optOutConfirmed: boolean;
+  /**
+   * PR2c tour 2b bloc B (post R-1) — isolation stricte test ↔ réel.
+   * `true` ssi l'acteur Clerk porte le claim `testAccount`. La tx
+   * refuse (`OrphanTestFixtureMismatchError`) si `orphan.isTestFixture
+   * !== actorTestAccount`. Previews et prod partagent la base — sans
+   * cette garde, un admin réel pourrait muter un doc fixture
+   * (ou l'inverse). Les routes POST posent la valeur depuis
+   * `ctx.testAccount`, jamais depuis le body client.
+   */
+  actorTestAccount: boolean;
 }
 
 export interface AttachOrphanResult {
@@ -755,6 +826,11 @@ export async function attachOrphanToConversation(
       });
     }
     const orphan = orphanSnap.data() as OrphanInboundDoc;
+
+    // Garde R-1 : isolation test ↔ réel. On vérifie AVANT la garde
+    // d'état pour qu'un compte réel ne découvre pas via le message
+    // d'erreur qu'un orphan fixture existe à cet id.
+    assertActorMatchesOrphanFixture(orphan, input.actorTestAccount);
 
     if (orphan.processingState !== "pending") {
       throw new OrphanProcessingStateConflict({
@@ -912,6 +988,8 @@ export interface DismissOrphanInput {
   orphanDocId: string;
   dismissReason: OrphanDismissReason;
   dismissedBy: string;
+  /** Cf. `AttachOrphanInput.actorTestAccount` — isolation stricte R-1. */
+  actorTestAccount: boolean;
 }
 
 export async function dismissOrphan(input: DismissOrphanInput): Promise<void> {
@@ -934,6 +1012,8 @@ export async function dismissOrphan(input: DismissOrphanInput): Promise<void> {
       });
     }
     const orphan = orphanSnap.data() as OrphanInboundDoc;
+    // Garde R-1 : isolation test ↔ réel.
+    assertActorMatchesOrphanFixture(orphan, input.actorTestAccount);
     if (orphan.processingState !== "pending") {
       throw new OrphanProcessingStateConflict({
         expectedState: "pending",
@@ -975,6 +1055,8 @@ export async function dismissOrphan(input: DismissOrphanInput): Promise<void> {
 export interface ReopenOrphanInput {
   orphanDocId: string;
   reopenedBy: string;
+  /** Cf. `AttachOrphanInput.actorTestAccount` — isolation stricte R-1. */
+  actorTestAccount: boolean;
 }
 
 export async function reopenOrphan(input: ReopenOrphanInput): Promise<void> {
@@ -997,6 +1079,8 @@ export async function reopenOrphan(input: ReopenOrphanInput): Promise<void> {
       });
     }
     const orphan = orphanSnap.data() as OrphanInboundDoc;
+    // Garde R-1 : isolation test ↔ réel.
+    assertActorMatchesOrphanFixture(orphan, input.actorTestAccount);
     if (orphan.processingState !== "dismissed") {
       throw new OrphanProcessingStateConflict({
         expectedState: "dismissed",

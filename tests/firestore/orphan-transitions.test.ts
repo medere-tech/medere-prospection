@@ -35,6 +35,7 @@ import {
   listOrphanInbounds,
   ORPHAN_INBOUNDS_COLLECTION,
   OrphanProcessingStateConflict,
+  OrphanTestFixtureMismatchError,
   reopenOrphan,
 } from "@/lib/firestore/orphan-inbounds";
 import { __resetEnvCacheForTests } from "@/lib/security/env";
@@ -143,6 +144,7 @@ describe("orphan transitions — emulator (PR2c tour 2a)", () => {
       conversationId: "c1_hubspot-list-9999",
       attachedBy: "user_admin_e2e",
       optOutConfirmed: false,
+      actorTestAccount: false,
     });
 
     expect(r.messageId).toMatch(/^oih_/);
@@ -187,6 +189,7 @@ describe("orphan transitions — emulator (PR2c tour 2a)", () => {
       conversationId: "c2_hubspot-list-9999",
       attachedBy: "user_admin_e2e",
       optOutConfirmed: false,
+      actorTestAccount: false,
     };
 
     await attachOrphanToConversation(input);
@@ -224,6 +227,7 @@ describe("orphan transitions — emulator (PR2c tour 2a)", () => {
         conversationId: "c3_hubspot-list-9999",
         attachedBy: "user_admin_e2e",
         optOutConfirmed: false,
+        actorTestAccount: false,
       }),
     ).rejects.toBeInstanceOf(ValidationError);
 
@@ -256,6 +260,7 @@ describe("orphan transitions — emulator (PR2c tour 2a)", () => {
       conversationId: "c4_hubspot-list-9999",
       attachedBy: "user_admin_e2e",
       optOutConfirmed: false,
+      actorTestAccount: false,
     });
     expect(r.phoneMatch).toBe("match");
   });
@@ -280,6 +285,7 @@ describe("orphan transitions — emulator (PR2c tour 2a)", () => {
       conversationId: "c5_hubspot-list-9999",
       attachedBy: "user_admin_e2e",
       optOutConfirmed: false,
+      actorTestAccount: false,
     });
     expect(r.phoneMatch).toBe("mismatch");
   });
@@ -295,12 +301,14 @@ describe("orphan transitions — emulator (PR2c tour 2a)", () => {
       orphanDocId: seed.docId,
       dismissReason: "unrelated_or_spam",
       dismissedBy: "user_admin_e2e",
+      actorTestAccount: false,
     });
     await expect(
       dismissOrphan({
         orphanDocId: seed.docId,
         dismissReason: "unrelated_or_spam",
         dismissedBy: "user_admin_e2e",
+        actorTestAccount: false,
       }),
     ).rejects.toBeInstanceOf(OrphanProcessingStateConflict);
 
@@ -329,8 +337,13 @@ describe("orphan transitions — emulator (PR2c tour 2a)", () => {
       orphanDocId: seedA.docId,
       dismissReason: "sender_not_identifiable",
       dismissedBy: "user_admin_e2e",
+      actorTestAccount: false,
     });
-    await reopenOrphan({ orphanDocId: seedA.docId, reopenedBy: "user_admin_e2e" });
+    await reopenOrphan({
+      orphanDocId: seedA.docId,
+      reopenedBy: "user_admin_e2e",
+      actorTestAccount: false,
+    });
     const afterA = await getAdminDb().collection(ORPHAN_INBOUNDS_COLLECTION).doc(seedA.docId).get();
     expect(afterA.data()?.processingState).toBe("pending");
 
@@ -347,9 +360,14 @@ describe("orphan transitions — emulator (PR2c tour 2a)", () => {
       conversationId: "c6_hubspot-list-9999",
       attachedBy: "user_admin_e2e",
       optOutConfirmed: false,
+      actorTestAccount: false,
     });
     await expect(
-      reopenOrphan({ orphanDocId: seedB.docId, reopenedBy: "user_admin_e2e" }),
+      reopenOrphan({
+        orphanDocId: seedB.docId,
+        reopenedBy: "user_admin_e2e",
+        actorTestAccount: false,
+      }),
     ).rejects.toBeInstanceOf(OrphanProcessingStateConflict);
   });
 
@@ -370,6 +388,7 @@ describe("orphan transitions — emulator (PR2c tour 2a)", () => {
       // le serveur DOIT ignorer la réponse admin et appliquer l'opt-out
       // (invariant L.34-5 CPCE — un client ne peut JAMAIS annuler un STOP).
       optOutConfirmed: false,
+      actorTestAccount: false,
     });
 
     expect(r.wasOptOut).toBe(true);
@@ -418,6 +437,7 @@ describe("orphan transitions — emulator (PR2c tour 2a)", () => {
       conversationId: "cadminyes_hubspot-list-9999",
       attachedBy: "user_admin_e2e",
       optOutConfirmed: true, // admin répond « Oui »
+      actorTestAccount: false,
     });
 
     expect(r.wasOptOut).toBe(true);
@@ -453,6 +473,7 @@ describe("orphan transitions — emulator (PR2c tour 2a)", () => {
       conversationId: "cadminno_hubspot-list-9999",
       attachedBy: "user_admin_e2e",
       optOutConfirmed: false,
+      actorTestAccount: false,
     });
 
     expect(r.wasOptOut).toBe(false);
@@ -493,6 +514,7 @@ describe("orphan transitions — emulator (PR2c tour 2a)", () => {
         conversationId: "cnoc_hubspot-list-9999",
         attachedBy: "user_admin_e2e",
         optOutConfirmed: false,
+        actorTestAccount: false,
       }),
     ).rejects.toThrow(/contact missing for conv/);
 
@@ -537,6 +559,7 @@ describe("orphan transitions — emulator (PR2c tour 2a)", () => {
         conversationId: "ccrash_hubspot-list-9999",
         attachedBy: "user_admin_e2e",
         optOutConfirmed: false,
+        actorTestAccount: false,
       });
       // Simule un crash post-return (ex: Slack notif throw).
       throw new Error("simulated post-tx crash");
@@ -578,6 +601,7 @@ describe("orphan transitions — emulator (PR2c tour 2a)", () => {
       conversationId: "ccnt_hubspot-list-9999",
       attachedBy: "user_admin_e2e",
       optOutConfirmed: false,
+      actorTestAccount: false,
     });
 
     const convAfter = await getAdminDb()
@@ -645,5 +669,145 @@ describe("orphan transitions — emulator (PR2c tour 2a)", () => {
     expect(computePhoneMatch("", "+33612345678")).toBe("not_computable");
     expect(computePhoneMatch(hashA, "")).toBe("not_computable");
     expect(computePhoneMatch(hashB, "+33622222222")).toBe("match");
+  });
+
+  // ─────────────────────────────────────────────────────────────────────
+  // R-1 : garde `isTestFixture` ↔ `actorTestAccount` (post-audit security)
+  // ─────────────────────────────────────────────────────────────────────
+  //
+  // Previews et prod partagent la même base Firestore. Un compte réel
+  // ne doit JAMAIS muter un orphan `isTestFixture: true` ; un compte
+  // test ne doit JAMAIS muter un orphan réel. La transaction refuse via
+  // `OrphanTestFixtureMismatchError` AVANT tout write.
+  //
+  // Mutation sentinelle : si on retire l'appel à
+  // `assertActorMatchesOrphanFixture` dans `attachOrphanToConversation`
+  // ou dans `dismissOrphan` / `reopenOrphan`, les tests « rejet » ci-
+  // dessous passent sans throw et donc fail.
+
+  it("R-1 attach : orphan réel + actor réel → OK (contrôle positif)", async () => {
+    const seed = await addOrphanInboundIdempotent({
+      reason: "unknown_contact",
+      body: "control positif",
+      idempotencyKey: "r1-real-real",
+      source: "process-reply",
+    });
+    await seedConvAndContact({ conversationId: "cr1a_hubspot-list-9999", contactId: "cr1a" });
+    const r = await attachOrphanToConversation({
+      orphanDocId: seed.docId,
+      conversationId: "cr1a_hubspot-list-9999",
+      attachedBy: "user_admin_e2e",
+      optOutConfirmed: false,
+      actorTestAccount: false,
+    });
+    expect(r.messageId).toMatch(/^oih_/);
+  });
+
+  it("R-1 attach : orphan fixture + actor réel → rejet (OrphanTestFixtureMismatchError)", async () => {
+    const seed = await addOrphanInboundIdempotent({
+      reason: "unknown_contact",
+      body: "fixture doc",
+      idempotencyKey: "r1-fixture-real",
+      source: "process-reply",
+      isTestFixture: true,
+    });
+    await seedConvAndContact({ conversationId: "cr1b_hubspot-list-9999", contactId: "cr1b" });
+    await expect(
+      attachOrphanToConversation({
+        orphanDocId: seed.docId,
+        conversationId: "cr1b_hubspot-list-9999",
+        attachedBy: "user_admin_e2e",
+        optOutConfirmed: false,
+        actorTestAccount: false, // compte réel
+      }),
+    ).rejects.toBeInstanceOf(OrphanTestFixtureMismatchError);
+    const after = await getAdminDb().collection(ORPHAN_INBOUNDS_COLLECTION).doc(seed.docId).get();
+    expect(after.data()?.processingState).toBe("pending"); // rien écrit
+  });
+
+  it("R-1 attach : orphan réel + actor testAccount → rejet", async () => {
+    const seed = await addOrphanInboundIdempotent({
+      reason: "unknown_contact",
+      body: "doc réel",
+      idempotencyKey: "r1-real-fixture",
+      source: "process-reply",
+    });
+    await seedConvAndContact({ conversationId: "cr1c_hubspot-list-9999", contactId: "cr1c" });
+    await expect(
+      attachOrphanToConversation({
+        orphanDocId: seed.docId,
+        conversationId: "cr1c_hubspot-list-9999",
+        attachedBy: "user_admin_e2e",
+        optOutConfirmed: false,
+        actorTestAccount: true, // compte test
+      }),
+    ).rejects.toBeInstanceOf(OrphanTestFixtureMismatchError);
+    const after = await getAdminDb().collection(ORPHAN_INBOUNDS_COLLECTION).doc(seed.docId).get();
+    expect(after.data()?.processingState).toBe("pending");
+  });
+
+  it("R-1 attach : orphan fixture + actor testAccount → OK (contrôle positif inverse)", async () => {
+    const seed = await addOrphanInboundIdempotent({
+      reason: "unknown_contact",
+      body: "fixture + testAccount",
+      idempotencyKey: "r1-fixture-fixture",
+      source: "process-reply",
+      isTestFixture: true,
+    });
+    await seedConvAndContact({ conversationId: "cr1d_hubspot-list-9999", contactId: "cr1d" });
+    const r = await attachOrphanToConversation({
+      orphanDocId: seed.docId,
+      conversationId: "cr1d_hubspot-list-9999",
+      attachedBy: "user_admin_e2e",
+      optOutConfirmed: false,
+      actorTestAccount: true,
+    });
+    expect(r.messageId).toMatch(/^oih_/);
+  });
+
+  it("R-1 dismiss : orphan fixture + actor réel → rejet, rien écrit", async () => {
+    const seed = await addOrphanInboundIdempotent({
+      reason: "unknown_contact",
+      body: "fixture spam",
+      idempotencyKey: "r1-dismiss-mismatch",
+      source: "process-reply",
+      isTestFixture: true,
+    });
+    await expect(
+      dismissOrphan({
+        orphanDocId: seed.docId,
+        dismissReason: "unrelated_or_spam",
+        dismissedBy: "user_admin_e2e",
+        actorTestAccount: false,
+      }),
+    ).rejects.toBeInstanceOf(OrphanTestFixtureMismatchError);
+    const after = await getAdminDb().collection(ORPHAN_INBOUNDS_COLLECTION).doc(seed.docId).get();
+    expect(after.data()?.processingState).toBe("pending");
+  });
+
+  it("R-1 reopen : orphan fixture dismissed + actor réel → rejet", async () => {
+    const seed = await addOrphanInboundIdempotent({
+      reason: "unknown_contact",
+      body: "fixture",
+      idempotencyKey: "r1-reopen-mismatch",
+      source: "process-reply",
+      isTestFixture: true,
+    });
+    // dismiss côté testAccount pour arriver à l'état "dismissed".
+    await dismissOrphan({
+      orphanDocId: seed.docId,
+      dismissReason: "sender_not_identifiable",
+      dismissedBy: "user_admin_e2e",
+      actorTestAccount: true,
+    });
+    await expect(
+      reopenOrphan({
+        orphanDocId: seed.docId,
+        reopenedBy: "user_admin_e2e",
+        actorTestAccount: false, // mismatch
+      }),
+    ).rejects.toBeInstanceOf(OrphanTestFixtureMismatchError);
+    const after = await getAdminDb().collection(ORPHAN_INBOUNDS_COLLECTION).doc(seed.docId).get();
+    expect(after.data()?.processingState).toBe("dismissed"); // rien bougé
   });
 });

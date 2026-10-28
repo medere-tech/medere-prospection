@@ -22,11 +22,11 @@ import { NextResponse } from "next/server";
 import { z } from "zod";
 
 import { requireRole } from "@/lib/auth/require-role";
+import { enrichOrphansWithContacts } from "@/lib/firestore/orphan-enrich";
 import {
   LIST_ORPHAN_INBOUNDS_MAX_LIMIT,
   listOrphanInbounds,
 } from "@/lib/firestore/orphan-inbounds";
-import { sanitizeOrphanInboundForClient } from "@/lib/firestore/orphan-inbounds-sanitize";
 import { applyAdminRateLimit } from "@/lib/security/admin-rate-limit";
 import { createRateLimiter } from "@/lib/security/rate-limit";
 import { AppError } from "@/lib/utils/errors";
@@ -84,8 +84,12 @@ export async function GET(request: Request): Promise<NextResponse> {
       includeTestFixtures: ctx.testAccount,
     });
 
+    // Enrichissement serveur (PR2c tour 2b bloc B) : résout le résumé
+    // pro du médecin pour chaque orphan — la vue client ne porte NI
+    // contactId racine NI identifiant Clerk. Dédoublonne les reads.
+    const enriched = await enrichOrphansWithContacts(result.orphans);
     return NextResponse.json({
-      orphans: result.orphans.map((o) => sanitizeOrphanInboundForClient(o)),
+      orphans: enriched,
       nextCursor: result.nextCursor,
       hasMore: result.hasMore,
     });

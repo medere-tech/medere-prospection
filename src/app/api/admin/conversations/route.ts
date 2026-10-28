@@ -41,6 +41,7 @@ import type { Timestamp } from "firebase-admin/firestore";
 import { NextResponse } from "next/server";
 import { z } from "zod";
 
+import { listCommerciauxForFilter } from "@/lib/airtable/commerciaux";
 import { requireRole } from "@/lib/auth/require-role";
 import { normalizeContactNameSearch } from "@/lib/firestore/conversation-list-fields";
 import { ALLOWED_TABS_BY_ROLE, statusesForTab } from "@/lib/firestore/conversation-list-tabs";
@@ -171,6 +172,20 @@ export async function GET(req: Request): Promise<Response> {
       ? await listConversationsByAssignee(effectiveAssignedTo, listInput)
       : await listConversations(listInput);
 
+    // PR2c tour 2b bloc B — enrichit chaque item avec `assignedToName`
+    // (donnée consommée par le dialog d'attach des SMS orphelins pour
+    // nommer le titulaire dans la confirmation). Résolu côté serveur
+    // via Airtable Commerciaux (cache 5 min partagé avec les autres
+    // vues). Fail-closed : si Airtable échoue, `assignedToName: null`
+    // → l'UI affiche « le titulaire de la conversation ».
+    const commerciauxList = await listCommerciauxForFilter().catch(() => null);
+    const commercialNameBySlackId = new Map<string, string>();
+    for (const c of commerciauxList ?? []) {
+      if (c.slackUserId.length > 0 && c.name.length > 0) {
+        commercialNameBySlackId.set(c.slackUserId, c.name);
+      }
+    }
+
     // Payload défensive — ISO strings côté serveur plutôt que
     // Timestamps bruts (évite le piège `{_seconds,_nanoseconds}` côté
     // client lors du JSON.stringify par défaut de firebase-admin).
@@ -188,6 +203,10 @@ export async function GET(req: Request): Promise<Response> {
       status: c.status,
       intent: c.intent,
       assignedTo: c.assignedTo ?? null,
+      assignedToName:
+        c.assignedTo && commercialNameBySlackId.has(c.assignedTo)
+          ? (commercialNameBySlackId.get(c.assignedTo) as string)
+          : null,
       lastMessageAtIso: tsToIso(c.lastMessageAt as Timestamp | undefined),
       lastInboundAtIso: tsToIso(c.lastInboundAt as Timestamp | undefined),
       lastOutboundAtIso: tsToIso(c.lastOutboundAt as Timestamp | undefined),

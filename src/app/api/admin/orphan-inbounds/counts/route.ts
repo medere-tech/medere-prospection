@@ -1,8 +1,13 @@
 /**
  * GET /api/admin/orphan-inbounds/counts — compteurs par processingState
- * (RBAC admin, PR2c tour 2a).
+ * (RBAC admin, PR2c tour 2a + "all" PR2c tour 2b).
  *
  * Fail-closed `isTestFixture` identique à la route liste.
+ *
+ * Shape de retour :
+ *   `{ counts: { pending, attached, dismissed, all } }` — `all` est
+ *   l'agrégat strict des 3 autres (jamais une requête séparée côté lib
+ *   → garantie sans drift, cf. `countOrphanInboundsByState`).
  */
 import { NextResponse } from "next/server";
 

@@ -52,6 +52,7 @@ function buildItem(overrides: Partial<ConversationListItem> = {}): ConversationL
     status: "opted_out",
     intent: "STOP",
     assignedTo: "U05UVHGBURX",
+    assignedToName: null,
     lastMessageAtIso: "2026-10-20T14:30:00.000Z",
     lastInboundAtIso: "2026-10-20T14:30:00.000Z",
     lastOutboundAtIso: "2026-10-20T13:00:00.000Z",

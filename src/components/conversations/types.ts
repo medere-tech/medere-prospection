@@ -50,6 +50,20 @@ export interface MessageProps {
    * résolvable (fallback « Commercial »).
    */
   commercialName: string | null;
+  /**
+   * PR2c tour 2b bloc B — origine « rattachement manuel depuis un SMS
+   * orphelin ». Posé par `attachOrphanToConversation` sur le doc message
+   * dans la même transaction. La bulle affiche :
+   *   - un bandeau « Ajouté manuellement depuis un SMS orphelin »,
+   *   - un sous-indicateur « Envoyé depuis un autre numéro » quand
+   *     `phoneMatch === "mismatch"`.
+   *
+   * `undefined` → message issu du flux normal (webhook OVH direct). Pas
+   * d'affichage particulier.
+   */
+  attachedFromOrphan?: {
+    phoneMatch: "match" | "mismatch" | "not_computable";
+  };
 }
 
 /** Statut global de la conversation (bandeau en-tête). */

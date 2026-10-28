@@ -7,15 +7,21 @@
  * - `enabled: false` = lien grisé "Bientôt disponible" (S10.2+).
  * - `adminOnly: true` = seuls les rôle "admin" voient l'item (filtré
  *   côté caller via la prop `role`).
+ * - `badge: "orphans_pending"` = badge dynamique du nombre d'orphans
+ *   « à traiter » (PR2c tour 2b bloc B) — admin uniquement, fetch côté
+ *   client via `useOrphanCounts` (fail-closed : rien affiché en loading
+ *   ou erreur, jamais `0` affiché par défaut puisqu'il traduirait un
+ *   état bénin et pourrait masquer un vrai 0).
  *
  * Le composant lui-même est CLIENT (`usePathname` pour l'active state).
  * Les Server Components parents lui passent `role` en prop.
  */
-import { Activity, BarChart3, FileText, MessageSquare, Users } from "lucide-react";
+import { Activity, BarChart3, FileText, Inbox, MessageSquare, Users } from "lucide-react";
 import Link from "next/link";
 import { usePathname } from "next/navigation";
 import type { ComponentType } from "react";
 
+import { useOrphanCounts } from "@/app/admin/orphan-inbounds/use-orphans";
 import { Badge } from "@/components/ui/badge";
 import type { Role } from "@/lib/auth/require-role";
 import { cn } from "@/lib/utils";
@@ -28,6 +34,8 @@ export interface AdminNavItem {
   adminOnly?: boolean;
   /** Indication "Bientôt" affichée comme badge. */
   comingSoon?: boolean;
+  /** Clé de badge dynamique (chiffre vivant). Résolu dans le composant. */
+  badge?: "orphans_pending";
 }
 
 export const ADMIN_NAV_ITEMS: readonly AdminNavItem[] = [
@@ -37,6 +45,14 @@ export const ADMIN_NAV_ITEMS: readonly AdminNavItem[] = [
     label: "Conversations",
     icon: MessageSquare,
     enabled: true,
+  },
+  {
+    href: "/admin/orphan-inbounds",
+    label: "SMS orphelins",
+    icon: Inbox,
+    enabled: true,
+    adminOnly: true,
+    badge: "orphans_pending",
   },
   {
     href: "/admin/campaigns",
@@ -74,6 +90,19 @@ export function AdminNavItems({
   const pathname = usePathname();
 
   const items = ADMIN_NAV_ITEMS.filter((item) => !item.adminOnly || role === "admin");
+
+  // PR2c tour 2b bloc B — badge « orphans à traiter ».
+  //
+  //   - Admin only (filtre `adminOnly` ci-dessus garantit que l'item
+  //     n'apparaît pas pour un commercial → `enabled: false` pour eux).
+  //   - Fixtures exclues côté API par défaut (fail-closed strict dans
+  //     `listOrphanInbounds` / `countOrphanInboundsByState`).
+  //   - Fail-closed UI : badge masqué en loading / erreur, pas de « 0 »
+  //     par défaut (pour éviter de cacher un vrai zéro derrière un
+  //     fallback bavard).
+  const orphanCounts = useOrphanCounts(role === "admin");
+  const orphansPending =
+    role === "admin" && orphanCounts.data !== undefined ? orphanCounts.data.counts.pending : null;
 
   return (
     <nav aria-label="Navigation admin" className="flex flex-col gap-1 p-2">
@@ -129,6 +158,11 @@ export function AdminNavItems({
           );
         }
 
+        const dynBadge =
+          item.badge === "orphans_pending" && orphansPending !== null && orphansPending > 0
+            ? orphansPending
+            : null;
+
         return (
           <Link
             key={item.href}
@@ -139,6 +173,15 @@ export function AdminNavItems({
           >
             <Icon className="size-4 shrink-0" aria-hidden />
             <span className="flex-1">{item.label}</span>
+            {dynBadge !== null && (
+              <Badge
+                variant="destructive"
+                className="tabular-nums"
+                aria-label={`${dynBadge} SMS orphelin${dynBadge > 1 ? "s" : ""} à traiter`}
+              >
+                {dynBadge}
+              </Badge>
+            )}
           </Link>
         );
       })}
