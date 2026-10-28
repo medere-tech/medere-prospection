@@ -667,6 +667,22 @@ export interface AttachOrphanInput {
   orphanDocId: string;
   conversationId: string;
   attachedBy: string;
+  /**
+   * PR2c tour 2b — réponse OBLIGATOIRE de l'admin à la question
+   * « Ce SMS demande-t-il l'arrêt des sollicitations ? ». Sans valeur
+   * par défaut : le body Zod côté route force la présence.
+   *
+   * Règle serveur (NON négociable) :
+   *   - Si `isOptOut(orphan.body)` retourne `true` → opt-out appliqué,
+   *     quelle que soit la valeur de `optOutConfirmed`. Un client NE
+   *     PEUT JAMAIS annuler un STOP détecté (invariant L.34-5 CPCE).
+   *   - Sinon `optOutConfirmed === true` → opt-out appliqué.
+   *   - Sinon → pas d'opt-out.
+   *
+   * `optOutDecision` dans l'audit discrimine `"detector"` / `"admin_yes"` /
+   * `"admin_no"`.
+   */
+  optOutConfirmed: boolean;
 }
 
 export interface AttachOrphanResult {
@@ -675,6 +691,7 @@ export interface AttachOrphanResult {
   phoneMatch: OrphanPhoneMatch;
   body: string;
   wasOptOut: boolean;
+  optOutDecision: "detector" | "admin_yes" | "admin_no";
   isTestFixture: boolean;
   /**
    * Slack user ID du titulaire si `conversation.handoff.assignedTo` défini,
@@ -765,14 +782,42 @@ export async function attachOrphanToConversation(
     const contactId = conv.contactId;
     const assignedToSlackUserId = conv.handoff?.assignedTo;
 
+    // PR2c tour 2b correction A2 : refus typé si la conv n'a pas de contact.
+    if (contactId.length === 0) {
+      throw new ValidationError({
+        message: "attachOrphanToConversation: conversation has no contact",
+        context: { conversationId: input.conversationId },
+        clientMessage:
+          "Impossible de rattacher : la conversation ciblée n'a pas de médecin associé.",
+      });
+    }
+
     const contactRef = db.collection("contacts").doc(contactId);
     const contactSnap = await tx.get(contactRef);
-    const contact = contactSnap.exists ? _parseContactOrThrow(contactSnap.data(), contactId) : null;
-    const contactE164 = contact?.phone?.e164;
+    if (!contactSnap.exists) {
+      throw new ValidationError({
+        message: "attachOrphanToConversation: contact missing for conv.contactId",
+        context: { conversationId: input.conversationId, contactId },
+        clientMessage:
+          "Impossible de rattacher : le médecin associé à la conversation est introuvable.",
+      });
+    }
+    const contact = _parseContactOrThrow(contactSnap.data(), contactId);
+    const contactE164 = contact.phone?.e164;
     const phoneMatch = computePhoneMatch(orphan.phoneHash, contactE164);
 
-    // Opt-out détecté serveur-side par le détecteur partagé.
-    const wasOptOut = isOptOut(orphan.body);
+    // PR2c tour 2b correction A1 : opt-out décision mixte.
+    //   - détecteur serveur-side (court-forme) prime toujours — un client
+    //     NE PEUT JAMAIS annuler un STOP détecté (invariant L.34-5 CPCE).
+    //   - sinon, `optOutConfirmed === true` depuis l'admin déclenche.
+    //   - sinon pas d'opt-out.
+    const detectorSaysOptOut = isOptOut(orphan.body);
+    const wasOptOut = detectorSaysOptOut || input.optOutConfirmed === true;
+    const optOutDecision: "detector" | "admin_yes" | "admin_no" = detectorSaysOptOut
+      ? "detector"
+      : input.optOutConfirmed === true
+        ? "admin_yes"
+        : "admin_no";
     const now = Timestamp.now();
 
     // ─── ALL WRITES AFTER ─────────────────────────────────────────────
@@ -785,7 +830,8 @@ export async function attachOrphanToConversation(
         body: orphan.body,
         channel: "sms",
         externalId: input.orphanDocId,
-        externalReceiver: "",
+        // Omis volontairement : un orphan `parse_failed` n'a pas de numéro
+        // émetteur normalisable (cf. remarque M3 security PR2c tour 2a bis).
       },
       { deterministicMessageId, now, conv },
     );
@@ -818,6 +864,7 @@ export async function attachOrphanToConversation(
       reason: orphan.reason,
       phoneMatch,
       wasOptOut,
+      optOutDecision,
       isTestFixture: orphan.isTestFixture === true,
     };
     appendAuditLogTx(tx, {
@@ -850,6 +897,7 @@ export async function attachOrphanToConversation(
       phoneMatch,
       body: orphan.body,
       wasOptOut,
+      optOutDecision,
       isTestFixture: orphan.isTestFixture === true,
       assignedToSlackUserId,
     } satisfies AttachOrphanResult;

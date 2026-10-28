@@ -60,7 +60,16 @@ const attachLimiter = createRateLimiter({
 const BodySchema = z.object({
   conversationId: z
     .string()
-    .regex(/^[^/]+_hubspot-list-\d+$/, "conversationId must match ${contactId}_${campaignId}"),
+    .regex(/^[^/]+_hubspot-list-\d+$/, "conversationId must match <contactId>_hubspot-list-<n>"),
+  /**
+   * PR2c tour 2b correction A1 — réponse OBLIGATOIRE à la question UI
+   * « Ce SMS demande-t-il l'arrêt des sollicitations ? ». Sans default.
+   * Le serveur applique l'opt-out si `isOptOut(body)` ET/OU
+   * `optOutConfirmed === true`. Un client ne peut JAMAIS annuler un STOP
+   * détecté (invariant L.34-5 CPCE enforced côté serveur, cf.
+   * `attachOrphanToConversation`).
+   */
+  optOutConfirmed: z.boolean(),
 });
 
 const IdSchema = z.string().regex(/^oih_[A-Za-z0-9_]+$/, "orphan docId must match /^oih_/");
@@ -98,6 +107,7 @@ export async function POST(
       orphanDocId: parsedId.data,
       conversationId: parsedBody.data.conversationId,
       attachedBy: ctx.userId,
+      optOutConfirmed: parsedBody.data.optOutConfirmed,
     });
 
     // Enrichissement notif : firstName/speciality/city depuis le contact
@@ -121,6 +131,7 @@ export async function POST(
       messageId: result.messageId,
       phoneMatch: result.phoneMatch,
       wasOptOut: result.wasOptOut,
+      optOutDecision: result.optOutDecision,
       notified: notifyResult.kind,
     });
   } catch (err) {

@@ -396,7 +396,14 @@ export interface AddInboundInput {
   body: string;
   channel: MessageChannel;
   externalId: string;
-  externalReceiver: string;
+  /**
+   * PR2c tour 2b — rendu OPTIONNEL. Dans le flow normal webhook OVH, on
+   * passe toujours le numéro E.164 émetteur. Dans le rattachement manuel
+   * `attachOrphanToConversation`, l'orphan peut provenir de `parse_failed`
+   * sans numéro identifiable → on omet le champ plutôt que d'écrire `""`
+   * (cf. remarque M3 security-reviewer PR2c tour 2a bis).
+   */
+  externalReceiver?: string;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -866,7 +873,9 @@ export async function addInbound(conversationId: string, input: AddInboundInput)
       status: "received",
       channel: input.channel,
       externalId: input.externalId,
-      externalReceiver: input.externalReceiver,
+      // PR2c tour 2b — omettre si absent plutôt qu'écrire "".
+      ...(input.externalReceiver !== undefined &&
+        input.externalReceiver.length > 0 && { externalReceiver: input.externalReceiver }),
       generatedBy: "human",
       createdAt: now,
       receivedAt: now,
@@ -958,7 +967,9 @@ export async function addInboundInTx(
     status: "received",
     channel: input.channel,
     externalId: input.externalId,
-    externalReceiver: input.externalReceiver,
+    // PR2c tour 2b — omettre quand absent/vide (cas rattachement orphan).
+    ...(input.externalReceiver !== undefined &&
+      input.externalReceiver.length > 0 && { externalReceiver: input.externalReceiver }),
     generatedBy: "human",
     createdAt: now,
     receivedAt: now,

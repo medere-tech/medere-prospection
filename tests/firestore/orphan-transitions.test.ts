@@ -142,6 +142,7 @@ describe("orphan transitions — emulator (PR2c tour 2a)", () => {
       orphanDocId: seed.docId,
       conversationId: "c1_hubspot-list-9999",
       attachedBy: "user_admin_e2e",
+      optOutConfirmed: false,
     });
 
     expect(r.messageId).toMatch(/^oih_/);
@@ -185,6 +186,7 @@ describe("orphan transitions — emulator (PR2c tour 2a)", () => {
       orphanDocId: seed.docId,
       conversationId: "c2_hubspot-list-9999",
       attachedBy: "user_admin_e2e",
+      optOutConfirmed: false,
     };
 
     await attachOrphanToConversation(input);
@@ -221,6 +223,7 @@ describe("orphan transitions — emulator (PR2c tour 2a)", () => {
         orphanDocId: seed.docId,
         conversationId: "c3_hubspot-list-9999",
         attachedBy: "user_admin_e2e",
+        optOutConfirmed: false,
       }),
     ).rejects.toBeInstanceOf(ValidationError);
 
@@ -252,6 +255,7 @@ describe("orphan transitions — emulator (PR2c tour 2a)", () => {
       orphanDocId: seed.docId,
       conversationId: "c4_hubspot-list-9999",
       attachedBy: "user_admin_e2e",
+      optOutConfirmed: false,
     });
     expect(r.phoneMatch).toBe("match");
   });
@@ -275,6 +279,7 @@ describe("orphan transitions — emulator (PR2c tour 2a)", () => {
       orphanDocId: seed.docId,
       conversationId: "c5_hubspot-list-9999",
       attachedBy: "user_admin_e2e",
+      optOutConfirmed: false,
     });
     expect(r.phoneMatch).toBe("mismatch");
   });
@@ -341,6 +346,7 @@ describe("orphan transitions — emulator (PR2c tour 2a)", () => {
       orphanDocId: seedB.docId,
       conversationId: "c6_hubspot-list-9999",
       attachedBy: "user_admin_e2e",
+      optOutConfirmed: false,
     });
     await expect(
       reopenOrphan({ orphanDocId: seedB.docId, reopenedBy: "user_admin_e2e" }),
@@ -360,9 +366,14 @@ describe("orphan transitions — emulator (PR2c tour 2a)", () => {
       orphanDocId: seed.docId,
       conversationId: "cstop_hubspot-list-9999",
       attachedBy: "user_admin_e2e",
+      // PR2c tour 2b — l'admin répond « Non », mais le détecteur voit STOP :
+      // le serveur DOIT ignorer la réponse admin et appliquer l'opt-out
+      // (invariant L.34-5 CPCE — un client ne peut JAMAIS annuler un STOP).
+      optOutConfirmed: false,
     });
 
     expect(r.wasOptOut).toBe(true);
+    expect(r.optOutDecision).toBe("detector");
 
     // Opt-out contact posé dans la MÊME tx.
     const contactAfter = await getAdminDb().collection("contacts").doc("cstop").get();
@@ -390,6 +401,122 @@ describe("orphan transitions — emulator (PR2c tour 2a)", () => {
     expect(attachAudits.size).toBe(1);
   });
 
+  it("attachOrphanToConversation : body NON-STOP + optOutConfirmed=true (admin_yes) → opt-out appliqué, audit discriminé", async () => {
+    const seed = await addOrphanInboundIdempotent({
+      reason: "unknown_contact",
+      body: "Bonjour, finalement je ne suis pas intéressé par vos services, merci",
+      idempotencyKey: "tx-admin-yes-1",
+      source: "process-reply",
+    });
+    await seedConvAndContact({
+      conversationId: "cadminyes_hubspot-list-9999",
+      contactId: "cadminyes",
+    });
+
+    const r = await attachOrphanToConversation({
+      orphanDocId: seed.docId,
+      conversationId: "cadminyes_hubspot-list-9999",
+      attachedBy: "user_admin_e2e",
+      optOutConfirmed: true, // admin répond « Oui »
+    });
+
+    expect(r.wasOptOut).toBe(true);
+    expect(r.optOutDecision).toBe("admin_yes");
+
+    const contactAfter = await getAdminDb().collection("contacts").doc("cadminyes").get();
+    expect(contactAfter.data()?.consent?.optedOut).toBe(true);
+
+    // Audit `orphan_attached_to_conversation` → payload discrimine la décision.
+    const attachAudits = await getAdminDb()
+      .collection("audit_log")
+      .where("action", "==", "orphan_attached_to_conversation")
+      .get();
+    expect(attachAudits.size).toBe(1);
+    const payload = attachAudits.docs[0]?.data()?.payload as { optOutDecision?: string };
+    expect(payload?.optOutDecision).toBe("admin_yes");
+  });
+
+  it("attachOrphanToConversation : body NON-STOP + optOutConfirmed=false → PAS d'opt-out, decision=admin_no", async () => {
+    const seed = await addOrphanInboundIdempotent({
+      reason: "unknown_contact",
+      body: "Bonjour, merci pour l'info",
+      idempotencyKey: "tx-admin-no-1",
+      source: "process-reply",
+    });
+    await seedConvAndContact({
+      conversationId: "cadminno_hubspot-list-9999",
+      contactId: "cadminno",
+    });
+
+    const r = await attachOrphanToConversation({
+      orphanDocId: seed.docId,
+      conversationId: "cadminno_hubspot-list-9999",
+      attachedBy: "user_admin_e2e",
+      optOutConfirmed: false,
+    });
+
+    expect(r.wasOptOut).toBe(false);
+    expect(r.optOutDecision).toBe("admin_no");
+
+    const contactAfter = await getAdminDb().collection("contacts").doc("cadminno").get();
+    expect(contactAfter.data()?.consent?.optedOut).toBe(false);
+  });
+
+  it("attachOrphanToConversation : conv sans contact résolvable → ValidationError, aucune écriture", async () => {
+    const seed = await addOrphanInboundIdempotent({
+      reason: "no_conversation",
+      body: "Message valide",
+      idempotencyKey: "tx-conv-no-contact-1",
+      source: "process-reply",
+    });
+
+    // Seed d'une conv dont le `contactId` pointe un doc contact INEXISTANT :
+    // la conv parse OK (contactId non-vide) mais le contact est absent.
+    // Scénario réel : contact anonymisé/supprimé après création de la conv.
+    await getAdminDb().collection("conversations").doc("cnoc_hubspot-list-9999").set({
+      contactId: "ghost-contact-id",
+      campaignId: "hubspot-list-9999",
+      channel: "sms",
+      status: "active",
+      intent: "unknown",
+      messageCount: 0,
+      outboundCount: 0,
+      inboundCount: 0,
+      followupCount: 0,
+      createdAt: Timestamp.now(),
+      updatedAt: Timestamp.now(),
+    });
+
+    await expect(
+      attachOrphanToConversation({
+        orphanDocId: seed.docId,
+        conversationId: "cnoc_hubspot-list-9999",
+        attachedBy: "user_admin_e2e",
+        optOutConfirmed: false,
+      }),
+    ).rejects.toThrow(/contact missing for conv/);
+
+    // Preuve d'aucune écriture : orphan reste pending, pas de message, pas d'audit attach.
+    const orphanAfter = await getAdminDb()
+      .collection(ORPHAN_INBOUNDS_COLLECTION)
+      .doc(seed.docId)
+      .get();
+    expect(orphanAfter.data()?.processingState).toBe("pending");
+
+    const msgs = await getAdminDb()
+      .collection("conversations")
+      .doc("cnoc_hubspot-list-9999")
+      .collection("messages")
+      .get();
+    expect(msgs.size).toBe(0);
+
+    const audits = await getAdminDb()
+      .collection("audit_log")
+      .where("action", "==", "orphan_attached_to_conversation")
+      .get();
+    expect(audits.size).toBe(0);
+  });
+
   it("attachOrphanToConversation : panne simulée APRÈS la tx — attach reste commité (atomique)", async () => {
     // Scenario : le tx attach commit (message + orphan + opt-out éventuel +
     // audits), puis le code post-tx throw (ex: notification Slack qui plante).
@@ -409,6 +536,7 @@ describe("orphan transitions — emulator (PR2c tour 2a)", () => {
         orphanDocId: seed.docId,
         conversationId: "ccrash_hubspot-list-9999",
         attachedBy: "user_admin_e2e",
+        optOutConfirmed: false,
       });
       // Simule un crash post-return (ex: Slack notif throw).
       throw new Error("simulated post-tx crash");
@@ -449,6 +577,7 @@ describe("orphan transitions — emulator (PR2c tour 2a)", () => {
       orphanDocId: seed.docId,
       conversationId: "ccnt_hubspot-list-9999",
       attachedBy: "user_admin_e2e",
+      optOutConfirmed: false,
     });
 
     const convAfter = await getAdminDb()

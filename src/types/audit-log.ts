@@ -818,6 +818,21 @@ export type OrphanDismissReason =
 export type OrphanPhoneMatch = "match" | "mismatch" | "not_computable";
 
 /**
+ * Discriminant de la décision opt-out posée pendant l'attach (PR2c tour 2b).
+ *
+ *   - `"detector"`  : `isOptOut(body)` a vu un STOP court-forme → le serveur
+ *                     applique l'opt-out, quelle que soit la réponse admin.
+ *   - `"admin_yes"` : détecteur négatif, admin a répondu « Oui, c'est un
+ *                     opt-out » dans la question obligatoire → opt-out appliqué.
+ *   - `"admin_no"`  : détecteur négatif, admin a répondu « Non » → pas d'opt-out.
+ *
+ * Note : le client NE PEUT JAMAIS annuler un opt-out détecté (invariant
+ * L.34-5 CPCE). Si détecteur positif ET admin répond « Non », l'opt-out
+ * s'applique quand même et `optOutDecision` reste `"detector"`.
+ */
+export type OrphanOptOutDecision = "detector" | "admin_yes" | "admin_no";
+
+/**
  * Payload pour `orphan_attached_to_conversation`.
  *
  * **Cible** : `targetType: "conversation"`, `targetId: conversationId`
@@ -828,14 +843,17 @@ export type OrphanPhoneMatch = "match" | "mismatch" | "not_computable";
  *   - `body`, `phone`, `email`, `firstName`, `phoneHash`
  *
  * Champs scrubber-safe :
- *   - `orphanDocId`     : docId `oih_...` (hash HMAC).
- *   - `contactId`       : hubspotId opaque.
- *   - `conversationId`  : docId composite `${contactId}_${campaignId}`.
- *   - `messageId`       : Firestore auto-ID 20 chars du doc inbound créé.
- *   - `reason`          : enum fermé OrphanInboundReason (4 valeurs).
- *   - `phoneMatch`      : enum fermé OrphanPhoneMatch (3 valeurs).
- *   - `wasOptOut`       : boolean (opt-out détecté sur le body rattaché).
- *   - `isTestFixture`   : boolean (orphan posé par seed e2e vs réel).
+ *   - `orphanDocId`      : docId `oih_...` (hash HMAC).
+ *   - `contactId`        : hubspotId opaque.
+ *   - `conversationId`   : docId composite `${contactId}_${campaignId}`.
+ *   - `messageId`        : Firestore auto-ID 20 chars du doc inbound créé.
+ *   - `reason`           : enum fermé OrphanInboundReason (4 valeurs).
+ *   - `phoneMatch`       : enum fermé OrphanPhoneMatch (3 valeurs).
+ *   - `wasOptOut`        : boolean (opt-out effectivement appliqué).
+ *   - `optOutDecision`   : enum fermé — qui a tranché l'opt-out
+ *                          (`"detector"` | `"admin_yes"` | `"admin_no"`).
+ *                          PR2c tour 2b.
+ *   - `isTestFixture`    : boolean (orphan posé par seed e2e vs réel).
  */
 export interface OrphanAttachedToConversationPayload {
   orphanDocId: string;
@@ -845,6 +863,7 @@ export interface OrphanAttachedToConversationPayload {
   reason: "no_conversation" | "unknown_contact" | "parse_failed" | "enqueue_failed";
   phoneMatch: OrphanPhoneMatch;
   wasOptOut: boolean;
+  optOutDecision: OrphanOptOutDecision;
   isTestFixture: boolean;
   readonly [k: string]: unknown;
 }
