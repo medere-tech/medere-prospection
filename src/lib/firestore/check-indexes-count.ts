@@ -79,11 +79,13 @@ export function countFromResult(r: unknown): number {
   if ("topConversationId" in rec) {
     return rec.topConversationId ? 1 : 0;
   }
-  // Legacy lookup `getActiveConversationByContactId` → `{ conversationId,
-  // conversation }` (object truthy) OR `null` (déjà géré ci-dessus).
-  if (typeof rec.conversationId === "string" && "conversation" in rec) {
-    return 1;
-  }
+  // ⚠️ PR2c tour 2b bis — on NE RE-MET PAS de branche legacy ici. Les
+  // formes du catalogue qui connaissent leur type (`Conversation | null`
+  // etc.) doivent se convertir en nombre AVANT d'appeler cette fonction
+  // (c.f. `conversation-list-query-forms.ts::buildLegacyForms`). Toute
+  // forme inconnue tombe sur le throw fail-closed ci-dessous — c'est
+  // ce qui a attrapé la régression où un POJO Conversation retournait
+  // `1` arbitraire sans qu'aucun test ne le voie.
   // Fail-closed : forme inconnue → throw explicite plutôt que fallback
   // arbitraire. Un script `check-*-indexes.mjs` qui tombe sur une forme
   // inattendue DOIT alerter l'opérateur, pas afficher un count bidon.

@@ -270,21 +270,28 @@ function buildLegacyForms(): QueryForm[] {
   // Pré-existants PR0 : trois lookups par contact qui émettent des queries
   // `where("contactId","==",X).where("status","in",[...])`. L'index
   // composite `(contactId asc, status asc)` doit exister.
+  // PR2c tour 2b bis — les formes legacy connaissent leur type (`Conversation
+  // | null` ou `{conversationId, conversation} | null`). Elles le convertissent
+  // ELLES-MÊMES en nombre avant de passer la main à `countFromResult`, qui
+  // reste fail-closed strict sur tout objet inconnu. Avant ce fix, les POJO
+  // tombaient dans un `return 1` arbitraire → régression masquée en prod
+  // quand les lookups ne trouvaient rien.
+  const toCount = (r: unknown): number => (r === null ? 0 : 1);
   return [
     {
       label: "legacy.getActiveConversationByContactId",
       category: "legacy",
-      run: () => getActiveConversationByContactId(PROBE_CONTACT_ID),
+      run: () => getActiveConversationByContactId(PROBE_CONTACT_ID).then(toCount),
     },
     {
       label: "legacy.getHandedOffConversationByContactId",
       category: "legacy",
-      run: () => getHandedOffConversationByContactId(PROBE_CONTACT_ID),
+      run: () => getHandedOffConversationByContactId(PROBE_CONTACT_ID).then(toCount),
     },
     {
       label: "legacy.getLatestConversationByContactId",
       category: "legacy",
-      run: () => getLatestConversationByContactId(PROBE_CONTACT_ID),
+      run: () => getLatestConversationByContactId(PROBE_CONTACT_ID).then(toCount),
     },
   ];
 }
