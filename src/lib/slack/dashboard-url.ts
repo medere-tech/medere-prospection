@@ -91,6 +91,21 @@ export function getDashboardOrphansUrl(deps: GetDashboardConversationUrlDeps = {
 }
 
 /**
+ * PR2c tour 2a bis — URL deep-link vers UN orphan précis dans la vue
+ * admin orphelins. Format `/admin/orphan-inbounds?id=<orphanDocId>`.
+ *
+ * UNIQUE fonction (plus de concaténation inline chez les callers Slack).
+ * Les notifications orphans channel + testAccount l'utilisent pour
+ * pointer la fiche détail en un clic.
+ */
+export function getDashboardOrphanDetailUrl(
+  orphanDocId: string,
+  deps: GetDashboardConversationUrlDeps = {},
+): string {
+  return `${resolveDashboardBase(deps.getBaseUrl, "getDashboardOrphanDetailUrl")}/admin/orphan-inbounds?id=${encodeURIComponent(orphanDocId)}`;
+}
+
+/**
  * Résout la base URL dashboard. Centralise la logique de fallback entre
  * les 2 constructeurs (`conversation` + `orphans`). Si
  * `NEXT_PUBLIC_APP_URL` est absente :

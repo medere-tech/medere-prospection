@@ -46,6 +46,7 @@ describe("GET /api/admin/conversations/[id]", () => {
     mockRequireRole.mockResolvedValue({
       userId: "user_admin_xxx",
       role: "admin",
+      testAccount: false,
       firstName: "Déthié",
       lastName: "Faye",
       slackUserId: "U05UVHGBURX",

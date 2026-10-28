@@ -141,6 +141,7 @@ describe("POST /api/admin/preview-first-sms", () => {
     mockRequireRole.mockResolvedValue({
       userId: "user_admin_xxx",
       role: "admin",
+      testAccount: false,
       firstName: "Déthié",
       lastName: "Faye",
     });

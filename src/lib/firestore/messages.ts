@@ -900,6 +900,94 @@ export async function addInbound(conversationId: string, input: AddInboundInput)
 // ─────────────────────────────────────────────────────────────────────────────
 
 /**
+ * Version TRANSACTIONNELLE pure de l'écriture inbound — PR2c tour 2a bis.
+ *
+ * Extrait de `addInboundIdempotent` pour que les callers qui orchestrent
+ * d'autres writes dans la MÊME tx (ex: `attachOrphanToConversation` qui
+ * doit coupler l'écriture message + update orphan + opt-out) puissent
+ * composer sans ouvrir une nouvelle tx. UNE SEULE implémentation —
+ * `addInboundIdempotent` ci-dessous délègue.
+ *
+ * Toute la machinerie (dedup via docId déterministe, bump counters,
+ * dénormalisation preview inbound, audit `sms_received`) vit ici. Le
+ * caller propage l'erreur `ALREADY_EXISTS` → la tx entière abort.
+ *
+ * ⚠️ Firestore règle : tous les `tx.get` AVANT les `tx.update/create`.
+ * Si le caller a déjà lu la conv dans sa propre tx, il peut l'injecter
+ * via `deps.conv` pour éviter un deuxième read (Firestore cache les
+ * reads intra-tx mais c'est une optimisation défensive).
+ *
+ * @throws ValidationError  si body / externalId vides.
+ */
+export async function addInboundInTx(
+  tx: Transaction,
+  conversationId: string,
+  input: AddInboundInput,
+  deps: {
+    deterministicMessageId?: string;
+    now?: Timestamp;
+    /**
+     * PR2c tour 2a bis — conv déjà lue en amont par le caller (évite
+     * un deuxième `tx.get` qui serait un READ-AFTER-WRITES invalide
+     * quand `addInboundInTx` est composé avec d'autres fonctions tx
+     * (`markOptedOutInTx` fait des writes avant l'appel). Si `conv`
+     * fourni, on skip la lecture ; sinon on lit comme avant.
+     */
+    conv?: import("@/types/conversation").Conversation;
+  } = {},
+): Promise<{ messageId: string }> {
+  validateBodyOrThrow(input.body, conversationId);
+  if (input.externalId.length === 0) {
+    throw new ValidationError({
+      message: "addInboundInTx: externalId must be non-empty",
+      context: { conversationId, op: "addInboundInTx" },
+    });
+  }
+  const deterministicMessageId =
+    deps.deterministicMessageId ?? safeExternalIdHash(input.externalId);
+
+  const convRef = getAdminDb().collection(CONVERSATIONS_COLLECTION).doc(conversationId);
+  const conv = deps.conv ?? (await readConversationInTxOrThrow(tx, convRef, conversationId));
+
+  const messageRef = messagesSubcollectionRef(conversationId).doc(deterministicMessageId);
+  const now = deps.now ?? Timestamp.now();
+
+  const messageDoc: Message = {
+    direction: "inbound",
+    body: input.body,
+    status: "received",
+    channel: input.channel,
+    externalId: input.externalId,
+    externalReceiver: input.externalReceiver,
+    generatedBy: "human",
+    createdAt: now,
+    receivedAt: now,
+  };
+  // ATOMIQUE — ALREADY_EXISTS si doc déjà créé par un run concurrent.
+  tx.create(messageRef, messageDoc);
+
+  // PR2a — dénormalisation preview inbound (authorKind="contact").
+  const preview = buildLastMessagePreview({
+    direction: "inbound",
+    authorKind: "contact",
+    text: input.body,
+    at: now,
+  });
+  _bumpConversationCountersTx(tx, convRef, conv, "inbound", now, preview);
+
+  appendAuditLogTx(tx, {
+    actorId: "system",
+    actorType: "system",
+    action: "sms_received",
+    targetType: "message",
+    targetId: messageRef.id,
+    payload: { direction: "inbound", messageId: messageRef.id },
+  });
+
+  return { messageId: messageRef.id };
+}
+
+/**
  * Variante IDEMPOTENTE de `addInbound` — garantit qu'un `externalId` donné
  * (= `ovhMessageId`) ne peut JAMAIS produire 2 docs messages distincts,
  * meme en cas de 2 pipelines concurrents (fix BUG-DEDUP-RACE B).
@@ -984,47 +1072,10 @@ export async function addInboundIdempotent(
 
   try {
     return await getAdminDb().runTransaction(async (tx) => {
-      const convRef = getAdminDb().collection(CONVERSATIONS_COLLECTION).doc(conversationId);
-      const conv = await readConversationInTxOrThrow(tx, convRef, conversationId);
-
-      const messageRef = messagesSubcollectionRef(conversationId).doc(deterministicMessageId);
-      const now = Timestamp.now();
-
-      const messageDoc: Message = {
-        direction: "inbound",
-        body: input.body,
-        status: "received",
-        channel: input.channel,
-        externalId: input.externalId,
-        externalReceiver: input.externalReceiver,
-        generatedBy: "human",
-        createdAt: now,
-        receivedAt: now,
-      };
-      // ATOMIQUE — Firestore refuse ALREADY_EXISTS si un autre run a deja
-      // commit avec ce meme docId. Pattern miroir `getOrCreateInitialConversation`
-      // dans conversations.ts.
-      tx.create(messageRef, messageDoc);
-
-      // PR2a — dénormalisation preview inbound (authorKind="contact").
-      const preview = buildLastMessagePreview({
-        direction: "inbound",
-        authorKind: "contact",
-        text: input.body,
-        at: now,
+      const { messageId } = await addInboundInTx(tx, conversationId, input, {
+        deterministicMessageId,
       });
-      _bumpConversationCountersTx(tx, convRef, conv, "inbound", now, preview);
-
-      appendAuditLogTx(tx, {
-        actorId: "system",
-        actorType: "system",
-        action: "sms_received",
-        targetType: "message",
-        targetId: messageRef.id,
-        payload: { direction: "inbound", messageId: messageRef.id },
-      });
-
-      return { messageId: messageRef.id, created: true as const };
+      return { messageId, created: true as const };
     });
   } catch (err) {
     // Primitif partage : code 6 / "already-exists". Cf. `_idempotent.ts`.

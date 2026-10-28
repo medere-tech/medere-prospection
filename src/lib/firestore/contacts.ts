@@ -49,7 +49,7 @@
  *      agir sur un contact inexistant = erreur d'orchestration côté
  *      caller (qui avait identifié ce contact comme cible).
  */
-import { Timestamp } from "firebase-admin/firestore";
+import { Timestamp, type Transaction } from "firebase-admin/firestore";
 import { z } from "zod";
 
 import { getAdminDb } from "@/lib/firestore/admin";
@@ -535,6 +535,138 @@ export async function getContactByPhone(e164: string): Promise<Contact | null> {
  * @throws ValidationError  si la conv est en état terminal (handed_off,
  *                          closed, blocked), ou si un doc est corrompu.
  */
+/**
+ * Version TRANSACTIONNELLE de `markOptedOut` — l'unique implémentation.
+ *
+ * PR2c tour 2a bis — exposée pour que `attachOrphanToConversation` applique
+ * l'opt-out DANS LA MÊME transaction que la création du message et la
+ * mise à jour de l'orphan. Sans ça, une panne entre les deux tx laisserait
+ * un orphan `attached` sans désabonnement effectif.
+ *
+ * `markOptedOut` publique (ci-dessous) devient un wrapper trivial qui
+ * ouvre sa propre tx et délègue ici.
+ *
+ * @throws NotFoundError    si contact / conv absents.
+ * @throws ValidationError  si conv en état terminal pour opt-out.
+ */
+export async function markOptedOutInTx(
+  tx: Transaction,
+  contactId: string,
+  channel: "sms" | "manual" | "dashboard",
+  options?: {
+    conversationId?: string;
+    intent?: "STOP";
+    now?: Date;
+    /**
+     * PR2c tour 2a bis — contact / conv déjà lus en amont par le caller.
+     * Évite un deuxième `tx.get` si une tx composée a déjà lu les docs.
+     * Utile pour `attachOrphanToConversation` qui doit respecter la règle
+     * Firestore "tous les reads AVANT tous les writes" en composant
+     * plusieurs fonctions tx.
+     */
+    preReadContact?: Contact;
+    preReadConv?: Conversation;
+  },
+): Promise<void> {
+  const conversationId = options?.conversationId;
+  const now = options?.now;
+
+  const contactRef = getAdminDb().collection(CONTACTS_COLLECTION).doc(contactId);
+  let contact: Contact;
+  if (options?.preReadContact !== undefined) {
+    contact = options.preReadContact;
+  } else {
+    const contactDoc = await tx.get(contactRef);
+    if (!contactDoc.exists) {
+      throw new NotFoundError({
+        message: `Contact not found: ${contactId}`,
+        context: { contactId },
+      });
+    }
+    contact = parseContactOrThrow(contactDoc.data(), contactId);
+  }
+
+  // Variante S9.2.2.1 : pré-fetch + parse + guard la conversation si
+  // conversationId fourni. tx.get DOIT précéder toutes les tx.update
+  // (règle Firestore : reads avant writes dans une transaction).
+  const convRef = conversationId
+    ? getAdminDb().collection(CONVERSATIONS_COLLECTION).doc(conversationId)
+    : null;
+  let conv: Conversation | null = null;
+
+  if (convRef && conversationId) {
+    if (options?.preReadConv !== undefined) {
+      conv = options.preReadConv;
+    } else {
+      const convDoc = await tx.get(convRef);
+      if (!convDoc.exists) {
+        throw new NotFoundError({
+          message: `Conversation not found: ${conversationId}`,
+          context: { conversationId, contactId },
+        });
+      }
+      conv = _parseConversationOrThrow(convDoc.data(), conversationId);
+    }
+
+    if (TERMINAL_CONV_STATUSES_FOR_OPT_OUT.includes(conv.status)) {
+      throw new ValidationError({
+        message: `Cannot mark opted_out, conversation in terminal state: ${conv.status}`,
+        context: {
+          conversationId,
+          contactId,
+          currentStatus: conv.status,
+        },
+      });
+    }
+  }
+
+  const contactAlreadyOptedOut = contact.consent.optedOut;
+  const convAlreadyOptedOut =
+    conv !== null && conv.status === "opted_out" && conv.intent === "STOP";
+
+  if (contactAlreadyOptedOut && (conv === null || convAlreadyOptedOut)) {
+    return;
+  }
+
+  const ts = now ? Timestamp.fromDate(now) : Timestamp.now();
+
+  if (!contactAlreadyOptedOut) {
+    tx.update(contactRef, {
+      status: "opted_out",
+      "consent.optedOut": true,
+      "consent.optedOutAt": ts,
+      "consent.optedOutChannel": channel,
+      updatedAt: ts,
+    });
+  }
+
+  if (convRef !== null && !convAlreadyOptedOut) {
+    tx.update(convRef, {
+      intent: "STOP",
+      status: "opted_out",
+      lastIntentChangeAt: ts,
+      updatedAt: ts,
+    });
+  }
+
+  const payload: Record<string, unknown> = { channel };
+  if (conversationId !== undefined) {
+    payload.conversationId = conversationId;
+  }
+  if (contactAlreadyOptedOut && conv !== null && !convAlreadyOptedOut) {
+    payload.reason = "sync_conversation";
+  }
+
+  appendAuditLogTx(tx, {
+    actorId: "system",
+    actorType: "system",
+    action: "opt_out",
+    targetType: "contact",
+    targetId: contactId,
+    payload,
+  });
+}
+
 export async function markOptedOut(
   contactId: string,
   channel: "sms" | "manual" | "dashboard",
@@ -544,105 +676,8 @@ export async function markOptedOut(
     now?: Date;
   },
 ): Promise<void> {
-  const conversationId = options?.conversationId;
-  const now = options?.now;
-
   await getAdminDb().runTransaction(async (tx) => {
-    const contactRef = getAdminDb().collection(CONTACTS_COLLECTION).doc(contactId);
-    const contactDoc = await tx.get(contactRef);
-    if (!contactDoc.exists) {
-      throw new NotFoundError({
-        message: `Contact not found: ${contactId}`,
-        context: { contactId },
-      });
-    }
-    const contact = parseContactOrThrow(contactDoc.data(), contactId);
-
-    // Variante S9.2.2.1 : pré-fetch + parse + guard la conversation si
-    // conversationId fourni. tx.get DOIT précéder toutes les tx.update
-    // (règle Firestore : reads avant writes dans une transaction).
-    const convRef = conversationId
-      ? getAdminDb().collection(CONVERSATIONS_COLLECTION).doc(conversationId)
-      : null;
-    let conv: Conversation | null = null;
-
-    if (convRef && conversationId) {
-      const convDoc = await tx.get(convRef);
-      if (!convDoc.exists) {
-        throw new NotFoundError({
-          message: `Conversation not found: ${conversationId}`,
-          context: { conversationId, contactId },
-        });
-      }
-      conv = _parseConversationOrThrow(convDoc.data(), conversationId);
-
-      if (TERMINAL_CONV_STATUSES_FOR_OPT_OUT.includes(conv.status)) {
-        throw new ValidationError({
-          message: `Cannot mark opted_out, conversation in terminal state: ${conv.status}`,
-          context: {
-            conversationId,
-            contactId,
-            currentStatus: conv.status,
-          },
-        });
-      }
-    }
-
-    // Idempotence sur l'ÉTAT FINAL CIBLE COMPLET : si tout est déjà
-    // atteint, no-op total. Sinon, on traite ce qui manque.
-    const contactAlreadyOptedOut = contact.consent.optedOut;
-    const convAlreadyOptedOut =
-      conv !== null && conv.status === "opted_out" && conv.intent === "STOP";
-
-    // No-op total :
-    //   - cas legacy (conv === null) : contact déjà opt-out → no-op (rétrocompat)
-    //   - cas étendu (conv !== null) : contact opt-out ET conv synchro → no-op
-    if (contactAlreadyOptedOut && (conv === null || convAlreadyOptedOut)) {
-      return;
-    }
-
-    const ts = now ? Timestamp.fromDate(now) : Timestamp.now();
-
-    if (!contactAlreadyOptedOut) {
-      tx.update(contactRef, {
-        status: "opted_out",
-        "consent.optedOut": true,
-        "consent.optedOutAt": ts,
-        "consent.optedOutChannel": channel,
-        updatedAt: ts,
-      });
-    }
-
-    if (convRef !== null && !convAlreadyOptedOut) {
-      tx.update(convRef, {
-        intent: "STOP",
-        status: "opted_out",
-        lastIntentChangeAt: ts,
-        updatedAt: ts,
-      });
-    }
-
-    // Payload audit : `channel` toujours présent (compat). `conversationId`
-    // ajouté si fourni (forensic). `reason: "sync_conversation"` si on
-    // est dans le cas de rattrapage désync (contact déjà opt, conv pas
-    // encore). Tous scrubber-safe (channel ∈ enum, conversationId opaque,
-    // reason ∈ string courte).
-    const payload: Record<string, unknown> = { channel };
-    if (conversationId !== undefined) {
-      payload.conversationId = conversationId;
-    }
-    if (contactAlreadyOptedOut && conv !== null && !convAlreadyOptedOut) {
-      payload.reason = "sync_conversation";
-    }
-
-    appendAuditLogTx(tx, {
-      actorId: "system",
-      actorType: "system",
-      action: "opt_out",
-      targetType: "contact",
-      targetId: contactId,
-      payload,
-    });
+    await markOptedOutInTx(tx, contactId, channel, options);
   });
 }
 

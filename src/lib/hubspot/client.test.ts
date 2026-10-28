@@ -26,12 +26,23 @@ function stubHubspotEnv(): void {
   vi.stubEnv("HUBSPOT_ACCESS_TOKEN", TEST_HUBSPOT_ACCESS_TOKEN);
 }
 
+// 🔒 Isolation stricte PR2c tour 2a — mitigation flake observé en shuffle.
+//
+// Le module `client.ts` tient un singleton `cachedClient` et `env.ts` memoize
+// la lecture de `getHubspotEnv()`. Les deux étaient réinitialisés en
+// `beforeEach` mais PAS en `afterEach` : si un test précédent laissait un
+// `cachedClient` défini (ou un env mémoïsé) et que le suivant ne tombait
+// pas sur sa propre `beforeEach` dans l'ordre attendu (shuffle, retry),
+// le second se retrouvait avec l'état sale. On nettoie symétriquement.
+// Modèle miroir `lists.test.ts:100-107` et `contacts.test.ts:51-57`.
 beforeEach(() => {
   __setHubspotClientForTests(null);
   __resetEnvCacheForTests();
 });
 
 afterEach(() => {
+  __setHubspotClientForTests(null);
+  __resetEnvCacheForTests();
   vi.unstubAllEnvs();
 });
 

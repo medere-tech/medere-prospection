@@ -54,6 +54,7 @@ function okAdmin() {
   mockRequireRole.mockResolvedValue({
     userId: "user_admin",
     role: "admin",
+    testAccount: false,
     firstName: "Dethie",
     lastName: "Faye",
     slackUserId: "U05UVHGBURX",
@@ -64,6 +65,7 @@ function okCommercial(slackUserId = "UVANESSA999") {
   mockRequireRole.mockResolvedValue({
     userId: "user_commercial",
     role: "commercial",
+    testAccount: false,
     firstName: "Vanessa",
     lastName: "Rabba",
     slackUserId,
@@ -148,6 +150,7 @@ describe("GET /api/admin/conversations (PR2a)", () => {
     mockRequireRole.mockResolvedValue({
       userId: "user_new_commercial",
       role: "commercial",
+      testAccount: false,
       firstName: "V",
       lastName: "R",
       // slackUserId absent (undefined, propre Zod sur `.optional()`)

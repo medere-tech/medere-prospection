@@ -51,16 +51,20 @@ import { assertSlackUserId } from "./slack-user-id";
 // ─────────────────────────────────────────────────────────────────────────────
 
 /**
- * Cible du relais — toujours un DM. Un `handoff.assignedTo` existe par
- * definition sur une conv `handed_off` (invariant pose par `setHandoff`).
- * Le champ `kind` est garde pour homogeneite avec `HandoffTarget` et pour
- * faciliter une evolution future (fallback canal titulaire absent).
+ * Cible du relais.
+ *
+ *   - `kind: "dm"` : DM au commercial titulaire (`U...`). Pattern historique
+ *     PR-A (branche handed_off).
+ *   - `kind: "channel"` : canal partagé (`C.../G...`). Ajouté PR2c tour 2a
+ *     bis pour permettre à la fonction unique `resolveOrphanNotifyTarget`
+ *     de router vers (a) le canal orphelins quand pas de titulaire, et
+ *     (b) `SLACK_TEST_CHANNEL_ID` quand l'acteur est `testAccount`.
+ *     L'échappement mrkdwn des blocks est le même, le body posté est
+ *     identique — le canal routé est juste différent.
  */
-export interface InboundAfterHandoffTarget {
-  kind: "dm";
-  /** Slack user ID (`U...`) du commercial titulaire. */
-  slackUserId: string;
-}
+export type InboundAfterHandoffTarget =
+  | { kind: "dm"; slackUserId: string }
+  | { kind: "channel"; channelId: string };
 
 /**
  * Input complet de `sendInboundAfterHandoffNotification` : le contenu du
@@ -100,11 +104,14 @@ export interface SendInboundAfterHandoffResult {
 export async function sendInboundAfterHandoffNotification(
   input: SendInboundAfterHandoffInput,
 ): Promise<SendInboundAfterHandoffResult> {
-  // Fix LOW security-reviewer PR-A : defense-in-depth sur docs legacy
-  // dont le `assignedTo` n'aurait pas ete valide a l'ecriture (avant
-  // cette PR). Throw ValidationError sans leak PII dans le context.
-  // Pattern miroir avec `sendHandoffNotification` et `setHandoff`.
-  assertSlackUserId(input.target.slackUserId, "sendInboundAfterHandoffNotification");
+  // PR-A branche DM : defense-in-depth sur docs legacy dont le `assignedTo`
+  // n'aurait pas ete valide. Pattern miroir `sendHandoffNotification`.
+  // PR2c tour 2a bis — la variante `channel` (canal orphelins OU
+  // SLACK_TEST_CHANNEL_ID) bypass la validation user-ID : le format est
+  // déjà verrouillé par les regex Zod côté `getSlackEnv()`.
+  if (input.target.kind === "dm") {
+    assertSlackUserId(input.target.slackUserId, "sendInboundAfterHandoffNotification");
+  }
 
   const blocks = buildInboundAfterHandoffBlocks({
     firstName: input.firstName,
@@ -116,7 +123,7 @@ export async function sendInboundAfterHandoffNotification(
     dashboardUrl: input.dashboardUrl,
   });
 
-  const channel = input.target.slackUserId;
+  const channel = input.target.kind === "dm" ? input.target.slackUserId : input.target.channelId;
 
   // `text` de fallback pour les clients Slack sans support Block Kit
   // (notifications mobiles pauvres, screen readers). JAMAIS de PII

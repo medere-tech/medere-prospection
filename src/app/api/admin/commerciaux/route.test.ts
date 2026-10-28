@@ -53,6 +53,7 @@ describe("GET /api/admin/commerciaux", () => {
     mockRequireRole.mockResolvedValue({
       userId: "user_admin_xxx",
       role: "admin",
+      testAccount: false,
       firstName: "Déthié",
       lastName: "Faye",
     });

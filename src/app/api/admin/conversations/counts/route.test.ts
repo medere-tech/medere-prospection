@@ -69,6 +69,7 @@ describe("GET /api/admin/conversations/counts (PR2a)", () => {
     mockRequireRole.mockResolvedValue({
       userId: "u",
       role: "admin",
+      testAccount: false,
       firstName: "A",
       lastName: "B",
       slackUserId: "U05UVHGBURX",
@@ -89,6 +90,7 @@ describe("GET /api/admin/conversations/counts (PR2a)", () => {
     mockRequireRole.mockResolvedValue({
       userId: "u",
       role: "commercial",
+      testAccount: false,
       firstName: "V",
       lastName: "R",
       slackUserId: "UVANESSA999",
@@ -108,6 +110,7 @@ describe("GET /api/admin/conversations/counts (PR2a)", () => {
     mockRequireRole.mockResolvedValue({
       userId: "u",
       role: "commercial",
+      testAccount: false,
       firstName: "V",
       lastName: "R",
       slackUserId: "UVANESSA999",
@@ -126,6 +129,7 @@ describe("GET /api/admin/conversations/counts (PR2a)", () => {
     mockRequireRole.mockResolvedValue({
       userId: "u",
       role: "commercial",
+      testAccount: false,
       firstName: "V",
       lastName: "R",
       // slackUserId absent (undefined)
@@ -140,6 +144,7 @@ describe("GET /api/admin/conversations/counts (PR2a)", () => {
     mockRequireRole.mockResolvedValue({
       userId: "u",
       role: "admin",
+      testAccount: false,
       firstName: "A",
       lastName: "B",
       slackUserId: "U05UVHGBURX",
@@ -158,6 +163,7 @@ describe("GET /api/admin/conversations/counts (PR2a)", () => {
     mockRequireRole.mockResolvedValue({
       userId: "u",
       role: "admin",
+      testAccount: false,
       firstName: "A",
       lastName: "B",
       slackUserId: "U05UVHGBURX",

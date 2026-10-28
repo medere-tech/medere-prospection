@@ -200,6 +200,13 @@ const ACTION_LABELS: Record<AuditAction, { label: string; kind: JournalEntryProp
     label: "Rattrapage des champs de liste (admin)",
     kind: "other",
   },
+  // PR2c tour 2a — transitions SMS orphelins
+  orphan_attached_to_conversation: {
+    label: "SMS orphelin rattaché à une conversation",
+    kind: "other",
+  },
+  orphan_dismissed: { label: "SMS orphelin marqué traité", kind: "other" },
+  orphan_reopened: { label: "SMS orphelin remis à traiter", kind: "other" },
 };
 
 function labelForAction(action: string): { label: string; kind: JournalEntryProps["kind"] } {

@@ -769,9 +769,19 @@ export async function processReplyHandler(
     // (a) Store orphan si pas de messageId existant.
     let orphanDocId: string | undefined;
     if (params.messageId === undefined) {
+      // PR2c tour 2a — `AddOrphanInboundInput.reason` est restreint aux 4
+      // raisons qui créent EFFECTIVEMENT un orphan (prouvé tour 1 bis par
+      // relecture code). Les call sites `handleInactiveInbound` sans
+      // messageId sont `unknown_contact` (l.1009) et `no_conversation`
+      // (l.1265) — les deux sont dans l'union narrow. Les 5 autres
+      // reasons (`closed`/`opted_out`/`blocked`/`handed_off_no_assignee`/
+      // `conversation_became_terminal`) passent toutes `messageId:
+      // storeResult.messageId` défini → cette branche n'est jamais prise.
+      // Cast compile-only : runtime safe par invariant.
+      const narrowReason = params.reason as "no_conversation" | "unknown_contact";
       const orphanResult = await step.run(`store-orphan-inbound-${params.stepSuffix}`, async () => {
         return _addOrphan({
-          reason: params.reason,
+          reason: narrowReason,
           body,
           idempotencyKey: ovhMessageId,
           source: "process-reply",
