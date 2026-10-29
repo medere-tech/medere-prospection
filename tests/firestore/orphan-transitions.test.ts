@@ -39,7 +39,7 @@ import {
   reopenOrphan,
 } from "@/lib/firestore/orphan-inbounds";
 import { __resetEnvCacheForTests } from "@/lib/security/env";
-import { ValidationError } from "@/lib/utils/errors";
+import { NotFoundError, ValidationError } from "@/lib/utils/errors";
 import { hashPii, safePhoneHash } from "@/lib/utils/pii-detector";
 
 const PEPPER = "c".repeat(64);
@@ -677,8 +677,17 @@ describe("orphan transitions — emulator (PR2c tour 2a)", () => {
   //
   // Previews et prod partagent la même base Firestore. Un compte réel
   // ne doit JAMAIS muter un orphan `isTestFixture: true` ; un compte
-  // test ne doit JAMAIS muter un orphan réel. La transaction refuse via
-  // `OrphanTestFixtureMismatchError` AVANT tout write.
+  // test ne doit JAMAIS muter un orphan réel. La transaction refuse
+  // AVANT tout write dans les deux cas.
+  //
+  // Durcissement security-reviewer : asymétrie assumée des erreurs.
+  //   - compte réel sur fixture → `NotFoundError` (404), indiscernable
+  //     du GET détail — un admin réel ne doit pas pouvoir découvrir par
+  //     le code HTTP qu'une fixture existe à cet id.
+  //   - compte test sur orphan réel → `OrphanTestFixtureMismatchError`
+  //     (403) — un compte test n'est jamais censé exister en prod ;
+  //     s'il essaye d'écrire sur un doc réel en preview, on remonte un
+  //     refus explicite aux mainteneurs.
   //
   // Mutation sentinelle : si on retire l'appel à
   // `assertActorMatchesOrphanFixture` dans `attachOrphanToConversation`
@@ -703,7 +712,7 @@ describe("orphan transitions — emulator (PR2c tour 2a)", () => {
     expect(r.messageId).toMatch(/^oih_/);
   });
 
-  it("R-1 attach : orphan fixture + actor réel → rejet (OrphanTestFixtureMismatchError)", async () => {
+  it("R-1 attach : orphan fixture + actor réel → NotFoundError (indiscernable du GET détail), rien écrit", async () => {
     const seed = await addOrphanInboundIdempotent({
       reason: "unknown_contact",
       body: "fixture doc",
@@ -720,9 +729,21 @@ describe("orphan transitions — emulator (PR2c tour 2a)", () => {
         optOutConfirmed: false,
         actorTestAccount: false, // compte réel
       }),
-    ).rejects.toBeInstanceOf(OrphanTestFixtureMismatchError);
+    ).rejects.toBeInstanceOf(NotFoundError);
     const after = await getAdminDb().collection(ORPHAN_INBOUNDS_COLLECTION).doc(seed.docId).get();
     expect(after.data()?.processingState).toBe("pending"); // rien écrit
+    // Preuve d'indiscernabilité : aucun message créé dans la conv, aucun audit.
+    const msgs = await getAdminDb()
+      .collection("conversations")
+      .doc("cr1b_hubspot-list-9999")
+      .collection("messages")
+      .get();
+    expect(msgs.size).toBe(0);
+    const audits = await getAdminDb()
+      .collection("audit_log")
+      .where("action", "==", "orphan_attached_to_conversation")
+      .get();
+    expect(audits.size).toBe(0);
   });
 
   it("R-1 attach : orphan réel + actor testAccount → rejet", async () => {
@@ -765,7 +786,7 @@ describe("orphan transitions — emulator (PR2c tour 2a)", () => {
     expect(r.messageId).toMatch(/^oih_/);
   });
 
-  it("R-1 dismiss : orphan fixture + actor réel → rejet, rien écrit", async () => {
+  it("R-1 dismiss : orphan fixture + actor réel → NotFoundError, rien écrit", async () => {
     const seed = await addOrphanInboundIdempotent({
       reason: "unknown_contact",
       body: "fixture spam",
@@ -780,12 +801,17 @@ describe("orphan transitions — emulator (PR2c tour 2a)", () => {
         dismissedBy: "user_admin_e2e",
         actorTestAccount: false,
       }),
-    ).rejects.toBeInstanceOf(OrphanTestFixtureMismatchError);
+    ).rejects.toBeInstanceOf(NotFoundError);
     const after = await getAdminDb().collection(ORPHAN_INBOUNDS_COLLECTION).doc(seed.docId).get();
     expect(after.data()?.processingState).toBe("pending");
+    const audits = await getAdminDb()
+      .collection("audit_log")
+      .where("action", "==", "orphan_dismissed")
+      .get();
+    expect(audits.size).toBe(0);
   });
 
-  it("R-1 reopen : orphan fixture dismissed + actor réel → rejet", async () => {
+  it("R-1 reopen : orphan fixture dismissed + actor réel → NotFoundError, rien écrit", async () => {
     const seed = await addOrphanInboundIdempotent({
       reason: "unknown_contact",
       body: "fixture",
@@ -804,10 +830,49 @@ describe("orphan transitions — emulator (PR2c tour 2a)", () => {
       reopenOrphan({
         orphanDocId: seed.docId,
         reopenedBy: "user_admin_e2e",
-        actorTestAccount: false, // mismatch
+        actorTestAccount: false, // compte réel sur fixture
       }),
-    ).rejects.toBeInstanceOf(OrphanTestFixtureMismatchError);
+    ).rejects.toBeInstanceOf(NotFoundError);
     const after = await getAdminDb().collection(ORPHAN_INBOUNDS_COLLECTION).doc(seed.docId).get();
     expect(after.data()?.processingState).toBe("dismissed"); // rien bougé
+  });
+
+  it("R-1 attach : NotFoundError sur fixture est indiscernable de NotFoundError sur orphan inexistant", async () => {
+    // Un orphan fixture et un id complètement inexistant doivent lever
+    // la MÊME classe d'erreur quand un compte réel essaye d'attach.
+    const seed = await addOrphanInboundIdempotent({
+      reason: "unknown_contact",
+      body: "fixture indiscernable",
+      idempotencyKey: "r1-indiscernable",
+      source: "process-reply",
+      isTestFixture: true,
+    });
+    await seedConvAndContact({
+      conversationId: "cr1e_hubspot-list-9999",
+      contactId: "cr1e",
+    });
+
+    const errOnFixture = await attachOrphanToConversation({
+      orphanDocId: seed.docId,
+      conversationId: "cr1e_hubspot-list-9999",
+      attachedBy: "user_admin_e2e",
+      optOutConfirmed: false,
+      actorTestAccount: false,
+    }).catch((e: unknown) => e);
+
+    const errOnGhost = await attachOrphanToConversation({
+      orphanDocId: "ghost-orphan-does-not-exist",
+      conversationId: "cr1e_hubspot-list-9999",
+      attachedBy: "user_admin_e2e",
+      optOutConfirmed: false,
+      actorTestAccount: false,
+    }).catch((e: unknown) => e);
+
+    expect(errOnFixture).toBeInstanceOf(NotFoundError);
+    expect(errOnGhost).toBeInstanceOf(NotFoundError);
+    // Même code HTTP, même nom de classe → l'attaquant ne peut pas distinguer.
+    expect((errOnFixture as NotFoundError).statusCode).toBe(
+      (errOnGhost as NotFoundError).statusCode,
+    );
   });
 });

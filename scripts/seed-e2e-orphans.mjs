@@ -57,8 +57,18 @@ const FIXTURES = [
     source: "process-reply",
   },
   {
+    // PR2c tour 2b bloc B — body volontairement VIDE : reproduit le cas
+    // réel « payload illisible » (OVH envoie un corps vide ou que le
+    // décodage utf-8 échoue). `addOrphanInboundIdempotent` l'accepte
+    // pour `parse_failed` ET `enqueue_failed` uniquement
+    // (validation `allowEmptyBody` ligne 255). L'invariant testé en e2e
+    // (O5) : la fixture parse_failed NE PEUT PAS être rattachée via l'UI
+    // — le bouton « Rattacher définitivement » est désactivé tant que
+    // `orphanBody.trim().length === 0`, le serveur refuse de toute façon
+    // (`ValidationError` « body must be non-empty » dans
+    // `attachOrphanToConversation`).
     reason: "parse_failed",
-    body: "SEED E2E — parse_failed. Payload illisible synthétique.",
+    body: "",
     idempotencyKey: "e2e-orphan-fixture-parse-failed-v1",
     source: "webhook-ovh-sms",
   },

@@ -68,6 +68,32 @@ export function queryBackfillLastHumanOutbound(
     .get();
 }
 
+/**
+ * `db.collection("conversations").doc(convId).collection("messages").where("direction","==","inbound").orderBy("createdAt","desc").limit(1).get()`.
+ *
+ * ⚠️ Requiert le composite index `(direction, createdAt desc)` sur la
+ * collection `messages`. Déjà présent dans `firestore.indexes.json`
+ * (bloc 1, lignes 4-10) : utilisé par la query collection-group des
+ * messages triés desc par direction, le PRÉDICAT y est identique. Pas
+ * d'index additionnel à poser.
+ *
+ * Vérifié par `scripts/check-conversation-list-indexes.mjs` sous le label
+ * `backfill.messages.last-inbound` (cf. `conversation-list-query-forms.ts`).
+ */
+export function queryBackfillLastInbound(
+  db: FirebaseFirestore.Firestore,
+  convId: string,
+): Promise<FirebaseFirestore.QuerySnapshot> {
+  return db
+    .collection("conversations")
+    .doc(convId)
+    .collection("messages")
+    .where("direction", "==", "inbound")
+    .orderBy("createdAt", "desc")
+    .limit(1)
+    .get();
+}
+
 /** `db.collection("contacts").doc(contactId).get()`. */
 export function queryBackfillContact(
   db: FirebaseFirestore.Firestore,
@@ -168,8 +194,19 @@ export async function computeBackfillUpdatesForConversation(
     }
   }
 
-  // ── Dernier message (preview) — SKIP si une lecture précédente a échoué ──
-  if (readErrors.length === 0 && !conv.lastMessagePreview) {
+  // ── Dernier message (preview + lastMessageAt) — SKIP si une lecture
+  //    précédente a échoué. Une seule query, deux champs posés depuis le
+  //    même doc : preview (si body est une chaîne) et lastMessageAt (si
+  //    createdAt est un Timestamp exploitable).
+  //    « uniquement quand absent » : chaque champ est posé seulement si
+  //    `conv.<field>` est falsy — invariant du backfill PR2a.
+  //    PR2c tour 2b bloc C : `lastMessageAt` n'était pas reposé avant ce
+  //    fix. Un `reset-e2e-orphans` qui l'effaçait laissait la conv sans
+  //    `lastMessageAt`, donc hors de la liste admin (orderBy desc). Fix :
+  //    quand le champ est absent, on repose à `m.createdAt` SI c'est un
+  //    `Timestamp` strict — jamais `Timestamp.now()` pour ce champ,
+  //    contrairement au preview où `now()` est un fallback d'affichage.
+  if (readErrors.length === 0 && (!conv.lastMessagePreview || !conv.lastMessageAt)) {
     try {
       const lastMsgSnap = await queryBackfillLastMessage(db, convId);
       if (!lastMsgSnap.empty) {
@@ -177,7 +214,7 @@ export async function computeBackfillUpdatesForConversation(
         const direction = m.direction === "outbound" ? "outbound" : "inbound";
         const authorKind =
           direction === "inbound" ? "contact" : m.generatedBy === "human" ? "human" : "ai";
-        if (typeof m.body === "string") {
+        if (!conv.lastMessagePreview && typeof m.body === "string") {
           updates.lastMessagePreview = buildLastMessagePreview({
             direction,
             authorKind,
@@ -186,10 +223,35 @@ export async function computeBackfillUpdatesForConversation(
           });
           posed.push("lastMessagePreview");
         }
+        if (!conv.lastMessageAt && m.createdAt instanceof Timestamp) {
+          updates.lastMessageAt = m.createdAt;
+          posed.push("lastMessageAt");
+        }
       }
     } catch (e) {
       readErrors.push(
         `messages.last: ${(e as Error)?.message ?? String(e)}`.split("\n")[0]!.slice(0, 180),
+      );
+    }
+  }
+
+  // ── Dernier message entrant (`lastInboundAt`) — PR2c tour 2b bloc C.
+  //    Requête dédiée indexée par `(direction, createdAt desc)`. Posé
+  //    uniquement quand absent, et seulement si `createdAt` est un
+  //    `Timestamp`. SKIP si une lecture précédente a échoué.
+  if (readErrors.length === 0 && !conv.lastInboundAt) {
+    try {
+      const lastInboundSnap = await queryBackfillLastInbound(db, convId);
+      if (!lastInboundSnap.empty) {
+        const t = lastInboundSnap.docs[0]!.data().createdAt;
+        if (t instanceof Timestamp) {
+          updates.lastInboundAt = t;
+          posed.push("lastInboundAt");
+        }
+      }
+    } catch (e) {
+      readErrors.push(
+        `messages.lastInbound: ${(e as Error)?.message ?? String(e)}`.split("\n")[0]!.slice(0, 180),
       );
     }
   }

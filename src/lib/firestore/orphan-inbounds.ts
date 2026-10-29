@@ -680,18 +680,35 @@ export class OrphanTestFixtureMismatchError extends ForbiddenError {
  * dans chaque transaction (`attach` / `dismiss` / `reopen`). Vérifie
  * l'isolation stricte test ↔ réel. Un compte réel n'écrit JAMAIS sur
  * une fixture ; un compte test n'écrit JAMAIS sur un doc réel.
+ *
+ * Durcissement security-reviewer : le sens « compte réel sur fixture »
+ * lève une `NotFoundError` (404), indiscernable du cas où le doc n'existe
+ * tout simplement pas — un admin réel ne doit pas pouvoir découvrir par
+ * le code d'erreur qu'une fixture existe à cet id (parité avec le GET
+ * détail qui applique déjà `includeTestFixtures: ctx.testAccount`).
+ *
+ * Le sens « compte test sur orphan réel » reste un refus explicite
+ * (`OrphanTestFixtureMismatchError`, 403) : un compte test n'est jamais
+ * censé exister en prod, mais si c'est le cas en preview, le refus
+ * remonte un signal clair aux mainteneurs.
  */
 function assertActorMatchesOrphanFixture(
   orphan: OrphanInboundDoc,
   actorTestAccount: boolean,
+  orphanDocId: string,
 ): void {
   const orphanIsFixture = orphan.isTestFixture === true;
-  if (orphanIsFixture !== actorTestAccount) {
-    throw new OrphanTestFixtureMismatchError({
-      orphanIsTestFixture: orphanIsFixture,
-      actorIsTestAccount: actorTestAccount,
+  if (orphanIsFixture === actorTestAccount) return;
+  if (orphanIsFixture && !actorTestAccount) {
+    throw new NotFoundError({
+      message: "orphan not found",
+      context: { orphanDocId },
     });
   }
+  throw new OrphanTestFixtureMismatchError({
+    orphanIsTestFixture: orphanIsFixture,
+    actorIsTestAccount: actorTestAccount,
+  });
 }
 
 /**
@@ -830,7 +847,7 @@ export async function attachOrphanToConversation(
     // Garde R-1 : isolation test ↔ réel. On vérifie AVANT la garde
     // d'état pour qu'un compte réel ne découvre pas via le message
     // d'erreur qu'un orphan fixture existe à cet id.
-    assertActorMatchesOrphanFixture(orphan, input.actorTestAccount);
+    assertActorMatchesOrphanFixture(orphan, input.actorTestAccount, input.orphanDocId);
 
     if (orphan.processingState !== "pending") {
       throw new OrphanProcessingStateConflict({
@@ -1013,7 +1030,7 @@ export async function dismissOrphan(input: DismissOrphanInput): Promise<void> {
     }
     const orphan = orphanSnap.data() as OrphanInboundDoc;
     // Garde R-1 : isolation test ↔ réel.
-    assertActorMatchesOrphanFixture(orphan, input.actorTestAccount);
+    assertActorMatchesOrphanFixture(orphan, input.actorTestAccount, input.orphanDocId);
     if (orphan.processingState !== "pending") {
       throw new OrphanProcessingStateConflict({
         expectedState: "pending",
@@ -1080,7 +1097,7 @@ export async function reopenOrphan(input: ReopenOrphanInput): Promise<void> {
     }
     const orphan = orphanSnap.data() as OrphanInboundDoc;
     // Garde R-1 : isolation test ↔ réel.
-    assertActorMatchesOrphanFixture(orphan, input.actorTestAccount);
+    assertActorMatchesOrphanFixture(orphan, input.actorTestAccount, input.orphanDocId);
     if (orphan.processingState !== "dismissed") {
       throw new OrphanProcessingStateConflict({
         expectedState: "dismissed",

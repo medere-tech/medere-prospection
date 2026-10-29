@@ -35,6 +35,7 @@ import {
   backfillConversationsRef,
   queryBackfillContact,
   queryBackfillLastHumanOutbound,
+  queryBackfillLastInbound,
   queryBackfillLastMessage,
 } from "@/lib/firestore/backfill-conversation-list-fields";
 import { normalizeContactNameSearch } from "@/lib/firestore/conversation-list-fields";
@@ -242,6 +243,15 @@ function buildBackfillForms(): QueryForm[] {
       label: "backfill.messages.last-human-outbound",
       category: "backfill",
       run: () => queryBackfillLastHumanOutbound(getAdminDb(), probeConvId),
+    },
+    {
+      // PR2c tour 2b bloc C — Requiert composite `(direction, createdAt desc)`
+      // sur messages (déjà déclaré dans `firestore.indexes.json` bloc 1).
+      // Pose `conv.lastInboundAt` manquant quand on vient d'effacer les
+      // champs de liste (ex: `reset-e2e-orphans.mjs`).
+      label: "backfill.messages.last-inbound",
+      category: "backfill",
+      run: () => queryBackfillLastInbound(getAdminDb(), probeConvId),
     },
   ];
 }
