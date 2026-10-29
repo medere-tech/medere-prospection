@@ -115,6 +115,18 @@ export default defineConfig({
      * splitter (trop de logique dans un seul test).
      */
     testTimeout: 15_000,
+    /**
+     * PR2c tour 2b bloc C bis — setup global Testing Library.
+     *
+     * Charge `tests/setup/testing-library-timeout.ts` qui pose
+     * `configure({ asyncUtilTimeout: 5000 })`. Vit APRÈS les constantes
+     * de pool pour garder la convention « config → setup → include ».
+     *
+     * Si ce fichier disparaît (ou cesse de poser `asyncUtilTimeout`),
+     * le test sentinelle `tests/setup/testing-library-timeout.test.ts`
+     * échoue en pre-push → impossible de régresser silencieusement.
+     */
+    setupFiles: ["./tests/setup/testing-library-timeout.ts"],
     include: ["tests/**/*.{test,spec}.{ts,tsx}", "src/**/*.{test,spec}.{ts,tsx}"],
     // Les tests Firestore demandent un emulator up — exclus du run par
     // défaut pour ne pas casser `npm test` / pre-push.
