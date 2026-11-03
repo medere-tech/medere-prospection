@@ -106,8 +106,9 @@ describe("sendHandoffNotification — contenu chat.postMessage", () => {
     const args = spy.mock.calls[0]?.[0];
     expect(args?.blocks).toBeDefined();
     expect(Array.isArray(args?.blocks)).toBe(true);
-    // 5 blocks garantis par format-handoff.test.ts
-    expect(args?.blocks).toHaveLength(5);
+    // 4 blocks garantis par format-handoff.test.ts (PR2c bloc C sexies —
+    // le pied `conv \`<id>\`` a été retiré des notifs commerciales).
+    expect(args?.blocks).toHaveLength(4);
   });
 
   it("fallback text (mobile / a11y) neutre — pas de PII (DM)", async () => {

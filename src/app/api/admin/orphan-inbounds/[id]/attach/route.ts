@@ -40,6 +40,7 @@ import { NextResponse } from "next/server";
 import { z } from "zod";
 
 import { requireRole } from "@/lib/auth/require-role";
+import { resolveAdminName } from "@/lib/auth/resolve-admin-name";
 import { getContact } from "@/lib/firestore/contacts";
 import {
   attachOrphanToConversation,
@@ -114,8 +115,14 @@ export async function POST(
     });
 
     // Enrichissement notif : firstName/speciality/city depuis le contact
-    // (hors tx — lecture seule, impact nul sur l'atomicité des writes).
-    const contact = await getContact(result.contactId).catch(() => null);
+    // + nom résolu de l'admin via Clerk (hors tx — lecture seule, impact
+    // nul sur l'atomicité des writes). PR2c tour 2b bloc C sexies : la
+    // notif de rattachement porte désormais le nom de l'admin et la date
+    // de réception D'ORIGINE de l'orphan (pas la date d'attach).
+    const [contact, adminName] = await Promise.all([
+      getContact(result.contactId).catch(() => null),
+      resolveAdminName(ctx.userId).catch(() => null),
+    ]);
 
     const notifyResult = await notifyOrphanAttachedBestEffort({
       actorTestAccount: ctx.testAccount,
@@ -127,6 +134,8 @@ export async function POST(
       city: contact?.city,
       lastInboundBody: result.body,
       isOptOut: result.wasOptOut,
+      adminName,
+      originalReceivedAtIso: result.originalReceivedAt.toDate().toISOString(),
     });
 
     return NextResponse.json({

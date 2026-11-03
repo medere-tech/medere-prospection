@@ -33,7 +33,10 @@ import { FieldValue, Timestamp } from "firebase-admin/firestore";
 
 import { safeExternalIdHash } from "@/lib/utils/pii-detector";
 
-import { computeBackfillUpdatesForConversation } from "./backfill-conversation-list-fields";
+import {
+  computeBackfillUpdatesForConversation,
+  isActiveMessageStatus,
+} from "./backfill-conversation-list-fields";
 import { buildLastMessagePreview, sanitizeLastMessageText } from "./conversation-list-fields";
 import { ORPHAN_INBOUNDS_COLLECTION } from "./orphan-inbounds";
 
@@ -219,14 +222,34 @@ export async function predictConvStateAfterReset(
   const convSnap = await convRef.get();
   const current = toSnapshotLike(convSnap.data() ?? {});
   const touchedSet = new Set(touched.map((t) => t.messageId));
-  const limit = touched.length + 5;
+
+  // PR2c tour 2b bloc C septies — marge augmentée (+10 au lieu de +5)
+  // parce qu'on skippe maintenant AUSSI les messages `duplicate` et
+  // `abandoned`. Un historique chargé d'un médecin spammé peut contenir
+  // plusieurs doublons consécutifs.
+  const limit = touched.length + 10;
+
+  // Prédicat partagé : un message « compte » pour les champs d'état
+  // (`lastMessageAt`, `lastInboundAt`, preview, `lastHumanOutboundAt`,
+  // `inboundCount`) ssi il n'est NI touché par le reset NI marqué
+  // `duplicate`/`abandoned`.
+  //
+  // 🔒 UNIQUE SOURCE de la règle « message actif » : `isActiveMessageStatus`
+  // dans `backfill-conversation-list-fields.ts`. Même fonction partout —
+  // un drift silencieux (ex. une nouvelle valeur de status ignorée côté
+  // backfill mais pas côté reset) casse la couverture (sentinelle
+  // `isActiveMessageStatus — source unique` dans la test suite).
+  const isActive = (doc: FirebaseFirestore.QueryDocumentSnapshot): boolean => {
+    if (touchedSet.has(doc.id)) return false;
+    return isActiveMessageStatus((doc.data() as { status?: unknown }).status);
+  };
 
   const topMsgs = await convRef
     .collection("messages")
     .orderBy("createdAt", "desc")
     .limit(limit)
     .get();
-  const remainingMsgs = topMsgs.docs.filter((d) => !touchedSet.has(d.id));
+  const remainingMsgs = topMsgs.docs.filter(isActive);
   const firstRemaining = remainingMsgs[0];
   const firstData = firstRemaining?.data();
 
@@ -252,19 +275,19 @@ export async function predictConvStateAfterReset(
     at: predictedLastMessageAt,
   });
 
-  // Dernier inbound restant.
+  // Dernier inbound actif (hors duplicate/abandoned, hors touched).
   const topInbound = await convRef
     .collection("messages")
     .where("direction", "==", "inbound")
     .orderBy("createdAt", "desc")
     .limit(limit)
     .get();
-  const remainingInbound = topInbound.docs.filter((d) => !touchedSet.has(d.id));
+  const remainingInbound = topInbound.docs.filter(isActive);
   const firstInbound = remainingInbound[0]?.data();
   const predictedLastInboundAt =
     firstInbound?.createdAt instanceof Timestamp ? firstInbound.createdAt : null;
 
-  // Dernier outbound humain restant.
+  // Dernier outbound humain actif.
   const topHuman = await convRef
     .collection("messages")
     .where("direction", "==", "outbound")
@@ -272,19 +295,25 @@ export async function predictConvStateAfterReset(
     .orderBy("createdAt", "desc")
     .limit(limit)
     .get();
-  const remainingHuman = topHuman.docs.filter((d) => !touchedSet.has(d.id));
+  const remainingHuman = topHuman.docs.filter(isActive);
   const firstHuman = remainingHuman[0]?.data();
   const predictedLastHumanOutboundAt =
     firstHuman?.createdAt instanceof Timestamp ? firstHuman.createdAt : null;
 
-  // inboundCount prédit = count actuel - inbound touché.
-  const currentInboundSnap = await convRef
-    .collection("messages")
-    .where("direction", "==", "inbound")
-    .count()
-    .get();
+  // PR2c tour 2b bloc C septies — inboundCount prédit = `conv.inboundCount`
+  // actuel (dénorm, duplicate/abandoned déjà exclus par le pipeline) MOINS
+  // le nombre d'inbound touchés par le reset. INVERSE EXACT du bump posé
+  // par `_bumpConversationCountersTx` lors de l'attach.
+  //
+  // ⚠ NE JAMAIS recompter via `.where("direction","==","inbound").count()` :
+  // cette requête inclut les docs marqués `duplicate`/`abandoned` et
+  // annulerait silencieusement les cleanups antérieurs (régression preuve
+  // bloc C septies : conv `427963864300_hubspot-list-6081` avait un
+  // duplicate du 16/10 corrigé par `close-duplicate-inbound` du 19/10 ;
+  // un recomptage brut aurait ramené inboundCount à 7 au lieu de 6).
   const touchedInboundCount = touched.filter((t) => t.direction === "inbound").length;
-  const predictedInboundCount = currentInboundSnap.data().count - touchedInboundCount;
+  const predictedInboundCount =
+    current.inboundCount !== null ? current.inboundCount - touchedInboundCount : null;
 
   return {
     current,
@@ -367,18 +396,37 @@ export async function applyResetWrites(
   const recomputed: string[] = [];
   if (touchedMessages.length > 0) {
     const convRef = db.collection("conversations").doc(convId);
+
+    // PR2c tour 2b bloc C septies — inboundCount = INVERSE EXACT du bump
+    // posé par `_bumpConversationCountersTx` lors de l'attach :
+    //   avant_attach + 1 = après_attach   (bump pipeline)
+    //   après_reset = après_attach − touchedInboundCount = avant_attach  (inverse)
+    //
+    // Lecture seule du doc AVANT clear, pour obtenir la valeur dénorm
+    // courante (qui exclut déjà les `duplicate`/`abandoned` corrigés par
+    // les cleanups `close-duplicate-inbound` / `close-stale-orphans`).
+    //
+    // ⚠ NE JAMAIS recompter via `.where("direction","==","inbound").count()` :
+    // la query brute inclut `duplicate`/`abandoned` et annule les cleanups
+    // antérieurs. Preuve directe (preview `c6ac6f0` dry-run) : conv
+    // `427963864300_hubspot-list-6081` avait un duplicate 16/10 ramené par
+    // `close-duplicate-inbound` du 19/10 (inboundCount 7 → 6). Un reset qui
+    // recompte afficherait 7 avant ET après — l'invariant est perdu.
+    const convSnapBefore = await convRef.get();
+    const currentInboundCount = (() => {
+      const raw = convSnapBefore.data()?.inboundCount;
+      return typeof raw === "number" ? raw : 0;
+    })();
+    const touchedInboundCount = touchedMessages.filter((t) => t.direction === "inbound").length;
+    const nextInboundCount = currentInboundCount - touchedInboundCount;
+
     await convRef.update({
       lastMessagePreview: FieldValue.delete(),
       lastMessageAt: FieldValue.delete(),
       lastInboundAt: FieldValue.delete(),
       lastHumanOutboundAt: FieldValue.delete(),
+      inboundCount: nextInboundCount,
     });
-    const remainingInbound = await convRef
-      .collection("messages")
-      .where("direction", "==", "inbound")
-      .count()
-      .get();
-    await convRef.update({ inboundCount: remainingInbound.data().count });
 
     const convSnap = await convRef.get();
     const { updates, posed, readErrors } = await computeBackfillUpdatesForConversation(

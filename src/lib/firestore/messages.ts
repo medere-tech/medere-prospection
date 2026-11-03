@@ -325,6 +325,33 @@ export const MessageSchema = z.object({
   abandonReason: z.enum(["stale_pre_launch_test_cleanup"]).optional(),
   duplicateOf: z.string().optional(),
   error: MessageErrorSchema.optional(),
+  /**
+   * PR2c tour 2b bloc C sexies — origine orphan (rattachement manuel admin).
+   *
+   * Posé par `attachOrphanToConversation` dans `orphan-inbounds.ts:938`
+   * APRÈS `addInboundInTx` via un `tx.update` dédié. Cf. `Message` type
+   * dans `src/types/message.ts:260` qui porte déjà la shape complète
+   * (`orphanId` + `phoneMatch`).
+   *
+   * ⚠ SOURCE DU BUG D'ORIGINE : avant cette entrée du schéma, Zod
+   * `.object()` par défaut applique un strip des clefs non déclarées
+   * (`.strip()`), donc `_parseMessageOrThrow` effaçait silencieusement
+   * `attachedFromOrphan` à la lecture — `load-conversation-detail`
+   * recevait un `Message` sans le champ, `sanitizeMessageForBubble` le
+   * mettait à `undefined`, et la mention « Ajouté manuellement depuis
+   * un SMS orphelin » ne s'affichait jamais sur le fil de la conv
+   * cible. Preuve : harnais e2e sur preview `c6ac6f0`, O7 fail avec
+   * message rattaché visible SANS le hint.
+   *
+   * Sentinelle : `messages.test.ts > _parseMessageOrThrow conserve
+   * attachedFromOrphan` fail si le champ est retiré du schéma.
+   */
+  attachedFromOrphan: z
+    .object({
+      orphanId: z.string().min(1),
+      phoneMatch: z.enum(["match", "mismatch", "not_computable"]),
+    })
+    .optional(),
 });
 
 /** Type inféré depuis le schéma Zod. */

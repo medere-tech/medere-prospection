@@ -788,6 +788,14 @@ export interface AttachOrphanResult {
    * juste ce que la tx a lu.
    */
   assignedToSlackUserId: string | undefined;
+  /**
+   * PR2c tour 2b bloc C sexies — date de réception d'origine de l'orphan,
+   * exposée pour que la notification Slack dédiée au rattachement puisse
+   * la rendre dans son format (« reçu le dd/mm/yyyy à HH:MM »). Lue depuis
+   * le doc orphan AVANT mutation, donc toujours la date originelle (pas
+   * la date d'attach).
+   */
+  originalReceivedAt: Timestamp;
 }
 
 /**
@@ -993,6 +1001,10 @@ export async function attachOrphanToConversation(
       optOutDecision,
       isTestFixture: orphan.isTestFixture === true,
       assignedToSlackUserId,
+      // PR2c tour 2b bloc C sexies — exposé pour la notification Slack dédiée.
+      // Toujours un `Timestamp` matérialisé à la lecture (invariant forensique
+      // posé par `addOrphanInboundIdempotent`).
+      originalReceivedAt: orphan.receivedAt,
     } satisfies AttachOrphanResult;
   });
 }

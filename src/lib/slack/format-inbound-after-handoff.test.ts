@@ -6,6 +6,26 @@ import {
   LAST_INBOUND_MAX_CHARS,
 } from "./format-inbound-after-handoff";
 
+/**
+ * Concatène tous les `text.text` et `elements[].text` d'une liste de
+ * blocks Block Kit — sans les URLs de lien (qui portent légitimement
+ * l'id dans leur query string). Utilisé par la sentinelle anti-ID.
+ */
+function extractAllMrkdwnText(blocks: readonly Record<string, unknown>[]): string {
+  const parts: string[] = [];
+  for (const b of blocks) {
+    const textObj = (b as { text?: { text?: string } }).text;
+    if (textObj && typeof textObj.text === "string") parts.push(textObj.text);
+    const elements = (b as { elements?: Array<{ text?: string }> }).elements;
+    if (Array.isArray(elements)) {
+      for (const e of elements) {
+        if (typeof e.text === "string") parts.push(e.text);
+      }
+    }
+  }
+  return parts.join("\n");
+}
+
 const BASE_INPUT: InboundAfterHandoffInput = {
   firstName: "Pierre",
   speciality: "Dentiste",
@@ -48,15 +68,22 @@ describe("buildInboundAfterHandoffBlocks — variante normale (isOptOut=false)",
     expect(serialized).not.toContain("Ne plus recontacter");
   });
 
-  it("lien dashboard + footer conv id", () => {
+  it("lien dashboard (pas de footer conv-id — PR2c bloc C sexies)", () => {
     const blocks = buildInboundAfterHandoffBlocks(BASE_INPUT);
     const link = blocks[3] as { text: { text: string } };
     expect(link.text.text).toBe(
       "<https://dashboard.medere.fr/conversations/conv-abc-123|Voir la conversation>",
     );
-    const footer = blocks[4] as { type: string; elements: { text: string }[] };
-    expect(footer.type).toBe("context");
-    expect(footer.elements[0]!.text).toBe("conv `conv-abc-123`");
+    // Pas de 5e block `context` : les notifs destinées aux commerciaux ne
+    // portent plus d'id technique de conv — le lien suffit.
+    expect(blocks[4]).toBeUndefined();
+  });
+
+  it("SENTINELLE ANTI-ID : aucun identifiant de conversation dans le texte Slack (PR2c bloc C sexies)", () => {
+    const blocks = buildInboundAfterHandoffBlocks(BASE_INPUT);
+    const textOnly = extractAllMrkdwnText(blocks).replace(/<https:\/\/[^|>]+\|[^>]*>/g, "[LINK]");
+    expect(textOnly).not.toContain(BASE_INPUT.conversationId);
+    expect(textOnly).not.toMatch(/\bconv\s+`[^`]+`/);
   });
 
   it("blockquote multi-lignes : chaque ligne est prefixee par `> `", () => {
@@ -85,14 +112,14 @@ describe("buildInboundAfterHandoffBlocks — variante STOP (isOptOut=true)", () 
     expect(serialized).toContain("Le consentement a été retiré (STOP).");
   });
 
-  it("variante STOP : structure (header + identite + body + action + lien + footer = 6 blocks)", () => {
+  it("variante STOP : structure (header + identite + body + action + lien = 5 blocks, pas de footer)", () => {
     const blocks = buildInboundAfterHandoffBlocks(STOP_INPUT);
-    expect(blocks).toHaveLength(6);
+    expect(blocks).toHaveLength(5);
   });
 
-  it("variante normale : 5 blocks (pas de bloc action)", () => {
+  it("variante normale : 4 blocks (pas de bloc action, pas de footer conv-id)", () => {
     const blocks = buildInboundAfterHandoffBlocks(BASE_INPUT);
-    expect(blocks).toHaveLength(5);
+    expect(blocks).toHaveLength(4);
   });
 });
 

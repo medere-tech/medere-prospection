@@ -183,9 +183,9 @@ export function buildHandoffBlocks(input: HandoffInput): HandoffBlock[] {
         text: `<${input.dashboardUrl}|Voir la conversation>`,
       },
     },
-    {
-      type: "context",
-      elements: [{ type: "mrkdwn", text: `conv \`${input.conversationId}\`` }],
-    },
+    // PR2c tour 2b bloc C sexies — pied `conv \`<id>\`` retiré des notifs
+    // destinées aux commerciaux. Le lien « Voir la conversation » suffit.
+    // Sentinelle anti-ID : `format-handoff.test.ts > aucun identifiant de
+    // conversation dans le texte Slack commercial`.
   ];
 }

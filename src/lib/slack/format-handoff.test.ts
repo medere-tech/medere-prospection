@@ -9,6 +9,27 @@ import { describe, expect, it } from "vitest";
 
 import { buildHandoffBlocks, type HandoffInput, LAST_INBOUND_MAX_CHARS } from "./format-handoff";
 
+/**
+ * Concatène tous les `text.text` et `elements[].text` mrkdwn/plain_text
+ * d'une liste de blocks Block Kit. Utilisé par la sentinelle anti-ID
+ * pour vérifier qu'une chaîne n'apparaît pas dans le texte Slack
+ * (en dehors des URLs de lien, extraites séparément).
+ */
+function extractAllMrkdwnText(blocks: readonly Record<string, unknown>[]): string {
+  const parts: string[] = [];
+  for (const b of blocks) {
+    const textObj = (b as { text?: { text?: string } }).text;
+    if (textObj && typeof textObj.text === "string") parts.push(textObj.text);
+    const elements = (b as { elements?: Array<{ text?: string }> }).elements;
+    if (Array.isArray(elements)) {
+      for (const e of elements) {
+        if (typeof e.text === "string") parts.push(e.text);
+      }
+    }
+  }
+  return parts.join("\n");
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Fixture minimale — jamais réutiliser un vrai PS/commercial
 // ─────────────────────────────────────────────────────────────────────────────
@@ -28,14 +49,15 @@ const BASE_INPUT: HandoffInput = {
 // ─────────────────────────────────────────────────────────────────────────────
 
 describe("buildHandoffBlocks — DM (isOrphan=false)", () => {
-  it("génère 5 blocks : header + section contexte + section blockquote + section lien + context footer", () => {
+  it("génère 4 blocks : header + section contexte + section blockquote + section lien (pas de pied conv-id)", () => {
     const blocks = buildHandoffBlocks(BASE_INPUT);
-    expect(blocks).toHaveLength(5);
+    expect(blocks).toHaveLength(4);
     expect(blocks[0]).toMatchObject({ type: "header" });
     expect(blocks[1]).toMatchObject({ type: "section" });
     expect(blocks[2]).toMatchObject({ type: "section" });
     expect(blocks[3]).toMatchObject({ type: "section" });
-    expect(blocks[4]).toMatchObject({ type: "context" });
+    // PR2c tour 2b bloc C sexies — pas de 5e block `context` (conv ID retiré).
+    expect(blocks[4]).toBeUndefined();
   });
 
   it("header : titre 'Lead intéressé' (R4-Point1 : plus d'emoji, accents conservés)", () => {
@@ -76,12 +98,18 @@ describe("buildHandoffBlocks — DM (isOrphan=false)", () => {
     });
   });
 
-  it("context footer : conversationId opaque pour correlation debug", () => {
+  it("SENTINELLE ANTI-ID : aucun identifiant de conversation dans le texte Slack (PR2c bloc C sexies)", () => {
+    // Les notifs destinées aux commerciaux (hand-off, inbound-after-handoff,
+    // rattachement) NE DOIVENT PLUS porter d'id technique de conv. Le lien
+    // suffit — l'id reste encodé dans la query string de dashboardUrl mais
+    // pas dans le TEXTE rendu à l'utilisateur. Toute régression (quelqu'un
+    // ré-injecte « conv `...` ») est capturée ici.
     const blocks = buildHandoffBlocks(BASE_INPUT);
-    expect(blocks[4]).toMatchObject({
-      type: "context",
-      elements: [{ type: "mrkdwn", text: "conv `conv-abc-123`" }],
-    });
+    const textOnly = extractAllMrkdwnText(blocks).replace(/<https:\/\/[^|>]+\|[^>]*>/g, "[LINK]");
+    expect(textOnly, "conversationId ne doit JAMAIS apparaître dans le texte Slack").not.toContain(
+      BASE_INPUT.conversationId,
+    );
+    expect(textOnly, "pattern `conv \\`<id>\\`` interdit").not.toMatch(/\bconv\s+`[^`]+`/);
   });
 });
 
@@ -115,9 +143,9 @@ describe("buildHandoffBlocks — orphelin (isOrphan=true)", () => {
     expect(json).not.toMatch(/<@U[A-Z0-9]+>/);
   });
 
-  it("reste 5 blocks au total (structure identique DM sauf header + <!here>)", () => {
+  it("reste 4 blocks au total (structure identique DM sauf header + <!here>, pas de pied conv-id)", () => {
     const blocks = buildHandoffBlocks(ORPHAN_INPUT);
-    expect(blocks).toHaveLength(5);
+    expect(blocks).toHaveLength(4);
   });
 });
 

@@ -312,6 +312,177 @@ describe("reset-e2e-orphans — scénario complet (PR2c tour 2b bloc C)", () => 
     expect(orphanAfter.data()?.processingState).toBe("pending");
     expect(orphanAfter.data()?.attachment).toBeUndefined();
   });
+
+  // ─────────────────────────────────────────────────────────────────────
+  // PR2c tour 2b bloc C septies — conv avec un INBOUND marqué `duplicate`
+  // + un INBOUND `abandoned`. `conv.inboundCount` reflète déjà le cleanup
+  // (duplicate/abandoned exclus). Après attach + reset :
+  //   - inboundCount STRICT = valeur d'avant (invariant pipeline).
+  //   - lastInboundAt pointe sur le reçu actif, PAS sur le duplicate.
+  // Mutation sentinelle : si on rebascule `applyResetWrites` sur un
+  // recomptage brut `.where("direction","==","inbound").count()`, ce test
+  // tombe parce que le recomptage ramène duplicate + abandoned.
+  // ─────────────────────────────────────────────────────────────────────
+  it("conv avec inbound duplicate + abandoned ⇒ inboundCount préservé STRICT après reset (sentinelle recomptage)", async () => {
+    const db = getAdminDb();
+    const convId = "crst_dup_hubspot-list-9999";
+    const contactId = "crstdup";
+    const idempotencyKey = "rst-dup-attach-1";
+
+    // Seed contact minimal (le reset ne lit pas ces champs mais la conv les requiert).
+    await db
+      .collection("contacts")
+      .doc(contactId)
+      .set({
+        hubspotId: contactId,
+        firstName: "Jean",
+        lastName: "Dupont",
+        civilite: "Dr",
+        speciality: "Chirurgien-dentiste",
+        city: "Paris",
+        postalCode: "75001",
+        phone: {
+          e164: "+33600000000",
+          raw: "+33600000000",
+          type: "mobile",
+          valid: true,
+          lookupAt: Timestamp.now(),
+        },
+        segment: "b2b_cabinet",
+        bloctelChecked: false,
+        bloctelOptOut: false,
+        consent: { legitimateInterest: "test duplicate inbound", optedOut: false },
+        enrichment: { source: "manual", enrichedAt: Timestamp.now() },
+        status: "ready",
+        campaignId: "hubspot-list-9999",
+        createdAt: Timestamp.now(),
+        updatedAt: Timestamp.now(),
+      });
+
+    // Seed messages :
+    //   t1  : inbound "received" (actif)   ← lastInboundAt pointe ici
+    //   t2  : inbound "duplicate"          ← exclu par pipeline cleanup
+    //   t3  : inbound "abandoned"          ← exclu par pipeline cleanup
+    //   t4  : outbound ai "sent"
+    const t1 = Timestamp.fromMillis(1_700_000_000_000);
+    const t2 = Timestamp.fromMillis(1_700_000_060_000);
+    const t3 = Timestamp.fromMillis(1_700_000_120_000);
+    const t4 = Timestamp.fromMillis(1_700_000_180_000);
+    const activeInboundBody = "Bonjour, je suis intéressé.";
+
+    const msgs = db.collection("conversations").doc(convId).collection("messages");
+    await msgs.doc("m1_in_received").set({
+      direction: "inbound",
+      body: activeInboundBody,
+      createdAt: t1,
+      status: "received",
+      channel: "sms",
+    });
+    await msgs.doc("m2_in_duplicate").set({
+      direction: "inbound",
+      body: "Doublon du 16/10 — exclu par close-duplicate-inbound",
+      createdAt: t2,
+      status: "duplicate",
+      duplicateOf: "m1_in_received",
+      channel: "sms",
+    });
+    await msgs.doc("m3_in_abandoned").set({
+      direction: "inbound",
+      body: "Inbound abandonné (hypothétique cleanup manuel)",
+      createdAt: t3,
+      status: "abandoned",
+      channel: "sms",
+    });
+    await msgs.doc("m4_out_ai").set({
+      direction: "outbound",
+      generatedBy: "ai",
+      body: "Bonjour Dr Dupont…",
+      createdAt: t4,
+      status: "sent",
+      channel: "sms",
+    });
+
+    // Seed conv : inboundCount = 1 (reflet du cleanup), lastInboundAt = t1.
+    // lastMessageAt = t4 (dernier message, outbound ai).
+    await db
+      .collection("conversations")
+      .doc(convId)
+      .set({
+        contactId,
+        campaignId: "hubspot-list-9999",
+        channel: "sms",
+        status: "active",
+        intent: "unknown",
+        messageCount: 4,
+        outboundCount: 1,
+        inboundCount: 1,
+        followupCount: 0,
+        lastMessageAt: t4,
+        lastInboundAt: t1,
+        lastMessagePreview: buildLastMessagePreview({
+          direction: "outbound",
+          authorKind: "ai",
+          text: "Bonjour Dr Dupont…",
+          at: t4,
+        }),
+        createdAt: Timestamp.fromMillis(1_699_999_000_000),
+        updatedAt: t4,
+      });
+
+    const beforeSnap = await db.collection("conversations").doc(convId).get();
+    const before = readConvSnapshot(beforeSnap.data()!);
+    expect(before.inboundCount).toBe(1);
+    expect(before.lastInboundAtIso).toBe(t1.toDate().toISOString());
+
+    // Attach : bump inboundCount à 2 (via `_bumpConversationCountersTx`).
+    const orphanSeed = await addOrphanInboundIdempotent({
+      reason: "no_conversation",
+      body: "SEED test duplicate",
+      idempotencyKey,
+      source: "process-reply",
+      isTestFixture: true,
+    });
+    await attachOrphanToConversation({
+      orphanDocId: orphanSeed.docId,
+      conversationId: convId,
+      attachedBy: "user_admin_e2e",
+      optOutConfirmed: false,
+      actorTestAccount: true,
+    });
+
+    const attachedSnap = await db.collection("conversations").doc(convId).get();
+    expect(attachedSnap.data()?.inboundCount).toBe(2);
+
+    // Reset : INVERSE EXACT du bump → inboundCount doit redevenir 1.
+    const scan = await scanFixturesForReset(db, convId, [idempotencyKey]);
+    const prediction = await predictConvStateAfterReset(db, convId, scan.touchedMessages);
+    // 🔒 Preuve directe : la prédiction utilise `current - touchedInbound`,
+    // JAMAIS `.count()` brut. Un recomptage brut ramènerait 2+1-1 = 2 (il
+    // compterait duplicate + abandoned + received − attachMsg) → régression
+    // du cleanup antérieur.
+    expect(prediction.predicted?.inboundCount).toBe(1);
+    expect(prediction.predicted?.lastInboundAt?.toDate().toISOString()).toBe(
+      t1.toDate().toISOString(),
+    );
+    assertSafeReset(prediction);
+
+    await applyResetWrites({
+      db,
+      convId,
+      touchedOrphans: scan.touchedOrphans,
+      touchedMessages: scan.touchedMessages,
+    });
+
+    const after = readConvSnapshot(
+      (await db.collection("conversations").doc(convId).get()).data()!,
+    );
+    // STRICT : inboundCount reste à 1 (pas 2, pas 3). lastInboundAt =
+    // t1 (le reçu actif), pas t2 (duplicate) ni t3 (abandoned).
+    expect(after.inboundCount).toBe(1);
+    expect(after.lastInboundAtIso).toBe(t1.toDate().toISOString());
+    // lastMessageAt reste t4 (outbound ai actif, pas touché).
+    expect(after.lastMessageAtIso).toBe(t4.toDate().toISOString());
+  });
 });
 
 // ─────────────────────────────────────────────────────────────────────────

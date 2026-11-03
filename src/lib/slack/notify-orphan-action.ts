@@ -1,6 +1,6 @@
 /**
  * Résolution + envoi de la notification Slack pour les actions admin
- * sur un orphan (PR2c tour 2a bis).
+ * sur un orphan (PR2c tour 2a bis + bloc C sexies — format dédié).
  *
  * ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
  * Discipline de routage (UNE SEULE fonction, réutilisable par PR4)
@@ -13,33 +13,33 @@
  *   3. Sinon → canal orphelins (SLACK_ORPHAN_LEADS_CHANNEL_ID, requis
  *      en prod et preview par `getSlackEnv()`).
  *
- * On ne retourne JAMAIS `"skipped"` dans les cas 2/3 : un acteur réel
- * reçoit toujours quelque chose quelque part. Seul le cas 1 avec var
- * manquante produit un no-op audible via logger.error.
- *
  * ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
- * Envoi
+ * Format dédié rattachement (PR2c tour 2b bloc C sexies)
  *
- *   L'envoi passe TOUJOURS par `sendInboundAfterHandoffNotification` —
- *   la seule fonction Slack du projet qui construit des blocks avec le
- *   bon échappement mrkdwn (`buildInboundAfterHandoffBlocks` escape déjà
- *   les `<`, `>`, `&`, `*`, `_` et `` ` `` du body PS pour éviter l'injection
- *   mrkdwn Slack). Pas de post direct `chat.postMessage` ici — on
- *   réutilise la cible `kind: "channel"` ajoutée au type `InboundAfterHandoffTarget`.
+ *   On n'utilise plus `buildInboundAfterHandoffBlocks` (qui parle de
+ *   « nouveau message ») — à la place `buildOrphanAttachedBlocks` qui dit
+ *   explicitement « SMS rattaché manuellement », porte le nom de l'admin,
+ *   la date de réception D'ORIGINE (pas celle du clic), et la mention
+ *   « Désabonnement appliqué » quand opt-out. Le post Slack reste un
+ *   `chat.postMessage` direct avec la même discipline anti-unfurl que
+ *   `sendInboundAfterHandoffNotification`.
  *
  * ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
  * URL du lien dashboard
  *
- *   `getDashboardOrphanDetailUrl(orphanDocId)` → `/admin/orphan-inbounds?id=...`.
- *   Pointe la fiche détail de l'orphan rattaché (pas la conv destinataire)
- *   pour permettre à l'admin de revoir le contexte de rattachement.
+ *   `getDashboardConversationUrl(conversationId)` → `/admin/conversations/<id>`.
+ *   Pointe la CONVERSATION où le SMS vient d'être rattaché, en cohérence
+ *   avec le libellé « Voir la conversation ». Avant le fix bloc C sexies,
+ *   le lien pointait vers `/admin/orphan-inbounds?id=...` — libellé
+ *   trompeur, régression harnais e2e sur preview `c6ac6f0`.
  */
 import { getSlackEnv } from "@/lib/security/env";
 import { logger } from "@/lib/utils/logger";
 
-import { getDashboardOrphanDetailUrl } from "./dashboard-url";
-import { sendInboundAfterHandoffNotification } from "./notify-inbound-after-handoff";
+import { getDashboardConversationUrl } from "./dashboard-url";
+import { buildOrphanAttachedBlocks } from "./format-orphan-attached";
 import { resolveTargetKind } from "./orphan-notify-target";
+import { sendSlackBlocks } from "./send-slack-blocks";
 
 /**
  * Pur, sans I/O — résout la cible à utiliser pour une notif orphan.
@@ -99,6 +99,17 @@ export interface OrphanAttachedNotifyInput {
   readonly city: string | undefined;
   readonly lastInboundBody: string;
   readonly isOptOut: boolean;
+  /**
+   * Nom résolu de l'admin qui a rattaché (`<firstName> <lastName>` depuis
+   * Clerk via `resolveAdminName`). `null` → le format tombe sur « un
+   * administrateur ». JAMAIS le `userId` Clerk brut.
+   */
+  readonly adminName: string | null;
+  /**
+   * Date de réception D'ORIGINE de l'orphan (`AttachOrphanResult.originalReceivedAt`),
+   * ISO 8601. Rendue en Paris par le builder. PAS la date de rattachement.
+   */
+  readonly originalReceivedAtIso: string;
 }
 
 export type OrphanNotifyResult =
@@ -139,21 +150,36 @@ export async function notifyOrphanAttachedBestEffort(
     return { kind: "skipped", target };
   }
 
+  const blocks = buildOrphanAttachedBlocks({
+    firstName: input.firstName ?? "",
+    speciality: input.speciality ?? "",
+    city: input.city ?? "",
+    lastInboundBody: input.lastInboundBody,
+    adminName: input.adminName,
+    originalReceivedAtIso: input.originalReceivedAtIso,
+    isOptOut: input.isOptOut,
+    // PR2c tour 2b bloc C sexies — lien vers la CONVERSATION (fix du
+    // lien trompeur). Fonction UNIQUE `getDashboardConversationUrl`.
+    dashboardUrl: getDashboardConversationUrl(input.conversationId),
+  });
+
+  const fallbackText = input.isOptOut
+    ? "SMS orphelin rattaché — demande d'arrêt (STOP)"
+    : "SMS orphelin rattaché à une conversation";
+
   try {
-    const result = await sendInboundAfterHandoffNotification({
+    // Wire layer UNIQUE (bloc C octies) : validation DM, postMessage
+    // anti-unfurl, mapping d'erreurs, log sans PII. Partagé avec
+    // `sendInboundAfterHandoffNotification`.
+    const result = await sendSlackBlocks({
       target:
         target.kind === "dm"
           ? { kind: "dm", slackUserId: target.slackUserId }
           : { kind: "channel", channelId: target.channelId },
-      firstName: input.firstName ?? "",
-      speciality: input.speciality ?? "",
-      city: input.city ?? "",
-      lastInboundBody: input.lastInboundBody,
-      conversationId: input.conversationId,
-      isOptOut: input.isOptOut,
-      // PR2c tour 2a bis — lien vers la fiche orphan dans le dashboard,
-      // construit par l'unique fonction d'URL dashboard.
-      dashboardUrl: getDashboardOrphanDetailUrl(input.orphanDocId),
+      fallbackText,
+      blocks,
+      logEvent: "Orphan-attached Slack notification sent",
+      logContext: { isOptOut: input.isOptOut },
     });
     return {
       kind: "sent",

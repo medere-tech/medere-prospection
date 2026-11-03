@@ -31,7 +31,43 @@ import {
 // (ex: ajout d'un filtre dans l'une mais pas l'autre) casse le build.
 // ─────────────────────────────────────────────────────────────────────────────
 
-/** `db.collection("conversations").doc(convId).collection("messages").orderBy("createdAt","desc").limit(1).get()`. */
+/**
+ * `db.collection("conversations").doc(convId).collection("messages").orderBy("createdAt","desc").limit(ACTIVE_SCAN_LIMIT).get()`.
+ *
+ * ⚠ Lit `ACTIVE_SCAN_LIMIT` (10) messages — PAS 1 — pour laisser au caller
+ * la possibilité d'ignorer les docs `status: "duplicate"` ou `"abandoned"`
+ * (invariant pipeline, cf. `_bumpConversationCountersTx` + cleanups
+ * `close-duplicate-inbound-core.mjs` / `close-stale-orphans-core.mjs`).
+ *
+ * PR2c tour 2b bloc C septies : avant ce fix, `.limit(1)` ramenait un
+ * duplicate et `computeBackfillUpdatesForConversation` posait son
+ * `createdAt` comme `lastMessageAt` — ce qui annule silencieusement le
+ * cleanup qui l'avait exclu.
+ */
+export const ACTIVE_SCAN_LIMIT = 10;
+
+/**
+ * Prédicat partagé — un message est "actif" (pris en compte par
+ * `lastMessageAt` / `lastInboundAt` / `lastHumanOutboundAt` / preview /
+ * `inboundCount`) ssi son `status` n'est NI `"duplicate"` NI
+ * `"abandoned"`.
+ *
+ * Alignement pipeline :
+ *   - `_bumpConversationCountersTx` incrémente les compteurs à chaque
+ *     write, sans filtrer par status (status est "received"/"queued"
+ *     à la création).
+ *   - Les cleanups (`close-duplicate-inbound-core.mjs:122`,
+ *     `close-stale-orphans-core.mjs:28`) marquent un message
+ *     `duplicate`/`abandoned` ET DÉCRÉMENTENT `inboundCount` /
+ *     réassignent `lastInboundAt` au prochain actif.
+ *   - Donc après cleanup, `conv.inboundCount` et `conv.lastInboundAt`
+ *     n'incluent pas les docs `duplicate`/`abandoned`. Le backfill doit
+ *     respecter la même règle pour ne pas annuler le cleanup.
+ */
+export function isActiveMessageStatus(status: unknown): boolean {
+  return status !== "duplicate" && status !== "abandoned";
+}
+
 export function queryBackfillLastMessage(
   db: FirebaseFirestore.Firestore,
   convId: string,
@@ -41,7 +77,7 @@ export function queryBackfillLastMessage(
     .doc(convId)
     .collection("messages")
     .orderBy("createdAt", "desc")
-    .limit(1)
+    .limit(ACTIVE_SCAN_LIMIT)
     .get();
 }
 
@@ -64,7 +100,7 @@ export function queryBackfillLastHumanOutbound(
     .where("direction", "==", "outbound")
     .where("generatedBy", "==", "human")
     .orderBy("createdAt", "desc")
-    .limit(1)
+    .limit(ACTIVE_SCAN_LIMIT)
     .get();
 }
 
@@ -90,7 +126,7 @@ export function queryBackfillLastInbound(
     .collection("messages")
     .where("direction", "==", "inbound")
     .orderBy("createdAt", "desc")
-    .limit(1)
+    .limit(ACTIVE_SCAN_LIMIT)
     .get();
 }
 
@@ -209,8 +245,13 @@ export async function computeBackfillUpdatesForConversation(
   if (readErrors.length === 0 && (!conv.lastMessagePreview || !conv.lastMessageAt)) {
     try {
       const lastMsgSnap = await queryBackfillLastMessage(db, convId);
-      if (!lastMsgSnap.empty) {
-        const m = lastMsgSnap.docs[0]!.data();
+      // PR2c tour 2b bloc C septies — on skip les docs `duplicate` et
+      // `abandoned` (invariant pipeline, cf. `isActiveMessageStatus`).
+      // Les queries fetchent `ACTIVE_SCAN_LIMIT` docs justement pour avoir
+      // la marge nécessaire au skip.
+      const firstActive = lastMsgSnap.docs.find((d) => isActiveMessageStatus(d.data().status));
+      if (firstActive) {
+        const m = firstActive.data();
         const direction = m.direction === "outbound" ? "outbound" : "inbound";
         const authorKind =
           direction === "inbound" ? "contact" : m.generatedBy === "human" ? "human" : "ai";
@@ -242,8 +283,9 @@ export async function computeBackfillUpdatesForConversation(
   if (readErrors.length === 0 && !conv.lastInboundAt) {
     try {
       const lastInboundSnap = await queryBackfillLastInbound(db, convId);
-      if (!lastInboundSnap.empty) {
-        const t = lastInboundSnap.docs[0]!.data().createdAt;
+      const firstActive = lastInboundSnap.docs.find((d) => isActiveMessageStatus(d.data().status));
+      if (firstActive) {
+        const t = firstActive.data().createdAt;
         if (t instanceof Timestamp) {
           updates.lastInboundAt = t;
           posed.push("lastInboundAt");
@@ -260,8 +302,9 @@ export async function computeBackfillUpdatesForConversation(
   if (readErrors.length === 0 && !conv.lastHumanOutboundAt) {
     try {
       const lastHumanSnap = await queryBackfillLastHumanOutbound(db, convId);
-      if (!lastHumanSnap.empty) {
-        const t = lastHumanSnap.docs[0]!.data().createdAt;
+      const firstActive = lastHumanSnap.docs.find((d) => isActiveMessageStatus(d.data().status));
+      if (firstActive) {
+        const t = firstActive.data().createdAt;
         if (t instanceof Timestamp) {
           updates.lastHumanOutboundAt = t;
           posed.push("lastHumanOutboundAt");

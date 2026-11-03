@@ -1871,6 +1871,79 @@ describe("messages.ts", () => {
     });
   });
 
+  describe("attachedFromOrphan (PR2c tour 2b bloc C sexies — sentinelle serveur)", () => {
+    it("_parseMessageOrThrow conserve attachedFromOrphan quand le doc le porte", async () => {
+      // Preuve directe : sans la clef `attachedFromOrphan` dans
+      // `MessageSchema`, Zod `.object()` applique `.strip()` → le champ
+      // est silencieusement effacé, `load-conversation-detail` ne le voit
+      // jamais, et `message-bubble.tsx` perd la mention « Ajouté
+      // manuellement ». Ce test échoue si quelqu'un retire la clef du
+      // schéma (régression harnais e2e preview `c6ac6f0` O7).
+      const convId = "conv_attached_sentinel";
+      await seedConversation(convId);
+
+      const ref = await getAdminDb()
+        .collection(__MESSAGES_PARENT_COLLECTION_FOR_TESTS)
+        .doc(convId)
+        .collection(__MESSAGES_SUBCOLLECTION_FOR_TESTS)
+        .add({
+          direction: "inbound",
+          body: "SMS rattaché manuellement par un admin",
+          status: "received",
+          channel: "sms",
+          generatedBy: "human",
+          createdAt: Timestamp.now(),
+          receivedAt: Timestamp.now(),
+          attachedFromOrphan: {
+            orphanId: "oih_test_sentinel",
+            phoneMatch: "match",
+          },
+        });
+
+      const snap = await getAdminDb()
+        .collection(__MESSAGES_PARENT_COLLECTION_FOR_TESTS)
+        .doc(convId)
+        .collection(__MESSAGES_SUBCOLLECTION_FOR_TESTS)
+        .doc(ref.id)
+        .get();
+
+      const parsed = _parseMessageOrThrow(snap.data(), convId, ref.id);
+      expect(parsed.attachedFromOrphan).toEqual({
+        orphanId: "oih_test_sentinel",
+        phoneMatch: "match",
+      });
+    });
+
+    it("_parseMessageOrThrow refuse un attachedFromOrphan.phoneMatch hors enum (fail-closed)", async () => {
+      const convId = "conv_attached_bogus";
+      await seedConversation(convId);
+
+      const ref = await getAdminDb()
+        .collection(__MESSAGES_PARENT_COLLECTION_FOR_TESTS)
+        .doc(convId)
+        .collection(__MESSAGES_SUBCOLLECTION_FOR_TESTS)
+        .add({
+          direction: "inbound",
+          body: "SMS avec phoneMatch inconnu",
+          status: "received",
+          channel: "sms",
+          generatedBy: "human",
+          createdAt: Timestamp.now(),
+          receivedAt: Timestamp.now(),
+          attachedFromOrphan: { orphanId: "oih_x", phoneMatch: "unknown" },
+        });
+
+      const snap = await getAdminDb()
+        .collection(__MESSAGES_PARENT_COLLECTION_FOR_TESTS)
+        .doc(convId)
+        .collection(__MESSAGES_SUBCOLLECTION_FOR_TESTS)
+        .doc(ref.id)
+        .get();
+
+      expect(() => _parseMessageOrThrow(snap.data(), convId, ref.id)).toThrow(ValidationError);
+    });
+  });
+
   describe("type-level (compile-time)", () => {
     it("placeholder runtime : les vrais checks sont les @ts-expect-error ci-dessous", () => {
       expect(true).toBe(true);
