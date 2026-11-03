@@ -19,7 +19,6 @@ import {
 import { addOrphanInboundIdempotent, listOrphanInbounds } from "@/lib/firestore/orphan-inbounds";
 import { __resetEnvCacheForTests } from "@/lib/security/env";
 import { ValidationError } from "@/lib/utils/errors";
-import type { InboundOnInactiveConversationReason } from "@/types/audit-log";
 
 const PEPPER = "b".repeat(64);
 
@@ -33,7 +32,11 @@ async function fullReset() {
 
 async function seedOrphan(
   idempotencyKey: string,
-  reason: InboundOnInactiveConversationReason,
+  // PR2c tour 2a — restreint aux 4 raisons qui créent effectivement un
+  // doc orphelin (cf. OrphanInboundReason). Les 5 autres valeurs de
+  // InboundOnInactiveConversationReason posent uniquement un audit, pas
+  // de doc orphan — elles n'ont rien à faire dans ce helper.
+  reason: "no_conversation" | "unknown_contact" | "parse_failed" | "enqueue_failed",
   source: "process-reply" | "webhook-ovh-sms" = "process-reply",
   body = "Bonjour, test orphelin",
 ) {

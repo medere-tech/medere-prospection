@@ -181,6 +181,8 @@ describe("requireRole — extraction firstName/lastName", () => {
       role: "admin",
       firstName: "Déthié",
       lastName: "Faye",
+      slackUserId: undefined,
+      testAccount: false,
     });
   });
 
@@ -194,6 +196,8 @@ describe("requireRole — extraction firstName/lastName", () => {
       role: "commercial",
       firstName: undefined,
       lastName: undefined,
+      slackUserId: undefined,
+      testAccount: false,
     });
   });
 
@@ -445,6 +449,9 @@ describe("requireRole — reproduction cas reel e2e-admin (FAIT 1)", () => {
       firstName: undefined,
       lastName: undefined,
       slackUserId: undefined,
+      // PR2c tour 2a — testAccount exposé pour routage Slack / filtre
+      // isTestFixture. Ici `true` (sessionClaims.testAccount=true).
+      testAccount: true,
     });
     expect(mocks.warn).not.toHaveBeenCalled();
   });

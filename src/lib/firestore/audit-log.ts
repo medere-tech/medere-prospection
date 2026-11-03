@@ -142,6 +142,13 @@ const ACTIONS = [
   // conversation touchée par le backfill PR2a. Payload = `{ fieldsPosed:
   // string[] }` — scrubber-safe.
   "backfill_conversation_list_fields",
+  // ── PR2c tour 2a — transitions SMS orphelins ─────────────────────────
+  // Cf. types/audit-log.ts pour la sémantique complète + payloads typés.
+  // Sentinelle anti-drift : ACTIONS ↔ AuditAction en égalité ensembliste
+  // (audit-log.test.ts). Ajout ici DOIT être miroir dans l'enum TS.
+  "orphan_attached_to_conversation",
+  "orphan_dismissed",
+  "orphan_reopened",
 ] as const;
 
 // ─────────────────────────────────────────────────────────────────────────────

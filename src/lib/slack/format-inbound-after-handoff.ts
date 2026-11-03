@@ -198,19 +198,17 @@ export function buildInboundAfterHandoffBlocks(
     });
   }
 
-  blocks.push(
-    {
-      type: "section",
-      text: {
-        type: "mrkdwn",
-        text: `<${input.dashboardUrl}|Voir la conversation>`,
-      },
+  blocks.push({
+    type: "section",
+    text: {
+      type: "mrkdwn",
+      text: `<${input.dashboardUrl}|Voir la conversation>`,
     },
-    {
-      type: "context",
-      elements: [{ type: "mrkdwn", text: `conv \`${input.conversationId}\`` }],
-    },
-  );
+  });
+  // PR2c tour 2b bloc C sexies — pied `conv \`<id>\`` retiré des notifs
+  // destinées aux commerciaux. Le lien « Voir la conversation » suffit ;
+  // la sentinelle anti-ID verrouille qu'aucun id technique de
+  // conversation n'atteigne plus le texte Slack.
 
   return blocks;
 }

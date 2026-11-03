@@ -52,6 +52,7 @@ function buildItem(overrides: Partial<ConversationListItem> = {}): ConversationL
     status: "opted_out",
     intent: "STOP",
     assignedTo: "U05UVHGBURX",
+    assignedToName: null,
     lastMessageAtIso: "2026-10-20T14:30:00.000Z",
     lastInboundAtIso: "2026-10-20T14:30:00.000Z",
     lastOutboundAtIso: "2026-10-20T13:00:00.000Z",
@@ -135,9 +136,9 @@ describe("<ConversationsPageClient />", () => {
     );
     // Message rendu DANS la table ET dans la vue mobile (deux conteneurs
     // CSS-switchés via `md:hidden`/`md:block`) → `findAllByText`.
-    const titles = await screen.findAllByText("Aucune conversation à traiter.", undefined, {
-      timeout: 2000,
-    });
+    // Timeout : réglage global Testing Library (5000 ms, cf.
+    // `tests/setup/testing-library-timeout.ts`) ; pas d'override local.
+    const titles = await screen.findAllByText("Aucune conversation à traiter.");
     expect(titles.length).toBeGreaterThan(0);
     expect(
       screen.getAllByText("Les nouvelles prises en charge apparaîtront ici.").length,
@@ -167,9 +168,7 @@ describe("<ConversationsPageClient />", () => {
         initialCommerciaux={COMMERCIAUX}
       />,
     );
-    expect(
-      await screen.findAllByText("Dr Jean Dupont", undefined, { timeout: 2000 }),
-    ).not.toHaveLength(0);
+    expect(await screen.findAllByText("Dr Jean Dupont")).not.toHaveLength(0);
     // Specialty et city affichés en sub-ligne.
     expect(screen.getAllByText(/Chirurgien-dentiste.*Paris/).length).toBeGreaterThan(0);
   });
@@ -197,7 +196,7 @@ describe("<ConversationsPageClient />", () => {
         initialCommerciaux={COMMERCIAUX}
       />,
     );
-    await screen.findAllByText("Dr Jean Dupont", undefined, { timeout: 2000 });
+    await screen.findAllByText("Dr Jean Dupont");
 
     // Le desktop (overflow-x-auto dans un md:block container) ET le mobile
     // (md:hidden) rendent CHACUN un `<a>` natif pointant vers le détail.
@@ -222,11 +221,7 @@ describe("<ConversationsPageClient />", () => {
         initialCommerciaux={COMMERCIAUX}
       />,
     );
-    const errMsgs = await screen.findAllByText(
-      /Impossible de charger les conversations/,
-      undefined,
-      { timeout: 2000 },
-    );
+    const errMsgs = await screen.findAllByText(/Impossible de charger les conversations/);
     expect(errMsgs.length).toBeGreaterThan(0);
     expect(screen.getAllByRole("button", { name: /Réessayer/ }).length).toBeGreaterThan(0);
   });
@@ -260,10 +255,8 @@ describe("<ConversationsPageClient />", () => {
         initialCommerciaux={COMMERCIAUX}
       />,
     );
-    const nextBtn = (
-      await screen.findAllByRole("button", { name: /Page suivante/ }, { timeout: 2000 })
-    )[0]!;
-    await waitFor(() => expect(nextBtn).not.toBeDisabled(), { timeout: 2000 });
+    const nextBtn = (await screen.findAllByRole("button", { name: /Page suivante/ }))[0]!;
+    await waitFor(() => expect(nextBtn).not.toBeDisabled());
     await userEvent.click(nextBtn);
     expect(setCursorMock).toHaveBeenCalledWith("c24_hubspot-list-6081");
   });
@@ -298,7 +291,7 @@ describe("<ConversationsPageClient />", () => {
         initialCommerciaux={COMMERCIAUX}
       />,
     );
-    await screen.findAllByText("P1 Dr 0", undefined, { timeout: 2000 });
+    await screen.findAllByText("P1 Dr 0");
     // Les 25 noms de P1 doivent être rendus (bornés dans le compteur côté footer).
     expect(screen.getByText(/25 conversations/)).toBeInTheDocument();
   });
@@ -326,7 +319,7 @@ describe("<ConversationsPageClient />", () => {
         initialCommerciaux={COMMERCIAUX}
       />,
     );
-    await screen.findAllByText("Dr Jean Dupont", undefined, { timeout: 2000 });
+    await screen.findAllByText("Dr Jean Dupont");
     // Le conteneur mobile a la classe `md:hidden` — rendu dans le DOM
     // (CSS décide la visibilité au runtime via media query).
     const mobileContainer = container.querySelector(".md\\:hidden");
@@ -393,9 +386,7 @@ describe("<ConversationsPageClient />", () => {
     // AVANT d'asserter l'absence du dropdown — évite l'avertissement
     // "not wrapped in act(...)" sur `setListState`/`setCountsState` qui
     // s'exécutent après le render synchrone.
-    await screen.findAllByText("Aucune conversation à traiter.", undefined, {
-      timeout: 2000,
-    });
+    await screen.findAllByText("Aucune conversation à traiter.");
     expect(screen.queryByLabelText(/Filtrer par commercial/)).toBeNull();
   });
 });

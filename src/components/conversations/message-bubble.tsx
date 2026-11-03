@@ -141,6 +141,19 @@ export function MessageBubble({ message }: Props) {
         ) : (
           <span className="px-1 text-[11px] text-muted-foreground">Reçu {timeLabel}</span>
         )}
+
+        {/* PR2c tour 2b bloc B — mentions explicites quand ce message a
+            été ajouté à ce fil manuellement depuis un SMS orphelin.
+            Visible sous la bulle (inbound comme outbound) pour que le
+            commercial et l'admin ne confondent jamais un message rattaché
+            avec un message reçu directement sur le fil. */}
+        {message.attachedFromOrphan && (
+          <span className="px-1 text-[11px] italic text-muted-foreground">
+            Ajouté manuellement depuis un SMS orphelin
+            {message.attachedFromOrphan.phoneMatch === "mismatch" &&
+              " · Envoyé depuis un autre numéro"}
+          </span>
+        )}
       </div>
     </article>
   );

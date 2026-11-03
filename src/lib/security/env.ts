@@ -222,6 +222,30 @@ const slackEnvSchema = z.object({
    * Format = channel ID Slack (C.../G...).
    */
   SLACK_ORPHAN_LEADS_CHANNEL_ID: z.string().regex(/^[CG][A-Z0-9]+$/, "must be a Slack channel ID"),
+  /**
+   * PR2c tour 2a — canal Slack dédié aux notifications déclenchées par un
+   * acteur `testAccount` (comptes e2e Playwright). Fail-closed en preview :
+   * si une notif qui aurait dû partir en DM commercial ou dans le canal
+   * orphelins est initiée par un testAccount, elle est REDIRIGÉE ici.
+   *
+   * **REQUIRED en preview Vercel** : si un dev provisionne un compte test
+   * mais oublie de poser cette var, la notif aurait échoué silencieusement
+   * côté Slack bot (channel vide) ou pollué le vrai canal orphelins. Le
+   * fail-closed force la configuration explicite. Format = channel ID
+   * Slack (C.../G...).
+   *
+   * **Optional en prod** : les comptes testAccount sont refusés par
+   * `requireRole` quand `VERCEL_ENV === "production"` (cf. require-role.ts),
+   * donc aucun code path ne touchera ce canal. On le garde optional pour
+   * ne pas forcer la var en prod réelle où elle n'a aucun sens.
+   *
+   * Comportement de l'getter : fail-closed EN PREVIEW (process.env.VERCEL_ENV
+   * === "preview" OR === "development"). Cf. getSlackEnv().
+   */
+  SLACK_TEST_CHANNEL_ID: z
+    .string()
+    .regex(/^[CG][A-Z0-9]+$/, "must be a Slack channel ID")
+    .optional(),
   /** Optional Phase 1 : Phase 4 hand-off. JSON `{ specialty: slackUserId }`. */
   SLACK_USER_IDS: slackUserIdsSchema.optional(),
 });
@@ -415,7 +439,24 @@ export function getLushaEnv() {
 }
 
 export function getSlackEnv() {
-  return memoize("slack", () => parseOrThrow(slackEnvSchema, "slack"));
+  const parsed = memoize("slack", () => parseOrThrow(slackEnvSchema, "slack"));
+  // PR2c tour 2a — fail-closed sur SLACK_TEST_CHANNEL_ID en preview :
+  // obligatoire quand des comptes testAccount peuvent s'authentifier.
+  // En prod réelle, testAccount est refusé par requireRole → aucune
+  // route code path n'atteindra cette lecture, donc on tolère l'absence.
+  // VERCEL_ENV ∈ {"production", "preview", "development"}.
+  const vercelEnv = process.env.VERCEL_ENV;
+  if (
+    (vercelEnv === "preview" || vercelEnv === "development") &&
+    (parsed.SLACK_TEST_CHANNEL_ID === undefined || parsed.SLACK_TEST_CHANNEL_ID.length === 0)
+  ) {
+    throw new ConfigError({
+      message:
+        "SLACK_TEST_CHANNEL_ID required in VERCEL_ENV=preview/development (testAccount routing)",
+      context: { service: "slack" },
+    });
+  }
+  return parsed;
 }
 
 export function getAirtableEnv() {

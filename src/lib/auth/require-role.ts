@@ -220,6 +220,24 @@ export interface RoleContext {
    * encore seedé (fallback propre — pas de crash).
    */
   slackUserId?: string;
+  /**
+   * PR2c tour 2a — `true` ssi le compte Clerk est provisionné par
+   * `scripts/setup-e2e-clerk-users.mjs` (claim JWT `testAccount`).
+   * Refusé par `requireRole` en `VERCEL_ENV === "production"`.
+   *
+   * Exposé publiquement pour que les routes admin puissent router les
+   * effets de bord (notifs Slack déclenchées par un testAccount vont
+   * dans `SLACK_TEST_CHANNEL_ID` au lieu du titulaire ou du canal
+   * orphelins) et que les lectures Firestore puissent inclure les docs
+   * `isTestFixture: true` UNIQUEMENT pour les comptes testAccount
+   * (fail-closed strict en production : testAccount y est de toute
+   * façon refusé).
+   *
+   * **Obligatoire** (PR2c tour 2a bis) : chaque mock et chaque consommateur
+   * reçoit un booléen explicite. Le runtime pose toujours une valeur
+   * (branche false si claim absent via `.transform(v => v === true)`).
+   */
+  testAccount: boolean;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -340,5 +358,5 @@ export async function requireRole(required: Role): Promise<RoleContext> {
     });
   }
 
-  return { userId, role, firstName, lastName, slackUserId };
+  return { userId, role, firstName, lastName, slackUserId, testAccount };
 }

@@ -36,31 +36,22 @@
  *   les metadonnees non-PII (`ts`, `channel`, `targetKind`, `isOptOut`).
  */
 
-import { ExternalServiceError } from "@/lib/utils/errors";
-import { logger } from "@/lib/utils/logger";
-
-import { getSlackClient } from "./client";
 import {
   buildInboundAfterHandoffBlocks,
   type InboundAfterHandoffInput,
 } from "./format-inbound-after-handoff";
-import { assertSlackUserId } from "./slack-user-id";
+import { sendSlackBlocks, type SlackSendTarget } from "./send-slack-blocks";
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Types
 // ─────────────────────────────────────────────────────────────────────────────
 
 /**
- * Cible du relais — toujours un DM. Un `handoff.assignedTo` existe par
- * definition sur une conv `handed_off` (invariant pose par `setHandoff`).
- * Le champ `kind` est garde pour homogeneite avec `HandoffTarget` et pour
- * faciliter une evolution future (fallback canal titulaire absent).
+ * Alias local — même shape que `SlackSendTarget` (bloc C octies : point
+ * d'envoi UNIQUE partagé). Le re-export est maintenu pour que les callers
+ * historiques (ex. `process-reply`) qui importent ce type ne cassent pas.
  */
-export interface InboundAfterHandoffTarget {
-  kind: "dm";
-  /** Slack user ID (`U...`) du commercial titulaire. */
-  slackUserId: string;
-}
+export type InboundAfterHandoffTarget = SlackSendTarget;
 
 /**
  * Input complet de `sendInboundAfterHandoffNotification` : le contenu du
@@ -100,12 +91,6 @@ export interface SendInboundAfterHandoffResult {
 export async function sendInboundAfterHandoffNotification(
   input: SendInboundAfterHandoffInput,
 ): Promise<SendInboundAfterHandoffResult> {
-  // Fix LOW security-reviewer PR-A : defense-in-depth sur docs legacy
-  // dont le `assignedTo` n'aurait pas ete valide a l'ecriture (avant
-  // cette PR). Throw ValidationError sans leak PII dans le context.
-  // Pattern miroir avec `sendHandoffNotification` et `setHandoff`.
-  assertSlackUserId(input.target.slackUserId, "sendInboundAfterHandoffNotification");
-
   const blocks = buildInboundAfterHandoffBlocks({
     firstName: input.firstName,
     speciality: input.speciality,
@@ -116,8 +101,6 @@ export async function sendInboundAfterHandoffNotification(
     dashboardUrl: input.dashboardUrl,
   });
 
-  const channel = input.target.slackUserId;
-
   // `text` de fallback pour les clients Slack sans support Block Kit
   // (notifications mobiles pauvres, screen readers). JAMAIS de PII
   // dedans — juste un resume neutre discriminant la variante.
@@ -125,48 +108,13 @@ export async function sendInboundAfterHandoffNotification(
     ? "Demande d'arrêt (STOP) à traiter"
     : "Nouveau message d'un lead";
 
-  const client = getSlackClient();
-
-  let result;
-  try {
-    result = await client.chat.postMessage({
-      channel,
-      text: fallbackText,
-      blocks,
-      // Anti-preview : les URLs dashboard peuvent leaker des IDs si Slack
-      // fait un GET d'unfurl cote serveur. Desactive par securite.
-      unfurl_links: false,
-      unfurl_media: false,
-    });
-  } catch (cause) {
-    throw new ExternalServiceError({
-      message: "Slack chat.postMessage failed",
-      context: { service: "slack", targetKind: input.target.kind },
-      cause,
-    });
-  }
-
-  if (!result.ok || result.ts === undefined || result.channel === undefined) {
-    throw new ExternalServiceError({
-      message: "Slack chat.postMessage returned non-ok",
-      context: {
-        service: "slack",
-        targetKind: input.target.kind,
-        slackError: result.error ?? "unknown",
-      },
-    });
-  }
-
-  logger.info(
-    {
-      service: "slack",
-      targetKind: input.target.kind,
-      channel: result.channel,
-      ts: result.ts,
-      isOptOut: input.isOptOut,
-    },
-    "Inbound-after-handoff Slack notification sent",
-  );
-
-  return { ts: result.ts, channel: result.channel };
+  // Wire layer unique (bloc C octies) : validation DM, postMessage
+  // anti-unfurl, mapping d'erreurs, log sans PII.
+  return sendSlackBlocks({
+    target: input.target,
+    fallbackText,
+    blocks,
+    logEvent: "Inbound-after-handoff Slack notification sent",
+    logContext: { isOptOut: input.isOptOut },
+  });
 }

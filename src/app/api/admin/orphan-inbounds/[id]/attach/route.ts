@@ -1,0 +1,169 @@
+/**
+ * POST /api/admin/orphan-inbounds/[id]/attach — rattache un orphan à une
+ * conversation EXISTANTE (RBAC admin, PR2c tour 2a bis).
+ *
+ * ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ * Body JSON — seulement `conversationId` (le contactId est dérivé de la
+ * conv côté serveur, invariant anti-tamper : un client ne peut pas
+ * demander à rattacher à une conv puis prétendre d'autres contactId).
+ *
+ *   { "conversationId": "<contactId>_<campaignId>" }
+ *
+ * ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ * Garanties
+ *
+ *   - Transaction atomique unique : `attachOrphanToConversation` lie
+ *     message + update orphan + opt-out éventuel + 2 audits dans la
+ *     MÊME tx. Une panne quelconque rollback TOUT (impossible de laisser
+ *     attached + non-désabonné).
+ *   - `isOptOut` calculé SERVEUR-SIDE sur orphan.body par le détecteur
+ *     partagé (`compliance/opt-out.ts`), jamais reçu du client.
+ *   - Léa (Inngest) jamais déclenchée (aucun dispatch d'event).
+ *   - Notification Slack best-effort via l'unique résolveur
+ *     `notifyOrphanAttachedBestEffort` :
+ *       * actor testAccount → SLACK_TEST_CHANNEL_ID (fail-closed si
+ *         manquant : log + rien envoyé, jamais de repli).
+ *       * conv.handoff.assignedTo défini → DM titulaire (quel que soit
+ *         le statut de la conv).
+ *       * sinon → canal orphelins.
+ *
+ * ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ * Note enqueue_failed — auto-relance impossible sans régression PII
+ *
+ *   Le doc orphan `enqueue_failed` porte `phoneHash` et `idempotencyKey`
+ *   mais AUCUN numéro E.164 en clair. L'event Inngest `smsReplyReceived`
+ *   exige `phone` en E.164 → impossible de relancer `process-reply` sans
+ *   stocker le numéro en orphan (invariant anti-PII orphans). L'admin
+ *   rattache manuellement après identification manuelle du PS.
+ */
+import { NextResponse } from "next/server";
+import { z } from "zod";
+
+import { requireRole } from "@/lib/auth/require-role";
+import { resolveAdminName } from "@/lib/auth/resolve-admin-name";
+import { getContact } from "@/lib/firestore/contacts";
+import {
+  attachOrphanToConversation,
+  OrphanProcessingStateConflict,
+} from "@/lib/firestore/orphan-inbounds";
+import { applyAdminRateLimit } from "@/lib/security/admin-rate-limit";
+import { createRateLimiter } from "@/lib/security/rate-limit";
+import { notifyOrphanAttachedBestEffort } from "@/lib/slack/notify-orphan-action";
+import { AppError } from "@/lib/utils/errors";
+import { logger } from "@/lib/utils/logger";
+
+const attachLimiter = createRateLimiter({
+  limit: 30,
+  window: "1 m",
+  prefix: "admin-orphan-attach",
+});
+
+const BodySchema = z.object({
+  conversationId: z
+    .string()
+    .regex(/^[^/]+_hubspot-list-\d+$/, "conversationId must match <contactId>_hubspot-list-<n>"),
+  /**
+   * PR2c tour 2b correction A1 — réponse OBLIGATOIRE à la question UI
+   * « Ce SMS demande-t-il l'arrêt des sollicitations ? ». Sans default.
+   * Le serveur applique l'opt-out si `isOptOut(body)` ET/OU
+   * `optOutConfirmed === true`. Un client ne peut JAMAIS annuler un STOP
+   * détecté (invariant L.34-5 CPCE enforced côté serveur, cf.
+   * `attachOrphanToConversation`).
+   */
+  optOutConfirmed: z.boolean(),
+});
+
+const IdSchema = z.string().regex(/^oih_[A-Za-z0-9_]+$/, "orphan docId must match /^oih_/");
+
+export async function POST(
+  request: Request,
+  { params }: { params: Promise<{ id: string }> },
+): Promise<NextResponse> {
+  try {
+    const ctx = await requireRole("admin");
+
+    const rateLimitResponse = await applyAdminRateLimit(attachLimiter, ctx.userId);
+    if (rateLimitResponse) return rateLimitResponse;
+
+    const { id } = await params;
+    const parsedId = IdSchema.safeParse(id);
+    if (!parsedId.success) {
+      return NextResponse.json(
+        { error: { code: "VALIDATION", message: "Identifiant orphelin invalide." } },
+        { status: 400 },
+      );
+    }
+
+    const rawBody = await request.json().catch(() => null);
+    const parsedBody = BodySchema.safeParse(rawBody);
+    if (!parsedBody.success) {
+      return NextResponse.json(
+        { error: { code: "VALIDATION", message: "Payload invalide." } },
+        { status: 400 },
+      );
+    }
+
+    // Transaction unique : message + orphan + opt-out + audits.
+    // `actorTestAccount` provient du claim JWT (jamais d'un body client).
+    // Garde R-1 : la tx refuse si orphan.isTestFixture !== actorTestAccount.
+    const result = await attachOrphanToConversation({
+      orphanDocId: parsedId.data,
+      conversationId: parsedBody.data.conversationId,
+      attachedBy: ctx.userId,
+      optOutConfirmed: parsedBody.data.optOutConfirmed,
+      actorTestAccount: ctx.testAccount,
+    });
+
+    // Enrichissement notif : firstName/speciality/city depuis le contact
+    // + nom résolu de l'admin via Clerk (hors tx — lecture seule, impact
+    // nul sur l'atomicité des writes). PR2c tour 2b bloc C sexies : la
+    // notif de rattachement porte désormais le nom de l'admin et la date
+    // de réception D'ORIGINE de l'orphan (pas la date d'attach).
+    const [contact, adminName] = await Promise.all([
+      getContact(result.contactId).catch(() => null),
+      resolveAdminName(ctx.userId).catch(() => null),
+    ]);
+
+    const notifyResult = await notifyOrphanAttachedBestEffort({
+      actorTestAccount: ctx.testAccount,
+      orphanDocId: parsedId.data,
+      conversationId: parsedBody.data.conversationId,
+      assignedToSlackUserId: result.assignedToSlackUserId,
+      firstName: contact?.firstName,
+      speciality: contact?.speciality,
+      city: contact?.city,
+      lastInboundBody: result.body,
+      isOptOut: result.wasOptOut,
+      adminName,
+      originalReceivedAtIso: result.originalReceivedAt.toDate().toISOString(),
+    });
+
+    return NextResponse.json({
+      ok: true,
+      messageId: result.messageId,
+      phoneMatch: result.phoneMatch,
+      wasOptOut: result.wasOptOut,
+      optOutDecision: result.optOutDecision,
+      notified: notifyResult.kind,
+    });
+  } catch (err) {
+    if (err instanceof OrphanProcessingStateConflict) {
+      return NextResponse.json(err.toClientBody(), { status: err.statusCode });
+    }
+    if (err instanceof AppError) {
+      logger.warn(err.toLogObject(), "[POST /api/admin/orphan-inbounds/:id/attach] AppError");
+      return NextResponse.json(err.toClientBody(), { status: err.statusCode });
+    }
+    logger.error(
+      {
+        errName: err instanceof Error ? err.name : "unknown",
+        errMessage: err instanceof Error ? err.message : undefined,
+      },
+      "[POST /api/admin/orphan-inbounds/:id/attach] unexpected error",
+    );
+    return NextResponse.json(
+      { error: { code: "INTERNAL", message: "Une erreur est survenue. Réessayez plus tard." } },
+      { status: 500 },
+    );
+  }
+}

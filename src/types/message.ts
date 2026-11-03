@@ -243,6 +243,25 @@ export interface Message {
    */
   duplicateOf?: string;
 
+  /**
+   * PR2c tour 2a — rattachement manuel admin d'un orphan
+   * `inbound_messages_orphans/{oih_...}` à une conversation existante.
+   *
+   * Posé par `attachOrphanToConversation` dans la MÊME transaction que
+   * la création du doc Message inbound. Immuable après écriture.
+   *
+   *   - `orphanId`    : docId `oih_...` de l'orphan source.
+   *   - `phoneMatch`  : comparaison serveur-side du phoneHash de l'orphan
+   *                     vs hash du numéro du contact (`"match"` | `"mismatch"`
+   *                     | `"not_computable"`). Préserve la trace que
+   *                     l'admin a rattaché un orphan dont le numéro ne
+   *                     match pas (cas parse_failed, cas numéro changé).
+   */
+  attachedFromOrphan?: {
+    orphanId: string;
+    phoneMatch: "match" | "mismatch" | "not_computable";
+  };
+
   error?: MessageError;
 }
 

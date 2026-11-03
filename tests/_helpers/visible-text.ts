@@ -20,10 +20,18 @@
  *   simulé en jsdom via `style.display` / `hidden`).
  *
  *   Zéro dépendance Playwright — testable en jsdom.
+ *
+ * ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ * PR2c tour 1 — module unique, miroir e2e inclus
+ *
+ *   `tests/e2e/fixtures.ts::innerTextWithoutMessageThread` injecte le
+ *   source de CETTE fonction dans la page Playwright via
+ *   `collectVisibleText.toString()` + `new Function(...)` — plus de
+ *   duplication (c.f. commit PR2c). CONSÉQUENCE : la fonction doit être
+ *   AUTO-SUFFISANTE (pas de closures sur des `const` module-level),
+ *   sinon le source stringifié perd ses dépendances dans la page.
+ *   Tous les symboles sont déclarés DANS le corps de `collectVisibleText`.
  */
-
-/** Tags dont le contenu n'est jamais rendu à l'écran. */
-const HIDDEN_TAGS = new Set(["SCRIPT", "STYLE", "NOSCRIPT", "TEMPLATE"]);
 
 /** Un élément est "exclu" (sauté dans le parcours) s'il est caché OU sous
  * `[role="log"]`. */
@@ -47,8 +55,16 @@ export interface CollectVisibleTextOptions {
  *     naturels, en séparant les blocs par `\n`.
  *
  * Retourne un `string` sans surprise (pas de HTML).
+ *
+ * 🔒 AUTO-SUFFISANCE : HIDDEN_TAGS, excludeSelectors défaut et `walk`
+ * sont déclarés DANS le corps — permet à `fixtures.ts` de passer la
+ * source stringifiée à `page.evaluate` sans perdre de dépendance.
  */
 export function collectVisibleText(root: Element, options?: CollectVisibleTextOptions): string {
+  // Déclarées INSIDE pour que `collectVisibleText.toString()` reste
+  // auto-portant (pas de closure sur des const module-level).
+  const HIDDEN_TAGS = new Set(["SCRIPT", "STYLE", "NOSCRIPT", "TEMPLATE"]);
+
   const isVisible = options?.isVisible ?? (() => true);
   const excludeSelectors = options?.excludeSelectors ?? ['[role="log"]'];
 

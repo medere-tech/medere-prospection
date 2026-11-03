@@ -19,6 +19,8 @@
 import { clerk, setupClerkTestingToken } from "@clerk/testing/playwright";
 import { expect as pwExpect, type Page, test as base } from "@playwright/test";
 
+import { collectVisibleText } from "../_helpers/visible-text";
+
 const DOMAIN = process.env.E2E_EMAIL_DOMAIN ?? "example.com";
 
 export const E2E_EMAIL_COMMERCIAL = `e2e-commercial+clerk_test@${DOMAIN}`;
@@ -128,38 +130,45 @@ export function assertNoAuditActionCode(text: string, context: string): void {
  * clés i18n Clerk (ex. `form_password_validation_failed`), déclenchant
  * un faux positif sur les 3 tailles.
  *
- * La logique miroir pure (tests jsdom) vit dans
- * `tests/e2e/_helpers/visible-text.ts`. Toute évolution ici doit être
- * répliquée là-bas pour que le filet soit vérifiable sans Playwright.
+ * ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ * PR2c tour 1 — module unique
+ *
+ * La logique du collecte vit dans `tests/_helpers/visible-text.ts`
+ * (`collectVisibleText`), testée par 7 cas en jsdom. Cette fonction
+ * PlaywrightBrowser-side réutilise EXACTEMENT ce code en passant sa
+ * source stringifiée (`collectVisibleText.toString()`) à `page.evaluate`
+ * et en l'évaluant dans la page. Pas de duplication — toute évolution
+ * du module unique bénéficie à l'e2e sans synchronisation manuelle.
+ *
+ * 🔒 `collectVisibleText` est AUTO-SUFFISANT (c.f. JSDoc du module) :
+ * HIDDEN_TAGS et le walker sont déclarés dans son corps, donc la source
+ * stringifiée garde toutes ses dépendances dans la page.
  */
 export async function innerTextWithoutMessageThread(page: Page): Promise<string> {
-  return page.evaluate(() => {
-    const HIDDEN_TAGS = new Set(["SCRIPT", "STYLE", "NOSCRIPT", "TEMPLATE"]);
-    const parts: string[] = [];
-    const walk = (el: Element): void => {
-      if (HIDDEN_TAGS.has(el.tagName)) return;
-      if (el.matches('[role="log"]')) return;
+  const collectVisibleTextSource = collectVisibleText.toString();
+  return page.evaluate((sourceStr: string) => {
+    // Reconstruit la fonction dans le contexte de la page. `new Function`
+    // n'hérite PAS du scope du caller → OK ici car la fonction est
+    // auto-suffisante. (Serveurs Vercel : la CSP de l'app n'affecte pas
+    // les scripts injectés par Playwright, qui bypass la frame — c.f.
+    // Playwright `page.evaluate` doc.)
+    const fn = new Function("return (" + sourceStr + ");")() as (
+      root: Element,
+      options?: { isVisible?: (el: Element) => boolean },
+    ) => string;
+
+    const isVisible = (el: Element): boolean => {
       // `checkVisibility()` renvoie `true` quand l'élément a un box
       // model et n'est pas masqué (`display:none`, `visibility:hidden`,
       // ancêtre caché, etc.). Fallback générique pour les anciennes
       // versions Chromium : accepter l'élément.
-      const isVisible =
-        typeof (el as Element & { checkVisibility?: () => boolean }).checkVisibility === "function"
-          ? (el as Element & { checkVisibility: () => boolean }).checkVisibility()
-          : true;
-      if (!isVisible) return;
-      for (const node of Array.from(el.childNodes)) {
-        if (node.nodeType === 3) {
-          const text = (node.nodeValue ?? "").replace(/\s+/g, " ");
-          if (text.trim().length > 0) parts.push(text);
-        } else if (node.nodeType === 1) {
-          walk(node as Element);
-        }
-      }
+      type MaybeCheck = Element & { checkVisibility?: () => boolean };
+      const maybe = (el as MaybeCheck).checkVisibility;
+      return typeof maybe === "function" ? maybe.call(el) : true;
     };
-    walk(document.body);
-    return parts.join(" ").replace(/\s+/g, " ").trim();
-  });
+
+    return fn(document.body, { isVisible });
+  }, collectVisibleTextSource);
 }
 
 /**

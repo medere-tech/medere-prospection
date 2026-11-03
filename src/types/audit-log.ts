@@ -234,7 +234,23 @@ export type AuditAction =
   // Posé par `scripts/backfill-conversation-list-fields.mjs` pour chaque
   // conversation touchée par le backfill PR2a. Payload = `{ fieldsPosed:
   // string[] }` — scrubber-safe.
-  | "backfill_conversation_list_fields";
+  | "backfill_conversation_list_fields"
+  // ── PR2c tour 2a — transitions SMS orphelins ─────────────────────────
+  // Un admin rattache un orphan `inbound_messages_orphans/{oih_...}` à
+  // une conversation EXISTANTE. Le SMS est posé via `addInboundIdempotent`
+  // sur la conv ciblée avec `attachedFromOrphan`. Léa n'est pas déclenchée.
+  // `targetType: "conversation"`, `targetId: conversationId` (la conv qui
+  // reçoit le message). Payload = `OrphanAttachedToConversationPayload`.
+  | "orphan_attached_to_conversation"
+  // Un admin ferme un orphan sans rattachement (`motif` dans enum fermé).
+  // `targetType: "message"`, `targetId: orphanDocId`.
+  // Payload = `OrphanDismissedPayload`.
+  | "orphan_dismissed"
+  // Un admin remet un orphan en file après l'avoir marqué traité par
+  // erreur. Transition `dismissed → pending` uniquement.
+  // `targetType: "message"`, `targetId: orphanDocId`.
+  // Payload = `OrphanReopenedPayload`.
+  | "orphan_reopened";
 
 export type AuditActorType = "system" | "ai" | "human";
 
@@ -771,6 +787,112 @@ export interface ContactPhoneAccessedPayload {
   // Index signature explicite : permet l'assignation a
   // `AuditLogInput.payload: Record<string, unknown>` sans cast (cf. pattern
   // miroir `HandoffUnassignedPayload` — TS-level uniquement, no-op runtime).
+  readonly [k: string]: unknown;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Payloads orphelins — PR2c tour 2a (transitions `pending → attached/dismissed`
+// et `dismissed → pending`). Tous les champs sont scrubber-safe par
+// construction (IDs opaques + enums fermés). JAMAIS de body, phone, email.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * Motif figé pour `orphan_dismissed`. Enum fermé pour empêcher du texte
+ * libre dans le payload audit (anti-leak + anti-divergence UX).
+ */
+export type OrphanDismissReason =
+  | "unrelated_or_spam"
+  | "already_handled_elsewhere"
+  | "sender_not_identifiable";
+
+/**
+ * Résultat de la comparaison `phoneHash` de l'orphan vs hash du numéro
+ * du contact ciblé par l'attach. Enum fermé pour forensic :
+ *   - `"match"`          : les hash concordent (sanity majeure).
+ *   - `"mismatch"`       : les hash diffèrent — l'admin rattache quand
+ *                          même (ex. parse_failed sans phoneHash, ou
+ *                          numéro contact changé entre temps).
+ *   - `"not_computable"` : l'orphan n'a pas de phoneHash OU le contact
+ *                          n'a pas de phone.e164 (parse_failed typique).
+ */
+export type OrphanPhoneMatch = "match" | "mismatch" | "not_computable";
+
+/**
+ * Discriminant de la décision opt-out posée pendant l'attach (PR2c tour 2b).
+ *
+ *   - `"detector"`  : `isOptOut(body)` a vu un STOP court-forme → le serveur
+ *                     applique l'opt-out, quelle que soit la réponse admin.
+ *   - `"admin_yes"` : détecteur négatif, admin a répondu « Oui, c'est un
+ *                     opt-out » dans la question obligatoire → opt-out appliqué.
+ *   - `"admin_no"`  : détecteur négatif, admin a répondu « Non » → pas d'opt-out.
+ *
+ * Note : le client NE PEUT JAMAIS annuler un opt-out détecté (invariant
+ * L.34-5 CPCE). Si détecteur positif ET admin répond « Non », l'opt-out
+ * s'applique quand même et `optOutDecision` reste `"detector"`.
+ */
+export type OrphanOptOutDecision = "detector" | "admin_yes" | "admin_no";
+
+/**
+ * Payload pour `orphan_attached_to_conversation`.
+ *
+ * **Cible** : `targetType: "conversation"`, `targetId: conversationId`
+ * (la conv qui reçoit le message rattaché).
+ *
+ * ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ * 🚨 INVARIANT ANTI-PII — INTERDITS
+ *   - `body`, `phone`, `email`, `firstName`, `phoneHash`
+ *
+ * Champs scrubber-safe :
+ *   - `orphanDocId`      : docId `oih_...` (hash HMAC).
+ *   - `contactId`        : hubspotId opaque.
+ *   - `conversationId`   : docId composite `${contactId}_${campaignId}`.
+ *   - `messageId`        : Firestore auto-ID 20 chars du doc inbound créé.
+ *   - `reason`           : enum fermé OrphanInboundReason (4 valeurs).
+ *   - `phoneMatch`       : enum fermé OrphanPhoneMatch (3 valeurs).
+ *   - `wasOptOut`        : boolean (opt-out effectivement appliqué).
+ *   - `optOutDecision`   : enum fermé — qui a tranché l'opt-out
+ *                          (`"detector"` | `"admin_yes"` | `"admin_no"`).
+ *                          PR2c tour 2b.
+ *   - `isTestFixture`    : boolean (orphan posé par seed e2e vs réel).
+ */
+export interface OrphanAttachedToConversationPayload {
+  orphanDocId: string;
+  contactId: string;
+  conversationId: string;
+  messageId: string;
+  reason: "no_conversation" | "unknown_contact" | "parse_failed" | "enqueue_failed";
+  phoneMatch: OrphanPhoneMatch;
+  wasOptOut: boolean;
+  optOutDecision: OrphanOptOutDecision;
+  isTestFixture: boolean;
+  readonly [k: string]: unknown;
+}
+
+/**
+ * Payload pour `orphan_dismissed`.
+ *
+ * **Cible** : `targetType: "message"`, `targetId: orphanDocId`.
+ *
+ * 🚨 INVARIANT ANTI-PII — pas de body/phone/motif texte libre. Le motif
+ * est contraint à l'enum fermé `OrphanDismissReason`.
+ */
+export interface OrphanDismissedPayload {
+  orphanDocId: string;
+  reason: "no_conversation" | "unknown_contact" | "parse_failed" | "enqueue_failed";
+  dismissReason: OrphanDismissReason;
+  isTestFixture: boolean;
+  readonly [k: string]: unknown;
+}
+
+/**
+ * Payload pour `orphan_reopened`.
+ *
+ * **Cible** : `targetType: "message"`, `targetId: orphanDocId`.
+ */
+export interface OrphanReopenedPayload {
+  orphanDocId: string;
+  reason: "no_conversation" | "unknown_contact" | "parse_failed" | "enqueue_failed";
+  isTestFixture: boolean;
   readonly [k: string]: unknown;
 }
 

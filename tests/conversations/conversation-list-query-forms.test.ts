@@ -72,6 +72,8 @@ const EXPECTED_BACKFILL_LABELS = [
   "backfill.contacts.lookup",
   "backfill.messages.last",
   "backfill.messages.last-human-outbound",
+  // PR2c tour 2b bloc C — repose `conv.lastInboundAt` effacé par le reset.
+  "backfill.messages.last-inbound",
 ];
 
 const EXPECTED_PROPAGATE_LABELS = ["propagate.by-contact-id"];
@@ -113,7 +115,7 @@ describe("QUERY_FORMS — couverture des 3 routes + legacy (PR2a)", () => {
     }
   });
 
-  it("couvre les 4 requêtes du backfill (scan + contact + messages × 2)", () => {
+  it("couvre toutes les requêtes du backfill (dérivé d'EXPECTED_BACKFILL_LABELS)", () => {
     for (const label of EXPECTED_BACKFILL_LABELS) {
       expect(actualLabels.has(label), `backfill : missing form "${label}"`).toBe(true);
     }
@@ -125,18 +127,21 @@ describe("QUERY_FORMS — couverture des 3 routes + legacy (PR2a)", () => {
     }
   });
 
-  it("totalise exactement 28+28+28+7+3+4+1 = 99 formes (pas de duplicat, pas d'orphelin)", () => {
+  it("totalise exactement la somme des formes attendues (pas de duplicat, pas d'orphelin)", () => {
     // Détecte un oubli d'orphelin : si quelqu'un ajoute une forme à
     // QUERY_FORMS sans mettre à jour les dimensions attendues, ce total
-    // change et le test tombe.
+    // change et le test tombe. Toutes les composantes sont DÉRIVÉES —
+    // aucun nombre en dur, pour que l'ajout d'une forme (ex. PR2c bloc C
+    // → `backfill.messages.last-inbound`) ne demande qu'une seule mise à
+    // jour (la liste `EXPECTED_*_LABELS` concernée).
     const expectedCount =
-      expectedListAndCountsAndCursorLabels("list").length + // 28
-      expectedListAndCountsAndCursorLabels("list.cursor").length + // 28
-      expectedListAndCountsAndCursorLabels("counts").length + // 28
-      expectedVersionLabels().length + // 7
-      EXPECTED_LEGACY_LABELS.length + // 3
-      EXPECTED_BACKFILL_LABELS.length + // 4
-      EXPECTED_PROPAGATE_LABELS.length; // 1
+      expectedListAndCountsAndCursorLabels("list").length +
+      expectedListAndCountsAndCursorLabels("list.cursor").length +
+      expectedListAndCountsAndCursorLabels("counts").length +
+      expectedVersionLabels().length +
+      EXPECTED_LEGACY_LABELS.length +
+      EXPECTED_BACKFILL_LABELS.length +
+      EXPECTED_PROPAGATE_LABELS.length;
     expect(QUERY_FORMS.length).toBe(expectedCount);
     // Zéro doublon.
     expect(actualLabels.size).toBe(QUERY_FORMS.length);

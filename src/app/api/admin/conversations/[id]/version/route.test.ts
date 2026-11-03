@@ -80,6 +80,7 @@ describe("GET /api/admin/conversations/[id]/version", () => {
     mockRequireRole.mockResolvedValue({
       userId: "user_admin",
       role: "admin",
+      testAccount: false,
       slackUserId: "U05UVHGBURX",
     });
     mockRateLimit.mockResolvedValue(null);
@@ -133,6 +134,7 @@ describe("GET /api/admin/conversations/[id]/version", () => {
     mockRequireRole.mockResolvedValue({
       userId: "user_c",
       role: "commercial",
+      testAccount: false,
       slackUserId: "UOWNER12345",
     });
     mockGetConv.mockResolvedValue(makeFakeConv());
@@ -144,6 +146,7 @@ describe("GET /api/admin/conversations/[id]/version", () => {
     mockRequireRole.mockResolvedValue({
       userId: "user_intruder",
       role: "commercial",
+      testAccount: false,
       slackUserId: "UINTRUDER99",
     });
     mockGetConv.mockResolvedValue(makeFakeConv());

@@ -325,6 +325,33 @@ export const MessageSchema = z.object({
   abandonReason: z.enum(["stale_pre_launch_test_cleanup"]).optional(),
   duplicateOf: z.string().optional(),
   error: MessageErrorSchema.optional(),
+  /**
+   * PR2c tour 2b bloc C sexies — origine orphan (rattachement manuel admin).
+   *
+   * Posé par `attachOrphanToConversation` dans `orphan-inbounds.ts:938`
+   * APRÈS `addInboundInTx` via un `tx.update` dédié. Cf. `Message` type
+   * dans `src/types/message.ts:260` qui porte déjà la shape complète
+   * (`orphanId` + `phoneMatch`).
+   *
+   * ⚠ SOURCE DU BUG D'ORIGINE : avant cette entrée du schéma, Zod
+   * `.object()` par défaut applique un strip des clefs non déclarées
+   * (`.strip()`), donc `_parseMessageOrThrow` effaçait silencieusement
+   * `attachedFromOrphan` à la lecture — `load-conversation-detail`
+   * recevait un `Message` sans le champ, `sanitizeMessageForBubble` le
+   * mettait à `undefined`, et la mention « Ajouté manuellement depuis
+   * un SMS orphelin » ne s'affichait jamais sur le fil de la conv
+   * cible. Preuve : harnais e2e sur preview `c6ac6f0`, O7 fail avec
+   * message rattaché visible SANS le hint.
+   *
+   * Sentinelle : `messages.test.ts > _parseMessageOrThrow conserve
+   * attachedFromOrphan` fail si le champ est retiré du schéma.
+   */
+  attachedFromOrphan: z
+    .object({
+      orphanId: z.string().min(1),
+      phoneMatch: z.enum(["match", "mismatch", "not_computable"]),
+    })
+    .optional(),
 });
 
 /** Type inféré depuis le schéma Zod. */
@@ -396,7 +423,14 @@ export interface AddInboundInput {
   body: string;
   channel: MessageChannel;
   externalId: string;
-  externalReceiver: string;
+  /**
+   * PR2c tour 2b — rendu OPTIONNEL. Dans le flow normal webhook OVH, on
+   * passe toujours le numéro E.164 émetteur. Dans le rattachement manuel
+   * `attachOrphanToConversation`, l'orphan peut provenir de `parse_failed`
+   * sans numéro identifiable → on omet le champ plutôt que d'écrire `""`
+   * (cf. remarque M3 security-reviewer PR2c tour 2a bis).
+   */
+  externalReceiver?: string;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -866,7 +900,9 @@ export async function addInbound(conversationId: string, input: AddInboundInput)
       status: "received",
       channel: input.channel,
       externalId: input.externalId,
-      externalReceiver: input.externalReceiver,
+      // PR2c tour 2b — omettre si absent plutôt qu'écrire "".
+      ...(input.externalReceiver !== undefined &&
+        input.externalReceiver.length > 0 && { externalReceiver: input.externalReceiver }),
       generatedBy: "human",
       createdAt: now,
       receivedAt: now,
@@ -898,6 +934,96 @@ export async function addInbound(conversationId: string, input: AddInboundInput)
 // ─────────────────────────────────────────────────────────────────────────────
 // addInboundIdempotent — fix BUG-DEDUP-RACE (B)
 // ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * Version TRANSACTIONNELLE pure de l'écriture inbound — PR2c tour 2a bis.
+ *
+ * Extrait de `addInboundIdempotent` pour que les callers qui orchestrent
+ * d'autres writes dans la MÊME tx (ex: `attachOrphanToConversation` qui
+ * doit coupler l'écriture message + update orphan + opt-out) puissent
+ * composer sans ouvrir une nouvelle tx. UNE SEULE implémentation —
+ * `addInboundIdempotent` ci-dessous délègue.
+ *
+ * Toute la machinerie (dedup via docId déterministe, bump counters,
+ * dénormalisation preview inbound, audit `sms_received`) vit ici. Le
+ * caller propage l'erreur `ALREADY_EXISTS` → la tx entière abort.
+ *
+ * ⚠️ Firestore règle : tous les `tx.get` AVANT les `tx.update/create`.
+ * Si le caller a déjà lu la conv dans sa propre tx, il peut l'injecter
+ * via `deps.conv` pour éviter un deuxième read (Firestore cache les
+ * reads intra-tx mais c'est une optimisation défensive).
+ *
+ * @throws ValidationError  si body / externalId vides.
+ */
+export async function addInboundInTx(
+  tx: Transaction,
+  conversationId: string,
+  input: AddInboundInput,
+  deps: {
+    deterministicMessageId?: string;
+    now?: Timestamp;
+    /**
+     * PR2c tour 2a bis — conv déjà lue en amont par le caller (évite
+     * un deuxième `tx.get` qui serait un READ-AFTER-WRITES invalide
+     * quand `addInboundInTx` est composé avec d'autres fonctions tx
+     * (`markOptedOutInTx` fait des writes avant l'appel). Si `conv`
+     * fourni, on skip la lecture ; sinon on lit comme avant.
+     */
+    conv?: import("@/types/conversation").Conversation;
+  } = {},
+): Promise<{ messageId: string }> {
+  validateBodyOrThrow(input.body, conversationId);
+  if (input.externalId.length === 0) {
+    throw new ValidationError({
+      message: "addInboundInTx: externalId must be non-empty",
+      context: { conversationId, op: "addInboundInTx" },
+    });
+  }
+  const deterministicMessageId =
+    deps.deterministicMessageId ?? safeExternalIdHash(input.externalId);
+
+  const convRef = getAdminDb().collection(CONVERSATIONS_COLLECTION).doc(conversationId);
+  const conv = deps.conv ?? (await readConversationInTxOrThrow(tx, convRef, conversationId));
+
+  const messageRef = messagesSubcollectionRef(conversationId).doc(deterministicMessageId);
+  const now = deps.now ?? Timestamp.now();
+
+  const messageDoc: Message = {
+    direction: "inbound",
+    body: input.body,
+    status: "received",
+    channel: input.channel,
+    externalId: input.externalId,
+    // PR2c tour 2b — omettre quand absent/vide (cas rattachement orphan).
+    ...(input.externalReceiver !== undefined &&
+      input.externalReceiver.length > 0 && { externalReceiver: input.externalReceiver }),
+    generatedBy: "human",
+    createdAt: now,
+    receivedAt: now,
+  };
+  // ATOMIQUE — ALREADY_EXISTS si doc déjà créé par un run concurrent.
+  tx.create(messageRef, messageDoc);
+
+  // PR2a — dénormalisation preview inbound (authorKind="contact").
+  const preview = buildLastMessagePreview({
+    direction: "inbound",
+    authorKind: "contact",
+    text: input.body,
+    at: now,
+  });
+  _bumpConversationCountersTx(tx, convRef, conv, "inbound", now, preview);
+
+  appendAuditLogTx(tx, {
+    actorId: "system",
+    actorType: "system",
+    action: "sms_received",
+    targetType: "message",
+    targetId: messageRef.id,
+    payload: { direction: "inbound", messageId: messageRef.id },
+  });
+
+  return { messageId: messageRef.id };
+}
 
 /**
  * Variante IDEMPOTENTE de `addInbound` — garantit qu'un `externalId` donné
@@ -984,47 +1110,10 @@ export async function addInboundIdempotent(
 
   try {
     return await getAdminDb().runTransaction(async (tx) => {
-      const convRef = getAdminDb().collection(CONVERSATIONS_COLLECTION).doc(conversationId);
-      const conv = await readConversationInTxOrThrow(tx, convRef, conversationId);
-
-      const messageRef = messagesSubcollectionRef(conversationId).doc(deterministicMessageId);
-      const now = Timestamp.now();
-
-      const messageDoc: Message = {
-        direction: "inbound",
-        body: input.body,
-        status: "received",
-        channel: input.channel,
-        externalId: input.externalId,
-        externalReceiver: input.externalReceiver,
-        generatedBy: "human",
-        createdAt: now,
-        receivedAt: now,
-      };
-      // ATOMIQUE — Firestore refuse ALREADY_EXISTS si un autre run a deja
-      // commit avec ce meme docId. Pattern miroir `getOrCreateInitialConversation`
-      // dans conversations.ts.
-      tx.create(messageRef, messageDoc);
-
-      // PR2a — dénormalisation preview inbound (authorKind="contact").
-      const preview = buildLastMessagePreview({
-        direction: "inbound",
-        authorKind: "contact",
-        text: input.body,
-        at: now,
+      const { messageId } = await addInboundInTx(tx, conversationId, input, {
+        deterministicMessageId,
       });
-      _bumpConversationCountersTx(tx, convRef, conv, "inbound", now, preview);
-
-      appendAuditLogTx(tx, {
-        actorId: "system",
-        actorType: "system",
-        action: "sms_received",
-        targetType: "message",
-        targetId: messageRef.id,
-        payload: { direction: "inbound", messageId: messageRef.id },
-      });
-
-      return { messageId: messageRef.id, created: true as const };
+      return { messageId, created: true as const };
     });
   } catch (err) {
     // Primitif partage : code 6 / "already-exists". Cf. `_idempotent.ts`.
