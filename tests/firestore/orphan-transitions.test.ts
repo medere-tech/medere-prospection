@@ -130,6 +130,64 @@ describe("orphan transitions — emulator (PR2c tour 2a)", () => {
     await fullReset();
   });
 
+  it("attachOrphanToConversation : tx.create + tx.update sur le même message produisent un doc final avec attachedFromOrphan ET tous les champs tx.create (sentinelle PR2c bloc C nonies)", async () => {
+    // Preuve directe que la séquence `tx.create(messageRef, msgDoc)` suivie
+    // de `tx.update(messageRef, {attachedFromOrphan: {...}})` DANS LA MÊME
+    // transaction Firestore produit un document final qui porte BOTH :
+    //   - les champs posés par `addInboundInTx` (direction, body, status,
+    //     generatedBy, createdAt, receivedAt, channel, externalId)
+    //   - le champ `attachedFromOrphan` posé par `attachOrphanToConversation`
+    //     après `addInboundInTx` dans la même tx.
+    //
+    // Si Firestore (ou un wrapper SDK) perdait silencieusement le
+    // `tx.update` consécutif à un `tx.create`, ce test tomberait sur
+    // `attachedFromOrphan`. Si le `tx.update` ÉCRASAIT au lieu de merger,
+    // ce test tomberait sur `direction`/`body`/`status`.
+    //
+    // Re-parse via `_parseMessageOrThrow` + lecture directe doc Firestore :
+    // les deux doivent voir le champ. Fail → MessageSchema a stripé (fix
+    // bloc C sexies manquant) OU la tx a perdu l'update.
+    const seed = await addOrphanInboundIdempotent({
+      reason: "no_conversation",
+      body: "Message de test O7 — rattachement manuel",
+      idempotencyKey: "tx-attach-sentinel-same-tx",
+      source: "process-reply",
+    });
+    await seedConvAndContact({ conversationId: "cTxSentinel_hubspot-list-9999", contactId: "cTx" });
+
+    const r = await attachOrphanToConversation({
+      orphanDocId: seed.docId,
+      conversationId: "cTxSentinel_hubspot-list-9999",
+      attachedBy: "user_admin_e2e",
+      optOutConfirmed: false,
+      actorTestAccount: false,
+    });
+
+    // Lecture brute du doc Firestore (après commit) — champs tx.create ET tx.update.
+    const msgRaw = await getAdminDb()
+      .collection("conversations")
+      .doc("cTxSentinel_hubspot-list-9999")
+      .collection("messages")
+      .doc(r.messageId)
+      .get();
+    expect(msgRaw.exists).toBe(true);
+    const raw = msgRaw.data();
+    // Champs tx.create (addInboundInTx) : encore là après le tx.update suivant.
+    expect(raw?.direction).toBe("inbound");
+    expect(raw?.status).toBe("received");
+    expect(raw?.generatedBy).toBe("human");
+    expect(raw?.body).toBe("Message de test O7 — rattachement manuel");
+    expect(raw?.channel).toBe("sms");
+    expect(raw?.externalId).toBe(seed.docId);
+    expect(raw?.createdAt).toBeDefined();
+    expect(raw?.receivedAt).toBeDefined();
+    // Champ tx.update (attachOrphanToConversation) : effectivement persisté.
+    expect(raw?.attachedFromOrphan).toEqual({
+      orphanId: seed.docId,
+      phoneMatch: "not_computable",
+    });
+  });
+
   it("attachOrphanToConversation : happy path pending → attached, message créé, audit posé", async () => {
     const seed = await addOrphanInboundIdempotent({
       reason: "unknown_contact",

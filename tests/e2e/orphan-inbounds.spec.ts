@@ -413,6 +413,29 @@ test.describe("SMS orphelins — /admin/orphan-inbounds (PR2c tour 2b bloc B)", 
       signInAsAdmin,
     }, testInfo) => {
       test.skip(testInfo.project.name !== "desktop-1440", O7_O8_DESKTOP_ONLY_REASON);
+      // PR2c tour 2b bloc C decies — budget explicite. O7 enchaîne beaucoup
+      // d'étapes sur une preview Vercel (latence réseau variable) :
+      //   ~15 s  signin Clerk OTP + redirect
+      //    ~2 s  fetchFixtureDocIdByReason (API lookup)
+      //    ~3 s  page.goto /admin/orphan-inbounds?id=… + tiroir visible
+      //    ~1 s  click « Rattacher… »
+      //    ~5 s  dialog étape 1 : recherche "dethie" (debounce 300 ms) +
+      //          option visible (toBeVisible timeout:5000 explicite)
+      //    ~1 s  click conv + apparition dialog étape 2
+      //    ~1 s  check radio « Non » + click Continuer
+      //    ~1 s  dialog étape 3 + assertion « sera prévenu »
+      //    ~3 s  click « Rattacher définitivement » + waitForResponse POST attach
+      //    ~1 s  toast de succès
+      //    ~3 s  page.goto /admin/orphan-inbounds?tab=attached + assertion onglet
+      //    ~4 s  page.goto …?tab=attached&id=… + assertion tiroir ouvert +
+      //          nom admin + lien conv
+      //    ~5 s  page.goto /admin/conversations/<id> + heading + mention
+      // ──────
+      //  ~45 s minimum observé (44 s en pre-push ⇒ timeout 30 s). Budget
+      //  90 s = marge x2 pour absorber un ralentissement réseau sans
+      //  masquer un vrai blocage (ne JAMAIS passer à 240 s type L17 qui
+      //  étire inutilement le hook).
+      test.setTimeout(90_000);
       installApiPhoneSentinel(page);
       await signInAsAdmin();
       const docId = await fetchFixtureDocIdByReason(page, "no_conversation", "pending");
@@ -496,6 +519,23 @@ test.describe("SMS orphelins — /admin/orphan-inbounds (PR2c tour 2b bloc B)", 
       signInAsAdmin,
     }, testInfo) => {
       test.skip(testInfo.project.name !== "desktop-1440", O7_O8_DESKTOP_ONLY_REASON);
+      // PR2c tour 2b bloc C decies — budget explicite. O8 est plus court
+      // qu'O7 (un seul dialog, deux mutations successives) :
+      //   ~15 s  signin Clerk (serial après O7 ⇒ session déjà chaude mais
+      //          garder la marge pour le run isolé)
+      //    ~2 s  fetchFixtureDocIdByReason
+      //    ~3 s  page.goto id=<fixture> + tiroir visible
+      //    ~1 s  click « Classer sans suite » + dialog ouvert
+      //    ~1 s  check radio motif
+      //    ~3 s  click « Classer sans suite » + waitForResponse POST dismiss
+      //    ~1 s  toast de succès
+      //    ~3 s  page.goto ?tab=dismissed + assertion onglet
+      //    ~3 s  page.goto ?tab=dismissed&id=… + motif visible
+      //    ~3 s  click « Remettre à traiter » + waitForResponse POST reopen
+      //    ~1 s  toast + lecture API finale
+      // ──────
+      //  ~36 s minimum. Budget 60 s = marge x1.7, suffisant sans excès.
+      test.setTimeout(60_000);
       installApiPhoneSentinel(page);
       await signInAsAdmin();
       const docId = await fetchFixtureDocIdByReason(page, "unknown_contact", "pending");
