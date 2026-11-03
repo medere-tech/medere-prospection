@@ -20,15 +20,26 @@
  *   quittait la liste admin (orderBy desc sur `lastMessageAt`).
  *
  * ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
- * Mutation sentinelle
+ * Zéro duplication
  *
- *   Si on retire du backfill le bloc qui pose `lastMessageAt`, ce test
- *   échoue sur l'assertion `convAfterReset.lastMessageAt` — c'est la
- *   garantie que la régression est capturée (preuve rejouée à la main
- *   dans la restitution PR2c bloc C).
+ *   PR2c tour 2b bloc C quater : ce test importe désormais le module
+ *   `src/lib/firestore/reset-e2e-orphans-core.ts` qui porte TOUTE la
+ *   logique de reset (scan + prédiction + garde + écriture). Le script
+ *   `scripts/reset-e2e-orphans.mjs` importe le même module — la logique
+ *   vit à UN seul endroit.
+ *
+ * ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ * Mutations sentinelles
+ *
+ *   1. Si on retire du backfill le bloc qui pose `lastMessageAt`, ce
+ *      test échoue sur `expect(after).toEqual(before)` → régression
+ *      PR2c bloc C initial capturée.
+ *   2. Si on retire le `throw` de `assertSafeReset`, le test unitaire
+ *      « assertSafeReset lève sur prediction.abort posé » échoue
+ *      immédiatement → régression PR2c bloc C quater capturée.
  */
 import { deleteApp } from "firebase-admin/app";
-import { FieldValue, Timestamp } from "firebase-admin/firestore";
+import { Timestamp } from "firebase-admin/firestore";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import {
@@ -37,13 +48,19 @@ import {
   __resetFirestoreAdminForTests,
   getAdminDb,
 } from "@/lib/firestore/admin";
-import { computeBackfillUpdatesForConversation } from "@/lib/firestore/backfill-conversation-list-fields";
 import { buildLastMessagePreview } from "@/lib/firestore/conversation-list-fields";
 import {
   addOrphanInboundIdempotent,
   attachOrphanToConversation,
   ORPHAN_INBOUNDS_COLLECTION,
 } from "@/lib/firestore/orphan-inbounds";
+import {
+  applyResetWrites,
+  assertSafeReset,
+  predictConvStateAfterReset,
+  type ResetPrediction,
+  scanFixturesForReset,
+} from "@/lib/firestore/reset-e2e-orphans-core";
 import { __resetEnvCacheForTests } from "@/lib/security/env";
 
 const PEPPER = "d".repeat(64);
@@ -100,50 +117,6 @@ function readConvSnapshot(data: Record<string, unknown>): ConvSnapshot {
   };
 }
 
-/**
- * Logique du reset-e2e-orphans en code TS — appelable depuis le test. On
- * reproduit EXACTEMENT ce que `scripts/reset-e2e-orphans.mjs` fait côté
- * conv (delete du message + clear des 4 champs + recount inboundCount +
- * backfill). Les deux versions divergent → ce test tombe.
- */
-async function runResetLogic(
-  db: FirebaseFirestore.Firestore,
-  convId: string,
-  touchedMessageId: string,
-): Promise<void> {
-  const convRef = db.collection("conversations").doc(convId);
-
-  // 1. Delete du message rattaché.
-  await convRef.collection("messages").doc(touchedMessageId).delete();
-
-  // 2. Clear des 4 champs d'état — invariant de la logique reset.
-  await convRef.update({
-    lastMessagePreview: FieldValue.delete(),
-    lastMessageAt: FieldValue.delete(),
-    lastInboundAt: FieldValue.delete(),
-    lastHumanOutboundAt: FieldValue.delete(),
-  });
-
-  // 3. Recompute inboundCount depuis les messages restants (le backfill
-  //    ne gère pas les compteurs, c'est un delta explicite).
-  const remainingInbound = await convRef
-    .collection("messages")
-    .where("direction", "==", "inbound")
-    .count()
-    .get();
-  await convRef.update({ inboundCount: remainingInbound.data().count });
-
-  // 4. Backfill — repose les 4 champs d'état depuis les messages restants.
-  const convSnap = await convRef.get();
-  const { updates, readErrors } = await computeBackfillUpdatesForConversation(convSnap, db);
-  if (readErrors.length > 0) {
-    throw new Error(`reset backfill readErrors: ${readErrors.join(" | ")}`);
-  }
-  if (Object.keys(updates).length > 0) {
-    await convRef.update(updates);
-  }
-}
-
 describe("reset-e2e-orphans — scénario complet (PR2c tour 2b bloc C)", () => {
   beforeEach(async () => {
     vi.unstubAllEnvs();
@@ -161,6 +134,7 @@ describe("reset-e2e-orphans — scénario complet (PR2c tour 2b bloc C)", () => 
     const db = getAdminDb();
     const convId = "crst_hubspot-list-9999";
     const contactId = "crst";
+    const idempotencyKey = "rst-full-attach-1";
 
     // ── Seed contact ────────────────────────────────────────────────
     await db
@@ -266,32 +240,32 @@ describe("reset-e2e-orphans — scénario complet (PR2c tour 2b bloc C)", () => 
     // ── Capture `before` ─────────────────────────────────────────────
     const beforeSnap = await db.collection("conversations").doc(convId).get();
     const before = readConvSnapshot(beforeSnap.data()!);
-    // Sanity : before ne doit pas être "UNSET".
     expect(before.lastMessageAtIso).not.toMatch(/^UNSET:/);
     expect(before.lastInboundAtIso).not.toMatch(/^UNSET:/);
     expect(before.lastHumanOutboundAtIso).not.toMatch(/^UNSET:/);
     expect(before.inboundCount).toBe(1);
 
-    // ── Attach : seed un orphan + rattache à la conv. L'attach bump
-    //    inboundCount, pose lastInboundAt, lastMessageAt et preview.
+    // ── Attach : seed un orphan FIXTURE (isTestFixture=true) + rattache
+    //    via un compte test. L'attach bump inboundCount, pose
+    //    lastInboundAt, lastMessageAt et preview.
     const orphanSeed = await addOrphanInboundIdempotent({
       reason: "no_conversation",
       body: "Oui je prends la plaquette, envoyez tout !",
-      idempotencyKey: "rst-full-attach-1",
+      idempotencyKey,
       source: "process-reply",
+      isTestFixture: true,
     });
     const attachResult = await attachOrphanToConversation({
       orphanDocId: orphanSeed.docId,
       conversationId: convId,
       attachedBy: "user_admin_e2e",
       optOutConfirmed: false,
-      actorTestAccount: false,
+      actorTestAccount: true, // garde R-1 : fixture ↔ testAccount
     });
 
     // ── Verif attach a bien avancé les champs ───────────────────────
     const attachedSnap = await db.collection("conversations").doc(convId).get();
-    const attachedData = attachedSnap.data()!;
-    const attached = readConvSnapshot(attachedData);
+    const attached = readConvSnapshot(attachedSnap.data()!);
     expect(attached.inboundCount).toBe(before.inboundCount + 1);
     expect(attached.lastMessageAtIso).not.toBe(before.lastMessageAtIso);
     expect(attached.lastInboundAtIso).not.toBe(before.lastInboundAtIso);
@@ -299,8 +273,25 @@ describe("reset-e2e-orphans — scénario complet (PR2c tour 2b bloc C)", () => 
     // lastHumanOutboundAt ne bouge PAS (le message rattaché est inbound).
     expect(attached.lastHumanOutboundAtIso).toBe(before.lastHumanOutboundAtIso);
 
-    // ── Reset : rejoue EXACTEMENT la logique du script ──────────────
-    await runResetLogic(db, convId, attachResult.messageId);
+    // ── Reset : SCAN → PREDICT → ASSERT SAFE → APPLY
+    //    Toute cette logique vit dans `reset-e2e-orphans-core.ts` et est
+    //    partagée avec le script CLI — zéro duplication côté test.
+    const scan = await scanFixturesForReset(db, convId, [idempotencyKey]);
+    expect(scan.refusedCount).toBe(0);
+    expect(scan.touchedOrphans).toHaveLength(1);
+    expect(scan.touchedMessages).toHaveLength(1);
+    expect(scan.touchedMessages[0]!.messageId).toBe(attachResult.messageId);
+
+    const prediction = await predictConvStateAfterReset(db, convId, scan.touchedMessages);
+    expect(prediction.abort).toBeNull();
+    assertSafeReset(prediction);
+
+    await applyResetWrites({
+      db,
+      convId,
+      touchedOrphans: scan.touchedOrphans,
+      touchedMessages: scan.touchedMessages,
+    });
 
     // ── Verif STRICTE égalité avec `before` ────────────────────────
     const afterSnap = await db.collection("conversations").doc(convId).get();
@@ -316,10 +307,55 @@ describe("reset-e2e-orphans — scénario complet (PR2c tour 2b bloc C)", () => 
       .get();
     expect(msgSnap.exists).toBe(false);
 
-    // Nettoyage orphan (invariant append-only : juste un reset d'état).
-    await db.collection(ORPHAN_INBOUNDS_COLLECTION).doc(orphanSeed.docId).update({
-      processingState: "pending",
-      attachment: FieldValue.delete(),
-    });
+    // L'orphan est bien revenu en pending (invariant append-only).
+    const orphanAfter = await db.collection(ORPHAN_INBOUNDS_COLLECTION).doc(orphanSeed.docId).get();
+    expect(orphanAfter.data()?.processingState).toBe("pending");
+    expect(orphanAfter.data()?.attachment).toBeUndefined();
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────
+// Mutation sentinelle unitaire — garde `assertSafeReset`
+// ─────────────────────────────────────────────────────────────────────────
+
+describe("assertSafeReset — garde fail-closed (sentinelle PR2c bloc C quater)", () => {
+  it("lève sur prediction.abort posé — si on retire ce throw du module, ce test tombe", () => {
+    // Mutation réelle : commenter la ligne `if (prediction.abort !== null)
+    // throw ...` dans `reset-e2e-orphans-core.ts::assertSafeReset`
+    // et ce test échoue immédiatement.
+    const prediction: ResetPrediction = {
+      current: {
+        lastMessageAt: null,
+        lastInboundAt: null,
+        lastMessagePreview: null,
+        lastHumanOutboundAt: null,
+        inboundCount: null,
+      },
+      predicted: null,
+      abort: "aucun message restant avec `createdAt: Timestamp` exploitable (test sentinelle)",
+    };
+    expect(() => assertSafeReset(prediction)).toThrow(/aucun message restant/);
+  });
+
+  it("ne lève pas sur prediction.abort === null (contrôle positif)", () => {
+    const ts = Timestamp.fromMillis(1_700_000_000_000);
+    const prediction: ResetPrediction = {
+      current: {
+        lastMessageAt: ts,
+        lastInboundAt: ts,
+        lastMessagePreview: null,
+        lastHumanOutboundAt: ts,
+        inboundCount: 1,
+      },
+      predicted: {
+        lastMessageAt: ts,
+        lastInboundAt: ts,
+        lastMessagePreview: null,
+        lastHumanOutboundAt: ts,
+        inboundCount: 1,
+      },
+      abort: null,
+    };
+    expect(() => assertSafeReset(prediction)).not.toThrow();
   });
 });

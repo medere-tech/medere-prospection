@@ -35,6 +35,10 @@
 import type { Page } from "@playwright/test";
 
 import {
+  ORPHAN_ATTACH_DIALOG_TITLES,
+  ORPHAN_OPT_OUT_LABELS,
+} from "../../src/app/admin/orphan-inbounds/orphan-labels";
+import {
   assertNoAuditActionCode,
   assertNoFrenchPhone,
   assertNoTechnicalId,
@@ -217,7 +221,15 @@ test.describe("SMS orphelins — /admin/orphan-inbounds (PR2c tour 2b bloc B)", 
 
     // (a) Sélection d'une valeur valide → URL reflète + libellé affiché.
     await page.goto("/admin/orphan-inbounds?reason=no_conversation");
-    const motifTrigger = page.getByLabel("Motif");
+    // `getByRole("combobox", { name: "Motif" })` au lieu de `getByLabel`.
+    // Preuve directe du bug (hook pre-push preview bc05d1c) : `<SelectValue>`
+    // de Base UI pose son propre `<span data-slot="select-value">` dans le
+    // trigger ; si on y ajoute un `aria-label`, `getByLabel("Motif")` matche
+    // à la fois le trigger (button role=combobox lié par `<label htmlFor>`)
+    // ET le span — strict mode violation. Le rôle `combobox` ne vise que
+    // le trigger, zéro ambiguïté. Fix de la source : `orphan-reason-filter`
+    // n'exporte plus d'`aria-label` redondant sur `<SelectValue>`.
+    const motifTrigger = page.getByRole("combobox", { name: "Motif" });
     await expect(motifTrigger).toBeVisible();
     await expect(motifTrigger).toContainText("Pas de conversation");
     expect(page.url()).toContain("reason=no_conversation");
@@ -290,22 +302,35 @@ test.describe("SMS orphelins — /admin/orphan-inbounds (PR2c tour 2b bloc B)", 
     // UI défense en profondeur (le serveur refuse aussi via
     // `ValidationError` « body must be non-empty »).
     await sheet.getByRole("button", { name: /^Rattacher…$/ }).click();
-    const attachDialog = page.getByRole("dialog", { name: /Rattacher ce SMS/i });
-    await expect(attachDialog).toBeVisible();
+    // Étape 1 — dialog titre « Rattacher ce SMS à une conversation ».
+    const pickConvDialog = page.getByRole("dialog", {
+      name: ORPHAN_ATTACH_DIALOG_TITLES.pickConv,
+    });
+    await expect(pickConvDialog).toBeVisible();
 
-    const searchInput = attachDialog.getByLabel("Recherche par nom du médecin");
+    const searchInput = pickConvDialog.getByLabel("Recherche par nom du médecin");
     await searchInput.fill(SEARCH_TERM_O7);
-    const firstHit = attachDialog.getByRole("option").first();
+    const firstHit = pickConvDialog.getByRole("option").first();
     await expect(firstHit).toBeVisible({ timeout: 5000 });
     await firstHit.click();
 
-    // Étape 2 : opt-out → « Non ».
-    const optOutNo = attachDialog.getByLabel(/Non, le médecin reste joignable/);
+    // Étape 2 — le MÊME `DialogContent` change de `DialogTitle` → le dialog
+    // actif a maintenant le nom « Désabonnement du médecin ? ». Preuve
+    // directe du bug précédent (hook pre-push preview bc05d1c) : scoper
+    // sur `pickConvDialog` ici renvoyait un locator stale, le radio était
+    // introuvable. Fix : nouveau locator qui matche le nom de l'étape 2.
+    const optOutDialog = page.getByRole("dialog", {
+      name: ORPHAN_ATTACH_DIALOG_TITLES.askOptOut,
+    });
+    await expect(optOutDialog).toBeVisible();
+    const optOutNo = optOutDialog.getByRole("radio", { name: ORPHAN_OPT_OUT_LABELS.no });
     await optOutNo.check();
-    await attachDialog.getByRole("button", { name: /^Continuer$/ }).click();
+    await optOutDialog.getByRole("button", { name: /^Continuer$/ }).click();
 
-    // Étape 3 : confirmation. Le bouton doit être DISABLED.
-    const confirmBtn = attachDialog.getByRole("button", { name: /^Rattacher définitivement$/ });
+    // Étape 3 — titre « Rattacher définitivement ? ».
+    const confirmDialog = page.getByRole("dialog", { name: ORPHAN_ATTACH_DIALOG_TITLES.confirm });
+    await expect(confirmDialog).toBeVisible();
+    const confirmBtn = confirmDialog.getByRole("button", { name: /^Rattacher définitivement$/ });
     await expect(confirmBtn).toBeDisabled();
   });
 
@@ -398,25 +423,33 @@ test.describe("SMS orphelins — /admin/orphan-inbounds (PR2c tour 2b bloc B)", 
       await expect(sheet).toBeVisible();
       await sheet.getByRole("button", { name: /^Rattacher…$/ }).click();
 
-      const attachDialog = page.getByRole("dialog", { name: /Rattacher ce SMS/i });
-      await expect(attachDialog).toBeVisible();
+      // Étape 1 — scope par nom de dialog précis (le DialogTitle change
+      // à chaque étape ; cf. O5 pour la preuve directe du bug).
+      const pickConvDialog = page.getByRole("dialog", {
+        name: ORPHAN_ATTACH_DIALOG_TITLES.pickConv,
+      });
+      await expect(pickConvDialog).toBeVisible();
 
       // Étape 1 : recherche par nom (debounce 300 ms, min 2 chars).
-      const searchInput = attachDialog.getByLabel("Recherche par nom du médecin");
+      const searchInput = pickConvDialog.getByLabel("Recherche par nom du médecin");
       await searchInput.fill(SEARCH_TERM_O7);
-      const firstHit = attachDialog.getByRole("option").first();
+      const firstHit = pickConvDialog.getByRole("option").first();
       await expect(firstHit).toBeVisible({ timeout: 5000 });
-      // Preuve stricte : le hit sélectionné correspond bien à CONV_ID_O7.
-      // On lit la réponse API déjà faite par le dialog pour s'en assurer.
       await firstHit.click();
 
-      // Étape 2 : opt-out → « Non, le médecin reste joignable ».
-      const optOutNo = attachDialog.getByLabel(/Non, le médecin reste joignable/);
+      // Étape 2 — nouveau titre « Désabonnement du médecin ? ».
+      const optOutDialog = page.getByRole("dialog", {
+        name: ORPHAN_ATTACH_DIALOG_TITLES.askOptOut,
+      });
+      await expect(optOutDialog).toBeVisible();
+      const optOutNo = optOutDialog.getByRole("radio", { name: ORPHAN_OPT_OUT_LABELS.no });
       await optOutNo.check();
-      await attachDialog.getByRole("button", { name: /^Continuer$/ }).click();
+      await optOutDialog.getByRole("button", { name: /^Continuer$/ }).click();
 
-      // Étape 3 : confirmation. L'écran nomme explicitement QUI sera prévenu.
-      await expect(attachDialog.getByText(/sera prévenu/)).toBeVisible();
+      // Étape 3 — titre « Rattacher définitivement ? ». L'écran nomme QUI sera prévenu.
+      const confirmDialog = page.getByRole("dialog", { name: ORPHAN_ATTACH_DIALOG_TITLES.confirm });
+      await expect(confirmDialog).toBeVisible();
+      await expect(confirmDialog.getByText(/sera prévenu/)).toBeVisible();
       // Déclenche l'attach (POST /attach + mise à jour UI).
       await Promise.all([
         page.waitForResponse(
@@ -424,7 +457,7 @@ test.describe("SMS orphelins — /admin/orphan-inbounds (PR2c tour 2b bloc B)", 
             r.url().includes(`/api/admin/orphan-inbounds/${docId}/attach`) &&
             r.request().method() === "POST",
         ),
-        attachDialog.getByRole("button", { name: /^Rattacher définitivement$/ }).click(),
+        confirmDialog.getByRole("button", { name: /^Rattacher définitivement$/ }).click(),
       ]);
 
       // Toast de succès.

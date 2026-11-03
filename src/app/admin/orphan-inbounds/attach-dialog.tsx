@@ -49,7 +49,11 @@ import { Input } from "@/components/ui/input";
 import { isOptOut } from "@/lib/compliance/opt-out";
 import { describeAttachNotifyTargetForUi } from "@/lib/slack/orphan-notify-target";
 
-import { UNKNOWN_SENDER_LABEL } from "./orphan-labels";
+import {
+  ORPHAN_ATTACH_DIALOG_TITLES,
+  ORPHAN_OPT_OUT_LABELS,
+  UNKNOWN_SENDER_LABEL,
+} from "./orphan-labels";
 import { TOAST_MESSAGES, useAttachOrphan } from "./use-orphans";
 
 const SEARCH_DEBOUNCE_MS = 300;
@@ -216,7 +220,7 @@ function AttachDialogBody({
       {step === "pick-conv" && (
         <>
           <DialogHeader>
-            <DialogTitle>Rattacher ce SMS à une conversation</DialogTitle>
+            <DialogTitle>{ORPHAN_ATTACH_DIALOG_TITLES.pickConv}</DialogTitle>
             <DialogDescription>
               Recherchez la conversation du médecin par son nom. Tapez au moins 2 lettres.
             </DialogDescription>
@@ -284,7 +288,7 @@ function AttachDialogBody({
       {step === "ask-opt-out" && selected && (
         <>
           <DialogHeader>
-            <DialogTitle>Désabonnement du médecin ?</DialogTitle>
+            <DialogTitle>{ORPHAN_ATTACH_DIALOG_TITLES.askOptOut}</DialogTitle>
             <DialogDescription>
               Ce SMS demande-t-il l&apos;arrêt des sollicitations ?
             </DialogDescription>
@@ -317,7 +321,7 @@ function AttachDialogBody({
                   onChange={() => handleOptOutAnswer(true)}
                   className="size-4"
                 />
-                <span>Oui, ne plus solliciter ce médecin</span>
+                <span>{ORPHAN_OPT_OUT_LABELS.yes}</span>
               </label>
               <label
                 htmlFor="opt-out-no"
@@ -336,7 +340,7 @@ function AttachDialogBody({
                   onChange={() => handleOptOutAnswer(false)}
                   className="size-4"
                 />
-                <span>Non, le médecin reste joignable</span>
+                <span>{ORPHAN_OPT_OUT_LABELS.no}</span>
               </label>
             </div>
           )}
@@ -358,7 +362,7 @@ function AttachDialogBody({
       {step === "confirm" && selected && (
         <>
           <DialogHeader>
-            <DialogTitle>Rattacher définitivement ?</DialogTitle>
+            <DialogTitle>{ORPHAN_ATTACH_DIALOG_TITLES.confirm}</DialogTitle>
             <DialogDescription>
               Le SMS sera ajouté au fil de{" "}
               <strong>{selected.contactDisplayName ?? UNKNOWN_SENDER_LABEL}</strong>. Léa ne

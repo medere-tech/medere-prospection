@@ -97,6 +97,33 @@ export const ORPHAN_UNKNOWN_ADMIN_LABEL = "Admin inconnu";
 /** Libellé pour un expéditeur dont le médecin n'a pas pu être résolu. */
 export const UNKNOWN_SENDER_LABEL = "Expéditeur non identifié";
 
+/**
+ * Titres des 3 étapes du dialog « Rattacher » (`attach-dialog.tsx`).
+ * Source unique pour que les tests e2e matchent la MÊME chaîne que
+ * celle rendue par le composant — sinon un rename FR dans l'UI casse
+ * le test par désynchronisation silencieuse.
+ */
+export const ORPHAN_ATTACH_DIALOG_TITLES = {
+  pickConv: "Rattacher ce SMS à une conversation",
+  askOptOut: "Désabonnement du médecin ?",
+  confirm: "Rattacher définitivement ?",
+} as const satisfies Record<string, string>;
+
+/**
+ * Libellés des 2 réponses opt-out du dialog « Rattacher » (étape 2).
+ * Source unique partagée test ↔ composant. Correction PR2c tour 2b
+ * bloc C ter : le dialog change de nom entre étapes (`DialogTitle`
+ * dépend du `step`), donc un locator qui scope sur le nom de
+ * l'étape 1 ne retrouve plus les éléments de l'étape 2. Les tests
+ * utilisent soit `page.getByRole("dialog", { name: ORPHAN_ATTACH_DIALOG_TITLES.askOptOut })`
+ * pour scoper correctement, soit `page.getByRole("radio", { name: ... })`
+ * sans scope (role unique sur la page quand le dialog est ouvert).
+ */
+export const ORPHAN_OPT_OUT_LABELS = {
+  yes: "Oui, ne plus solliciter ce médecin",
+  no: "Non, le médecin reste joignable",
+} as const satisfies Record<string, string>;
+
 /** Toasts FR exposés comme table pour que les tests sentinelle vérifient
  * leur présence au complet. */
 export const ORPHAN_TOASTS = {

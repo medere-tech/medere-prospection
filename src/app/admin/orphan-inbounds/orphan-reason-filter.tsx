@@ -66,8 +66,16 @@ export function OrphanReasonFilter({ onChange }: OrphanReasonFilterProps) {
         Motif
       </label>
       <Select value={reason ?? ALL_SENTINEL} onValueChange={handleValueChange}>
+        {/* PR2c tour 2b bloc C ter — pas d'`aria-label` sur `<SelectValue>`.
+            Le `<label htmlFor="orphan-reason-filter">Motif</label>` ci-dessus
+            fournit déjà le nom accessible du combobox. Un `aria-label` sur le
+            `<span data-slot="select-value">` interne crée un second élément
+            matchable par `getByLabel("Motif")` → strict mode violation
+            Playwright, et un bruit lecteurs d'écran (le span n'est pas
+            interactif). Les tests qui ciblent le trigger utilisent désormais
+            `getByRole("combobox", { name: "Motif" })`. */}
         <SelectTrigger id="orphan-reason-filter" className="w-56">
-          <SelectValue aria-label="Motif sélectionné">{resolved.display}</SelectValue>
+          <SelectValue>{resolved.display}</SelectValue>
         </SelectTrigger>
         <SelectContent>
           <SelectItem value={ALL_SENTINEL}>Tous les motifs</SelectItem>
