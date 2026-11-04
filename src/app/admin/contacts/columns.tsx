@@ -22,8 +22,8 @@
  * masqué). Pas de fetch supplémentaire côté modal — data déjà en cache.
  */
 import type { ColumnDef } from "@tanstack/react-table";
-import { Copy, Eye, EyeOff, MoreHorizontal, Send } from "lucide-react";
-import { useId, useState } from "react";
+import { Copy, Eye, MoreHorizontal, Send } from "lucide-react";
+import { useId } from "react";
 import { toast } from "sonner";
 
 import { Badge } from "@/components/ui/badge";
@@ -38,7 +38,7 @@ import {
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
-import type { Contact, ContactStatus } from "@/types/contact";
+import type { ContactListItem, ContactStatus } from "@/types/contact";
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Meta typée pour callbacks parent → cells
@@ -48,10 +48,11 @@ declare module "@tanstack/react-table" {
   // eslint-disable-next-line @typescript-eslint/no-unused-vars
   interface TableMeta<TData> {
     /**
-     * S10.1.6 — reçoit le Contact complet (pas juste le hubspotId) pour
-     * que la modal puisse rendre son header riche sans fetch supplémentaire.
+     * S10.1.6 → PR3 — reçoit un `ContactListItem` (sans `phone.e164`/`raw`).
+     * La modal rend son header riche sur `phoneLast4` (masqué), le numéro
+     * complet ne transite plus que via `POST /api/admin/contacts/[id]/reveal-phone`.
      */
-    onPreview?: (contact: Contact) => void;
+    onPreview?: (contact: ContactListItem) => void;
   }
 }
 
@@ -60,21 +61,19 @@ declare module "@tanstack/react-table" {
 // ─────────────────────────────────────────────────────────────────────────────
 
 /**
- * Masque un téléphone E.164 pour affichage UI :
- *   `+33612345678` → `+33 6•• ••• •78`
+ * Masque un téléphone pour affichage UI depuis `phoneLast4`. On ne reçoit
+ * plus l'E.164 complet depuis PR3 (`/api/admin/contacts` sanitize), donc
+ * on ne peut plus révéler l'opérateur FR (6 vs 7). On affiche :
+ *   `last4="7845"` → `•• •• •• •• •• 45`
  *
- * Différent de `maskPhone()` (lib/utils/phone) qui sert aux logs/audit
- * forensic — ici, c'est juste un masquage VISUEL réversible côté admin.
- *
- * 🚨 S10.1.6 — exporté pour réutilisation par `preview-dialog.tsx`
- * (header riche du Dialog réutilise le même masquage que la cellule
- * table, cohérence visuelle).
+ * Les 2 derniers chiffres suffisent au commercial pour reconnaître un
+ * numéro connu lors d'un hover de ligne — le reste exige une action
+ * explicite auditée (`POST /reveal-phone`), branchée en PR3 tour 2b.
  */
-export function maskPhoneForUI(e164: string): string {
-  if (e164.length < 5) return "••••";
-  const head = e164.slice(0, 4); // +336 ou +337 etc.
-  const tail = e164.slice(-2);
-  return `${head} •• ••• •${tail}`;
+export function maskPhoneForUI(last4: string): string {
+  if (last4.length < 2) return "••••";
+  const visible = last4.slice(-2);
+  return `•• •• •• •• •• ${visible}`;
 }
 
 /**
@@ -128,21 +127,16 @@ const PREVIEW_ALLOWED_STATUSES: readonly ContactStatus[] = ["pending", "enriched
 // PhoneCell — toggle masqué/clair par ligne
 // ─────────────────────────────────────────────────────────────────────────────
 
-function PhoneCell({ e164 }: { e164: string }) {
-  const [revealed, setRevealed] = useState(false);
-  const displayed = revealed ? e164 : maskPhoneForUI(e164);
-  const Icon = revealed ? EyeOff : Eye;
-  const label = revealed ? "Masquer le numéro" : "Afficher le numéro complet";
-
+function PhoneCell({ phoneLast4 }: { phoneLast4: string }) {
+  // PR3 tour 2a — la cellule n'a plus l'E.164 côté client (la route
+  // sanitize). Le bouton « œil » est désactivé avec badge « Bientôt » en
+  // attendant le branchement sur `POST /api/admin/contacts/[id]/reveal-phone`
+  // (tour 2b). Pattern miroir du bouton en-tête conversation (preuve
+  // directe : `src/components/conversations/conversation-header.tsx:67-82`).
+  const displayed = maskPhoneForUI(phoneLast4);
   return (
     <div className="flex items-center gap-1.5">
-      <span
-        className="font-mono text-sm tabular-nums"
-        // S10.1.5-FIX-A11Y : aria-label lit le numéro complet quand révélé
-        // (utile pour screen reader qui sinon entendrait juste le pattern
-        // de bullets) ; texte explicite quand masqué.
-        aria-label={revealed ? `Numéro complet : ${e164}` : "Numéro masqué"}
-      >
+      <span className="font-mono text-sm tabular-nums" aria-label="Numéro masqué">
         {displayed}
       </span>
       <Button
@@ -150,11 +144,12 @@ function PhoneCell({ e164 }: { e164: string }) {
         variant="ghost"
         size="sm"
         className="size-7 p-0"
-        onClick={() => setRevealed((v) => !v)}
-        aria-label={label}
-        title={label}
+        disabled
+        aria-disabled="true"
+        aria-label="Afficher le numéro, disponible prochainement"
+        title="Disponible prochainement"
       >
-        <Icon className="size-3.5" aria-hidden />
+        <Eye className="size-3.5" aria-hidden />
       </Button>
     </div>
   );
@@ -168,8 +163,8 @@ function ActionsCell({
   contact,
   onPreview,
 }: {
-  contact: Contact;
-  onPreview?: (contact: Contact) => void;
+  contact: ContactListItem;
+  onPreview?: (contact: ContactListItem) => void;
 }) {
   // useId : génère un ID unique par instance pour `aria-describedby`.
   // Évite les collisions HTML quand plusieurs ActionsCell sont rendues
@@ -272,7 +267,7 @@ function ActionsCell({
 // Column definitions
 // ─────────────────────────────────────────────────────────────────────────────
 
-export const contactColumns: ColumnDef<Contact>[] = [
+export const contactColumns: ColumnDef<ContactListItem>[] = [
   {
     id: "name",
     header: "Contact",
@@ -306,7 +301,7 @@ export const contactColumns: ColumnDef<Contact>[] = [
   {
     id: "phone",
     header: "Téléphone",
-    cell: ({ row }) => <PhoneCell e164={row.original.phone.e164} />,
+    cell: ({ row }) => <PhoneCell phoneLast4={row.original.phoneLast4} />,
   },
   {
     id: "status",

@@ -69,7 +69,7 @@ import {
 } from "@/components/ui/dialog";
 import { Skeleton } from "@/components/ui/skeleton";
 import { cn } from "@/lib/utils";
-import type { Contact } from "@/types/contact";
+import type { ContactListItem } from "@/types/contact";
 
 import { maskPhoneForUI } from "./columns";
 
@@ -172,7 +172,7 @@ async function fetchSend(
 // Sub-component : ContactHeader (A1)
 // ─────────────────────────────────────────────────────────────────────────────
 
-function ContactHeader({ contact }: { contact: Contact }) {
+function ContactHeader({ contact }: { contact: ContactListItem }) {
   const civilite = contact.civilite ? `${contact.civilite} ` : "";
   const fullName = `${civilite}${contact.firstName} ${contact.lastName}`;
   return (
@@ -193,7 +193,7 @@ function ContactHeader({ contact }: { contact: Contact }) {
         <span className="inline-flex items-center gap-1">
           <Phone className="size-3" aria-hidden />
           <span className="font-mono tabular-nums" aria-label="Numéro masqué">
-            {maskPhoneForUI(contact.phone.e164)}
+            {maskPhoneForUI(contact.phoneLast4)}
           </span>
         </span>
       </div>
@@ -591,7 +591,9 @@ export interface PreviewDialogProps {
    * `contactId: string | null`). Le parent a déjà les Contact en cache
    * via `/api/admin/contacts` → pas de fetch supplémentaire.
    */
-  contact: Contact | null;
+  contact: ContactListItem | null;
+  // Note: ContactListItem n'a plus `phone.e164` depuis PR3.
+
   /** Callback fermeture (parent reset son state à null). */
   onClose: () => void;
   /** Callback optionnel après send success (parent peut refresh la table). */
@@ -625,7 +627,7 @@ export function PreviewDialog({ contact, onClose, onSendSuccess }: PreviewDialog
 }
 
 interface PreviewDialogContentProps {
-  contact: Contact;
+  contact: ContactListItem;
   onClose: () => void;
   onSendSuccess?: () => void;
   onRetry: () => void;

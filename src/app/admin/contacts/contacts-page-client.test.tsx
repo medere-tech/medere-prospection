@@ -32,7 +32,7 @@ vi.mock("sonner", () => ({
 }));
 
 import type { HubspotListInfo } from "@/lib/hubspot/lists";
-import type { Contact } from "@/types/contact";
+import type { ContactListItem } from "@/types/contact";
 
 import { ContactsPageClient } from "./contacts-page-client";
 
@@ -46,7 +46,10 @@ const CAMPAIGNS: HubspotListInfo[] = [
   },
 ];
 
-function buildContact(overrides: Partial<Contact> = {}): Contact {
+// PR3 — fixture `ContactListItem` (plus de `phone` complet, uniquement
+// `phoneLast4` + `phoneMeta`). Miroir exact du JSON renvoyé par
+// `/api/admin/contacts` après la révocation D2.
+function buildContact(overrides: Partial<ContactListItem> = {}): ContactListItem {
   const now = Timestamp.now();
   return {
     hubspotId: "hs_test_1",
@@ -57,13 +60,8 @@ function buildContact(overrides: Partial<Contact> = {}): Contact {
     city: "Paris",
     postalCode: "75001",
     email: "jean.dupont@cabinet-test.fr",
-    phone: {
-      e164: "+33612345678",
-      raw: "06 12 34 56 78",
-      type: "mobile",
-      valid: true,
-      lookupAt: now,
-    },
+    phoneLast4: "5678",
+    phoneMeta: { type: "mobile", valid: true },
     segment: "b2b_cabinet",
     bloctelChecked: true,
     bloctelOptOut: false,

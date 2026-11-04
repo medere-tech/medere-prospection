@@ -780,8 +780,14 @@ export type ContactPhoneAccessMethod = "display" | "copy" | "call";
 export interface ContactPhoneAccessedPayload {
   /** Methode d'acces : `display` (afficher) | `copy` (copier) | `call` (appeler). */
   method: ContactPhoneAccessMethod;
-  /** docId composite `${contactId}_${campaignId}` — origine du clic. */
-  conversationId: string;
+  /**
+   * docId composite `${contactId}_${campaignId}` — origine du clic quand
+   * le reveal se fait depuis une page conversation. OPTIONAL depuis PR3
+   * Tour 2a : la route `/api/admin/contacts/[id]/reveal-phone` (admin,
+   * liste `/admin/contacts`) n'a pas de conversation à référencer, et
+   * omet proprement la clef plutôt que d'inventer une valeur vide.
+   */
+  conversationId?: string;
   /** hubspotId opaque (duplique avec `targetId` pour requete payload). */
   contactId: string;
   // Index signature explicite : permet l'assignation a

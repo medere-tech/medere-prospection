@@ -25,7 +25,7 @@ vi.mock("sonner", () => ({
 import { toast } from "sonner";
 
 import { TooltipProvider } from "@/components/ui/tooltip";
-import type { Contact, ContactStatus } from "@/types/contact";
+import type { ContactListItem, ContactStatus } from "@/types/contact";
 
 import {
   __ActionsCell_FOR_TESTS as ActionsCell,
@@ -39,7 +39,9 @@ import {
 // Fixtures
 // ─────────────────────────────────────────────────────────────────────────────
 
-function buildContact(overrides: Partial<Contact> = {}): Contact {
+// PR3 — fixture `ContactListItem` : `phoneLast4` + `phoneMeta` à la place
+// de `phone` complet. Le `e164` ne doit plus apparaître ici.
+function buildContact(overrides: Partial<ContactListItem> = {}): ContactListItem {
   const now = Timestamp.now();
   return {
     hubspotId: "hs_test_1",
@@ -49,13 +51,8 @@ function buildContact(overrides: Partial<Contact> = {}): Contact {
     speciality: "Chirurgien-dentiste",
     city: "Paris",
     postalCode: "75001",
-    phone: {
-      e164: "+33612345678",
-      raw: "06 12 34 56 78",
-      type: "mobile",
-      valid: true,
-      lookupAt: now,
-    },
+    phoneLast4: "5678",
+    phoneMeta: { type: "mobile", valid: true },
     segment: "b2b_cabinet",
     bloctelChecked: true,
     bloctelOptOut: false,
@@ -77,18 +74,20 @@ function buildContact(overrides: Partial<Contact> = {}): Contact {
 // ─────────────────────────────────────────────────────────────────────────────
 
 describe("maskPhoneForUI", () => {
-  it("masque un E.164 mobile français", () => {
-    expect(maskPhoneForUI("+33612345678")).toBe("+336 •• ••• •78");
+  // PR3 — la fonction prend désormais `phoneLast4` (plus de `e164`), le
+  // numéro complet ne quitte plus la liste. Affichage : 5 paires de
+  // bullets + les 2 derniers chiffres.
+  it("masque depuis last4 (4 chiffres)", () => {
+    expect(maskPhoneForUI("5678")).toBe("•• •• •• •• •• 78");
   });
 
-  it("masque un E.164 fixe (+33 1)", () => {
-    expect(maskPhoneForUI("+33145678901")).toBe("+331 •• ••• •01");
+  it("masque depuis last4=99 (edge court)", () => {
+    expect(maskPhoneForUI("99")).toBe("•• •• •• •• •• 99");
   });
 
-  it("retourne placeholder pour string < 5 chars", () => {
+  it("retourne placeholder pour string < 2 chars", () => {
     expect(maskPhoneForUI("")).toBe("••••");
-    expect(maskPhoneForUI("+33")).toBe("••••");
-    expect(maskPhoneForUI("1234")).toBe("••••");
+    expect(maskPhoneForUI("7")).toBe("••••");
   });
 });
 
@@ -140,29 +139,32 @@ describe("statusVariant (helper sémantique Badge)", () => {
 // ─────────────────────────────────────────────────────────────────────────────
 
 describe("PhoneCell", () => {
-  it("rend le numéro masqué par défaut + bouton 'Afficher'", () => {
-    render(<PhoneCell e164="+33612345678" />);
-    expect(screen.getByText("+336 •• ••• •78")).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "Afficher le numéro complet" })).toBeInTheDocument();
+  // PR3 tour 2a — le toggle est désactivé en attendant le branchement
+  // sur `POST /api/admin/contacts/[id]/reveal-phone` (tour 2b). Le
+  // numéro complet n'est plus présent côté client — seul `phoneLast4`
+  // est utilisé pour l'affichage masqué.
+  it("rend le numéro masqué depuis last4 + bouton 'Afficher le numéro' grisé", () => {
+    render(<PhoneCell phoneLast4="5678" />);
+    expect(screen.getByText("•• •• •• •• •• 78")).toBeInTheDocument();
+    const btn = screen.getByRole("button", {
+      name: "Afficher le numéro, disponible prochainement",
+    });
+    expect(btn).toBeDisabled();
+    expect(btn).toHaveAttribute("aria-disabled", "true");
   });
 
-  it("clic sur 'Afficher' → révèle le numéro complet + bouton devient 'Masquer'", async () => {
-    render(<PhoneCell e164="+33612345678" />);
-    const toggleBtn = screen.getByRole("button", { name: "Afficher le numéro complet" });
-    await userEvent.click(toggleBtn);
-
-    expect(screen.getByText("+33612345678")).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "Masquer le numéro" })).toBeInTheDocument();
-    expect(screen.queryByText("+336 •• ••• •78")).not.toBeInTheDocument();
-  });
-
-  it("aria-label change selon l'état (révélé / masqué)", async () => {
-    render(<PhoneCell e164="+33612345678" />);
-    // Masqué initialement
+  it("aria-label du span: 'Numéro masqué' (aucun numéro complet accessible)", () => {
+    render(<PhoneCell phoneLast4="5678" />);
     expect(screen.getByLabelText("Numéro masqué")).toBeInTheDocument();
+  });
 
-    await userEvent.click(screen.getByRole("button", { name: /Afficher/i }));
-    expect(screen.getByLabelText("Numéro complet : +33612345678")).toBeInTheDocument();
+  it("sentinelle — aucun chiffre autre que le last4 n'est présent dans le DOM", () => {
+    render(<PhoneCell phoneLast4="5678" />);
+    // Les 6 premiers chiffres d'un E.164 FR ne doivent JAMAIS être
+    // dans le DOM (la cellule n'a plus l'E.164 en main).
+    const body = document.body.textContent ?? "";
+    expect(body).not.toMatch(/\+33/);
+    expect(body).not.toMatch(/\d{6,}/);
   });
 });
 

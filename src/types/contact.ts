@@ -123,6 +123,33 @@ export interface ContactEnrichment {
   raw?: Record<string, unknown>;
 }
 
+/**
+ * Shape « liste admin » renvoyée par `GET /api/admin/contacts` depuis
+ * PR3. **Zéro E.164 complet** : seul `phoneLast4` (4 derniers chiffres,
+ * forensic humain non PII) accompagne les champs identité. Le numéro
+ * complet transite UNIQUEMENT via les routes auditées
+ * `POST /api/admin/contacts/[id]/reveal-phone` et
+ * `POST /api/admin/conversations/[id]/reveal-phone`.
+ *
+ * Avant PR3, la route renvoyait `Contact` complet (dont `phone.e164`).
+ * Décision D2 révoquée — toute lecture du numéro est désormais auditée
+ * (`contact_phone_accessed`).
+ */
+export interface ContactListItem extends Omit<Contact, "phone"> {
+  /** 4 derniers chiffres du numéro, sans masquage (forensic humain). */
+  phoneLast4: string;
+  /**
+   * Métadonnées non-PII du numéro, conservées pour la cellule UI
+   * (statut `valid`, type `mobile`/`landline` — info utile sans leak).
+   * `e164` et `raw` sont volontairement omis.
+   */
+  phoneMeta: {
+    type: ContactPhoneType;
+    valid: boolean;
+    carrier?: string;
+  };
+}
+
 export interface Contact {
   // Identité
   hubspotId: string;

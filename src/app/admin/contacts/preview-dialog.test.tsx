@@ -37,7 +37,7 @@ vi.mock("sonner", () => ({
   },
 }));
 
-import type { Contact } from "@/types/contact";
+import type { ContactListItem } from "@/types/contact";
 
 import { PreviewDialog } from "./preview-dialog";
 
@@ -66,7 +66,9 @@ function jsonResponse(body: unknown, status = 200): Response {
   });
 }
 
-function buildContact(overrides: Partial<Contact> = {}): Contact {
+// PR3 — fixture `ContactListItem` : `phoneLast4` + `phoneMeta` à la place
+// de `phone` complet. Le numéro n'est plus dans la payload client.
+function buildContact(overrides: Partial<ContactListItem> = {}): ContactListItem {
   const now = Timestamp.now();
   return {
     hubspotId: "hs_abc",
@@ -77,13 +79,8 @@ function buildContact(overrides: Partial<Contact> = {}): Contact {
     city: "Paris",
     postalCode: "75001",
     email: "jean.dupont@cabinet-test.fr",
-    phone: {
-      e164: "+33612345678",
-      raw: "06 12 34 56 78",
-      type: "mobile",
-      valid: true,
-      lookupAt: now,
-    },
+    phoneLast4: "5678",
+    phoneMeta: { type: "mobile", valid: true },
     segment: "b2b_cabinet",
     bloctelChecked: true,
     bloctelOptOut: false,
@@ -145,8 +142,9 @@ describe("PreviewDialog (S10.1.6 — UX premium)", () => {
     expect(await screen.findByText("Dr Jean Dupont")).toBeInTheDocument();
     expect(screen.getByText("Chirurgien-dentiste")).toBeInTheDocument();
     expect(screen.getByText(/Paris · 75001/)).toBeInTheDocument();
-    // Téléphone masqué visuellement (cohérent avec PhoneCell de la table)
-    expect(screen.getByText("+336 •• ••• •78")).toBeInTheDocument();
+    // PR3 — téléphone masqué visuellement à partir du last4
+    // (`maskPhoneForUI("5678")` → `•• •• •• •• •• 78`).
+    expect(screen.getByText("•• •• •• •• •• 78")).toBeInTheDocument();
 
     // Wait final pour s'assurer que le fetch résolu a settled le state
     // (success) — évite que le test termine avant le setState du then().

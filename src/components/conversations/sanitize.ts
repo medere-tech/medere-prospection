@@ -183,6 +183,9 @@ const ACTION_LABELS: Record<AuditAction, { label: string; kind: JournalEntryProp
     label: "SMS entrant sur conversation inactive",
     kind: "other",
   },
+  // PR3 — un libellé par méthode (`display | copy | call`) via résolution
+  // par payload dans `labelForAction`. Le fallback générique « Numéro
+  // consulté » reste si le payload est absent (docs legacy pré-PR3).
   contact_phone_accessed: { label: "Numéro consulté", kind: "override" },
   // CAMPAIGN / ADMIN
   manual_override: { label: "Intervention manuelle (admin)", kind: "override" },
@@ -222,9 +225,33 @@ const ACTION_LABELS: Record<AuditAction, { label: string; kind: JournalEntryProp
   orphan_reopened: { label: "SMS orphelin remis à traiter", kind: "other" },
 };
 
-function labelForAction(action: string): { label: string; kind: JournalEntryProps["kind"] } {
+/**
+ * PR3 — table exhaustive des libellés `contact_phone_accessed` par méthode.
+ * Trois valeurs, 100 % couvertes par l'enum fermé `ContactPhoneAccessMethod`
+ * (`src/types/audit-log.ts:747-755`). Fallback générique « Numéro consulté »
+ * (via `ACTION_LABELS`) si un doc legacy (pré-PR3) n'a pas de `method`.
+ */
+export const PHONE_ACCESSED_LABELS: Record<"display" | "copy" | "call", string> = {
+  display: "Numéro affiché",
+  copy: "Numéro copié",
+  call: "Appel lancé",
+};
+
+function labelForAction(
+  action: string,
+  payload?: Record<string, unknown>,
+): { label: string; kind: JournalEntryProps["kind"] } {
   if (Object.prototype.hasOwnProperty.call(ACTION_LABELS, action) as boolean) {
-    return ACTION_LABELS[action as AuditAction];
+    const base = ACTION_LABELS[action as AuditAction];
+    // PR3 — spécialisation `contact_phone_accessed` par méthode. Fail-safe
+    // au libellé générique si `method` manquant ou hors enum (docs legacy).
+    if (action === "contact_phone_accessed" && payload !== undefined) {
+      const m = payload.method;
+      if (m === "display" || m === "copy" || m === "call") {
+        return { label: PHONE_ACCESSED_LABELS[m], kind: base.kind };
+      }
+    }
+    return base;
   }
   // Action inconnue au type TS (devrait être impossible — la whitelist Zod
   // `ACTIONS` de `audit-log.ts` + le type `AuditAction` sont en égalité
@@ -245,7 +272,9 @@ export function sanitizeAuditEntriesForJournal(
   entries: Array<AuditLog & { docId: string }>,
 ): JournalEntryProps[] {
   return entries.map((e) => {
-    const { label, kind } = labelForAction(e.action);
+    // PR3 — `payload` passé au résolveur pour spécialiser
+    // `contact_phone_accessed` par méthode (`display`/`copy`/`call`).
+    const { label, kind } = labelForAction(e.action, e.payload);
     return {
       docId: e.docId,
       timestampLabel: formatDateTimeParis(e.timestamp),

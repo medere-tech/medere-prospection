@@ -31,16 +31,16 @@
  *        passe TOUJOURS `status` explicite à `listContacts` (jamais
  *        `filters: { status: undefined }`).
  *
- *   D2 — PAS de masquage des phones (`phone.e164`/`phone.raw`) côté
- *        response. Admin authentifié RBAC doit voir le numéro complet
- *        (validation, call-back). Le masquage UX éventuel est de la
- *        responsabilité du frontend (S10.1.5+). Anti-leak Pino/Sentry géré
- *        en aval par le sanitizer logger.
+ *   D2 (RÉVOQUÉE EN PR3) — plus de `phone.e164` ni `phone.raw` dans la
+ *        réponse. Seul `phoneLast4` + méta non-PII (`type`, `valid`,
+ *        `carrier`). Le numéro complet transite UNIQUEMENT par
+ *        `POST /api/admin/contacts/[id]/reveal-phone` (audité, un write
+ *        `contact_phone_accessed` par clic). Sentinelle anti-régression :
+ *        `route.test.ts > D2 (PR3) — plus d'E.164 dans la liste`.
  *
- *   Pas d'audit log sur READ — lecture pure sans impact compliance
- *   critique. Si un jour la compliance exige un audit READ, on l'ajoutera
- *   via `appendAuditLog({ action: "contacts_listed", ... })` avec payload
- *   PII-free.
+ *   Pas d'audit log sur READ liste — lecture pure. L'audit vit sur la
+ *   révélation unitaire (route `/reveal-phone`), un write par méthode
+ *   d'accès (`display | copy | call`).
  */
 import { type NextRequest, NextResponse } from "next/server";
 import { z } from "zod";
@@ -148,12 +148,35 @@ export async function GET(req: NextRequest): Promise<NextResponse> {
       limit,
     });
 
-    // ── 4. Response — phones EN CLAIR (D2 arbitrage Déthié) ───────────────
-    return NextResponse.json({
-      contacts: result.contacts,
-      nextCursor: result.nextCursor,
-      hasMore: result.hasMore,
+    // ── 4. Response — PR3 — `phone` complet strippé, `phoneLast4` + méta
+    //    (forensic humain non PII) sur chaque item. Le numéro ne sort plus
+    //    jamais d'une lecture de liste. Toute révélation unitaire passe par
+    //    `POST /api/admin/contacts/[id]/reveal-phone` (audité).
+    const sanitizedContacts = result.contacts.map((c) => {
+      const { phone, ...rest } = c;
+      const phoneMeta: { type: typeof phone.type; valid: boolean; carrier?: string } = {
+        type: phone.type,
+        valid: phone.valid,
+        ...(phone.carrier !== undefined ? { carrier: phone.carrier } : {}),
+      };
+      return {
+        ...rest,
+        phoneLast4: phone.e164.slice(-4),
+        phoneMeta,
+      };
     });
+    return NextResponse.json(
+      {
+        contacts: sanitizedContacts,
+        nextCursor: result.nextCursor,
+        hasMore: result.hasMore,
+      },
+      {
+        status: 200,
+        // Miroir route conversations : jamais de cache HTTP sur les lectures PII.
+        headers: { "Cache-Control": "private, no-store, must-revalidate" },
+      },
+    );
   } catch (err) {
     // AppError = surface client connue (401, 403, 400 cursor invalide…).
     // On expose `code` + `clientMessage` via `toClientBody()`, jamais
