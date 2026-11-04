@@ -208,7 +208,7 @@ getAdminDb()
 **Requêtes qui en dépendent** :
 
 - `listAuditLogByTarget({targetType, targetId, ...})` — panneau latéral
-  « Journal » de la vue conversation.
+  « Journal » de la vue conversation (lecture simple, viewer testAccount).
   → `src/lib/firestore/audit-log.ts`
 
 **Pattern de la query** :
@@ -220,6 +220,81 @@ getAdminDb()
   .where("targetId", "==", conversationId)
   .orderBy("timestamp", "desc");
 ```
+
+### 15. `audit_log` — `targetType` ASC + `targetId` ASC + `actorTestAccount` ASC + `timestamp` DESC — PR3 tour 2b bis (quater)
+
+**Requêtes qui en dépendent** :
+
+- `fetchJournalEntriesRealOnly(...)` — lecture UNIQUE indexée pour un
+  viewer réel.
+  → `src/lib/conversations/load-conversation-detail.ts`
+
+**Pattern de la query** :
+
+```typescript
+getAdminDb()
+  .collection("audit_log")
+  .where("targetType", "==", "conversation")
+  .where("targetId", "==", conversationId)
+  .where("actorTestAccount", "==", false)
+  .orderBy("timestamp", "desc")
+  .limit(20);
+```
+
+**Pourquoi cet index** : `appendAuditLog` écrit maintenant le champ
+top-level `actorTestAccount: boolean` sur CHAQUE nouvelle entrée (false
+pour `system`/`ai`, dérivé du contexte pour `human`). Cet index permet
+de filtrer en O(20) les 20 entrées réelles les plus récentes,
+indépendamment du volume d'entrées test accumulé par le harnais
+Playwright sur la même conversation (le pathologique « 200 entrées
+test récentes + N réelles anciennes » devient trivial).
+
+**Pré-requis opérationnel** — rattrapage des entrées sans le champ.
+Firestore ne matche pas un champ absent à `== false`. Toute entrée
+d'audit écrite AVANT ce PR (ou par un rollback de prod) est donc
+invisible du journal d'un compte réel. Le script
+`scripts/backfill-audit-actor-test-account.mjs` (logique partagée dans
+`src/lib/firestore/backfill-actor-test-account-core.ts`) pose le champ
+top-level sur tous les docs qui en sont dépourvus. **Il doit être
+lancé une fois, en `--apply` après confirmation du projectId, AVANT le
+merge** sur chaque projet qui partage la base (preview + prod). Scan
+
+- journal query validés contre la vraie base via le script en mode
+  dry-run d'abord (lecture seule, affiche `scanned/needsUpdate/updated/
+testCount`).
+
+### 16. `audit_log` — `__name__` (COLLECTION) — PR3 tour 2b bis (quater) — scan du rattrapage
+
+**Requête qui en dépend** :
+
+- `scanBackfillAuditActorTestAccount(db, pageSize)` — pagination du
+  rattrapage one-shot.
+  → `src/lib/firestore/backfill-actor-test-account-core.ts`
+
+**Pattern de la query** :
+
+```typescript
+getAdminDb().collection("audit_log").orderBy(FieldPath.documentId()).limit(500).startAfter(cursor); // sur les pages suivantes
+```
+
+**Pourquoi PAS d'index composite explicite** : l'ordre par
+`FieldPath.documentId()` (`__name__`) est natif Firestore, auto-généré
+sur toute collection, pas besoin de versionner dans
+`firestore.indexes.json`. L'ordre déterministe par docId suffit à
+garantir la pagination exhaustive du rattrapage one-shot.
+
+### 17. `audit_log` — `actorId` IN (listes) — PR3 tour 2b bis (quater) — diff backfill
+
+**Requête qui en dépend** :
+
+- `tests/firestore/backfill-audit-actor-test-account.test.ts` — assertion
+  « aucun autre champ modifié : diff complet avant/après sauf
+  actorTestAccount ». Seul usage pratique : tests émulateur,
+  l'application réelle ne requête jamais `audit_log` par `actorId` (c'est
+  un champ identitaire opaque, pas un axe de lecture produit).
+
+Pas d'index composite requis : la clause `in` sur un single-field
+utilise le single-field index automatique de Firestore.
 
 ### 13. `inbound_messages_orphans` — `reason` ASC + `receivedAt` DESC — VUE-CONVERSATION PR0
 

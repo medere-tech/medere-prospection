@@ -13,10 +13,19 @@
  */
 import "@testing-library/jest-dom/vitest";
 
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { Timestamp } from "firebase-admin/firestore";
 import { beforeEach, describe, expect, it, vi } from "vitest";
+
+/** Wrapper requis par `RevealPhoneAction` (useMutation) depuis PR3 tour 2b. */
+function renderWithQuery(ui: React.ReactElement) {
+  const client = new QueryClient({
+    defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
+  });
+  return render(<QueryClientProvider client={client}>{ui}</QueryClientProvider>);
+}
 
 vi.mock("sonner", () => ({
   toast: { success: vi.fn(), error: vi.fn() },
@@ -139,32 +148,37 @@ describe("statusVariant (helper sémantique Badge)", () => {
 // ─────────────────────────────────────────────────────────────────────────────
 
 describe("PhoneCell", () => {
-  // PR3 tour 2a — le toggle est désactivé en attendant le branchement
-  // sur `POST /api/admin/contacts/[id]/reveal-phone` (tour 2b). Le
-  // numéro complet n'est plus présent côté client — seul `phoneLast4`
-  // est utilisé pour l'affichage masqué.
-  it("rend le numéro masqué depuis last4 + bouton 'Afficher le numéro' grisé", () => {
-    render(<PhoneCell phoneLast4="5678" />);
+  // PR3 tour 2b — la cellule branche désormais `RevealPhoneAction` sur
+  // `POST /api/admin/contacts/[id]/reveal-phone` (audit par clic). Le
+  // numéro masqué reste visible tant que l'admin n'a pas cliqué.
+  it("rend le numéro masqué depuis last4 + bouton 'Afficher le numéro' ACTIF (plus de grisé)", () => {
+    renderWithQuery(<PhoneCell contactId="hs_abc" phoneLast4="5678" />);
     expect(screen.getByText("•• •• •• •• •• 78")).toBeInTheDocument();
-    const btn = screen.getByRole("button", {
-      name: "Afficher le numéro, disponible prochainement",
-    });
-    expect(btn).toBeDisabled();
-    expect(btn).toHaveAttribute("aria-disabled", "true");
+    const btn = screen.getByRole("button", { name: /Afficher le numéro/i });
+    expect(btn).toBeEnabled();
+    // Sentinelle anti-régression : plus de badge « Bientôt » ni d'aria-label
+    // « disponible prochainement ».
+    expect(screen.queryByText("Bientôt")).toBeNull();
+    expect(btn.getAttribute("aria-label") ?? "").not.toMatch(/disponible prochainement/i);
   });
 
   it("aria-label du span: 'Numéro masqué' (aucun numéro complet accessible)", () => {
-    render(<PhoneCell phoneLast4="5678" />);
+    renderWithQuery(<PhoneCell contactId="hs_abc" phoneLast4="5678" />);
     expect(screen.getByLabelText("Numéro masqué")).toBeInTheDocument();
   });
 
-  it("sentinelle — aucun chiffre autre que le last4 n'est présent dans le DOM", () => {
-    render(<PhoneCell phoneLast4="5678" />);
-    // Les 6 premiers chiffres d'un E.164 FR ne doivent JAMAIS être
-    // dans le DOM (la cellule n'a plus l'E.164 en main).
+  it("sentinelle — aucun chiffre autre que le last4 n'est présent dans le DOM, aucun fetch avant clic", () => {
+    const fetchSpy = vi.fn();
+    Object.defineProperty(globalThis, "fetch", {
+      value: fetchSpy,
+      configurable: true,
+      writable: true,
+    });
+    renderWithQuery(<PhoneCell contactId="hs_abc" phoneLast4="5678" />);
     const body = document.body.textContent ?? "";
     expect(body).not.toMatch(/\+33/);
     expect(body).not.toMatch(/\d{6,}/);
+    expect(fetchSpy).not.toHaveBeenCalled();
   });
 });
 

@@ -167,11 +167,15 @@ function MetaRow({ icon, label, value }: { icon: React.ReactNode; label: string;
 }
 
 function JournalRow({ entry }: { entry: JournalEntryProps }) {
+  // PR3 tour 2b — préfixe le nom résolu côté serveur si disponible.
+  // Jamais d'identifiant Clerk brut (`actorName === null` → pas de préfixe,
+  // juste le libellé + l'horodatage).
+  const lead = entry.actorName !== null ? `${entry.actorName} — ${entry.label}` : entry.label;
   return (
     <li className="flex items-start gap-2">
       <FileText className="mt-0.5 h-3 w-3 shrink-0 text-muted-foreground" aria-hidden="true" />
       <div className="flex flex-col">
-        <span className="text-foreground">{entry.label}</span>
+        <span className="text-foreground">{lead}</span>
         <span className="text-muted-foreground">{entry.timestampLabel}</span>
       </div>
     </li>

@@ -134,6 +134,7 @@ function makeAuditEntry(): AuditLog & { docId: string } {
     docId: "aud_1",
     actorId: "U05UVHGBURX",
     actorType: "human",
+    actorTestAccount: false,
     action: "handoff",
     targetType: "conversation",
     targetId: "427963864300_test-camp",
@@ -211,7 +212,10 @@ describe("Sentinelle PR1 — zero PII dans la payload RSC", () => {
         sanitizeMessageForBubble(makeOutboundMsg("sent"), null),
         sanitizeMessageForBubble(makeInboundMsg(), null),
       ].filter((m): m is NonNullable<typeof m> => m !== null),
-      journal: sanitizeAuditEntriesForJournal(audits),
+      journal: sanitizeAuditEntriesForJournal(audits, {
+        actorNameByUserId: new Map(),
+        viewerIsTestAccount: false,
+      }),
       viewerIsOwner: true,
     };
 

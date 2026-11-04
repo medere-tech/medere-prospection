@@ -2,11 +2,16 @@
  * Journal Firestore `audit_log/` — point d'entrée unique d'écriture.
  *
  * ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
- * Invariants forensiques (CNIL / RGPD) :
+ * Invariants projet (choix d'ingénierie, pas obligation légale démontrée
+ * par un article précis) :
  *
  *   1. **Append-only**. Cette API n'expose AUCUN update/delete. Pour
  *      corriger une entrée, écrire un `manual_override` qui pointe la
- *      cible. `firestore.rules` refuse en parallèle toute écriture client.
+ *      cible. `firestore.rules` refuse en parallèle toute écriture
+ *      client. C'est une règle projet (pas une obligation légale
+ *      opposable), qui sert à : (a) garder le forensic lisible, et
+ *      (b) permettre à `fetchJournalEntriesRealOnly` de garantir une
+ *      borne sur le coût du chemin legacy.
  *
  *   2. **Zéro PII en clair dans `payload`**. Détection à 2 niveaux :
  *        a. Zod refuse les types non documentés (fail-fast structurel)
@@ -164,6 +169,13 @@ const AuditLogInputSchema = z.object({
   payload: z.record(z.string(), z.unknown()),
   ipAddress: z.string().optional(),
   userAgent: z.string().optional(),
+  /**
+   * PR3 tour 2b bis (ter) — top-level, dérivé côté serveur pour
+   * `system`/`ai`, OBLIGATOIRE côté caller pour `human`. La sentinelle
+   * `validateAndScrub` throw `ValidationError` si un acteur `human`
+   * omet le flag (cf. `tests/firestore/audit-log.test.ts`).
+   */
+  actorTestAccount: z.boolean().optional(),
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -186,7 +198,7 @@ const AuditLogInputSchema = z.object({
  *           caller applicatif : utiliser `appendAuditLog` ou
  *           `appendAuditLogTx`.
  */
-function validateAndScrub(entry: AuditLogInput): AuditLogInput {
+function validateAndScrub(entry: AuditLogInput): AuditLogInput & { actorTestAccount: boolean } {
   const parsed = AuditLogInputSchema.safeParse(entry);
   if (!parsed.success) {
     // ⚠️  NE PAS ajouter cause: parsed.error — la ZodError contient la
@@ -206,6 +218,32 @@ function validateAndScrub(entry: AuditLogInput): AuditLogInput {
     });
   }
 
+  // PR3 tour 2b bis (ter) — sentinelle `actorTestAccount` :
+  //   - `system`/`ai` → défaut `false` (dérivation serveur, pas de
+  //     possibilité pour un acteur non-humain d'être un testAccount).
+  //   - `human`       → DOIT être fourni explicitement par le caller
+  //     (sinon un oubli silencieux fait entrer une entrée test dans la
+  //     vue d'un vrai utilisateur). Zod ne peut pas valider ce
+  //     conditionnel à lui seul (`actorTestAccount` optionnel au
+  //     niveau schéma pour ne pas casser les 71 callers system/ai) ;
+  //     on l'applique ICI.
+  let actorTestAccount = parsed.data.actorTestAccount;
+  if (parsed.data.actorType === "human") {
+    if (typeof actorTestAccount !== "boolean") {
+      throw new ValidationError({
+        message:
+          "Audit log input invalid: actorTestAccount is required for actorType=human (no silent default).",
+        context: {
+          issues: [{ path: "actorTestAccount", code: "required_for_human" }],
+          actorType: parsed.data.actorType,
+          action: parsed.data.action,
+        },
+      });
+    }
+  } else {
+    actorTestAccount = actorTestAccount ?? false;
+  }
+
   const violations = detectPiiInPayload(parsed.data.payload);
   if (violations.length > 0) {
     throw new AuditPiiError({
@@ -222,7 +260,7 @@ function validateAndScrub(entry: AuditLogInput): AuditLogInput {
     });
   }
 
-  return parsed.data;
+  return { ...parsed.data, actorTestAccount };
 }
 
 /**
@@ -260,8 +298,8 @@ export async function appendAuditLog(entry: AuditLogInput): Promise<string> {
  *
  * Retourne le docId généré côté serveur (string, pas DocumentReference).
  * Décision Déthié S6.3 : `DocumentReference` exposerait `.set/.update/.delete`
- * et romprait la promesse append-only. Le caller a tout ce qu'il faut avec
- * la string.
+ * et romprait la règle projet append-only. Le caller a tout ce qu'il faut
+ * avec la string.
  *
  * Throw possible (DANS L'ORDRE) :
  *   - `ValidationError` : payload structurellement invalide (Zod).

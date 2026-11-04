@@ -50,7 +50,7 @@ export async function GET(
   { params }: { params: Promise<RouteParams> },
 ): Promise<Response> {
   try {
-    const { role, slackUserId, userId } = await requireRole("commercial");
+    const { role, slackUserId, userId, testAccount } = await requireRole("commercial");
 
     // Rate-limit (même politique que les autres routes admin).
     const rateLimitResponse = await applyAdminRateLimit(conversationDetailLimiter, userId);
@@ -58,7 +58,7 @@ export async function GET(
 
     const { id } = await params;
 
-    const result = await loadConversationDetail(id, { role, slackUserId });
+    const result = await loadConversationDetail(id, { role, slackUserId, testAccount });
 
     if (result.kind === "not_found") {
       return NextResponse.json({ error: "not_found" }, { status: 404 });

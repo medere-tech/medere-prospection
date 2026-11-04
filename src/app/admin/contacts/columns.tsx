@@ -22,10 +22,11 @@
  * masqué). Pas de fetch supplémentaire côté modal — data déjà en cache.
  */
 import type { ColumnDef } from "@tanstack/react-table";
-import { Copy, Eye, MoreHorizontal, Send } from "lucide-react";
+import { Copy, MoreHorizontal, Send } from "lucide-react";
 import { useId } from "react";
 import { toast } from "sonner";
 
+import { RevealPhoneAction } from "@/components/conversations/reveal-phone-action";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import {
@@ -127,31 +128,18 @@ const PREVIEW_ALLOWED_STATUSES: readonly ContactStatus[] = ["pending", "enriched
 // PhoneCell — toggle masqué/clair par ligne
 // ─────────────────────────────────────────────────────────────────────────────
 
-function PhoneCell({ phoneLast4 }: { phoneLast4: string }) {
-  // PR3 tour 2a — la cellule n'a plus l'E.164 côté client (la route
-  // sanitize). Le bouton « œil » est désactivé avec badge « Bientôt » en
-  // attendant le branchement sur `POST /api/admin/contacts/[id]/reveal-phone`
-  // (tour 2b). Pattern miroir du bouton en-tête conversation (preuve
-  // directe : `src/components/conversations/conversation-header.tsx:67-82`).
-  const displayed = maskPhoneForUI(phoneLast4);
+function PhoneCell({ contactId, phoneLast4 }: { contactId: string; phoneLast4: string }) {
+  // PR3 tour 2b — branché sur `POST /api/admin/contacts/[id]/reveal-phone`
+  // via `RevealPhoneAction` (même composant que l'en-tête conversation,
+  // route différente). Chaque action est auditée côté serveur avant de
+  // révéler quoi que ce soit. L'état vit UNIQUEMENT dans le composant :
+  // quitter la ligne ou la page re-masque le numéro.
   return (
-    <div className="flex items-center gap-1.5">
-      <span className="font-mono text-sm tabular-nums" aria-label="Numéro masqué">
-        {displayed}
-      </span>
-      <Button
-        type="button"
-        variant="ghost"
-        size="sm"
-        className="size-7 p-0"
-        disabled
-        aria-disabled="true"
-        aria-label="Afficher le numéro, disponible prochainement"
-        title="Disponible prochainement"
-      >
-        <Eye className="size-3.5" aria-hidden />
-      </Button>
-    </div>
+    <RevealPhoneAction
+      endpoint={`/api/admin/contacts/${encodeURIComponent(contactId)}/reveal-phone`}
+      phoneLast4={phoneLast4}
+      size="sm"
+    />
   );
 }
 
@@ -301,7 +289,9 @@ export const contactColumns: ColumnDef<ContactListItem>[] = [
   {
     id: "phone",
     header: "Téléphone",
-    cell: ({ row }) => <PhoneCell phoneLast4={row.original.phoneLast4} />,
+    cell: ({ row }) => (
+      <PhoneCell contactId={row.original.hubspotId} phoneLast4={row.original.phoneLast4} />
+    ),
   },
   {
     id: "status",

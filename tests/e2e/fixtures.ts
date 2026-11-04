@@ -172,14 +172,55 @@ export async function innerTextWithoutMessageThread(page: Page): Promise<string>
 }
 
 /**
- * Installe un listener réseau sur `/api/admin/conversations/*` qui
- * échoue immédiatement si une réponse contient un numéro FR. C'est le
- * vrai filet de sécurité anti-régression côté backend.
+ * Détermine si une réponse `/api/admin/*` est exemptée du scan « zéro
+ * numéro FR ». Fonction PURE (zéro I/O, zéro Playwright) — extraite de
+ * `installApiPhoneSentinel` pour être testée unitairement et mutée en
+ * isolation.
+ *
+ * Règle (PR3 tour 2b) :
+ *
+ *   1. Si l'URL ne touche pas `/api/admin/(conversations|contacts)/`, on
+ *      laisse passer (hors scope — ce n'est pas la sentinelle qui s'en
+ *      occupe).
+ *   2. Sinon, si c'est un **POST** vers un path se terminant par
+ *      `/reveal-phone` (avec query/fragment optionnel), on exempte —
+ *      cette route a pour contrat produit de renvoyer l'E.164 audité.
+ *   3. Sinon, on NE l'exempte PAS — le scan s'applique.
+ *
+ * Mutation testing (prouvé par la suite unitaire ci-dessous) :
+ *
+ *   - Exempter `GET` en plus de `POST` : les polls `/version` deviennent
+ *     invisibles si un jour ils fuitent un numéro → faille silencieuse.
+ *   - Retirer `/reveal-phone$` (laisser `/reveal-phone` match quelconque) :
+ *     une future route `/reveal-phones-bulk` passerait au travers.
+ *   - Toujours exempter (`return true;`) : plus aucune sentinelle, bugs
+ *     anti-RGPD invisibles.
+ */
+export function isPhoneSentinelExempt(method: string, url: string): boolean {
+  // Scope : `/api/admin/conversations/*` et `/api/admin/contacts/*`, y
+  // compris la base (`/api/admin/contacts`, `/api/admin/contacts?cursor=…`)
+  // car c'est précisément la route liste qui ne doit JAMAIS fuir l'E.164.
+  if (!/\/api\/admin\/(?:conversations|contacts)(?:$|\/|\?|#)/.test(url)) return true;
+  if (method !== "POST") return false;
+  return /\/reveal-phone(?:$|\?|#)/.test(url);
+}
+
+/**
+ * Installe un listener réseau sur `/api/admin/conversations/*` ET
+ * `/api/admin/contacts/*` qui échoue immédiatement si une réponse
+ * contient un numéro FR. C'est le filet de sécurité anti-régression
+ * côté backend — la liste `/api/admin/contacts` ne doit JAMAIS renvoyer
+ * `phone.e164`, et la payload polling `/conversations/[id]` ne doit
+ * jamais fuir le numéro non plus (seule `POST .../reveal-phone` est
+ * autorisée à le faire, audité serveur).
+ *
+ * La règle d'exemption vit dans `isPhoneSentinelExempt` (fonction pure,
+ * testable unitairement, cf. `tests/e2e/fixtures.sentinel-exempt.test.ts`).
  */
 export function installApiPhoneSentinel(page: Page): void {
   page.on("response", async (resp) => {
     const url = resp.url();
-    if (!/\/api\/admin\/conversations\//.test(url)) return;
+    if (isPhoneSentinelExempt(resp.request().method(), url)) return;
     try {
       const body = await resp.text();
       for (const re of PHONE_PATTERNS) {

@@ -14,6 +14,7 @@
  */
 import "@testing-library/jest-dom/vitest";
 
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { cleanup, render, screen } from "@testing-library/react";
 import { afterEach, describe, expect, it } from "vitest";
 
@@ -23,6 +24,17 @@ import { ConversationStatusBanner } from "@/components/conversations/conversatio
 import { MessageBubble } from "@/components/conversations/message-bubble";
 import { MessageThread } from "@/components/conversations/message-thread";
 import type { MessageProps } from "@/components/conversations/types";
+
+/**
+ * Wrapper QueryClient — `ConversationHeader` branche `RevealPhoneAction`
+ * depuis PR3 tour 2b, qui utilise `useMutation` (nécessite un provider).
+ */
+function renderWithQuery(ui: React.ReactElement) {
+  const client = new QueryClient({
+    defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
+  });
+  return render(<QueryClientProvider client={client}>{ui}</QueryClientProvider>);
+}
 
 afterEach(() => cleanup());
 
@@ -228,8 +240,8 @@ describe("ConversationNotMine", () => {
 });
 
 describe("ConversationHeader", () => {
-  it("affiche civilité + nom + spé + ville, pas de téléphone", () => {
-    render(
+  it("affiche civilité + nom + spé + ville + bouton « Afficher le numéro » ACTIF (PR3 tour 2b)", () => {
+    renderWithQuery(
       <ConversationHeader
         contact={{
           contactId: "x",
@@ -239,28 +251,33 @@ describe("ConversationHeader", () => {
           speciality: "Dentiste",
           city: "Paris",
           optedOut: false,
+          phoneLast4: "5678",
         }}
         intent="INTERESSE"
+        conversationId="conv_1"
       />,
     );
     expect(screen.getByRole("heading")).toHaveTextContent("Dr Jean Dupont");
     expect(screen.getByText("Dentiste")).toBeInTheDocument();
     expect(screen.getByText("Paris")).toBeInTheDocument();
     expect(screen.getByText("Intéressé")).toBeInTheDocument();
-    // Pas de téléphone affiché (bouton désactivé, aligné sur pattern grisé sidebar
-    // PR1.14 : aria-label = "<label>, disponible prochainement", badge "Bientôt",
-    // plus aucune mention "hors scope PR1" lue par un lecteur d'écran).
-    const phoneButton = screen.getByRole("button", {
-      name: "Afficher le numéro, disponible prochainement",
-    });
-    expect(phoneButton).toBeDisabled();
-    expect(phoneButton.getAttribute("aria-label")).not.toMatch(/hors scope|PR1/i);
-    // Badge « Bientôt » adjacent au bouton
-    expect(screen.getByText("Bientôt")).toBeInTheDocument();
+    // PR3 tour 2b — le bouton est maintenant branché, plus de badge « Bientôt ».
+    // L'ancien aria-label « disponible prochainement » disparaît ; le nouveau
+    // libellé est simplement « Afficher le numéro », le bouton est enabled, et
+    // le numéro masqué `•• •• •• •• •• 78` apparaît à côté. Sentinelle anti-régression :
+    // aucun chiffre consécutif > 2 dans le DOM avant clic (= pas de fuite).
+    expect(screen.queryByText("Bientôt")).toBeNull();
+    const phoneButton = screen.getByRole("button", { name: /Afficher le numéro/i });
+    expect(phoneButton).toBeEnabled();
+    expect(phoneButton.getAttribute("aria-label") ?? "").not.toMatch(/disponible prochainement/i);
+    expect(screen.getByLabelText("Numéro masqué")).toBeInTheDocument();
+    const bodyText = document.body.textContent ?? "";
+    expect(bodyText).not.toMatch(/\+33/);
+    expect(bodyText).not.toMatch(/\d{3,}/);
   });
 
   it("contact sans nom : fallback 'Contact sans nom'", () => {
-    render(
+    renderWithQuery(
       <ConversationHeader
         contact={{
           contactId: "x",
@@ -270,8 +287,10 @@ describe("ConversationHeader", () => {
           speciality: null,
           city: null,
           optedOut: false,
+          phoneLast4: "9999",
         }}
         intent="unknown"
+        conversationId="conv_2"
       />,
     );
     expect(screen.getByRole("heading")).toHaveTextContent("Contact sans nom");

@@ -175,6 +175,11 @@ export async function revealContactPhone(
   await appendAuditLog({
     actorId: input.actor.userId,
     actorType: "human",
+    // PR3 tour 2b bis (ter) — top-level pour permettre au journal de
+    // filtrer en O(1) (index composite). La valeur reste AUSSI dans
+    // `payload.actorTestAccount` pour la rétrocompatibilité des docs
+    // écrits sous l'ancien schéma et pour l'inspection payload-only.
+    actorTestAccount: input.actor.testAccount,
     action: "contact_phone_accessed",
     targetType: "contact",
     targetId: input.contactId,

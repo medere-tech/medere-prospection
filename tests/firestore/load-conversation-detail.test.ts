@@ -179,6 +179,7 @@ describe("loadConversationDetail — persist emulator (VUE-CONVERSATION PR1)", (
     const res = await loadConversationDetail("no_such_conv", {
       role: "admin",
       slackUserId: undefined,
+      testAccount: false,
     });
     expect(res.kind).toBe("not_found");
   });
@@ -188,7 +189,11 @@ describe("loadConversationDetail — persist emulator (VUE-CONVERSATION PR1)", (
     // titulaire (slackUserId === assignedToSlack). L'ancien comportement
     // `isAdmin || ...` renvoyait toujours true, ce qui cachait la bannière.
     await seed({ withHandoff: true });
-    const res = await loadConversationDetail(CONV_ID, { role: "admin", slackUserId: undefined });
+    const res = await loadConversationDetail(CONV_ID, {
+      role: "admin",
+      slackUserId: undefined,
+      testAccount: false,
+    });
     expect(res.kind).toBe("ok");
     if (res.kind !== "ok") throw new Error();
     expect(res.data.viewerIsOwner).toBe(false);
@@ -202,6 +207,7 @@ describe("loadConversationDetail — persist emulator (VUE-CONVERSATION PR1)", (
     const res = await loadConversationDetail(CONV_ID, {
       role: "admin",
       slackUserId: OWNER_SLACK,
+      testAccount: false,
     });
     expect(res.kind).toBe("ok");
     if (res.kind !== "ok") throw new Error();
@@ -213,6 +219,7 @@ describe("loadConversationDetail — persist emulator (VUE-CONVERSATION PR1)", (
     const res = await loadConversationDetail(CONV_ID, {
       role: "commercial",
       slackUserId: OWNER_SLACK,
+      testAccount: false,
     });
     expect(res.kind).toBe("ok");
     if (res.kind !== "ok") throw new Error();
@@ -224,6 +231,7 @@ describe("loadConversationDetail — persist emulator (VUE-CONVERSATION PR1)", (
     const res = await loadConversationDetail(CONV_ID, {
       role: "commercial",
       slackUserId: INTRUDER_SLACK,
+      testAccount: false,
     });
     expect(res.kind).toBe("not_mine");
     // assignedToName peut être null (Airtable non seedé en test)
@@ -237,6 +245,7 @@ describe("loadConversationDetail — persist emulator (VUE-CONVERSATION PR1)", (
     const res = await loadConversationDetail(CONV_ID, {
       role: "commercial",
       slackUserId: undefined,
+      testAccount: false,
     });
     expect(res.kind).toBe("not_mine");
   });
@@ -251,7 +260,11 @@ describe("loadConversationDetail — persist emulator (VUE-CONVERSATION PR1)", (
 
   it("exclusion duplicate : un message status='duplicate' n'apparaît PAS dans messages[]", async () => {
     await seed({ withHandoff: true, withDuplicate: true });
-    const res = await loadConversationDetail(CONV_ID, { role: "admin", slackUserId: undefined });
+    const res = await loadConversationDetail(CONV_ID, {
+      role: "admin",
+      slackUserId: undefined,
+      testAccount: false,
+    });
     expect(res.kind).toBe("ok");
     if (res.kind !== "ok") throw new Error();
     const ids = res.data.messages.map((m) => m.messageId);
@@ -262,7 +275,11 @@ describe("loadConversationDetail — persist emulator (VUE-CONVERSATION PR1)", (
 
   it("mutation testing filtre duplicate — vérif qu'il n'apparaît pas", async () => {
     await seed({ withHandoff: true, withDuplicate: true });
-    const res = await loadConversationDetail(CONV_ID, { role: "admin", slackUserId: undefined });
+    const res = await loadConversationDetail(CONV_ID, {
+      role: "admin",
+      slackUserId: undefined,
+      testAccount: false,
+    });
     if (res.kind !== "ok") throw new Error();
     // Si listMessagesInConversation retirait son filtre `duplicate`, le body
     // "DOUBLON INVISIBLE" apparaîtrait. On teste l'absence.
@@ -272,7 +289,11 @@ describe("loadConversationDetail — persist emulator (VUE-CONVERSATION PR1)", (
 
   it("sanity : aucun pattern téléphone dans la payload sérialisée", async () => {
     await seed({ withHandoff: true });
-    const res = await loadConversationDetail(CONV_ID, { role: "admin", slackUserId: undefined });
+    const res = await loadConversationDetail(CONV_ID, {
+      role: "admin",
+      slackUserId: undefined,
+      testAccount: false,
+    });
     if (res.kind !== "ok") throw new Error();
     const json = JSON.stringify(res.data);
     expect(json).not.toMatch(/\+33\d{9}/);
@@ -282,7 +303,11 @@ describe("loadConversationDetail — persist emulator (VUE-CONVERSATION PR1)", (
 
   it("conversation sans handoff : status='in_dialogue' + handoff=null", async () => {
     await seed({ withHandoff: false });
-    const res = await loadConversationDetail(CONV_ID, { role: "admin", slackUserId: undefined });
+    const res = await loadConversationDetail(CONV_ID, {
+      role: "admin",
+      slackUserId: undefined,
+      testAccount: false,
+    });
     expect(res.kind).toBe("ok");
     if (res.kind !== "ok") throw new Error();
     expect(res.data.status).toBe("in_dialogue");
@@ -297,6 +322,7 @@ describe("loadConversationDetail — persist emulator (VUE-CONVERSATION PR1)", (
     const res = await loadConversationDetail(CONV_ID, {
       role: "commercial",
       slackUserId: INTRUDER_SLACK,
+      testAccount: false,
     });
     expect(res.kind).toBe("not_mine");
   });

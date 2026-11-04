@@ -971,6 +971,7 @@ export async function attachOrphanToConversation(
     appendAuditLogTx(tx, {
       actorId: input.attachedBy,
       actorType: "human",
+      actorTestAccount: input.actorTestAccount,
       action: "orphan_attached_to_conversation",
       targetType: "conversation",
       targetId: input.conversationId,
@@ -1069,6 +1070,7 @@ export async function dismissOrphan(input: DismissOrphanInput): Promise<void> {
     appendAuditLogTx(tx, {
       actorId: input.dismissedBy,
       actorType: "human",
+      actorTestAccount: input.actorTestAccount,
       action: "orphan_dismissed",
       targetType: "message",
       targetId: input.orphanDocId,
@@ -1131,6 +1133,7 @@ export async function reopenOrphan(input: ReopenOrphanInput): Promise<void> {
     appendAuditLogTx(tx, {
       actorId: input.reopenedBy,
       actorType: "human",
+      actorTestAccount: input.actorTestAccount,
       action: "orphan_reopened",
       targetType: "message",
       targetId: input.orphanDocId,

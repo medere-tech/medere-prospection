@@ -212,7 +212,18 @@ export function ConversationDetailClient({ conversationId, initialData, viewerRo
 
   return (
     <div className="flex flex-col gap-6">
-      <ConversationHeader contact={data.contact} intent={data.intent} />
+      <ConversationHeader
+        contact={data.contact}
+        intent={data.intent}
+        conversationId={conversationId}
+        // PR3 tour 2b — un clic reveal-phone ne mute pas
+        // `conversation.updatedAt` côté Firestore (c'est un write `audit_log`
+        // seul), donc le poll `/version` ne détecte pas la nouvelle entrée
+        // de journal. On force un refetch du détail à chaque POST reveal
+        // réussi pour que l'admin voie « Numéro affiché » / « copié » /
+        // « Appel lancé » apparaître immédiatement.
+        onAudited={() => setRefetchKey((k) => k + 1)}
+      />
 
       {showAdminBanner ? (
         <ConversationAdminBanner assignedToName={data.handoff?.assignedToName ?? null} />

@@ -1361,6 +1361,13 @@ export async function setHandoff(
     appendAuditLogTx(tx, {
       actorId: assignedTo,
       actorType: "human",
+      // PR3 tour 2b bis (ter) — `setHandoff` est déclenché depuis le
+      // webhook Slack (bouton « Je prends »), jamais depuis le harnais
+      // e2e Playwright (qui opère sur le dashboard). Le flag est donc
+      // `false` en toute généralité : il faudrait thread un
+      // `actorTestAccount: boolean` optionnel via l'input si un jour
+      // un test de bout en bout passait par ce chemin.
+      actorTestAccount: false,
       action: "handoff",
       targetType: "conversation",
       targetId: conversationId,
