@@ -46,17 +46,29 @@
  *   0 — succès (dry-run ou apply).
  *   2 — env Firebase invalide.
  *   3 — erreur fatale non catchée.
+ *   4 — lookup Clerk a échoué OU aucun user testAccount trouvé.
  *   5 — confirmation refusée par l'opérateur (projectId non confirmé).
  */
 import { config } from "dotenv";
 config({ path: ".env.local" });
 
+// ⚠ `createClerkClient` de `@clerk/backend` est un factory pur (pas
+// d'`import.meta`/top-level read de `process.env`). Il peut être importé
+// AVANT ou APRÈS dotenv, le secretKey est lu à l'appel. NE PAS importer
+// `clerkClient` depuis `@clerk/nextjs/server` : son module `constants.js`
+// capture `process.env.CLERK_SECRET_KEY` à l'évaluation de l'import ESM
+// (cf. `scripts/_lib/clerk-admin-client.mjs` pour le JSDoc complet).
 import { stdin as input, stdout as output } from "node:process";
 import { createInterface } from "node:readline/promises";
 
 import { getAdminDb } from "../src/lib/firestore/admin.ts";
-import { runBackfill } from "../src/lib/firestore/backfill-actor-test-account-core.ts";
+import {
+  EmptyTestUserSetError,
+  fetchTestAccountUserIds,
+  runBackfill,
+} from "../src/lib/firestore/backfill-actor-test-account-core.ts";
 import { getFirebaseEnv } from "../src/lib/security/env.ts";
+import { makeClerkAdminClient } from "./_lib/clerk-admin-client.mjs";
 
 const APPLY = process.argv.includes("--apply");
 
@@ -92,6 +104,34 @@ async function main() {
   const mode = APPLY ? "APPLY" : "dry-run";
   console.log(`[backfill-audit-actor-test-account] projectId=${projectId} mode=${mode}`);
 
+  // ── 1. Lecture Clerk des comptes test (fail-closed) ──────────────────
+  // Client instancié APRÈS `config({ path: ".env.local" })` via
+  // `createClerkClient({ secretKey: process.env.CLERK_SECRET_KEY })`.
+  // Le helper arrête proprement avec un exit 2 si la variable est absente.
+  let testUserIds;
+  try {
+    const client = makeClerkAdminClient();
+    testUserIds = await fetchTestAccountUserIds({
+      getUserList: (opts) => client.users.getUserList(opts),
+    });
+  } catch (err) {
+    console.error(
+      "[backfill-audit-actor-test-account] lookup Clerk a échoué :",
+      err instanceof Error ? err.message : err,
+    );
+    process.exit(4);
+  }
+  console.log(
+    `[backfill-audit-actor-test-account] comptes test Clerk trouvés : ${testUserIds.size}`,
+  );
+  if (testUserIds.size === 0) {
+    console.error(
+      "[backfill-audit-actor-test-account] aucun user Clerk avec publicMetadata.testAccount=true — refus d'appliquer.",
+    );
+    process.exit(4);
+  }
+
+  // ── 2. Confirmation projectId AVANT apply ────────────────────────────
   if (APPLY) {
     const ok = await confirmProjectId(projectId);
     if (!ok) {
@@ -102,25 +142,47 @@ async function main() {
     }
   }
 
+  // ── 3. Scan + (dry-run | apply) ──────────────────────────────────────
   const db = getAdminDb();
-  const stats = await runBackfill(db, {
-    apply: APPLY,
-    onBatch: (s) => {
-      // Une ligne par batch : scan progressant, écriture potentielle.
-      console.log(
-        `  scanned=${s.scanned} needsUpdate=${s.needsUpdate} updated=${s.updated} ofWhichTest=${s.testCount}`,
-      );
-    },
-  });
+  let stats;
+  try {
+    stats = await runBackfill(db, {
+      apply: APPLY,
+      testUserIds,
+      onBatch: (s) => {
+        console.log(
+          `  scanned=${s.scanned} needsUpdate=${s.needsUpdate} updated=${s.updated} ofWhichTest=${s.testCount}`,
+        );
+      },
+    });
+  } catch (err) {
+    if (err instanceof EmptyTestUserSetError) {
+      // En théorie déjà filtré ci-dessus — ceinture et bretelles.
+      console.error("[backfill-audit-actor-test-account]", err.message);
+      process.exit(4);
+    }
+    throw err;
+  }
 
+  // ── 4. Récapitulatif + ventilation par action ────────────────────────
   console.log("─".repeat(72));
   console.log(
     `[backfill-audit-actor-test-account] TOTAL :\n` +
       `  scanned      = ${stats.scanned} docs\n` +
       `  needsUpdate  = ${stats.needsUpdate} docs (sans actorTestAccount top-level)\n` +
       `  updated      = ${stats.updated} docs ${APPLY ? "(écrits)" : "(dry-run — rien écrit)"}\n` +
-      `  testCount    = ${stats.testCount} docs posés à true (payload.actorTestAccount === true)`,
+      `  testCount    = ${stats.testCount} docs posés à true\n` +
+      `                 (payload.actorTestAccount === true OR actorId ∈ testUserIds)`,
   );
+  const actions = Object.keys(stats.testCountByAction).sort();
+  if (actions.length > 0) {
+    console.log("  ventilation testCount par action :");
+    for (const action of actions) {
+      console.log(`    - ${action.padEnd(40, " ")} ${stats.testCountByAction[action]}`);
+    }
+  } else {
+    console.log("  ventilation testCount par action : aucune (testCount=0)");
+  }
   process.exit(0);
 }
 

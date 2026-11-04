@@ -51,9 +51,72 @@
  * Idempotence : les docs qui ont DÉJÀ le champ top-level sont ignorés
  * par le scan (`needsUpdate: false`). Un 2e passage = 0 updates.
  */
+import type { ClerkClient } from "@clerk/backend";
 import { FieldPath, Firestore, type QueryDocumentSnapshot } from "firebase-admin/firestore";
 
 export const AUDIT_COLLECTION_NAME = "audit_log";
+
+/**
+ * Sous-type STRICT du SDK Clerk réel. On pique précisément
+ * `ClerkClient["users"]` depuis `@clerk/backend` et on projette sur la
+ * méthode utilisée (`getUserList`). Résultat :
+ *
+ *   - Le type `getUserList` conserve sa vraie signature
+ *     `(params?) => Promise<PaginatedResourceResponse<User[]>>` avec
+ *     `{ data: User[]; totalCount: number }` en retour.
+ *   - Un faux Clerk qui renvoie un tableau brut (comme l'ancien mock
+ *     avant fix) est refusé par le compilateur, pas seulement par le
+ *     runtime.
+ *   - `User` conserve ses champs `id`, `publicMetadata`, `firstName`,
+ *     `lastName` — on peut les lire sans élargir le port.
+ *
+ * `Pick<..., "getUserList">` protège aussi contre la découverte
+ * accidentelle d'autres endpoints via le mock (sentinelle "surface
+ * API minimale consommée").
+ */
+export type ClerkUsersListPort = Pick<ClerkClient["users"], "getUserList">;
+
+/**
+ * Récupère tous les `userId` Clerk dont `publicMetadata.testAccount`
+ * est strictement `true`. Pagination `limit`/`offset` jusqu'à
+ * `totalCount`, miroir exact de ce que font déjà
+ * `scripts/setup-e2e-clerk-users.mjs:177-179` et
+ * `scripts/cleanup-e2e-clerk-users.mjs:93-94` :
+ *
+ *   ```js
+ *   const list = await clerk.users.getUserList({ emailAddress: [email] });
+ *   // L'API Clerk retourne `{ data, totalCount }`.
+ *   const users = list.data ?? list;
+ *   ```
+ *
+ * On lit ici le même shape (`data` + `totalCount`) et on continue à
+ * paginer tant que `offset + data.length < totalCount`.
+ *
+ * Fail-fast : propage toute erreur Clerk. Le caller (runBackfill /
+ * script CLI) décide si une liste vide ou un throw doit arrêter.
+ */
+export async function fetchTestAccountUserIds(
+  clerk: ClerkUsersListPort,
+): Promise<ReadonlySet<string>> {
+  const ids = new Set<string>();
+  const pageSize = 100;
+  let offset = 0;
+  for (;;) {
+    const page = await clerk.getUserList({ limit: pageSize, offset });
+    // `page.data` est l'array d'users. `page.totalCount` donne la
+    // cardinalité globale — on s'en sert comme critère d'arrêt pour
+    // les instances Clerk vides ou plus petites qu'une page.
+    for (const user of page.data) {
+      if (user.publicMetadata["testAccount"] === true) {
+        ids.add(user.id);
+      }
+    }
+    const nextOffset = offset + page.data.length;
+    if (page.data.length === 0 || nextOffset >= page.totalCount) break;
+    offset = nextOffset;
+  }
+  return ids;
+}
 
 /**
  * Décomptes retournés par le scan et par l'application du rattrapage.
@@ -68,12 +131,21 @@ export interface BackfillStats {
   updated: number;
   /** Parmi `needsUpdate`, combien seront posés à `true` (test accounts). */
   testCount: number;
+  /**
+   * Ventilation `testCount` par `action` auditable (ex. `orphan_attached_to_conversation`).
+   * Permet au CLI d'afficher « 12 clics test réattachement + 3 opt-outs
+   * marqués, 0 réels » et de prouver que les actions PR2c des comptes
+   * e2e sont bien reclassées.
+   */
+  testCountByAction: Record<string, number>;
 }
 
 /** Un doc identifié par le scan comme à mettre à jour. */
 export interface BackfillWritePlan {
   readonly docId: string;
   readonly derivedValue: boolean;
+  /** Action auditée du doc, propagée pour `testCountByAction`. */
+  readonly action: string;
 }
 
 export interface BackfillOptions {
@@ -82,6 +154,19 @@ export interface BackfillOptions {
    * Le script CLI force la confirmation `projectId` avant d'appliquer.
    */
   readonly apply: boolean;
+  /**
+   * Ensemble des `userId` Clerk dont `publicMetadata.testAccount === true`.
+   * Source de vérité : Clerk (lue au DÉMARRAGE par
+   * `fetchTestAccountUserIds`), JAMAIS une liste recopiée en dur.
+   *
+   * Fail-closed : `runBackfill` throw AVANT toute écriture si cet
+   * ensemble est VIDE (soit Clerk a échoué, soit la métadonnée n'est
+   * pas provisionnée). Cette garde évite de poser `false` par défaut
+   * sur toutes les actions des comptes e2e qui n'avaient pas le flag
+   * dans le payload (ex. tous les `orphan_attached_to_conversation` du
+   * harnais PR2c).
+   */
+  readonly testUserIds: ReadonlySet<string>;
   /**
    * Taille d'un batch d'écriture. Max Firestore = 500. Défaut 400 pour
    * garder une marge de sécurité.
@@ -99,19 +184,49 @@ export interface BackfillOptions {
   readonly onBatch?: (snapshot: BackfillStats) => void;
 }
 
+/**
+ * Erreur levée par `runBackfill` quand `testUserIds` est vide. Fait
+ * échouer explicitement le dry-run ET l'apply — le CLI doit vérifier
+ * son wiring Clerk avant de relancer.
+ */
+export class EmptyTestUserSetError extends Error {
+  constructor(hint: string) {
+    super(`runBackfill: testUserIds is empty (${hint})`);
+    this.name = "EmptyTestUserSetError";
+  }
+}
+
 const DEFAULT_BATCH_SIZE = 400;
 const DEFAULT_PAGE_SIZE = 500;
 
 /**
- * Dérive la valeur à poser : `true` SSI le payload portait déjà
- * `actorTestAccount: true` (valeur stricte, pas truthy). Pour toutes
- * les autres valeurs (absent, false, string, number, null, objet), on
- * pose `false`. C'est cohérent avec `validateAndScrub` qui normalise
- * la valeur d'entrée de la même façon pour les acteurs `system`/`ai`.
+ * Dérive la valeur à poser.
+ *
+ * RÈGLES (OR logique, strict) :
+ *   1. `payload.actorTestAccount === true` (valeur stricte, pas truthy) —
+ *      couvre `revealContactPhone` historique qui posait déjà le flag
+ *      dans le payload.
+ *   2. `actorId ∈ testUserIds` — couvre les actions PR2c des comptes e2e
+ *      (`orphan_attached_to_conversation`, `orphan_dismissed`,
+ *      `orphan_reopened`) qui NE POSAIENT PAS de `actorTestAccount` dans
+ *      leur payload. `testUserIds` vient de Clerk au démarrage du
+ *      backfill (jamais hardcodé).
+ *
+ * Pour toutes les autres valeurs (payload absent, false, string, number,
+ * null, objet) ET quand `actorId` n'est pas dans l'ensemble, on pose
+ * `false`. Cohérent avec `validateAndScrub` qui normalise la valeur
+ * d'entrée pour les acteurs `system`/`ai`.
  */
-export function deriveActorTestAccount(payload: Record<string, unknown> | undefined): boolean {
-  if (payload === undefined || payload === null) return false;
-  return payload["actorTestAccount"] === true;
+export function deriveActorTestAccount(
+  payload: Record<string, unknown> | undefined,
+  actorId: string,
+  testUserIds: ReadonlySet<string>,
+): boolean {
+  if (payload?.["actorTestAccount"] === true) return true;
+  if (typeof actorId === "string" && actorId.length > 0 && testUserIds.has(actorId)) {
+    return true;
+  }
+  return false;
 }
 
 /**
@@ -138,9 +253,16 @@ export function needsBackfill(data: Record<string, unknown>): boolean {
  */
 export async function* scanBackfillAuditActorTestAccount(
   db: Firestore,
+  testUserIds: ReadonlySet<string>,
   pageSize: number = DEFAULT_PAGE_SIZE,
 ): AsyncGenerator<{ plans: BackfillWritePlan[]; stats: BackfillStats }> {
-  const stats: BackfillStats = { scanned: 0, needsUpdate: 0, updated: 0, testCount: 0 };
+  const stats: BackfillStats = {
+    scanned: 0,
+    needsUpdate: 0,
+    updated: 0,
+    testCount: 0,
+    testCountByAction: {},
+  };
   let cursor: QueryDocumentSnapshot | undefined;
   for (;;) {
     let q = db.collection(AUDIT_COLLECTION_NAME).orderBy(FieldPath.documentId()).limit(pageSize);
@@ -153,16 +275,23 @@ export async function* scanBackfillAuditActorTestAccount(
       stats.scanned += 1;
       const data = doc.data();
       if (needsBackfill(data)) {
-        const derived = deriveActorTestAccount(
-          data["payload"] as Record<string, unknown> | undefined,
-        );
-        plans.push({ docId: doc.id, derivedValue: derived });
+        const payload = data["payload"] as Record<string, unknown> | undefined;
+        const actorId = typeof data["actorId"] === "string" ? (data["actorId"] as string) : "";
+        const action = typeof data["action"] === "string" ? (data["action"] as string) : "unknown";
+        const derived = deriveActorTestAccount(payload, actorId, testUserIds);
+        plans.push({ docId: doc.id, derivedValue: derived, action });
         stats.needsUpdate += 1;
-        if (derived) stats.testCount += 1;
+        if (derived) {
+          stats.testCount += 1;
+          stats.testCountByAction[action] = (stats.testCountByAction[action] ?? 0) + 1;
+        }
       }
     }
 
-    yield { plans, stats: { ...stats } };
+    yield {
+      plans,
+      stats: { ...stats, testCountByAction: { ...stats.testCountByAction } },
+    };
 
     if (snap.docs.length < pageSize) break;
     cursor = snap.docs[snap.docs.length - 1];
@@ -198,21 +327,43 @@ export async function applyBackfillBatch(
  * process.exit.
  */
 export async function runBackfill(db: Firestore, options: BackfillOptions): Promise<BackfillStats> {
+  // Fail-closed (PR3 tour 2b bis sexies) : si l'ensemble des comptes test
+  // Clerk est vide (lookup failed ou metadata non seedée), on refuse
+  // AVANT toute écriture. Sinon on marquerait `false` toutes les actions
+  // des comptes e2e qui n'ont pas `payload.actorTestAccount` — exactement
+  // la pathologie à éviter (clics PR2c pollueraient le journal réel).
+  if (options.testUserIds.size === 0) {
+    throw new EmptyTestUserSetError(
+      "lookup Clerk a échoué OU aucun user avec publicMetadata.testAccount === true n'a été trouvé",
+    );
+  }
+
   const batchSize = options.batchSize ?? DEFAULT_BATCH_SIZE;
   const pageSize = options.pageSize ?? DEFAULT_PAGE_SIZE;
-  const final: BackfillStats = { scanned: 0, needsUpdate: 0, updated: 0, testCount: 0 };
+  const final: BackfillStats = {
+    scanned: 0,
+    needsUpdate: 0,
+    updated: 0,
+    testCount: 0,
+    testCountByAction: {},
+  };
 
-  for await (const { plans, stats } of scanBackfillAuditActorTestAccount(db, pageSize)) {
+  for await (const { plans, stats } of scanBackfillAuditActorTestAccount(
+    db,
+    options.testUserIds,
+    pageSize,
+  )) {
     // Stats scan cumulées jusqu'ici.
     final.scanned = stats.scanned;
     final.needsUpdate = stats.needsUpdate;
     final.testCount = stats.testCount;
+    final.testCountByAction = { ...stats.testCountByAction };
 
     if (options.apply && plans.length > 0) {
       const written = await applyBackfillBatch(db, plans, batchSize);
       final.updated += written;
     }
-    options.onBatch?.({ ...final });
+    options.onBatch?.({ ...final, testCountByAction: { ...final.testCountByAction } });
   }
   return final;
 }
