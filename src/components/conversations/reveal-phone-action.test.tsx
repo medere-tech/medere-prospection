@@ -34,13 +34,16 @@ function wrapQuery(ui: React.ReactElement) {
   return render(<QueryClientProvider client={client}>{ui}</QueryClientProvider>);
 }
 
-interface FetchMock extends ReturnType<typeof vi.fn> {
-  calls(): Array<[RequestInfo | URL, RequestInit | undefined]>;
-}
+/**
+ * Mock typé de `fetch`. `vi.fn<typeof fetch>()` propage la signature
+ * officielle de `fetch`, donc `mockResolvedValueOnce(ok(...))` est
+ * directement typé (le retour est `Response` qui match `ReturnType<typeof fetch>`
+ * via Promise<Response>). Pas de cast `as unknown as`, pas de `any`.
+ */
+type FetchMock = ReturnType<typeof vi.fn<typeof fetch>>;
 
 function installFetchStub(): FetchMock {
-  const fn = vi.fn() as FetchMock;
-  fn.calls = () => fn.mock.calls as unknown as Array<[RequestInfo | URL, RequestInit | undefined]>;
+  const fn: FetchMock = vi.fn<typeof fetch>();
   Object.defineProperty(globalThis, "fetch", {
     value: fn,
     configurable: true,
@@ -65,20 +68,20 @@ function err(status: number, body: unknown, headers: Record<string, string> = {}
   });
 }
 
-let clipboardWriteMock: ReturnType<typeof vi.fn>;
+let clipboardWriteMock: ReturnType<typeof vi.fn<(text: string) => Promise<void>>>;
 
 function installClipboardStub() {
-  clipboardWriteMock = vi.fn().mockResolvedValue(undefined);
+  clipboardWriteMock = vi.fn<(text: string) => Promise<void>>().mockResolvedValue(undefined);
   Object.defineProperty(navigator, "clipboard", {
     value: { writeText: clipboardWriteMock },
     configurable: true,
   });
 }
 
-let locationAssignMock: ReturnType<typeof vi.fn>;
+let locationAssignMock: ReturnType<typeof vi.fn<(url: string) => void>>;
 
 function installLocationStub() {
-  locationAssignMock = vi.fn();
+  locationAssignMock = vi.fn<(url: string) => void>();
   // Remplace `window.location` par un objet mutable qui enregistre les
   // écritures de `href` (jsdom interdit normalement la navigation mais ne
   // nous le dit pas de façon capturable → un stub avec setter est propre).
@@ -123,6 +126,23 @@ describe("<RevealPhoneAction> — invariants PR3 tour 2b", () => {
     expect(fetchMock).not.toHaveBeenCalled();
   });
 
+  it("phoneLast4=null → « Numéro indisponible » sans bouton, aucun fetch tentable", () => {
+    wrapQuery(<RevealPhoneAction endpoint={ENDPOINT} phoneLast4={null} />);
+    // Libellé explicite visible.
+    expect(screen.getByText("Numéro indisponible")).toBeInTheDocument();
+    expect(screen.getByTestId("phone-unavailable")).toHaveAttribute(
+      "aria-label",
+      "Numéro indisponible pour ce contact",
+    );
+    // Aucun bouton (ni Afficher, ni Copier, ni Appeler).
+    expect(screen.queryByRole("button")).toBeNull();
+    // Aucun masque avec chiffres — l'UI ne laisse pas penser qu'on
+    // pourrait révéler quoi que ce soit.
+    expect(screen.queryByLabelText("Numéro masqué")).toBeNull();
+    // Aucun fetch n'est jamais tentable depuis cet état.
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
   it("clic « Afficher » → POST display → numéro FR + boutons Copier/Appeler", async () => {
     fetchMock.mockResolvedValueOnce(
       ok({ e164: "+33612345678", display: "06 12 34 56 78", optedOut: false }),
@@ -133,8 +153,8 @@ describe("<RevealPhoneAction> — invariants PR3 tour 2b", () => {
 
     // La fetch a bien ciblé l'endpoint avec method: "display".
     expect(fetchMock).toHaveBeenCalledTimes(1);
-    const [, init] = fetchMock.calls()[0]!;
-    expect(fetchMock.calls()[0]?.[0]).toBe(ENDPOINT);
+    const [url, init] = fetchMock.mock.calls[0]!;
+    expect(url).toBe(ENDPOINT);
     expect(init?.method).toBe("POST");
     expect(JSON.parse(String(init?.body))).toEqual({ method: "display" });
 
@@ -182,7 +202,7 @@ describe("<RevealPhoneAction> — invariants PR3 tour 2b", () => {
 
     // La fetch copy a bien tourné.
     await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2));
-    expect(JSON.parse(String(fetchMock.calls()[1]?.[1]?.body))).toEqual({ method: "copy" });
+    expect(JSON.parse(String(fetchMock.mock.calls[1]?.[1]?.body))).toEqual({ method: "copy" });
 
     // Mais le clipboard N'A JAMAIS été écrit (ordre : audit d'abord).
     expect(clipboardWriteMock).not.toHaveBeenCalled();

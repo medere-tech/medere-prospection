@@ -95,8 +95,14 @@ export interface ContactHeaderProps {
    * `RevealPhoneAction` pour afficher le masque `•• •• •• •• •• XX`
    * avant qu'un clic audité ne dévoile le numéro complet. Considéré
    * non-PII par PR3 tour 2a (miroir `ContactListItem.phoneLast4`).
+   *
+   * `null` fail-closed (PR3 tour 2b bis quinquies) : le contact n'a pas
+   * de `phone.e164` (doc Firestore corrompu ou enrichissement échoué).
+   * L'UI (`RevealPhoneAction`) affiche « Numéro indisponible » sans
+   * bouton. L'ancienne valeur par défaut `"0000"` aurait affiché un
+   * faux masque et un bouton qui échoue côté serveur avec 500.
    */
-  phoneLast4: string;
+  phoneLast4: string | null;
 }
 
 /** Infos hand-off à afficher dans le panneau latéral. */

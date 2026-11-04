@@ -59,10 +59,14 @@ export function sanitizeContactForHeader(contact: Contact): ContactHeaderProps {
     // PR3 tour 2b — 4 derniers chiffres uniquement (non PII par
     // construction, pattern miroir `ContactListItem.phoneLast4` posé en
     // PR3 tour 2a). Permet au composant `RevealPhoneAction` de l'en-tête
-    // d'afficher `•• •• •• •• •• XX` avant tout clic audité. Défense en
-    // profondeur : si le doc est malformé (phone absent), on fallback
-    // sur `"0000"` plutôt que crasher le rendu serveur.
-    phoneLast4: typeof contact.phone?.e164 === "string" ? contact.phone.e164.slice(-4) : "0000",
+    // d'afficher `•• •• •• •• •• XX` avant tout clic audité.
+    //
+    // Fail-closed (PR3 tour 2b bis quinquies) : si le doc contact est
+    // corrompu (`phone.e164` absent ou non-string), on retourne `null` —
+    // jamais `"0000"` qui afficherait un faux masque et un bouton qui
+    // échouerait ensuite côté serveur avec 500. `RevealPhoneAction` sait
+    // rendre « Numéro indisponible » sans bouton quand `phoneLast4 === null`.
+    phoneLast4: typeof contact.phone?.e164 === "string" ? contact.phone.e164.slice(-4) : null,
   };
 }
 

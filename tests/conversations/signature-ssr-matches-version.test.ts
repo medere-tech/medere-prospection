@@ -88,6 +88,7 @@ function makeDetail(): ConversationDetailProps {
       speciality: "Dentiste",
       city: "Paris",
       optedOut: false,
+      phoneLast4: "9876",
     },
     messages: [],
     journal: [],

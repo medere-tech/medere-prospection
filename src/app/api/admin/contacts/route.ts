@@ -159,9 +159,15 @@ export async function GET(req: NextRequest): Promise<NextResponse> {
         valid: phone.valid,
         ...(phone.carrier !== undefined ? { carrier: phone.carrier } : {}),
       };
+      // Fail-closed (PR3 tour 2b bis quinquies) : doc contact corrompu
+      // (phone.e164 absent) → `phoneLast4: null`. La cellule PhoneCell
+      // affiche alors « Numéro indisponible » sans bouton — jamais de
+      // faux masque `"•• •• •• •• •• 00"` qui laisserait croire qu'on
+      // peut révéler.
+      const hasE164 = typeof phone?.e164 === "string" && phone.e164.length > 0;
       return {
         ...rest,
-        phoneLast4: phone.e164.slice(-4),
+        phoneLast4: hasE164 ? phone.e164.slice(-4) : null,
         phoneMeta,
       };
     });

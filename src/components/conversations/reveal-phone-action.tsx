@@ -63,8 +63,13 @@ export interface RevealPhoneActionProps {
    * contact) pour aller avec la bonne route RBAC.
    */
   endpoint: string;
-  /** 4 derniers chiffres du numéro pour l'affichage masqué initial. */
-  phoneLast4: string;
+  /**
+   * 4 derniers chiffres du numéro pour l'affichage masqué initial.
+   * `null` = le contact n'a pas de `phone.e164` (fail-closed PR3 tour 2b
+   * bis quinquies). Le composant rend alors « Numéro indisponible » sans
+   * bouton — pas d'appel réseau tentable, pas de 500 côté serveur.
+   */
+  phoneLast4: string | null;
   /**
    * Appelé après un POST réussi (quel que soit la méthode). Le parent
    * peut s'en servir pour invalider une query (journal) ou pour
@@ -154,6 +159,22 @@ export function RevealPhoneAction(props: RevealPhoneActionProps): React.ReactEle
 
   const busy = mutation.isPending;
   const size = props.size ?? "default";
+
+  // Fail-closed (PR3 tour 2b bis quinquies) : pas de numéro en base →
+  // libellé explicite, pas de bouton (donc pas d'appel réseau tentable).
+  if (props.phoneLast4 === null) {
+    return (
+      <div className="flex flex-col gap-1">
+        <span
+          className="text-sm text-muted-foreground"
+          aria-label="Numéro indisponible pour ce contact"
+          data-testid="phone-unavailable"
+        >
+          Numéro indisponible
+        </span>
+      </div>
+    );
+  }
 
   if (revealed === null) {
     const trimmedLast = props.phoneLast4.length >= 2 ? props.phoneLast4.slice(-2) : "••";

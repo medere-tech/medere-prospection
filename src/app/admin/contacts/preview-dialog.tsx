@@ -193,7 +193,12 @@ function ContactHeader({ contact }: { contact: ContactListItem }) {
         <span className="inline-flex items-center gap-1">
           <Phone className="size-3" aria-hidden />
           <span className="font-mono tabular-nums" aria-label="Numéro masqué">
-            {maskPhoneForUI(contact.phoneLast4)}
+            {/* Fail-closed PR3 tour 2b bis quinquies : si phoneLast4
+                est null (doc corrompu), on affiche « indisponible »
+                — pas un faux masque. Le bouton d'envoi reste piloté
+                par `preSendCheckPassed` serveur (qui refusera déjà
+                un envoi sans phone valide). */}
+            {contact.phoneLast4 === null ? "indisponible" : maskPhoneForUI(contact.phoneLast4)}
           </span>
         </span>
       </div>

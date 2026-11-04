@@ -136,8 +136,13 @@ export interface ContactEnrichment {
  * (`contact_phone_accessed`).
  */
 export interface ContactListItem extends Omit<Contact, "phone"> {
-  /** 4 derniers chiffres du numéro, sans masquage (forensic humain). */
-  phoneLast4: string;
+  /**
+   * 4 derniers chiffres du numéro, sans masquage (forensic humain).
+   * `null` fail-closed (PR3 tour 2b bis quinquies) : le doc contact
+   * est corrompu (pas de `phone.e164`). La cellule UI affiche alors
+   * « Numéro indisponible » sans bouton.
+   */
+  phoneLast4: string | null;
   /**
    * Métadonnées non-PII du numéro, conservées pour la cellule UI
    * (statut `valid`, type `mobile`/`landline` — info utile sans leak).

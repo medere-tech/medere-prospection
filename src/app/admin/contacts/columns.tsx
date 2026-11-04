@@ -128,7 +128,15 @@ const PREVIEW_ALLOWED_STATUSES: readonly ContactStatus[] = ["pending", "enriched
 // PhoneCell — toggle masqué/clair par ligne
 // ─────────────────────────────────────────────────────────────────────────────
 
-function PhoneCell({ contactId, phoneLast4 }: { contactId: string; phoneLast4: string }) {
+function PhoneCell({
+  contactId,
+  phoneLast4,
+}: {
+  contactId: string;
+  // Fail-closed PR3 tour 2b bis quinquies : `null` = pas de phone.e164
+  // en base. `RevealPhoneAction` rend alors « Numéro indisponible ».
+  phoneLast4: string | null;
+}) {
   // PR3 tour 2b — branché sur `POST /api/admin/contacts/[id]/reveal-phone`
   // via `RevealPhoneAction` (même composant que l'en-tête conversation,
   // route différente). Chaque action est auditée côté serveur avant de

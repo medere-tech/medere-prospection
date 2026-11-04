@@ -110,6 +110,21 @@ export async function revealContactPhone(
     });
   }
 
+  // 1 bis) Fail-closed (PR3 tour 2b bis quinquies) : le contact existe
+  //        mais n'a pas de `phone.e164` (doc Firestore corrompu ou
+  //        enrichissement échoué). On refuse proprement en 404 avec un
+  //        message FR — PAS un 500 opaque, PAS un `e164 = ""` qui
+  //        polluerait le front. Audit NON posé : il n'y a rien à
+  //        tracer (aucune donnée PII n'a été lue, l'opération n'a pas
+  //        eu lieu).
+  if (typeof contact.phone?.e164 !== "string" || contact.phone.e164.length === 0) {
+    throw new NotFoundError({
+      message: "revealContactPhone: contact has no phone.e164",
+      clientMessage: "Ce contact n'a pas de numéro.",
+      context: { contactId: input.contactId },
+    });
+  }
+
   // 2) Vérif d'accès — règle UNIQUE :
   //    - admin : OK partout.
   //    - commercial : REQUIS `conversationId` + `slackUserId` égal au

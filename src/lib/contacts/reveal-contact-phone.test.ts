@@ -340,6 +340,34 @@ describe("revealContactPhone", () => {
 
       expect(mockAppendAuditLog).not.toHaveBeenCalled();
     });
+
+    it("contact SANS phone.e164 → NotFoundError FR + pas d'audit (fail-closed PR3 2b bis quinquies)", async () => {
+      // Doc contact corrompu : l'enrichissement Lusha/HubSpot a échoué,
+      // le champ phone n'a pas été posé. On refuse proprement sans
+      // écrire d'audit (rien à tracer — aucune PII n'a été lue).
+      const corrupted = fakeContact();
+      // On force phone à undefined pour simuler le doc corrompu —
+      // `getContact` renverrait ce shape si Zod était permissif, mais
+      // ici on teste la défense en profondeur de `revealContactPhone`.
+      const noPhone = { ...corrupted, phone: undefined } as unknown as typeof corrupted;
+      mockGetContact.mockResolvedValue(noPhone);
+
+      try {
+        await revealContactPhone({
+          actor: adminActor,
+          contactId: "hs_abc",
+          method: "display",
+        });
+        throw new Error("expected NotFoundError");
+      } catch (err) {
+        expect(err).toBeInstanceOf(NotFoundError);
+        const nf = err as NotFoundError;
+        // Message FR exposable au client (via `toClientBody()`).
+        expect(nf.clientMessage).toBe("Ce contact n'a pas de numéro.");
+      }
+      // Aucun audit : il n'y a rien à tracer.
+      expect(mockAppendAuditLog).not.toHaveBeenCalled();
+    });
   });
 
   describe("audit — ordre + PII-free", () => {
