@@ -34,6 +34,10 @@ async function seedAudit(action: string, targetType: string, targetId: string) {
   await appendAuditLog({
     actorId: "U05UVHGBURX",
     actorType: "human",
+    // Fixture : seed d'audit pour tester `listAuditLogByTarget`. L'acteur
+    // seed est un admin connu (Dethie), pas un compte de test — valeur
+    // explicite, requise par `validateAndScrub` (`src/lib/firestore/audit-log.ts:234-245`).
+    actorTestAccount: false,
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     action: action as any,
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
