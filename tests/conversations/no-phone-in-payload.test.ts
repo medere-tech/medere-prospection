@@ -134,6 +134,7 @@ function makeAuditEntry(): AuditLog & { docId: string } {
     docId: "aud_1",
     actorId: "U05UVHGBURX",
     actorType: "human",
+    actorTestAccount: false,
     action: "handoff",
     targetType: "conversation",
     targetId: "427963864300_test-camp",
@@ -160,6 +161,67 @@ describe("Sentinelle PR1 — zero PII dans la payload RSC", () => {
     expect(header.firstName).toBe("Jean");
     expect(header.speciality).toBe("Dentiste");
     expect(header.city).toBe("Paris");
+  });
+
+  it("sanitizeContactForHeader — phoneLast4 fait EXACTEMENT 4 chiffres, aucun autre champ ne contient de numéro", () => {
+    // Le navigateur reçoit `phoneLast4` depuis PR3 tour 2b. On verrouille :
+    //   1. phoneLast4 est présent, 4 caractères, 4 chiffres.
+    //   2. AUCUN autre champ du header ne contient un pattern NUMÉRO FR —
+    //      `containsFrenchPhoneNumber` (scrubber projet) attrape E.164,
+    //      national FR, 0033 et les séparateurs variés. Le `contactId`
+    //      HubSpot est un identifiant numérique opaque LEGITIME (12
+    //      chiffres consécutifs) qui ne doit PAS déclencher la sentinelle :
+    //      le scrubber ne matche pas car ça ne commence pas par un pattern
+    //      téléphone valide.
+    //   3. Les clefs `e164`, `raw`, `phone` ne sont PAS présentes
+    //      (projection explicite, miroir de la sanitize serveur).
+    const contact = makeContact();
+    const header = sanitizeContactForHeader(contact);
+    expect(header.phoneLast4).toHaveLength(4);
+    expect(header.phoneLast4).toMatch(/^\d{4}$/);
+    // Projection : les autres champs ne doivent PAS matcher un numéro FR.
+    const otherFields = {
+      contactId: header.contactId,
+      civilite: header.civilite,
+      firstName: header.firstName,
+      lastName: header.lastName,
+      speciality: header.speciality,
+      city: header.city,
+      optedOut: header.optedOut,
+    };
+    const otherJson = JSON.stringify(otherFields);
+    expect(
+      containsFrenchPhoneNumber(otherJson),
+      "aucun champ de ContactHeaderProps hors phoneLast4 ne doit contenir un pattern FR",
+    ).toBe(false);
+    // Clefs interdites — l'objet header ne doit avoir QUE le flag + last4.
+    expect(header).not.toHaveProperty("e164");
+    expect(header).not.toHaveProperty("raw");
+    expect(header).not.toHaveProperty("phone");
+    // Preuve directe que les 4 chiffres sont bien les DERNIERS du e164
+    // d'entrée (et PAS les premiers ni un slice arbitraire). `contact`
+    // fixture a bien `phone.e164` → le fail-closed null ne s'applique pas ici.
+    expect(header.phoneLast4).not.toBeNull();
+    expect(header.phoneLast4).toBe(contact.phone.e164.slice(-4));
+    // phoneLast4 isolé ne matche PAS la sentinelle téléphone FR
+    // (puisque 4 chiffres seuls ne reconstituent pas un numéro).
+    expect(containsFrenchPhoneNumber(header.phoneLast4 ?? "")).toBe(false);
+  });
+
+  it("sanitizeContactForHeader — contact SANS phone.e164 → phoneLast4=null (fail-closed PR3 tour 2b bis quinquies)", () => {
+    // Doc corrompu (phone absent) : au lieu de poser un faux `"0000"`
+    // qui tromperait l'UI et déclencherait un 500 côté serveur quand
+    // l'admin cliquerait « Afficher », on retourne `null` et l'UI rend
+    // « Numéro indisponible » sans bouton.
+    const corrupted = { ...makeContact() } as unknown as Record<string, unknown>;
+    delete corrupted.phone;
+    const header = sanitizeContactForHeader(
+      corrupted as unknown as Parameters<typeof sanitizeContactForHeader>[0],
+    );
+    expect(header.phoneLast4).toBeNull();
+    // Les autres champs restent intacts.
+    expect(header.firstName).toBe("Jean");
+    expect(header.contactId).toBe("427963864300");
   });
 
   it("sanitizeMessageForBubble strippe externalReceiver (outbound)", () => {
@@ -211,7 +273,10 @@ describe("Sentinelle PR1 — zero PII dans la payload RSC", () => {
         sanitizeMessageForBubble(makeOutboundMsg("sent"), null),
         sanitizeMessageForBubble(makeInboundMsg(), null),
       ].filter((m): m is NonNullable<typeof m> => m !== null),
-      journal: sanitizeAuditEntriesForJournal(audits),
+      journal: sanitizeAuditEntriesForJournal(audits, {
+        actorNameByUserId: new Map(),
+        viewerIsTestAccount: false,
+      }),
       viewerIsOwner: true,
     };
 

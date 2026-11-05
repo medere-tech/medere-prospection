@@ -128,7 +128,7 @@ const sendFirstSmsLimiter = createRateLimiter({
 export async function POST(req: NextRequest): Promise<NextResponse> {
   try {
     // ── 1. Auth Clerk + RBAC admin (récupère userId pour actorId audit) ──
-    const { userId: adminUserId } = await requireRole("admin");
+    const { userId: adminUserId, testAccount: adminTestAccount } = await requireRole("admin");
 
     // ── 1.bis. Rate-limit Upstash (S10.1.9 RATELIMIT-001) ─────────────────
     // Court-circuit AVANT le parse + Claude + Inngest — la défense la plus
@@ -212,6 +212,7 @@ export async function POST(req: NextRequest): Promise<NextResponse> {
     const auditId = await appendAuditLog({
       actorId: adminUserId,
       actorType: "human",
+      actorTestAccount: adminTestAccount,
       action: "sms_send_initiated_by_admin",
       targetType: "contact",
       targetId: contactId,

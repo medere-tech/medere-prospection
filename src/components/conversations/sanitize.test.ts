@@ -22,6 +22,7 @@ import type { Message } from "@/types/message";
 import {
   __ACTION_LABELS_FOR_TESTS as ACTION_LABELS,
   __labelForAction_FOR_TESTS as labelForAction,
+  sanitizeAuditEntriesForJournal,
   sanitizeMessageForBubble,
 } from "./sanitize";
 
@@ -141,5 +142,95 @@ describe("sanitizeMessageForBubble — propagation attachedFromOrphan (sentinell
       null,
     );
     expect(sanitized!.attachedFromOrphan).toBeUndefined();
+  });
+});
+
+/**
+ * Sentinelles PR3 tour 2b — filtre « compte test » + résolution noms.
+ *
+ * On couvre deux invariants brief Déthié :
+ *   1. Un viewer réel (`viewerIsTestAccount: false`) NE VOIT PAS les
+ *      entrées d'audit dont le payload porte `actorTestAccount: true`
+ *      (évite qu'un harnais Playwright pollue le journal d'une conv réelle).
+ *   2. Un viewer test (`viewerIsTestAccount: true`) voit tout — c'est son
+ *      canal de debug.
+ *   3. `actorName` est injecté depuis la map Clerk uniquement pour les
+ *      acteurs `human`, remplacé par `"Léa"` / `"Système"` pour `ai` /
+ *      `system`, et jamais l'identifiant brut.
+ */
+describe("sanitizeAuditEntriesForJournal — filtre testAccount + résolution noms (PR3 tour 2b)", () => {
+  function makeEntry(
+    overrides: Partial<Parameters<typeof sanitizeAuditEntriesForJournal>[0][number]>,
+  ): Parameters<typeof sanitizeAuditEntriesForJournal>[0][number] {
+    return {
+      docId: "aud_x",
+      actorId: "clerk_admin_1",
+      actorType: "human",
+      actorTestAccount: false,
+      action: "contact_phone_accessed",
+      targetType: "contact",
+      targetId: "hs_abc",
+      payload: {},
+      timestamp: Timestamp.fromMillis(1_700_000_000_000),
+      ...overrides,
+    } as Parameters<typeof sanitizeAuditEntriesForJournal>[0][number];
+  }
+
+  it("viewer réel : les entrées actorTestAccount=true sont MASQUÉES", () => {
+    const entries = [
+      makeEntry({ docId: "aud_real", payload: { method: "display", actorTestAccount: false } }),
+      makeEntry({ docId: "aud_test", payload: { method: "display", actorTestAccount: true } }),
+    ];
+    const result = sanitizeAuditEntriesForJournal(entries, {
+      actorNameByUserId: new Map([["clerk_admin_1", "Déthié Faye"]]),
+      viewerIsTestAccount: false,
+    });
+    expect(result.map((e) => e.docId)).toEqual(["aud_real"]);
+  });
+
+  it("viewer testAccount : toutes les entrées restent visibles", () => {
+    const entries = [
+      makeEntry({ docId: "aud_real", payload: { method: "display", actorTestAccount: false } }),
+      makeEntry({ docId: "aud_test", payload: { method: "display", actorTestAccount: true } }),
+    ];
+    const result = sanitizeAuditEntriesForJournal(entries, {
+      actorNameByUserId: new Map(),
+      viewerIsTestAccount: true,
+    });
+    expect(result.map((e) => e.docId)).toEqual(["aud_real", "aud_test"]);
+  });
+
+  it("actorName : résolu Clerk pour `human`, « Léa » pour `ai`, « Système » pour `system`", () => {
+    const entries = [
+      makeEntry({ docId: "aud_h", actorType: "human", actorId: "clerk_x" }),
+      makeEntry({ docId: "aud_ai", actorType: "ai", actorId: "sonnet-4-6" }),
+      makeEntry({ docId: "aud_sys", actorType: "system", actorId: "inngest" }),
+      makeEntry({ docId: "aud_unknown_h", actorType: "human", actorId: "clerk_removed" }),
+    ];
+    const result = sanitizeAuditEntriesForJournal(entries, {
+      actorNameByUserId: new Map([
+        ["clerk_x", "Vanessa Rabba"],
+        ["clerk_removed", null],
+      ]),
+      viewerIsTestAccount: true,
+    });
+    expect(result.find((e) => e.docId === "aud_h")?.actorName).toBe("Vanessa Rabba");
+    expect(result.find((e) => e.docId === "aud_ai")?.actorName).toBe("Léa");
+    expect(result.find((e) => e.docId === "aud_sys")?.actorName).toBe("Système");
+    expect(result.find((e) => e.docId === "aud_unknown_h")?.actorName).toBeNull();
+  });
+
+  it("sentinelle anti-régression : les identifiants Clerk/Slack bruts n'apparaissent JAMAIS dans actorName", () => {
+    const entries = [makeEntry({ actorId: "user_abc123def456" })];
+    const result = sanitizeAuditEntriesForJournal(entries, {
+      actorNameByUserId: new Map(),
+      viewerIsTestAccount: true,
+    });
+    expect(result[0]?.actorName).toBeNull();
+    // Serialize → pas d'`user_...` ni de `clerk_...` ni de `U[A-Z0-9]{8+}`.
+    const json = JSON.stringify(result);
+    expect(json).not.toMatch(/user_[A-Za-z0-9]{10,}/);
+    expect(json).not.toMatch(/\bU[A-Z0-9]{8,}\b/);
+    expect(json).not.toMatch(/clerk_/);
   });
 });

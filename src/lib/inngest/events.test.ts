@@ -115,6 +115,28 @@ describe("SmsSendFirstRequestedDataSchema", () => {
     expect(result.success).toBe(false);
   });
 
+  it("PR3 Point 0 — sentinelle anti-régression : `phone` jamais dans le payload", () => {
+    // Invariant pipeline 1er SMS : le numéro NE QUITTE PAS Firestore
+    // côté serveur. `send-first-sms` (route) ne lit le téléphone nulle
+    // part dans le body ; l'event Inngest `smsSendFirstRequested` ne
+    // transporte pas de `phone` ; l'Inngest handler relit depuis
+    // Firestore via `getContact(contactId)` et dispatche OVH avec
+    // `loaded.contact.phone.e164` (cf. `send-first-sms.ts:282`).
+    //
+    // Si un futur dev tente d'optimiser en passant le `phone` dans
+    // l'event (sous prétexte d'économiser un Firestore read), ce test
+    // doit échouer : la surface Inngest cloud doit rester PII-minimale
+    // et le numéro provient toujours de la source de vérité serveur.
+    const sneakyPhone = { ...validData, phone: "+33612345678" };
+    expect(SmsSendFirstRequestedDataSchema.safeParse(sneakyPhone).success).toBe(false);
+
+    const sneakyPhoneObj = {
+      ...validData,
+      phone: { e164: "+33612345678", raw: "0612345678" },
+    };
+    expect(SmsSendFirstRequestedDataSchema.safeParse(sneakyPhoneObj).success).toBe(false);
+  });
+
   it("refuse les champs manquants", () => {
     const result = SmsSendFirstRequestedDataSchema.safeParse({
       contactId: "c",

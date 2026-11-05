@@ -13,10 +13,26 @@
  */
 import "@testing-library/jest-dom/vitest";
 
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { Timestamp } from "firebase-admin/firestore";
 import { beforeEach, describe, expect, it, vi } from "vitest";
+
+/**
+ * Wrapper QueryClient — la colonne `phone` du tableau rend désormais
+ * `RevealPhoneAction` (PR3 tour 2b) qui utilise `useMutation` et requiert
+ * un `QueryClientProvider` dans l'arbre. On en instancie un par test
+ * pour isoler les éventuels caches (il n'y en a pas puisque la mutation
+ * ne cache rien, mais la discipline est la même que le wrapper
+ * applicatif `src/app/layout.tsx`).
+ */
+function renderWithQuery(ui: React.ReactElement) {
+  const client = new QueryClient({
+    defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
+  });
+  return render(<QueryClientProvider client={client}>{ui}</QueryClientProvider>);
+}
 
 // Mock nuqs : useQueryState retourne [value, setter] standard.
 const setCursorMock = vi.fn();
@@ -32,7 +48,7 @@ vi.mock("sonner", () => ({
 }));
 
 import type { HubspotListInfo } from "@/lib/hubspot/lists";
-import type { Contact } from "@/types/contact";
+import type { ContactListItem } from "@/types/contact";
 
 import { ContactsPageClient } from "./contacts-page-client";
 
@@ -46,7 +62,10 @@ const CAMPAIGNS: HubspotListInfo[] = [
   },
 ];
 
-function buildContact(overrides: Partial<Contact> = {}): Contact {
+// PR3 — fixture `ContactListItem` (plus de `phone` complet, uniquement
+// `phoneLast4` + `phoneMeta`). Miroir exact du JSON renvoyé par
+// `/api/admin/contacts` après la révocation D2.
+function buildContact(overrides: Partial<ContactListItem> = {}): ContactListItem {
   const now = Timestamp.now();
   return {
     hubspotId: "hs_test_1",
@@ -57,13 +76,8 @@ function buildContact(overrides: Partial<Contact> = {}): Contact {
     city: "Paris",
     postalCode: "75001",
     email: "jean.dupont@cabinet-test.fr",
-    phone: {
-      e164: "+33612345678",
-      raw: "06 12 34 56 78",
-      type: "mobile",
-      valid: true,
-      lookupAt: now,
-    },
+    phoneLast4: "5678",
+    phoneMeta: { type: "mobile", valid: true },
     segment: "b2b_cabinet",
     bloctelChecked: true,
     bloctelOptOut: false,
@@ -98,7 +112,7 @@ describe("ContactsPageClient (S10.1.5 Phase 6)", () => {
       .spyOn(global, "fetch")
       .mockResolvedValue(jsonResponse({ contacts: [], nextCursor: null, hasMore: false }));
 
-    render(<ContactsPageClient initialCampaigns={CAMPAIGNS} />);
+    renderWithQuery(<ContactsPageClient initialCampaigns={CAMPAIGNS} />);
 
     expect(screen.getByRole("heading", { name: "Contacts", level: 1 })).toBeInTheDocument();
     expect(screen.getByLabelText("Sélectionner une campagne")).toBeInTheDocument();
@@ -118,7 +132,7 @@ describe("ContactsPageClient (S10.1.5 Phase 6)", () => {
       jsonResponse({ contacts: [contact], nextCursor: null, hasMore: false }),
     );
 
-    render(<ContactsPageClient initialCampaigns={CAMPAIGNS} />);
+    renderWithQuery(<ContactsPageClient initialCampaigns={CAMPAIGNS} />);
 
     // S10.1.7-Q1-D : tous les expects dans le MÊME waitFor — re-poll
     // jusqu'à ce que TOUT le sous-arbre settle (row Marie Curie +
@@ -139,7 +153,7 @@ describe("ContactsPageClient (S10.1.5 Phase 6)", () => {
       jsonResponse({ contacts: [], nextCursor: null, hasMore: false }),
     );
 
-    render(<ContactsPageClient initialCampaigns={CAMPAIGNS} />);
+    renderWithQuery(<ContactsPageClient initialCampaigns={CAMPAIGNS} />);
 
     await waitFor(() => {
       expect(screen.getByText(/Aucun contact trouvé pour ces filtres/)).toBeInTheDocument();
@@ -151,7 +165,7 @@ describe("ContactsPageClient (S10.1.5 Phase 6)", () => {
       jsonResponse({ error: { code: "INTERNAL", message: "Firestore down" } }, 500),
     );
 
-    render(<ContactsPageClient initialCampaigns={CAMPAIGNS} />);
+    renderWithQuery(<ContactsPageClient initialCampaigns={CAMPAIGNS} />);
 
     await waitFor(() => {
       expect(screen.getByText(/Impossible de charger les contacts \(500\)/)).toBeInTheDocument();
@@ -168,7 +182,7 @@ describe("ContactsPageClient (S10.1.5 Phase 6)", () => {
       }),
     );
 
-    render(<ContactsPageClient initialCampaigns={CAMPAIGNS} />);
+    renderWithQuery(<ContactsPageClient initialCampaigns={CAMPAIGNS} />);
 
     const nextBtn = await screen.findByRole("button", { name: "Page suivante" });
     await waitFor(() => expect(nextBtn).not.toBeDisabled());
@@ -182,7 +196,7 @@ describe("ContactsPageClient (S10.1.5 Phase 6)", () => {
       jsonResponse({ contacts: [buildContact()], nextCursor: null, hasMore: false }),
     );
 
-    render(<ContactsPageClient initialCampaigns={CAMPAIGNS} />);
+    renderWithQuery(<ContactsPageClient initialCampaigns={CAMPAIGNS} />);
 
     const nextBtn = await screen.findByRole("button", { name: "Page suivante" });
     await waitFor(() => expect(nextBtn).toBeDisabled());
@@ -193,7 +207,7 @@ describe("ContactsPageClient (S10.1.5 Phase 6)", () => {
       jsonResponse({ contacts: [buildContact()], nextCursor: null, hasMore: false }),
     );
 
-    render(<ContactsPageClient initialCampaigns={CAMPAIGNS} />);
+    renderWithQuery(<ContactsPageClient initialCampaigns={CAMPAIGNS} />);
 
     const firstBtn = await screen.findByRole("button", { name: "Première page" });
     expect(firstBtn).toBeDisabled();
@@ -215,7 +229,7 @@ describe("ContactsPageClient (S10.1.5 Phase 6)", () => {
       jsonResponse({ contacts: [buildContact()], nextCursor: null, hasMore: false }),
     );
 
-    render(<ContactsPageClient initialCampaigns={CAMPAIGNS} />);
+    renderWithQuery(<ContactsPageClient initialCampaigns={CAMPAIGNS} />);
 
     const firstBtn = await screen.findByRole("button", { name: "Première page" });
     await waitFor(() => expect(firstBtn).not.toBeDisabled());
@@ -229,7 +243,7 @@ describe("ContactsPageClient (S10.1.5 Phase 6)", () => {
       jsonResponse({ contacts: [buildContact()], nextCursor: null, hasMore: false }),
     );
 
-    render(<ContactsPageClient initialCampaigns={CAMPAIGNS} />);
+    renderWithQuery(<ContactsPageClient initialCampaigns={CAMPAIGNS} />);
 
     await waitFor(() => {
       // "1 contact affiché" — singulier (vs pluriel testé plus haut)

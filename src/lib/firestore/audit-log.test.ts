@@ -974,3 +974,89 @@ describe("PR-A — sentinelle inbound_relayed_to_human anti-PII (defense-in-dept
     expect(await countAuditDocs()).toBe(0);
   });
 });
+
+// ─────────────────────────────────────────────────────────────────────────────
+// PR3 tour 2b bis (ter) — sentinelle actorTestAccount
+// ─────────────────────────────────────────────────────────────────────────────
+
+describe("PR3 — sentinelle actorTestAccount (top-level obligatoire pour human)", () => {
+  beforeEach(async () => {
+    vi.unstubAllEnvs();
+    vi.stubEnv("AUDIT_PII_PEPPER", PEPPER);
+    await fullReset();
+  });
+
+  afterEach(async () => {
+    vi.unstubAllEnvs();
+    await fullReset();
+  });
+
+  it("human SANS actorTestAccount → ValidationError + 0 doc créé", async () => {
+    await expect(
+      appendAuditLog({
+        actorId: "clerk_admin",
+        actorType: "human",
+        action: "contact_phone_accessed",
+        targetType: "contact",
+        targetId: "hs_abc",
+        payload: { method: "display", contactId: "hs_abc" },
+      }),
+    ).rejects.toBeInstanceOf(ValidationError);
+    expect(await countAuditDocs()).toBe(0);
+  });
+
+  it("human AVEC actorTestAccount: false → doc créé + champ top-level persisté", async () => {
+    const docId = await appendAuditLog({
+      actorId: "clerk_admin",
+      actorType: "human",
+      actorTestAccount: false,
+      action: "contact_phone_accessed",
+      targetType: "contact",
+      targetId: "hs_abc",
+      payload: { method: "display", contactId: "hs_abc" },
+    });
+    const snap = await getAdminDb().collection(__AUDIT_COLLECTION_FOR_TESTS).doc(docId).get();
+    expect(snap.exists).toBe(true);
+    expect(snap.data()?.actorTestAccount).toBe(false);
+  });
+
+  it("human AVEC actorTestAccount: true → doc créé + champ top-level persisté", async () => {
+    const docId = await appendAuditLog({
+      actorId: "clerk_e2e",
+      actorType: "human",
+      actorTestAccount: true,
+      action: "contact_phone_accessed",
+      targetType: "contact",
+      targetId: "hs_abc",
+      payload: { method: "display", contactId: "hs_abc" },
+    });
+    const snap = await getAdminDb().collection(__AUDIT_COLLECTION_FOR_TESTS).doc(docId).get();
+    expect(snap.data()?.actorTestAccount).toBe(true);
+  });
+
+  it("system SANS actorTestAccount → défaut false (dérivation serveur)", async () => {
+    const docId = await appendAuditLog({
+      actorId: "system",
+      actorType: "system",
+      action: "compliance_check",
+      targetType: "contact",
+      targetId: "contact_sys",
+      payload: { result: "allowed" },
+    });
+    const snap = await getAdminDb().collection(__AUDIT_COLLECTION_FOR_TESTS).doc(docId).get();
+    expect(snap.data()?.actorTestAccount).toBe(false);
+  });
+
+  it("ai SANS actorTestAccount → défaut false (dérivation serveur)", async () => {
+    const docId = await appendAuditLog({
+      actorId: "sonnet-4-6",
+      actorType: "ai",
+      action: "intent_classified",
+      targetType: "conversation",
+      targetId: "conv_ai",
+      payload: { intent: "INTERESSE", confidence: 0.9, fallback: false },
+    });
+    const snap = await getAdminDb().collection(__AUDIT_COLLECTION_FOR_TESTS).doc(docId).get();
+    expect(snap.data()?.actorTestAccount).toBe(false);
+  });
+});

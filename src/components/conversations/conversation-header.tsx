@@ -1,23 +1,31 @@
 /**
- * En-tête contact de la vue conversation (VUE-CONVERSATION PR1).
+ * En-tête contact de la vue conversation (VUE-CONVERSATION PR1 → PR3).
  *
  * Affiche : civilité + prénom + nom + spécialité + ville. Zéro PII
  * numéro ni email (strippés par `sanitize.ts`).
  *
- * Le bouton « Afficher le numéro » devient fonctionnel en PR3 (endpoint
- * audité `contact_phone_accessed`). D'ici là il est grisé avec badge
- * « Bientôt », aligné sur le pattern des items sidebar non fonctionnels
- * (décision produit PR1.14 : cibles visibles, jamais masquées).
+ * PR3 tour 2b — le bouton « Afficher le numéro » est branché sur
+ * `POST /api/admin/conversations/[id]/reveal-phone` via
+ * `RevealPhoneAction`. Chaque action (afficher/copier/appeler) déclenche
+ * un write `contact_phone_accessed` audité AVANT de rendre le numéro ;
+ * audit en échec = clipboard et tel: intacts (cf. JSDoc du composant).
  */
-import { MapPin, Phone, Stethoscope } from "lucide-react";
+import { MapPin, Stethoscope } from "lucide-react";
 
-import { Badge } from "@/components/ui/badge";
-
+import { RevealPhoneAction } from "./reveal-phone-action";
 import type { ContactHeaderProps, ConversationDisplayIntent } from "./types";
 
 interface Props {
   contact: ContactHeaderProps;
   intent: ConversationDisplayIntent;
+  /**
+   * docId Firestore composite `${contactId}_${campaignId}` — passé à
+   * `RevealPhoneAction` pour construire l'endpoint audité. Requis en PR3.
+   * `phoneLast4` est lu depuis `contact.phoneLast4` (source unique).
+   */
+  conversationId: string;
+  /** Callback appelé après chaque POST reveal-phone réussi — invalide le journal. */
+  onAudited?: () => void;
 }
 
 const INTENT_LABELS: Record<ConversationDisplayIntent, string> = {
@@ -36,7 +44,7 @@ const INTENT_CLASSES: Record<ConversationDisplayIntent, string> = {
   unknown: "border-dashed border-border bg-card text-muted-foreground",
 };
 
-export function ConversationHeader({ contact, intent }: Props) {
+export function ConversationHeader({ contact, intent, conversationId, onAudited }: Props) {
   const fullName = buildFullName(contact);
   return (
     <header className="flex flex-col gap-3 border-b pb-4 md:flex-row md:items-start md:justify-between">
@@ -64,22 +72,11 @@ export function ConversationHeader({ contact, intent }: Props) {
         </div>
       </div>
 
-      {/* "Afficher le numéro" — grisé jusqu'à PR3 (endpoint audité). */}
-      <div className="flex items-center gap-2">
-        <button
-          type="button"
-          disabled
-          aria-label="Afficher le numéro, disponible prochainement"
-          title="Disponible prochainement"
-          className="inline-flex cursor-not-allowed items-center gap-2 rounded-md border border-border bg-card px-3 py-2 text-sm text-muted-foreground opacity-60"
-        >
-          <Phone className="h-4 w-4" aria-hidden="true" />
-          Afficher le numéro
-          <Badge variant="outline" className="text-[10px] uppercase tracking-wide">
-            Bientôt
-          </Badge>
-        </button>
-      </div>
+      <RevealPhoneAction
+        endpoint={`/api/admin/conversations/${encodeURIComponent(conversationId)}/reveal-phone`}
+        phoneLast4={contact.phoneLast4}
+        onAudited={onAudited}
+      />
     </header>
   );
 }

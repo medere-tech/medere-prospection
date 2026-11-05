@@ -5,11 +5,15 @@
  * Source de vérité : skill `medere-firestore-schema`, section 4.
  *
  * ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
- * Règles invariantes (CNIL / RGPD) :
+ * Règles projet (choix d'ingénierie, pas obligation légale démontrée
+ * par un article précis) :
  *
- *   1. **Append-only**. Aucun update, aucun delete (sauf purge légale
- *      à 5 ans). Forfait : si on doit corriger une entrée, on écrit une
- *      nouvelle entrée `manual_override` qui la pointe — JAMAIS modifier.
+ *   1. **Append-only**. Aucun update, aucun delete côté applicatif.
+ *      Forfait : si on doit corriger une entrée, on écrit une nouvelle
+ *      entrée `manual_override` qui la pointe — JAMAIS modifier. C'est
+ *      une règle projet qui simplifie le forensic ET qui permet au
+ *      chemin legacy de `fetchJournalEntriesRealOnly` de prouver la
+ *      borne de son coût (le set « docs legacy » ne grossit plus).
  *
  *   2. **Pas de PII en clair dans `payload`**. Téléphone (E.164 ou FR),
  *      email, nom complet sont INTERDITS. Pour téléphone : utiliser
@@ -780,8 +784,14 @@ export type ContactPhoneAccessMethod = "display" | "copy" | "call";
 export interface ContactPhoneAccessedPayload {
   /** Methode d'acces : `display` (afficher) | `copy` (copier) | `call` (appeler). */
   method: ContactPhoneAccessMethod;
-  /** docId composite `${contactId}_${campaignId}` — origine du clic. */
-  conversationId: string;
+  /**
+   * docId composite `${contactId}_${campaignId}` — origine du clic quand
+   * le reveal se fait depuis une page conversation. OPTIONAL depuis PR3
+   * Tour 2a : la route `/api/admin/contacts/[id]/reveal-phone` (admin,
+   * liste `/admin/contacts`) n'a pas de conversation à référencer, et
+   * omet proprement la clef plutôt que d'inventer une valeur vide.
+   */
+  conversationId?: string;
   /** hubspotId opaque (duplique avec `targetId` pour requete payload). */
   contactId: string;
   // Index signature explicite : permet l'assignation a
@@ -915,11 +925,39 @@ export interface AuditLog {
   ipAddress?: string;
   userAgent?: string;
   timestamp: Timestamp;
+  /**
+   * PR3 tour 2b bis (ter) — booléen top-level posé par `appendAuditLog`
+   * sur CHAQUE nouvelle entrée. Indexé (cf. `firestore.indexes.json`) et
+   * utilisé par la vue journal pour filtrer en O(1) les clics du harnais
+   * Playwright qui autrement polluent la vue d'un compte réel sur la
+   * conv `427963864300_hubspot-list-6081` (12 entrées test/run).
+   *
+   * Dérivation côté serveur :
+   *   - `actorType === "system"` → `false` (toujours).
+   *   - `actorType === "ai"`     → `false` (toujours).
+   *   - `actorType === "human"`  → OBLIGATOIRE côté caller (sinon
+   *     `ValidationError` thrown par la sentinelle `validateAndScrub`).
+   *
+   * Les docs ÉCRITS AVANT l'introduction du champ (cf.
+   * `AUDIT_ACTOR_TESTACCOUNT_INTRODUCED_AT` dans
+   * `src/lib/firestore/audit-log.ts`) n'ont pas ce champ — ils sont lus
+   * via le chemin legacy de `fetchJournalEntriesRealOnly`.
+   */
+  actorTestAccount: boolean;
 }
 
 /**
  * Forme d'entrée pour `appendAuditLog()` — pas de `timestamp` (posé
  * côté serveur). Validation Zod + scrubber PII appliquée par
  * `lib/firestore/audit-log.ts`.
+ *
+ * `actorTestAccount` reste OPTIONAL au niveau TypeScript : la Zod +
+ * `validateAndScrub` dérivent `false` pour les acteurs `system`/`ai`,
+ * et throw `ValidationError` quand un acteur `human` omet le flag.
+ * Cette asymétrie permet aux ~71 call sites system/ai existants de
+ * rester inchangés ; les ~7 call sites human doivent fournir le flag
+ * explicitement.
  */
-export type AuditLogInput = Omit<AuditLog, "timestamp">;
+export type AuditLogInput = Omit<AuditLog, "timestamp" | "actorTestAccount"> & {
+  actorTestAccount?: boolean;
+};

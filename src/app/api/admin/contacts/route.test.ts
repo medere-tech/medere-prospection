@@ -301,7 +301,12 @@ describe("GET /api/admin/contacts", () => {
       expect(callArg?.filters?.status).toBe("in_conversation");
     });
 
-    it("D2 — phone retourné EN CLAIR (e164 + raw) — pas de maskPhone backend", async () => {
+    // PR3 (D2 RÉVOQUÉE) — la route NE renvoie plus `phone.e164` ni
+    // `phone.raw`. Le dévoilement passe désormais par
+    // `POST /api/admin/contacts/[id]/reveal-phone` (audité). Cette
+    // sentinelle échoue si une régression réintroduit un E.164 ou le
+    // raw formaté dans le JSON de liste.
+    it("sentinelle — JSON de liste ne contient JAMAIS phone.e164 ni phone.raw", async () => {
       mockListContacts.mockResolvedValue({
         contacts: [buildFakeContact()],
         nextCursor: null,
@@ -311,12 +316,17 @@ describe("GET /api/admin/contacts", () => {
       const res = await GET(mockReq());
       const bodyText = await res.text();
 
-      // E.164 complet présent.
-      expect(bodyText).toContain("+33612345678");
-      // Forme raw présente.
-      expect(bodyText).toContain("06 12 34 56 78");
-      // Aucun masquage `*` appliqué.
-      expect(bodyText).not.toContain("***");
+      // E.164 complet absent.
+      expect(bodyText).not.toContain("+33612345678");
+      // Raw formaté absent.
+      expect(bodyText).not.toContain("06 12 34 56 78");
+      // Clés JSON `e164` et `raw` absentes du payload liste.
+      expect(bodyText).not.toMatch(/"e164"\s*:/);
+      expect(bodyText).not.toMatch(/"raw"\s*:/);
+      // Mais `phoneLast4` reste présent — c'est la forme autorisée.
+      expect(bodyText).toContain('"phoneLast4":"5678"');
+      // Et le Cache-Control est no-store (PR3 — pas de cache navigateur).
+      expect(res.headers.get("cache-control")).toContain("no-store");
     });
   });
 

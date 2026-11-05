@@ -28,10 +28,10 @@ export const dynamic = "force-dynamic";
 export default async function ConversationDetailPage({ params }: { params: Promise<Params> }) {
   // PR1.14.2 → factorisé en `requireRoleOrForbidden` (PR2b-1 round 3).
   // Même pattern utilisé par layout + page liste.
-  const { role, slackUserId } = await requireRoleOrForbidden("commercial");
+  const { role, slackUserId, testAccount } = await requireRoleOrForbidden("commercial");
   const { id } = await params;
 
-  const result = await loadConversationDetail(id, { role, slackUserId });
+  const result = await loadConversationDetail(id, { role, slackUserId, testAccount });
 
   if (result.kind === "not_found") {
     notFound();

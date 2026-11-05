@@ -29,7 +29,7 @@ import {
 } from "@/components/ui/table";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import type { HubspotListInfo } from "@/lib/hubspot/lists";
-import type { Contact } from "@/types/contact";
+import type { ContactListItem } from "@/types/contact";
 
 import { CampaignSelect } from "./campaign-select";
 import { contactColumns } from "./columns";
@@ -41,7 +41,9 @@ import { StatusFilter } from "./status-filter";
 // ─────────────────────────────────────────────────────────────────────────────
 
 interface ContactsApiResponse {
-  contacts: Contact[];
+  // PR3 — plus de `Contact` complet (pas de `phone.e164`/`raw`). La route
+  // sanitize vers `ContactListItem` avec `phoneLast4` + méta non PII.
+  contacts: ContactListItem[];
   nextCursor: string | null;
   hasMore: boolean;
 }
@@ -110,7 +112,7 @@ export function ContactsPageClient({ initialCampaigns }: ContactsPageClientProps
    * modal puisse rendre son header riche (nom, ville, phone masqué) sans
    * fetch supplémentaire. Data déjà en cache via `/api/admin/contacts`.
    */
-  const [previewContact, setPreviewContact] = useState<Contact | null>(null);
+  const [previewContact, setPreviewContact] = useState<ContactListItem | null>(null);
   /** Bumpé après send success → trigger refetch sans bouger filtres/cursor. */
   const [refetchKey, setRefetchKey] = useState(0);
 
@@ -133,9 +135,9 @@ export function ContactsPageClient({ initialCampaigns }: ContactsPageClientProps
   const hasMore = state.kind === "success" ? state.data.hasMore : false;
   const nextCursor = state.kind === "success" ? state.data.nextCursor : null;
 
-  const table = useReactTable<Contact>({
+  const table = useReactTable<ContactListItem>({
     data,
-    columns: contactColumns as ColumnDef<Contact>[],
+    columns: contactColumns as ColumnDef<ContactListItem>[],
     manualPagination: true,
     pageCount: -1,
     getCoreRowModel: getCoreRowModel(),

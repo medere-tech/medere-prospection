@@ -90,6 +90,19 @@ export interface ContactHeaderProps {
   city: string | null;
   /** `true` si le contact a `consent.optedOut`. Affiché en pastille rouge. */
   optedOut: boolean;
+  /**
+   * PR3 tour 2b — 4 derniers chiffres du numéro, utilisés par
+   * `RevealPhoneAction` pour afficher le masque `•• •• •• •• •• XX`
+   * avant qu'un clic audité ne dévoile le numéro complet. Considéré
+   * non-PII par PR3 tour 2a (miroir `ContactListItem.phoneLast4`).
+   *
+   * `null` fail-closed (PR3 tour 2b bis quinquies) : le contact n'a pas
+   * de `phone.e164` (doc Firestore corrompu ou enrichissement échoué).
+   * L'UI (`RevealPhoneAction`) affiche « Numéro indisponible » sans
+   * bouton. L'ancienne valeur par défaut `"0000"` aurait affiché un
+   * faux masque et un bouton qui échoue côté serveur avec 500.
+   */
+  phoneLast4: string | null;
 }
 
 /** Infos hand-off à afficher dans le panneau latéral. */
@@ -112,6 +125,21 @@ export interface JournalEntryProps {
   label: string;
   /** Icône générique recommandée pour l'UI. */
   kind: "handoff" | "opt_out" | "intent" | "override" | "sms" | "other";
+  /**
+   * PR3 tour 2b — nom de l'auteur de l'action, résolu côté serveur :
+   *   - `actorType === "human"` → prénom + nom Clerk (via
+   *     `resolveAdminNamesBatch`), ou `null` si le compte Clerk a été
+   *     supprimé / Clerk indispo.
+   *   - `actorType === "ai"`     → `"Léa"` (convention projet).
+   *   - `actorType === "system"` → `"Système"`.
+   *   - `null` — fallback ultime quand rien n'est résolvable. L'UI
+   *     affiche alors la ligne sans préfixe « — ».
+   *
+   * 🚨 JAMAIS d'identifiant brut (userId Clerk / Slack / HubSpot) côté
+   * client — la sentinelle `assertNoTechnicalId` de `fixtures.ts` tombe
+   * dès qu'un `U...` ou `user_...` apparaît dans le DOM de l'UI admin.
+   */
+  actorName: string | null;
 }
 
 /** Shape complète passée au client wrapper. */

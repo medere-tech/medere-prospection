@@ -56,6 +56,17 @@ export function sanitizeContactForHeader(contact: Contact): ContactHeaderProps {
     speciality: contact.speciality && contact.speciality.length > 0 ? contact.speciality : null,
     city: contact.city && contact.city.length > 0 ? contact.city : null,
     optedOut: Boolean(contact.consent?.optedOut),
+    // PR3 tour 2b — 4 derniers chiffres uniquement (non PII par
+    // construction, pattern miroir `ContactListItem.phoneLast4` posé en
+    // PR3 tour 2a). Permet au composant `RevealPhoneAction` de l'en-tête
+    // d'afficher `•• •• •• •• •• XX` avant tout clic audité.
+    //
+    // Fail-closed (PR3 tour 2b bis quinquies) : si le doc contact est
+    // corrompu (`phone.e164` absent ou non-string), on retourne `null` —
+    // jamais `"0000"` qui afficherait un faux masque et un bouton qui
+    // échouerait ensuite côté serveur avec 500. `RevealPhoneAction` sait
+    // rendre « Numéro indisponible » sans bouton quand `phoneLast4 === null`.
+    phoneLast4: typeof contact.phone?.e164 === "string" ? contact.phone.e164.slice(-4) : null,
   };
 }
 
@@ -183,6 +194,9 @@ const ACTION_LABELS: Record<AuditAction, { label: string; kind: JournalEntryProp
     label: "SMS entrant sur conversation inactive",
     kind: "other",
   },
+  // PR3 — un libellé par méthode (`display | copy | call`) via résolution
+  // par payload dans `labelForAction`. Le fallback générique « Numéro
+  // consulté » reste si le payload est absent (docs legacy pré-PR3).
   contact_phone_accessed: { label: "Numéro consulté", kind: "override" },
   // CAMPAIGN / ADMIN
   manual_override: { label: "Intervention manuelle (admin)", kind: "override" },
@@ -222,9 +236,33 @@ const ACTION_LABELS: Record<AuditAction, { label: string; kind: JournalEntryProp
   orphan_reopened: { label: "SMS orphelin remis à traiter", kind: "other" },
 };
 
-function labelForAction(action: string): { label: string; kind: JournalEntryProps["kind"] } {
+/**
+ * PR3 — table exhaustive des libellés `contact_phone_accessed` par méthode.
+ * Trois valeurs, 100 % couvertes par l'enum fermé `ContactPhoneAccessMethod`
+ * (`src/types/audit-log.ts:747-755`). Fallback générique « Numéro consulté »
+ * (via `ACTION_LABELS`) si un doc legacy (pré-PR3) n'a pas de `method`.
+ */
+export const PHONE_ACCESSED_LABELS: Record<"display" | "copy" | "call", string> = {
+  display: "Numéro affiché",
+  copy: "Numéro copié",
+  call: "Appel lancé",
+};
+
+function labelForAction(
+  action: string,
+  payload?: Record<string, unknown>,
+): { label: string; kind: JournalEntryProps["kind"] } {
   if (Object.prototype.hasOwnProperty.call(ACTION_LABELS, action) as boolean) {
-    return ACTION_LABELS[action as AuditAction];
+    const base = ACTION_LABELS[action as AuditAction];
+    // PR3 — spécialisation `contact_phone_accessed` par méthode. Fail-safe
+    // au libellé générique si `method` manquant ou hors enum (docs legacy).
+    if (action === "contact_phone_accessed" && payload !== undefined) {
+      const m = payload.method;
+      if (m === "display" || m === "copy" || m === "call") {
+        return { label: PHONE_ACCESSED_LABELS[m], kind: base.kind };
+      }
+    }
+    return base;
   }
   // Action inconnue au type TS (devrait être impossible — la whitelist Zod
   // `ACTIONS` de `audit-log.ts` + le type `AuditAction` sont en égalité
@@ -237,20 +275,83 @@ export const __labelForAction_FOR_TESTS = labelForAction;
 export const __ACTION_LABELS_FOR_TESTS = ACTION_LABELS;
 
 /**
+ * Options pour `sanitizeAuditEntriesForJournal` (PR3 tour 2b).
+ */
+export interface SanitizeJournalOptions {
+  /**
+   * Map `actorId` Clerk → nom affichable (préfixé par `resolveAdminNamesBatch`).
+   * Ne couvre que les `actorType === "human"` collectés en amont. Les autres
+   * acteurs (`ai` / `system`) ont un libellé constant.
+   */
+  readonly actorNameByUserId: ReadonlyMap<string, string | null>;
+  /**
+   * `true` ssi le viewer courant est un compte test (claim JWT Clerk
+   * `testAccount`). Quand `false`, on filtre les entrées dont le payload
+   * audit porte `actorTestAccount === true` — un vrai utilisateur ne doit
+   * pas voir les clics simulés par le harnais Playwright pollur le journal
+   * d'une conversation réelle. Miroir du filtre fixtures orphelins
+   * (`isTestFixture === true` masqué pour les comptes réels).
+   */
+  readonly viewerIsTestAccount: boolean;
+}
+
+/**
  * Sanitize une liste d'entrées `audit_log` en entrées de journal (shape
  * minimale `JournalEntryProps`). `timestampLabel` est pré-formaté en
  * Europe/Paris côté serveur pour éviter de passer les Timestamp au client.
+ *
+ * PR3 tour 2b — ajoute :
+ *   - résolution serveur de `actorName` (Clerk) injectée via
+ *     `options.actorNameByUserId` ;
+ *   - filtre des entrées `actorTestAccount === true` pour les viewers
+ *     non-testAccount.
  */
 export function sanitizeAuditEntriesForJournal(
   entries: Array<AuditLog & { docId: string }>,
+  options: SanitizeJournalOptions,
 ): JournalEntryProps[] {
-  return entries.map((e) => {
-    const { label, kind } = labelForAction(e.action);
-    return {
-      docId: e.docId,
-      timestampLabel: formatDateTimeParis(e.timestamp),
-      label,
-      kind,
-    };
-  });
+  return entries
+    .filter((e) => {
+      // Filtre test-account : un compte réel ne voit pas les entrées
+      // posées par un harnais Playwright. La sentinelle est le flag
+      // `actorTestAccount` posé en payload par `revealContactPhone` (et
+      // tout futur site d'écriture qui voudra adopter le même pattern).
+      if (options.viewerIsTestAccount) return true;
+      return e.payload?.actorTestAccount !== true;
+    })
+    .map((e) => {
+      // PR3 — `payload` passé au résolveur pour spécialiser
+      // `contact_phone_accessed` par méthode (`display`/`copy`/`call`).
+      const { label, kind } = labelForAction(e.action, e.payload);
+      return {
+        docId: e.docId,
+        timestampLabel: formatDateTimeParis(e.timestamp),
+        label,
+        kind,
+        actorName: resolveActorName(e, options.actorNameByUserId),
+      };
+    });
+}
+
+/**
+ * Résout le nom d'un acteur pour affichage dans le journal.
+ *
+ *   - `human` → map Clerk (prénom + nom résolu côté serveur). Si non
+ *     résolvable (compte supprimé, erreur Clerk), on retourne `null` et
+ *     l'UI tombera sur « — » (pas d'identifiant brut).
+ *   - `ai`     → `"Léa"` (convention projet, cf. `medere-claude-prompts`).
+ *   - `system` → `"Système"`.
+ *
+ * 🚨 Jamais d'identifiant Clerk/Slack/HubSpot brut — c'est la sentinelle
+ * `assertNoTechnicalId` de l'e2e fixtures qui tombe sinon.
+ */
+function resolveActorName(
+  entry: AuditLog & { docId: string },
+  actorNameByUserId: ReadonlyMap<string, string | null>,
+): string | null {
+  if (entry.actorType === "ai") return "Léa";
+  if (entry.actorType === "system") return "Système";
+  // human
+  const resolved = actorNameByUserId.get(entry.actorId);
+  return resolved ?? null;
 }

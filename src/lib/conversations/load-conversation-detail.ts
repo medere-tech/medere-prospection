@@ -51,19 +51,102 @@ import type {
   MessageProps,
 } from "@/components/conversations/types";
 import { resolveCommercialBySlackUserId } from "@/lib/airtable/commerciaux";
+import { resolveAdminNamesBatch } from "@/lib/auth/resolve-admin-name";
 import { resolveCampaignName } from "@/lib/campaigns/campaign-id";
 import { campaignNameByListIdFrom, getCachedSmsCampaigns } from "@/lib/campaigns/campaigns-cache";
+import { getAdminDb } from "@/lib/firestore/admin";
 import { listAuditLogByTarget } from "@/lib/firestore/audit-log";
 import { getContact } from "@/lib/firestore/contacts";
 import { getConversation } from "@/lib/firestore/conversations";
 import { listMessagesInConversation } from "@/lib/firestore/messages";
 import { logger } from "@/lib/utils/logger";
+import type { AuditLog, AuditTargetType } from "@/types/audit-log";
 
 export type LoadConversationDetailResult =
   | { kind: "ok"; data: ConversationDetailProps }
   | { kind: "not_found" }
   | { kind: "not_mine"; assignedToName: string | null }
   | { kind: "error"; code: string };
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Journal — lecture unique indexée, coût O(20) indépendant des entrées test
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * Taille cible du journal pour le viewer réel. L'UI n'affiche aujourd'hui
+ * que les 5 plus récentes, on en collecte 20 pour que le slice final
+ * reste stable même si plusieurs entrées se disputent la tête.
+ */
+const JOURNAL_REAL_TARGET_COUNT = 20;
+
+/**
+ * Lit les entrées d'audit pour un `(targetType, targetId)` donné.
+ *
+ * ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ * Un seul chemin de lecture
+ *
+ *   - `viewerIsTestAccount: true`  → lecture simple `listAuditLogByTarget`
+ *     (voit tout — canal de debug du harnais).
+ *   - `viewerIsTestAccount: false` → query indexée unique :
+ *       where targetType == tt
+ *         AND targetId == ti
+ *         AND actorTestAccount == false
+ *         orderBy timestamp DESC
+ *         limit 20
+ *     Utilise l'index composite #15 (`targetType + targetId +
+ *     actorTestAccount + timestamp DESC`). Coût O(20) indépendant du
+ *     nombre d'entrées test accumulées.
+ *
+ * ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ * Pré-condition : rattrapage des entrées sans le champ top-level
+ *
+ *   Firestore ne matche pas un champ absent à `== false`. Toute entrée
+ *   écrite AVANT ce PR (ou par un rollback de prod) est donc invisible
+ *   du journal d'un compte réel tant qu'elle n'a pas le champ.
+ *
+ *   La règle projet append-only reste tenue : on n'EDITE PAS l'événement,
+ *   on l'enrichit d'une donnée DÉRIVÉE (`actorTestAccount` dérivé du
+ *   contexte de l'auteur, calculable a posteriori à partir du payload).
+ *   Le rattrapage vit dans `src/lib/firestore/backfill-actor-test-account-core.ts`
+ *   et son script mince `scripts/backfill-audit-actor-test-account.mjs`.
+ *   Il doit être lancé une fois avant le merge pour que le journal d'un
+ *   compte réel n'ait pas de trou.
+ *
+ * ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ * Fail-closed : tout throw Firestore remonte au caller
+ * (`loadConversationDetail`) qui logge et renvoie `kind: "error"`.
+ */
+export async function fetchJournalEntriesRealOnly(args: {
+  targetType: AuditTargetType;
+  targetId: string;
+  viewerIsTestAccount: boolean;
+  targetCount?: number;
+}): Promise<Array<AuditLog & { docId: string }>> {
+  const targetCount = args.targetCount ?? JOURNAL_REAL_TARGET_COUNT;
+
+  if (args.viewerIsTestAccount) {
+    const { entries } = await listAuditLogByTarget({
+      targetType: args.targetType,
+      targetId: args.targetId,
+      limit: targetCount,
+    });
+    return entries;
+  }
+
+  const snap = await getAdminDb()
+    .collection("audit_log")
+    .where("targetType", "==", args.targetType)
+    .where("targetId", "==", args.targetId)
+    .where("actorTestAccount", "==", false)
+    .orderBy("timestamp", "desc")
+    .limit(targetCount)
+    .get();
+  return snap.docs.map((d) => ({ ...(d.data() as AuditLog), docId: d.id }));
+}
+
+export const __JOURNAL_CONSTANTS_FOR_TESTS = {
+  JOURNAL_REAL_TARGET_COUNT,
+} as const;
 
 /**
  * PR1.14.2 (fix S5) — un admin n'est "owner" d'une conversation que si
@@ -150,7 +233,17 @@ export async function resolveCampaignNameServerSide(
  */
 export async function loadConversationDetail(
   conversationId: string,
-  viewer: { role: "admin" | "commercial"; slackUserId: string | undefined },
+  viewer: {
+    role: "admin" | "commercial";
+    slackUserId: string | undefined;
+    /**
+     * PR3 tour 2b — flag JWT Clerk `testAccount`. Quand `false`, le
+     * sanitize du journal filtre les entrées dont le payload audit porte
+     * `actorTestAccount === true` (actions posées par le harnais
+     * Playwright). Quand `true`, toutes les entrées sont visibles.
+     */
+    testAccount: boolean;
+  },
 ): Promise<LoadConversationDetailResult> {
   try {
     const conv = await getConversation(conversationId);
@@ -173,11 +266,28 @@ export async function loadConversationDetail(
     }
 
     // Charge en parallèle contact + messages + 2 audits (conv + contact).
+    // PR3 tour 2b bis — les audits sont paginés jusqu'à `JOURNAL_REAL_TARGET_COUNT`
+    // entrées RÉELLES par stream (viewer réel), ou un seul fetch avec
+    // `limit = targetCount` (viewer testAccount). Fail-closed : tout throw
+    // remonte à `loadConversationDetail` (catch global en bas).
     const [contact, messagesPage, convAudit, contactAudit] = await Promise.all([
       getContact(conv.contactId),
       listMessagesInConversation({ conversationId, order: "asc", limit: 200 }),
-      listAuditLogByTarget({ targetType: "conversation", targetId: conversationId, limit: 20 }),
-      listAuditLogByTarget({ targetType: "contact", targetId: conv.contactId, limit: 20 }),
+      fetchJournalEntriesRealOnly({
+        targetType: "conversation",
+        targetId: conversationId,
+        viewerIsTestAccount: viewer.testAccount,
+      }),
+      // Le second stream (contact) peut être appelé après que l'on
+      // connaisse `conv.contactId`. Dans un `Promise.all` top-level on
+      // doit l'instancier séparément — on le fait AVANT le Promise.all
+      // en wrappant dans un IIFE qui reçoit la conv. Trop verbose : on
+      // passe directement `conv.contactId` (déjà disponible).
+      fetchJournalEntriesRealOnly({
+        targetType: "contact",
+        targetId: conv.contactId,
+        viewerIsTestAccount: viewer.testAccount,
+      }),
     ]);
 
     if (contact === null) return { kind: "not_found" };
@@ -201,13 +311,27 @@ export async function loadConversationDetail(
       .map((m) => sanitizeMessageForBubble(m, m.generatedBy === "human" ? titulaireName : null))
       .filter((m): m is MessageProps => m !== null);
 
-    // Fusion des 2 audits par date desc, top 5.
-    const merged = [...convAudit.entries, ...contactAudit.entries].sort((a, b) => {
+    // Fusion des 2 streams (chacun déjà filtré côté `fetchJournalEntriesRealOnly`
+    // pour un viewer réel) par date desc, top 5 pour la place UI actuelle.
+    // Le filtre `actorTestAccount` AU NIVEAU DE LA SANITIZE reste en
+    // place en défense en profondeur (si un futur site d'écriture
+    // oublie de dénormaliser `actorTestAccount`, il sera quand même
+    // filtré UI-side — cf. sanitize.ts).
+    const merged = [...convAudit, ...contactAudit].sort((a, b) => {
       const aMs = a.timestamp.toMillis();
       const bMs = b.timestamp.toMillis();
       return bMs - aMs;
     });
-    const journal: JournalEntryProps[] = sanitizeAuditEntriesForJournal(merged.slice(0, 5));
+    const topFive = merged.slice(0, 5);
+    const humanActorIds = topFive.filter((e) => e.actorType === "human").map((e) => e.actorId);
+    const actorNameByUserId =
+      humanActorIds.length > 0
+        ? await resolveAdminNamesBatch(humanActorIds)
+        : new Map<string, string | null>();
+    const journal: JournalEntryProps[] = sanitizeAuditEntriesForJournal(topFive, {
+      actorNameByUserId,
+      viewerIsTestAccount: viewer.testAccount,
+    });
 
     const data: ConversationDetailProps = {
       conversationId,

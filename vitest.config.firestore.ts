@@ -1,6 +1,19 @@
+import path from "node:path";
+import { fileURLToPath } from "node:url";
+
 import react from "@vitejs/plugin-react";
 import tsconfigPaths from "vite-tsconfig-paths";
 import { defineConfig } from "vitest/config";
+
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+
+/**
+ * PR3 tour 2b bis — alias `server-only` partagé avec `vitest.config.ts`.
+ * Nécessaire depuis que `loadConversationDetail` importe transitivement
+ * `resolveAdminNamesBatch` (qui `import "server-only"`). Sans l'alias,
+ * le run `test:firestore` crash avant la découverte des tests.
+ */
+const serverOnlyStubPath = path.resolve(__dirname, "tests/mocks/server-only.ts");
 
 /**
  * Config Vitest dédiée aux tests Firestore (parlent à l'emulator local).
@@ -56,6 +69,11 @@ export default defineConfig({
           statements: 95,
         },
       },
+    },
+  },
+  resolve: {
+    alias: {
+      "server-only": serverOnlyStubPath,
     },
   },
 });
