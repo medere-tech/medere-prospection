@@ -331,7 +331,7 @@ describe("<ConversationsPageClient />", () => {
     expect(mobileLinks.length).toBeGreaterThan(0);
   });
 
-  it("commercial sans en_cours : seulement 3 onglets rendus", async () => {
+  it("commercial sans en_cours : 4 onglets rendus", async () => {
     mockFetch({
       items: [],
       nextCursor: null,
@@ -354,8 +354,18 @@ describe("<ConversationsPageClient />", () => {
         initialCommerciaux={null}
       />,
     );
+    // Libellés + ordre = `COMMERCIAL_TAB_ORDER`
+    // (`src/app/admin/conversations/tabs-bar.tsx:41-46`) ×
+    // `TAB_LABELS` (`src/app/admin/conversations/tabs-bar.tsx:25-31`).
+    // PR4 (D3) : ajout de « Contactées » juste après « À traiter ».
     const tabs = await screen.findAllByRole("tab");
-    expect(tabs).toHaveLength(3);
+    expect(tabs).toHaveLength(4);
+    expect(tabs.map((t) => t.textContent?.replace(/\s+/g, " ").trim())).toEqual([
+      expect.stringMatching(/^À traiter/),
+      expect.stringMatching(/^Contactées/),
+      expect.stringMatching(/^Clôturées/),
+      expect.stringMatching(/^Toutes/),
+    ]);
     expect(screen.queryByText("En cours avec Léa")).toBeNull();
   });
 
