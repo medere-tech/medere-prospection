@@ -35,43 +35,61 @@ test.describe("Liste conversations — lecture seule", () => {
   // L1 — admin : onglets propres + compteurs réels
   // ────────────────────────────────────────────────────────────────────
 
-  test("L1 admin — onglets propres + compteurs = valeurs réelles", async ({
+  test("L1 admin — 5 onglets PR4 + compteurs = valeurs de /counts (jamais de constantes)", async ({
     page,
     signInAsAdmin,
   }) => {
     test.skip(!CONV_ID_ADMIN_NON_OWNER, "E2E_CONV_ID_FOR_ADMIN_NON_OWNER manquant");
     installApiPhoneSentinel(page);
     await signInAsAdmin();
-    await page.goto("/admin/conversations");
 
-    // 4 onglets rendus pour un admin.
+    // PR4 B2 — compteurs attendus LUS depuis l'API `/counts` (plus de
+    // constantes en dur, qui cassent dès qu'une 2e conv apparaît en base
+    // comme la conv test PR4 `427963864300_hubspot-list-999999`).
+    const [countsResp] = await Promise.all([
+      page.waitForResponse(
+        (r) =>
+          /\/api\/admin\/conversations\/counts\?/.test(r.url()) && r.request().method() === "GET",
+      ),
+      page.goto("/admin/conversations"),
+    ]);
+    const { counts } = (await countsResp.json()) as {
+      counts: {
+        a_traiter: number;
+        contactees: number;
+        en_cours: number;
+        cloturees: number;
+        toutes: number;
+      };
+    };
+
+    // PR4 — 5 onglets admin dans l'ordre `ADMIN_TAB_ORDER`
+    // (`src/app/admin/conversations/tabs-bar.tsx:33-39`).
     const tabs = page.getByRole("tab");
-    await expect(tabs).toHaveCount(4);
+    await expect(tabs).toHaveCount(5);
+    const expectedLabels = ["À traiter", "Contactées", "En cours avec Léa", "Clôturées", "Toutes"];
+    for (const label of expectedLabels) {
+      await expect(tabs.filter({ hasText: label })).toHaveCount(1);
+    }
 
-    // Compteurs (texte Badge). A traiter + En cours = 0 ; Clôturées = 1 ; Toutes = 1.
-    const aTraiter = tabs.filter({ hasText: "À traiter" });
-    await expect(aTraiter.getByText(/^0$/)).toBeVisible();
-    const enCours = tabs.filter({ hasText: "En cours avec Léa" });
-    await expect(enCours.getByText(/^0$/)).toBeVisible();
-    const cloturees = tabs.filter({ hasText: "Clôturées" });
-    await expect(cloturees.getByText(/^1$/)).toBeVisible();
-    const toutes = tabs.filter({ hasText: "Toutes" });
-    await expect(toutes.getByText(/^1$/)).toBeVisible();
+    // Chaque badge affiche la valeur exacte de /counts.
+    for (const [label, value] of [
+      ["À traiter", counts.a_traiter],
+      ["Contactées", counts.contactees],
+      ["En cours avec Léa", counts.en_cours],
+      ["Clôturées", counts.cloturees],
+      ["Toutes", counts.toutes],
+    ] as const) {
+      const tab = tabs.filter({ hasText: label });
+      await expect(tab.getByText(new RegExp(`^${value}$`))).toBeVisible();
+    }
 
-    // Onglet "A traiter" vide → phrase utile (role=status, UN SEUL dans le DOM).
-    await expect(
-      page.getByRole("status").filter({ hasText: "Aucune conversation à traiter." }),
-    ).toBeVisible();
+    // Clôturées : la conv A (`CONV_ID_ADMIN_NON_OWNER`, opted_out) doit y
+    // apparaître → cible par HREF, jamais par position/nom.
+    await tabs.filter({ hasText: "Clôturées" }).click();
+    const convALink = page.locator(`a[href$="/admin/conversations/${CONV_ID_ADMIN_NON_OWNER}"]`);
+    await expect(convALink.first()).toBeVisible();
 
-    // Clôturées : A visible.
-    await cloturees.click();
-    await expect(page.getByRole("link", { name: /Ouvrir la conversation/ })).toBeVisible();
-
-    // Toutes : A visible.
-    await toutes.click();
-    await expect(page.getByRole("link", { name: /Ouvrir la conversation/ })).toBeVisible();
-
-    // Vérif DOM anti-numéro.
     const body = await page.locator("body").innerText();
     assertNoFrenchPhone(body, "L1 admin — body liste");
   });
@@ -89,8 +107,9 @@ test.describe("Liste conversations — lecture seule", () => {
     await signInAsAdmin();
     // Pré-sélectionne "Toutes" + commercial Déthié via URL.
     await page.goto("/admin/conversations?tab=toutes&assignedTo=U05UVHGBURX");
-    // A visible.
-    await expect(page.getByRole("link", { name: /Ouvrir la conversation/ })).toBeVisible();
+    // A visible — on CIBLE PAR HREF (jamais par position ni nom) depuis PR4.
+    const convALink = page.locator(`a[href$="/admin/conversations/${CONV_ID_ADMIN_NON_OWNER}"]`);
+    await expect(convALink.first()).toBeVisible();
     expect(page.url()).toContain("assignedTo=U05UVHGBURX");
 
     // Autre commercial fictif → aucune ligne.
@@ -115,9 +134,17 @@ test.describe("Liste conversations — lecture seule", () => {
     await page.goto("/admin/conversations?tab=toutes");
 
     const tabs = page.getByRole("tab");
-    await expect(tabs).toHaveCount(3);
+    // PR4 : commercial a maintenant 4 onglets (ajout « Contactées »),
+    // pas d'onglet « En cours avec Léa ». Ordre `COMMERCIAL_TAB_ORDER`
+    // (`src/app/admin/conversations/tabs-bar.tsx:41-46`).
+    await expect(tabs).toHaveCount(4);
+    for (const label of ["À traiter", "Contactées", "Clôturées", "Toutes"]) {
+      await expect(tabs.filter({ hasText: label })).toHaveCount(1);
+    }
     await expect(page.getByText("En cours avec Léa")).toHaveCount(0);
-    await expect(page.getByRole("link", { name: /Ouvrir la conversation/ })).toBeVisible();
+    // Conv A ciblée par HREF (plusieurs convs possibles depuis PR4).
+    const convALink = page.locator(`a[href$="/admin/conversations/${CONV_ID_ADMIN_NON_OWNER}"]`);
+    await expect(convALink.first()).toBeVisible();
   });
 
   // ────────────────────────────────────────────────────────────────────
@@ -172,7 +199,10 @@ test.describe("Liste conversations — lecture seule", () => {
     test.skip(!CONV_ID_ADMIN_NON_OWNER, "E2E_CONV_ID_FOR_ADMIN_NON_OWNER manquant");
     await signInAsAdmin();
     await page.goto("/admin/conversations?tab=toutes");
-    const row = page.getByRole("link", { name: /Ouvrir la conversation/ }).first();
+    // PR4 — cibler par HREF (plusieurs convs partagent `Déthié Faye`
+    // comme contact depuis la seed PR4).
+    const hrefSelector = `a[href$="/admin/conversations/${CONV_ID_ADMIN_NON_OWNER}"]`;
+    const row = page.locator(hrefSelector).first();
     await expect(row).toBeVisible();
 
     // 1) Clic simple → navigation même onglet.
@@ -185,14 +215,18 @@ test.describe("Liste conversations — lecture seule", () => {
     await page.goBack();
 
     // 2) Entrée au clavier (focus puis Enter).
-    const row2 = page.getByRole("link", { name: /Ouvrir la conversation/ }).first();
+    const row2 = page.locator(hrefSelector).first();
     await row2.focus();
     await page.keyboard.press("Enter");
-    await expect(page).toHaveURL(/\/admin\/conversations\//);
+    await expect(page).toHaveURL(
+      new RegExp(
+        `/admin/conversations/${CONV_ID_ADMIN_NON_OWNER!.replace(/[.*+?^${}()|[\\]\\\\]/g, "\\\\$&")}`,
+      ),
+    );
     await page.goBack();
 
     // 3) Ctrl/Cmd+clic → ouvre un nouvel onglet.
-    const row3 = page.getByRole("link", { name: /Ouvrir la conversation/ }).first();
+    const row3 = page.locator(hrefSelector).first();
     const [newPage] = await Promise.all([
       context.waitForEvent("page"),
       row3.click({ modifiers: [process.platform === "darwin" ? "Meta" : "Control"] }),
@@ -236,7 +270,8 @@ test.describe("Liste conversations — lecture seule", () => {
   // rendue avant la vérification DOM.
   // ────────────────────────────────────────────────────────────────────
 
-  for (const tab of ["a_traiter", "en_cours", "cloturees", "toutes"] as const) {
+  // PR4 — ajout du 5ᵉ onglet `contactees` (même scan sentinelle).
+  for (const tab of ["a_traiter", "contactees", "en_cours", "cloturees", "toutes"] as const) {
     test(`L8 ${tab} — zéro numéro FR dans la réponse API et dans le DOM`, async ({
       page,
       signInAsAdmin,
@@ -459,7 +494,8 @@ test.describe("Liste conversations — lecture seule", () => {
     // Chaque onglet de la liste admin : négative (pas d'id) + positive
     // (le nom réel apparaît quand A est présent dans l'onglet — donc
     // "toutes" et "cloturees" uniquement puisque A est opted_out).
-    for (const tab of ["a_traiter", "en_cours", "cloturees", "toutes"] as const) {
+    // PR4 — ajout du 5ᵉ onglet `contactees` (même scan sentinelle).
+    for (const tab of ["a_traiter", "contactees", "en_cours", "cloturees", "toutes"] as const) {
       await Promise.all([
         page.waitForResponse(
           (r) =>
@@ -535,8 +571,11 @@ test.describe("Liste conversations — lecture seule", () => {
     );
     expect(requestsWithQ.length).toBe(1);
 
-    // La conversation A est visible (contact "Déthié Faye").
-    await expect(page.getByRole("link", { name: /Ouvrir la conversation/ })).toBeVisible();
+    // PR4 — la recherche "dethie" matche DEUX convs qui partagent le
+    // contact (A + PR4). On cible A par HREF, jamais par position/nom.
+    await expect(
+      page.locator(`a[href$="/admin/conversations/${CONV_ID_ADMIN_NON_OWNER}"]`).first(),
+    ).toBeVisible();
 
     // Indicateur "Trié par nom" visible.
     await expect(page.getByText(/triés par nom/i)).toBeVisible();

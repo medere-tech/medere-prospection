@@ -266,6 +266,7 @@ function AttachDialogBody({
                       type="button"
                       role="option"
                       aria-selected={false}
+                      data-conversation-id={hit.conversationId}
                       onClick={() => handlePickConversation(hit)}
                       className="flex w-full flex-col rounded-md border border-border px-3 py-2 text-left transition-colors hover:border-primary/40"
                     >
