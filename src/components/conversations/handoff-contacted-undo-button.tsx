@@ -74,14 +74,7 @@ export function HandoffContactedUndoButton(props: HandoffContactedUndoButtonProp
 
   return (
     <div className="flex flex-col gap-1" data-testid="handoff-contacted-undo">
-      <Button
-        type="button"
-        variant="outline"
-        size="sm"
-        onClick={handleClick}
-        disabled={busy}
-        aria-label="Annuler le contact"
-      >
+      <Button type="button" variant="outline" size="sm" onClick={handleClick} disabled={busy}>
         {busy ? "Annulation…" : "Annuler le contact"}
       </Button>
       {errorMessage !== null ? (

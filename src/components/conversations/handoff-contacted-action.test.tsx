@@ -2,18 +2,34 @@
 import "@testing-library/jest-dom/vitest";
 
 /**
- * Tests unitaires jsdom — `HandoffContactedAction` (PR4 B1).
+ * Tests unitaires jsdom — `HandoffContactedAction` (PR4 B1 — review commit c1c40f4).
  *
  * Invariants :
  *   - bouton absent si `canMarkContacted` false ;
  *   - double clic → un seul POST ;
- *   - toast « Annuler » propose un DELETE ;
- *   - 409 serveur → clientMessage affiché ;
- *   - zéro identifiant technique (userId / conversationId) visible dans le DOM.
+ *   - sur succès : `toast.success` appelé avec le message, l'action
+ *     « Annuler » et `duration: 10_000` ;
+ *   - BUG FIX : le toast « Annuler » reste disponible même quand le
+ *     parent flip `canMarkContacted` à false au refetch (simulé). Le
+ *     toast est émis par le système global sonner, pas par un rendu
+ *     conditionnel du composant lui-même.
+ *   - action « Annuler » invoque un DELETE puis `onAudited()` ;
+ *   - 409 serveur → `toast.error(clientMessage)` ;
+ *   - aucun identifiant technique (userId / conversationId) visible
+ *     dans le DOM.
  */
+vi.mock("sonner", () => ({
+  toast: {
+    success: vi.fn(),
+    error: vi.fn(),
+  },
+}));
+
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
+import { useState } from "react";
+import { toast } from "sonner";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { HandoffContactedAction } from "./handoff-contacted-action";
@@ -30,22 +46,21 @@ function renderWithQuery(ui: React.ReactElement) {
 const originalFetch = globalThis.fetch;
 
 beforeEach(() => {
-  vi.useFakeTimers({ shouldAdvanceTime: true });
+  vi.mocked(toast.success).mockReset();
+  vi.mocked(toast.error).mockReset();
 });
 
 afterEach(() => {
-  vi.useRealTimers();
   globalThis.fetch = originalFetch;
 });
 
 describe("HandoffContactedAction", () => {
   it("rend NULL si canMarkContacted=false (bouton absent)", () => {
-    const onAudited = vi.fn();
     const { container } = renderWithQuery(
       <HandoffContactedAction
         conversationId={CONV_ID}
         canMarkContacted={false}
-        onAudited={onAudited}
+        onAudited={vi.fn()}
       />,
     );
     expect(container.querySelector("[data-testid=handoff-contacted-action]")).toBeNull();
@@ -53,7 +68,7 @@ describe("HandoffContactedAction", () => {
   });
 
   it("double clic → un seul POST (anti-double-clic via disabled pendant la mutation)", async () => {
-    const user = userEvent.setup({ advanceTimers: vi.advanceTimersByTime.bind(vi) });
+    const user = userEvent.setup();
     const onAudited = vi.fn();
     let resolvePost: (v: Response) => void = () => {};
     const postPromise = new Promise<Response>((r) => {
@@ -71,9 +86,8 @@ describe("HandoffContactedAction", () => {
     );
     const button = screen.getByRole("button", { name: /J'ai contacté/i });
     await user.click(button);
-    await user.click(button); // 2e clic pendant la mutation en cours
-    await user.click(button); // 3e clic
-    // La mutation n'a pas encore résolu — un seul fetch.
+    await user.click(button);
+    await user.click(button);
     expect(fetchSpy).toHaveBeenCalledTimes(1);
 
     resolvePost(
@@ -82,14 +96,12 @@ describe("HandoffContactedAction", () => {
         headers: { "Content-Type": "application/json" },
       }),
     );
-
     await waitFor(() => expect(onAudited).toHaveBeenCalledTimes(1));
     expect(fetchSpy).toHaveBeenCalledTimes(1);
   });
 
-  it("succès POST → toast « Médecin marqué comme contacté. » + action « Annuler »", async () => {
-    const user = userEvent.setup({ advanceTimers: vi.advanceTimersByTime.bind(vi) });
-    const onAudited = vi.fn();
+  it("succès POST → toast.success(message, { action: 'Annuler', duration: 10000 })", async () => {
+    const user = userEvent.setup();
     const fetchSpy = vi.fn().mockResolvedValue(
       new Response(JSON.stringify({ contactedAtIso: "2026-11-09T10:00:00.000Z" }), {
         status: 200,
@@ -102,33 +114,80 @@ describe("HandoffContactedAction", () => {
       <HandoffContactedAction
         conversationId={CONV_ID}
         canMarkContacted={true}
-        onAudited={onAudited}
+        onAudited={vi.fn()}
       />,
     );
     await user.click(screen.getByRole("button", { name: /J'ai contacté/i }));
-    await waitFor(() => expect(onAudited).toHaveBeenCalledTimes(1));
-    expect(await screen.findByText("Médecin marqué comme contacté.")).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: /Annuler le marquage/i })).toBeInTheDocument();
+    await waitFor(() => expect(toast.success).toHaveBeenCalledTimes(1));
+    const call = vi.mocked(toast.success).mock.calls[0]!;
+    expect(call[0]).toBe("Médecin marqué comme contacté.");
+    const opts = call[1] as { action?: { label: string }; duration?: number } | undefined;
+    expect(opts?.action?.label).toBe("Annuler");
+    expect(opts?.duration).toBe(10_000);
   });
 
-  it("le toast « Annuler » déclenche un DELETE", async () => {
-    const user = userEvent.setup({ advanceTimers: vi.advanceTimersByTime.bind(vi) });
+  it("🔒 BUG FIX — le toast reste visible quand le parent flip canMarkContacted à false au refetch", async () => {
+    const user = userEvent.setup();
+    const fetchSpy = vi.fn().mockResolvedValue(
+      new Response(JSON.stringify({ contactedAtIso: "2026-11-09T10:00:00.000Z" }), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      }),
+    );
+    globalThis.fetch = fetchSpy as unknown as typeof fetch;
+
+    // Parent qui simule le vrai cycle : au onAudited() il rechange
+    // canMarkContacted à false (comme loadConversationDetail renvoie
+    // après POST). Le composant action va donc se démonter — le toast,
+    // émis par le système sonner global, doit survivre.
+    function Harness() {
+      const [canMark, setCanMark] = useState(true);
+      return (
+        <HandoffContactedAction
+          conversationId={CONV_ID}
+          canMarkContacted={canMark}
+          onAudited={() => setCanMark(false)}
+        />
+      );
+    }
+
+    const { container } = renderWithQuery(<Harness />);
+    await user.click(screen.getByRole("button", { name: /J'ai contacté/i }));
+
+    // Après un flush : bouton démonté (canMarkContacted=false).
+    await waitFor(() =>
+      expect(container.querySelector("[data-testid=handoff-contacted-action]")).toBeNull(),
+    );
+
+    // MAIS : `toast.success` a bien été appelé AVANT le démontage —
+    // l'action Annuler est portée par sonner, pas par ce composant,
+    // donc elle reste cliquable après démontage.
+    expect(toast.success).toHaveBeenCalledTimes(1);
+    const call = vi.mocked(toast.success).mock.calls[0]!;
+    const opts = call[1] as unknown as { action?: { label: string; onClick: () => void } };
+    expect(opts.action?.label).toBe("Annuler");
+    expect(typeof opts.action?.onClick).toBe("function");
+
+    // Et l'action Annuler, invoquée APRÈS démontage, déclenche le DELETE
+    // + ne plante pas (ne s'appuie plus sur un state démonté).
+    fetchSpy.mockResolvedValueOnce(new Response("{}", { status: 200 }));
+    opts.action!.onClick();
+    await waitFor(() => expect(fetchSpy).toHaveBeenCalledTimes(2));
+    expect(fetchSpy.mock.calls[1]![1]?.method).toBe("DELETE");
+  });
+
+  it("action « Annuler » du toast → DELETE + onAudited()", async () => {
+    const user = userEvent.setup();
     const onAudited = vi.fn();
     const fetchSpy = vi
       .fn()
-      .mockImplementationOnce(() =>
-        Promise.resolve(
-          new Response(JSON.stringify({ contactedAtIso: "2026-11-09T10:00:00.000Z" }), {
-            status: 200,
-            headers: { "Content-Type": "application/json" },
-          }),
-        ),
+      .mockResolvedValueOnce(
+        new Response(JSON.stringify({ contactedAtIso: "2026-11-09T10:00:00.000Z" }), {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        }),
       )
-      .mockImplementationOnce(() =>
-        Promise.resolve(
-          new Response("{}", { status: 200, headers: { "Content-Type": "application/json" } }),
-        ),
-      );
+      .mockResolvedValueOnce(new Response("{}", { status: 200 }));
     globalThis.fetch = fetchSpy as unknown as typeof fetch;
 
     renderWithQuery(
@@ -139,17 +198,18 @@ describe("HandoffContactedAction", () => {
       />,
     );
     await user.click(screen.getByRole("button", { name: /J'ai contacté/i }));
-    const undo = await screen.findByRole("button", { name: /Annuler le marquage/i });
-    await user.click(undo);
-    await waitFor(() => expect(onAudited).toHaveBeenCalledTimes(2));
+    await waitFor(() => expect(toast.success).toHaveBeenCalledTimes(1));
 
-    expect(fetchSpy).toHaveBeenCalledTimes(2);
-    const lastCall = fetchSpy.mock.calls[1]!;
-    expect(lastCall[1]?.method).toBe("DELETE");
+    const call = vi.mocked(toast.success).mock.calls[0]!;
+    const opts = call[1] as unknown as { action: { onClick: () => void } };
+    opts.action.onClick();
+
+    await waitFor(() => expect(onAudited).toHaveBeenCalledTimes(2));
+    expect(fetchSpy.mock.calls[1]![1]?.method).toBe("DELETE");
   });
 
-  it("409 serveur → affiche le clientMessage FR", async () => {
-    const user = userEvent.setup({ advanceTimers: vi.advanceTimersByTime.bind(vi) });
+  it("409 serveur → toast.error(clientMessage FR)", async () => {
+    const user = userEvent.setup();
     const fetchSpy = vi.fn().mockResolvedValue(
       new Response(
         JSON.stringify({
@@ -171,13 +231,15 @@ describe("HandoffContactedAction", () => {
       />,
     );
     await user.click(screen.getByRole("button", { name: /J'ai contacté/i }));
-    expect(
-      await screen.findByText("Cette conversation est déjà marquée comme contactée."),
-    ).toBeInTheDocument();
+    await waitFor(() =>
+      expect(toast.error).toHaveBeenCalledWith(
+        "Cette conversation est déjà marquée comme contactée.",
+      ),
+    );
   });
 
   it("zéro identifiant technique (conversationId) visible dans le DOM", async () => {
-    const user = userEvent.setup({ advanceTimers: vi.advanceTimersByTime.bind(vi) });
+    const user = userEvent.setup();
     const fetchSpy = vi.fn().mockResolvedValue(
       new Response(JSON.stringify({ contactedAtIso: "2026-11-09T10:00:00.000Z" }), {
         status: 200,
@@ -194,10 +256,8 @@ describe("HandoffContactedAction", () => {
       />,
     );
     await user.click(screen.getByRole("button", { name: /J'ai contacté/i }));
-    await screen.findByText("Médecin marqué comme contacté.");
+    await waitFor(() => expect(toast.success).toHaveBeenCalledTimes(1));
 
-    // Le DOM ne doit contenir NI le conversationId (427963864300_hubspot-list-999999)
-    // NI un Clerk userId (user_...) NI un Slack U-prefix.
     const txt = container.textContent ?? "";
     expect(txt).not.toContain(CONV_ID);
     expect(txt).not.toMatch(/user_[A-Za-z0-9]{10,}/);
