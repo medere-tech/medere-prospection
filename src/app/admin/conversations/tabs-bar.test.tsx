@@ -33,7 +33,7 @@ import type { CountsFetchState } from "./types";
 
 const SUCCESS_COUNTS: CountsFetchState = {
   kind: "success",
-  data: { a_traiter: 3, cloturees: 5, toutes: 10, en_cours: 2 },
+  data: { a_traiter: 3, contactees: 7, cloturees: 5, toutes: 10, en_cours: 2 },
 };
 
 describe("<TabsBar />", () => {
@@ -41,21 +41,23 @@ describe("<TabsBar />", () => {
     setTabMock.mockClear();
   });
 
-  it("admin : rend les 4 onglets dans l'ordre A traiter / En cours / Clôturées / Toutes", () => {
+  it("admin : rend les 5 onglets dans l'ordre A traiter / Contactées / En cours / Clôturées / Toutes (PR4)", () => {
     render(<TabsBar role="admin" countsState={SUCCESS_COUNTS} />);
     const tabs = screen.getAllByRole("tab");
-    expect(tabs).toHaveLength(4);
+    expect(tabs).toHaveLength(5);
     expect(tabs[0]).toHaveTextContent("À traiter");
-    expect(tabs[1]).toHaveTextContent("En cours avec Léa");
-    expect(tabs[2]).toHaveTextContent("Clôturées");
-    expect(tabs[3]).toHaveTextContent("Toutes");
+    expect(tabs[1]).toHaveTextContent("Contactées");
+    expect(tabs[2]).toHaveTextContent("En cours avec Léa");
+    expect(tabs[3]).toHaveTextContent("Clôturées");
+    expect(tabs[4]).toHaveTextContent("Toutes");
   });
 
-  it("commercial : rend 3 onglets, aucun 'En cours avec Léa'", () => {
+  it("commercial : rend 4 onglets, aucun 'En cours avec Léa' (PR4 : + Contactées)", () => {
     render(<TabsBar role="commercial" countsState={SUCCESS_COUNTS} />);
     const tabs = screen.getAllByRole("tab");
-    expect(tabs).toHaveLength(3);
+    expect(tabs).toHaveLength(4);
     expect(screen.queryByText("En cours avec Léa")).toBeNull();
+    expect(screen.getByText("Contactées")).toBeInTheDocument();
   });
 
   it("sans tab dans l'URL, 'À traiter' est actif par défaut", () => {
@@ -64,10 +66,11 @@ describe("<TabsBar />", () => {
     expect(aTraiter).toHaveAttribute("aria-selected", "true");
   });
 
-  it("rend les compteurs quand countsState est success", () => {
+  it("rend les compteurs quand countsState est success (PR4 : 5 badges admin)", () => {
     render(<TabsBar role="admin" countsState={SUCCESS_COUNTS} />);
-    // On vérifie que les 4 valeurs du mock apparaissent exactement une fois.
+    // On vérifie que les 5 valeurs du mock apparaissent exactement une fois.
     expect(screen.getByText("3")).toBeInTheDocument(); // a_traiter
+    expect(screen.getByText("7")).toBeInTheDocument(); // contactees
     expect(screen.getByText("2")).toBeInTheDocument(); // en_cours
     expect(screen.getByText("5")).toBeInTheDocument(); // cloturees
     expect(screen.getByText("10")).toBeInTheDocument(); // toutes

@@ -104,13 +104,6 @@ export function ConversationSidePanel({ data }: Props) {
                 value={formatDateTimeParis(data.handoff.contactedAtIso)}
               />
             ) : null}
-            {data.handoff.acceptedAtIso ? (
-              <MetaRow
-                icon={<Clock className="h-3.5 w-3.5" />}
-                label="Accepté le"
-                value={formatDateTimeParis(data.handoff.acceptedAtIso)}
-              />
-            ) : null}
           </dl>
         </section>
       ) : null}

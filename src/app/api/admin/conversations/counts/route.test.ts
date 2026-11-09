@@ -65,7 +65,7 @@ describe("GET /api/admin/conversations/counts (PR2a)", () => {
     expect(res.status).toBe(403);
   });
 
-  it("admin — 4 compteurs retournés, 4 agrégations", async () => {
+  it("admin — 5 compteurs retournés, 5 agrégations (PR4 : + contactees)", async () => {
     mockRequireRole.mockResolvedValue({
       userId: "u",
       role: "admin",
@@ -76,17 +76,24 @@ describe("GET /api/admin/conversations/counts (PR2a)", () => {
     });
     mockCount
       .mockResolvedValueOnce(2) // a_traiter
+      .mockResolvedValueOnce(4) // contactees
       .mockResolvedValueOnce(10) // cloturees
       .mockResolvedValueOnce(42) // toutes
       .mockResolvedValueOnce(5); // en_cours
     const res = await GET(new Request("http://x"));
     expect(res.status).toBe(200);
     const body = await res.json();
-    expect(body.counts).toEqual({ a_traiter: 2, cloturees: 10, toutes: 42, en_cours: 5 });
-    expect(mockCount).toHaveBeenCalledTimes(4);
+    expect(body.counts).toEqual({
+      a_traiter: 2,
+      contactees: 4,
+      cloturees: 10,
+      toutes: 42,
+      en_cours: 5,
+    });
+    expect(mockCount).toHaveBeenCalledTimes(5);
   });
 
-  it("commercial — 3 compteurs seulement, pas de en_cours, 3 agrégations", async () => {
+  it("commercial — 4 compteurs seulement, pas de en_cours, 4 agrégations (PR4 : + contactees)", async () => {
     mockRequireRole.mockResolvedValue({
       userId: "u",
       role: "commercial",
@@ -97,13 +104,14 @@ describe("GET /api/admin/conversations/counts (PR2a)", () => {
     });
     mockCount
       .mockResolvedValueOnce(1) // a_traiter
+      .mockResolvedValueOnce(2) // contactees
       .mockResolvedValueOnce(3) // cloturees
       .mockResolvedValueOnce(7); // toutes
     const res = await GET(new Request("http://x"));
     const body = await res.json();
-    expect(body.counts).toEqual({ a_traiter: 1, cloturees: 3, toutes: 7 });
+    expect(body.counts).toEqual({ a_traiter: 1, contactees: 2, cloturees: 3, toutes: 7 });
     expect(body.counts.en_cours).toBeUndefined();
-    expect(mockCount).toHaveBeenCalledTimes(3);
+    expect(mockCount).toHaveBeenCalledTimes(4);
   });
 
   it("commercial — toutes les agrégations sont filtrées sur son slackUserId", async () => {

@@ -31,6 +31,8 @@ export interface ConversationListVersionResult {
 export async function queryConversationListVersion(options: {
   statusIn?: ConversationStatus[];
   assignedTo?: string | null;
+  /** PR4 — filtre indexé pour a_traiter (`false`) / contactees (`true`). */
+  handoffContacted?: boolean;
 }): Promise<ConversationListVersionResult> {
   let q: FirebaseFirestore.Query = getAdminDb().collection(CONVERSATIONS_COLLECTION);
   if (options.assignedTo) q = q.where("assignedTo", "==", options.assignedTo);
@@ -38,6 +40,9 @@ export async function queryConversationListVersion(options: {
     q = q.where("status", "==", options.statusIn[0]!);
   } else if (options.statusIn && options.statusIn.length > 1) {
     q = q.where("status", "in", options.statusIn);
+  }
+  if (options.handoffContacted !== undefined) {
+    q = q.where("handoffContacted", "==", options.handoffContacted);
   }
   q = q.orderBy("updatedAt", "desc").limit(1);
 

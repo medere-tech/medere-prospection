@@ -112,8 +112,10 @@ export interface HandoffDisplayProps {
   /** Slack userId du titulaire (identifiant workspace, pas PII personnelle). */
   assignedToSlackId: string | null;
   assignedAtIso: string | null;
+  /** PR4 — horodatage ISO du clic « J'ai contacté » ou `null`. */
   contactedAtIso: string | null;
-  acceptedAtIso: string | null;
+  /** PR4 — Clerk userId de l'auteur du clic ou `null`. Non PII. */
+  contactedBy: string | null;
 }
 
 /** Entrée du journal fusionné (audits conversation + audits contact). */

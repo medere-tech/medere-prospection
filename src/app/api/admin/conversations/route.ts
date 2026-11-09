@@ -44,7 +44,7 @@ import { z } from "zod";
 import { listCommerciauxForFilter } from "@/lib/airtable/commerciaux";
 import { requireRole } from "@/lib/auth/require-role";
 import { normalizeContactNameSearch } from "@/lib/firestore/conversation-list-fields";
-import { ALLOWED_TABS_BY_ROLE, statusesForTab } from "@/lib/firestore/conversation-list-tabs";
+import { ALLOWED_TABS_BY_ROLE, filterForTab } from "@/lib/firestore/conversation-list-tabs";
 import {
   LIST_CONVERSATIONS_DEFAULT_LIMIT,
   LIST_CONVERSATIONS_MAX_LIMIT,
@@ -70,7 +70,7 @@ const conversationsListLimiter = createRateLimiter({
 });
 
 const QuerySchema = z.object({
-  tab: z.enum(["a_traiter", "en_cours", "cloturees", "toutes"]).optional(),
+  tab: z.enum(["a_traiter", "contactees", "en_cours", "cloturees", "toutes"]).optional(),
   // Partage la regex avec `assertSlackUserId` (source unique). Supporte
   // les préfixes U (user) et W (Enterprise Grid) — M-2 security review.
   assignedTo: z.string().regex(SLACK_USER_ID_REGEX, "slackUserId mal formé").optional(),
@@ -142,7 +142,7 @@ export async function GET(req: Request): Promise<Response> {
       return NextResponse.json({ error: "forbidden_tab" }, { status: 403 });
     }
 
-    const statuses = statusesForTab(tab);
+    const { statuses, handoffContacted } = filterForTab(tab);
     const limit = parsed.data.limit ?? LIST_CONVERSATIONS_DEFAULT_LIMIT;
 
     // Dispatch droits serveur.
@@ -157,7 +157,8 @@ export async function GET(req: Request): Promise<Response> {
     const nameSearch = parsed.data.q ? normalizeContactNameSearch(parsed.data.q) : undefined;
 
     const filters: ListConversationsFilters = {
-      ...(statuses && statuses.length > 0 && { statusIn: statuses }),
+      ...(statuses && statuses.length > 0 && { statusIn: [...statuses] }),
+      ...(handoffContacted !== undefined && { handoffContacted }),
       ...(parsed.data.campaignId && { campaignId: parsed.data.campaignId }),
       ...(nameSearch && nameSearch.length > 0 && { contactNameSearch: nameSearch }),
     };
@@ -244,7 +245,8 @@ export async function GET(req: Request): Promise<Response> {
         role,
         tab,
         assignedTo: effectiveAssignedTo,
-        statuses: statuses ?? null,
+        statuses: statuses ? [...statuses] : null,
+        handoffContacted: handoffContacted ?? null,
         campaignId: parsed.data.campaignId ?? null,
         q: nameSearch ?? null,
         searchMode: Boolean(nameSearch),

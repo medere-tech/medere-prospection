@@ -78,7 +78,7 @@ function makeDetail(): ConversationDetailProps {
       assignedToSlackId: "UVAN12345",
       assignedAtIso: "2026-10-19T10:03:00.000Z",
       contactedAtIso: null,
-      acceptedAtIso: null,
+      contactedBy: null,
     },
     contact: {
       contactId: "contact1",

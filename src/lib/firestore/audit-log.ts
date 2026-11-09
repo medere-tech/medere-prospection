@@ -90,6 +90,9 @@ const ACTIONS = [
   "opt_out",
   "handoff",
   "handoff_accepted",
+  // PR4 — clic « J'ai contacté » + annulation.
+  "handoff_contacted",
+  "handoff_contact_undone",
   // S9.9-PR5a — lead INTERESSE non routé vers un commercial (branche
   // orphelins de `slack-handoff` S9.9-PR5b). Cf. types/audit-log.ts pour
   // la sémantique complète + `HandoffUnassignedPayload` typé.

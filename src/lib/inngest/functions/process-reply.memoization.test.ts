@@ -204,6 +204,7 @@ function makeFakeConversation(contactId: string, campaignId: string): Conversati
     outboundCount: 1,
     inboundCount: 0,
     followupCount: 0,
+    handoffContacted: false,
     createdAt: { toMillis: () => 0 } as unknown as Timestamp,
     updatedAt: { toMillis: () => 0 } as unknown as Timestamp,
   };

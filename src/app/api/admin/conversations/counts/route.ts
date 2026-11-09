@@ -21,7 +21,7 @@ import { z } from "zod";
 
 import { requireRole } from "@/lib/auth/require-role";
 import { normalizeContactNameSearch } from "@/lib/firestore/conversation-list-fields";
-import { TAB_TO_STATUSES } from "@/lib/firestore/conversation-list-tabs";
+import { TAB_TO_FILTER } from "@/lib/firestore/conversation-list-tabs";
 import { countConversations, type ListConversationsFilters } from "@/lib/firestore/conversations";
 import { applyAdminRateLimit } from "@/lib/security/admin-rate-limit";
 import { createRateLimiter } from "@/lib/security/rate-limit";
@@ -89,8 +89,12 @@ export async function GET(req: Request): Promise<Response> {
 
     const nameSearch = parsed.data.q ? normalizeContactNameSearch(parsed.data.q) : undefined;
 
-    const baseFilters = (statuses?: ConversationStatus[]): ListConversationsFilters => ({
-      ...(statuses && statuses.length > 0 && { statusIn: statuses }),
+    const baseFilters = (
+      statuses?: readonly ConversationStatus[],
+      handoffContacted?: boolean,
+    ): ListConversationsFilters => ({
+      ...(statuses && statuses.length > 0 && { statusIn: [...statuses] }),
+      ...(handoffContacted !== undefined && { handoffContacted }),
       ...(parsed.data.campaignId && { campaignId: parsed.data.campaignId }),
       ...(nameSearch && nameSearch.length > 0 && { contactNameSearch: nameSearch }),
     });
@@ -99,15 +103,25 @@ export async function GET(req: Request): Promise<Response> {
       ? ({ kind: "specific", slackUserId: effectiveAssignedTo } as const)
       : ({ kind: "none" } as const);
 
-    // Lance les agrégations en parallèle — 3 lectures pour commercial, 4
-    // pour admin.
-    const [aTraiter, cloturees, toutes, enCoursMaybe] = await Promise.all([
+    // Lance les agrégations en parallèle — 4 lectures pour commercial, 5
+    // pour admin (PR4 : ajout de `contactees`).
+    const [aTraiter, contactees, cloturees, toutes, enCoursMaybe] = await Promise.all([
       countConversations({
-        filters: baseFilters(TAB_TO_STATUSES.a_traiter),
+        filters: baseFilters(
+          TAB_TO_FILTER.a_traiter.statuses,
+          TAB_TO_FILTER.a_traiter.handoffContacted,
+        ),
         assigneeFilter,
       }),
       countConversations({
-        filters: baseFilters(TAB_TO_STATUSES.cloturees),
+        filters: baseFilters(
+          TAB_TO_FILTER.contactees.statuses,
+          TAB_TO_FILTER.contactees.handoffContacted,
+        ),
+        assigneeFilter,
+      }),
+      countConversations({
+        filters: baseFilters(TAB_TO_FILTER.cloturees.statuses),
         assigneeFilter,
       }),
       countConversations({
@@ -116,7 +130,7 @@ export async function GET(req: Request): Promise<Response> {
       }),
       role === "admin"
         ? countConversations({
-            filters: baseFilters(TAB_TO_STATUSES.en_cours),
+            filters: baseFilters(TAB_TO_FILTER.en_cours.statuses),
             assigneeFilter,
           })
         : Promise.resolve<number | null>(null),
@@ -124,6 +138,7 @@ export async function GET(req: Request): Promise<Response> {
 
     const counts: Record<string, number> = {
       a_traiter: aTraiter,
+      contactees,
       cloturees,
       toutes,
     };

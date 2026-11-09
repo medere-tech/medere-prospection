@@ -164,7 +164,7 @@ describe("ConversationStatusBanner", () => {
           assignedToSlackId: "UVAN1234",
           assignedAtIso: "2026-10-19T09:00:00.000Z",
           contactedAtIso: null,
-          acceptedAtIso: null,
+          contactedBy: null,
         }}
         contactOptedOut={true}
       />,
@@ -192,7 +192,7 @@ describe("ConversationStatusBanner", () => {
           assignedToSlackId: "UVAN1234",
           assignedAtIso: "2026-10-19T09:00:00.000Z",
           contactedAtIso: null,
-          acceptedAtIso: null,
+          contactedBy: null,
         }}
         contactOptedOut={false}
       />,
@@ -211,7 +211,7 @@ describe("ConversationStatusBanner", () => {
           assignedToSlackId: "UXYZ123",
           assignedAtIso: null,
           contactedAtIso: null,
-          acceptedAtIso: null,
+          contactedBy: null,
         }}
         contactOptedOut={false}
       />,

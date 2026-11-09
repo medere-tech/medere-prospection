@@ -39,11 +39,7 @@ import {
   queryBackfillLastMessage,
 } from "@/lib/firestore/backfill-conversation-list-fields";
 import { normalizeContactNameSearch } from "@/lib/firestore/conversation-list-fields";
-import {
-  ADMIN_TABS,
-  COMMERCIAL_TABS,
-  TAB_TO_STATUSES,
-} from "@/lib/firestore/conversation-list-tabs";
+import { ADMIN_TABS, COMMERCIAL_TABS, filterForTab } from "@/lib/firestore/conversation-list-tabs";
 import { queryConversationListVersion } from "@/lib/firestore/conversation-list-version-query";
 import {
   countConversations,
@@ -77,9 +73,9 @@ export interface QueryForm {
  */
 function buildFilters(tab: string, hasCampaign: boolean, hasQ: boolean): ListConversationsFilters {
   const filters: ListConversationsFilters = {};
-  if (tab !== "toutes") {
-    filters.statusIn = TAB_TO_STATUSES[tab as "a_traiter" | "en_cours" | "cloturees"];
-  }
+  const { statuses, handoffContacted } = filterForTab(tab);
+  if (statuses !== undefined) filters.statusIn = [...statuses];
+  if (handoffContacted !== undefined) filters.handoffContacted = handoffContacted;
   if (hasCampaign) filters.campaignId = PROBE_CAMPAIGN_ID;
   if (hasQ) filters.contactNameSearch = PROBE_Q;
   return filters;
@@ -199,14 +195,16 @@ function buildVersionForms(): QueryForm[] {
   for (const { role, tabs } of ROLES) {
     const assignedTo = role === "commercial" ? PROBE_SLACK_USER_ID : null;
     for (const tab of tabs) {
-      const statuses =
-        tab === "toutes"
-          ? undefined
-          : TAB_TO_STATUSES[tab as "a_traiter" | "en_cours" | "cloturees"];
+      const { statuses, handoffContacted } = filterForTab(tab);
       forms.push({
         label: versionLabel(role, tab),
         category: "version",
-        run: () => queryConversationListVersion({ statusIn: statuses, assignedTo }),
+        run: () =>
+          queryConversationListVersion({
+            statusIn: statuses ? [...statuses] : undefined,
+            assignedTo,
+            ...(handoffContacted !== undefined && { handoffContacted }),
+          }),
       });
     }
   }

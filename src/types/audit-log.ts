@@ -170,6 +170,17 @@ export type AuditAction =
   | "opt_out"
   | "handoff"
   | "handoff_accepted"
+  // PR4 — clic « J'ai contacté le médecin » par le titulaire (admin OU
+  // commercial avec slackUserId === handoff.assignedTo). Pose
+  // `handoff.contactedAt`, `handoff.contactedBy` et `handoffContacted
+  // = true` dans la même transaction. Payload = `{ contactedBy:
+  // actor.userId }`. Aucune PII.
+  | "handoff_contacted"
+  // PR4 — annulation du marquage par l'auteur (`actor.userId ===
+  // handoff.contactedBy`) OU par un admin. Efface les 3 champs
+  // (`FieldValue.delete` × 2 + `handoffContacted: false`) dans la
+  // même tx. Payload = `{ originalContactedBy, originalContactedAtMs }`.
+  | "handoff_contact_undone"
   // S9.9-PR5a — lead INTERESSE non routé vers un commercial (owner
   // manquant/inactif ou service HubSpot/Airtable indisponible). Posé par
   // la function Inngest `slack-handoff` (S9.9-PR5b) sur la branche
