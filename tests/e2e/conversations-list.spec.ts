@@ -85,9 +85,14 @@ test.describe("Liste conversations — lecture seule", () => {
     }
 
     // Clôturées : la conv A (`CONV_ID_ADMIN_NON_OWNER`, opted_out) doit y
-    // apparaître → cible par HREF, jamais par position/nom.
+    // apparaître → cible par HREF, jamais par position/nom. En mobile
+    // 390, le tableau desktop est rendu mais caché (CSS) et porte le
+    // MÊME href que la carte mobile — on ne garde que les nœuds
+    // visibles via `.filter({ visible: true })` (Playwright 1.60+).
     await tabs.filter({ hasText: "Clôturées" }).click();
-    const convALink = page.locator(`a[href$="/admin/conversations/${CONV_ID_ADMIN_NON_OWNER}"]`);
+    const convALink = page
+      .locator(`a[href$="/admin/conversations/${CONV_ID_ADMIN_NON_OWNER}"]`)
+      .filter({ visible: true });
     await expect(convALink.first()).toBeVisible();
 
     const body = await page.locator("body").innerText();
@@ -107,8 +112,11 @@ test.describe("Liste conversations — lecture seule", () => {
     await signInAsAdmin();
     // Pré-sélectionne "Toutes" + commercial Déthié via URL.
     await page.goto("/admin/conversations?tab=toutes&assignedTo=U05UVHGBURX");
-    // A visible — on CIBLE PAR HREF (jamais par position ni nom) depuis PR4.
-    const convALink = page.locator(`a[href$="/admin/conversations/${CONV_ID_ADMIN_NON_OWNER}"]`);
+    // A visible — on CIBLE PAR HREF (jamais par position ni nom) depuis
+    // PR4, et on filtre sur les nœuds visibles (mobile vs desktop).
+    const convALink = page
+      .locator(`a[href$="/admin/conversations/${CONV_ID_ADMIN_NON_OWNER}"]`)
+      .filter({ visible: true });
     await expect(convALink.first()).toBeVisible();
     expect(page.url()).toContain("assignedTo=U05UVHGBURX");
 
@@ -142,8 +150,11 @@ test.describe("Liste conversations — lecture seule", () => {
       await expect(tabs.filter({ hasText: label })).toHaveCount(1);
     }
     await expect(page.getByText("En cours avec Léa")).toHaveCount(0);
-    // Conv A ciblée par HREF (plusieurs convs possibles depuis PR4).
-    const convALink = page.locator(`a[href$="/admin/conversations/${CONV_ID_ADMIN_NON_OWNER}"]`);
+    // Conv A ciblée par HREF (plusieurs convs possibles depuis PR4),
+    // filtrée sur les nœuds visibles (mobile vs desktop).
+    const convALink = page
+      .locator(`a[href$="/admin/conversations/${CONV_ID_ADMIN_NON_OWNER}"]`)
+      .filter({ visible: true });
     await expect(convALink.first()).toBeVisible();
   });
 
@@ -200,9 +211,11 @@ test.describe("Liste conversations — lecture seule", () => {
     await signInAsAdmin();
     await page.goto("/admin/conversations?tab=toutes");
     // PR4 — cibler par HREF (plusieurs convs partagent `Déthié Faye`
-    // comme contact depuis la seed PR4).
+    // comme contact depuis la seed PR4), et filtrer sur visible pour
+    // ne pas tomber sur le tableau desktop caché en mobile 390.
     const hrefSelector = `a[href$="/admin/conversations/${CONV_ID_ADMIN_NON_OWNER}"]`;
-    const row = page.locator(hrefSelector).first();
+    const visibleRow = () => page.locator(hrefSelector).filter({ visible: true }).first();
+    const row = visibleRow();
     await expect(row).toBeVisible();
 
     // 1) Clic simple → navigation même onglet.
@@ -215,7 +228,7 @@ test.describe("Liste conversations — lecture seule", () => {
     await page.goBack();
 
     // 2) Entrée au clavier (focus puis Enter).
-    const row2 = page.locator(hrefSelector).first();
+    const row2 = visibleRow();
     await row2.focus();
     await page.keyboard.press("Enter");
     await expect(page).toHaveURL(
@@ -226,7 +239,7 @@ test.describe("Liste conversations — lecture seule", () => {
     await page.goBack();
 
     // 3) Ctrl/Cmd+clic → ouvre un nouvel onglet.
-    const row3 = page.locator(hrefSelector).first();
+    const row3 = visibleRow();
     const [newPage] = await Promise.all([
       context.waitForEvent("page"),
       row3.click({ modifiers: [process.platform === "darwin" ? "Meta" : "Control"] }),
@@ -572,9 +585,13 @@ test.describe("Liste conversations — lecture seule", () => {
     expect(requestsWithQ.length).toBe(1);
 
     // PR4 — la recherche "dethie" matche DEUX convs qui partagent le
-    // contact (A + PR4). On cible A par HREF, jamais par position/nom.
+    // contact (A + PR4). On cible A par HREF (jamais par position/nom),
+    // filtré sur les nœuds visibles (mobile vs desktop).
     await expect(
-      page.locator(`a[href$="/admin/conversations/${CONV_ID_ADMIN_NON_OWNER}"]`).first(),
+      page
+        .locator(`a[href$="/admin/conversations/${CONV_ID_ADMIN_NON_OWNER}"]`)
+        .filter({ visible: true })
+        .first(),
     ).toBeVisible();
 
     // Indicateur "Trié par nom" visible.

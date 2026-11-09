@@ -26,6 +26,9 @@
  *   (refetch détail), GET /conversations?tab=... (filtre list). Jamais
  *   d'attente sur une position ou un nom qui peut diverger.
  */
+import { clerk } from "@clerk/testing/playwright";
+import type { Page } from "@playwright/test";
+
 import {
   assertNoFrenchPhone,
   assertNoTechnicalId,
@@ -33,6 +36,45 @@ import {
   installApiPhoneSentinel,
   test,
 } from "./fixtures";
+
+/**
+ * Déconnecte la session Clerk COURANTE puis purge les cookies.
+ *
+ * `clerk.signOut` vit dans `node_modules/@clerk/testing/dist/types/playwright/helpers.d.ts:81`
+ * (signature : `(opts: PlaywrightClerkSignOutParams) => Promise<void>`
+ * avec `PlaywrightClerkSignOutParams = { page: Page; signOutOptions?: SignOutOptions }`,
+ * mêmes fichier/lignes :95-98). Son impl attend que `window.Clerk` soit
+ * chargé sur la page (JSDoc l.62 : « It is required to call `page.goto`
+ * before calling this helper, and navigate to a page that loads Clerk »).
+ *
+ * Donc :
+ *   1. si la page est encore sur `about:blank` (aucun `goto` effectué)
+ *      OU sur une route qui n'inclut pas Clerk, on navigue vers
+ *      `/sign-in` pour charger `window.Clerk` ;
+ *   2. on appelle `clerk.signOut({ page })` ;
+ *   3. en défense en profondeur, on purge les cookies (une session
+ *      abandonnée peut laisser un `__session` traîner si signOut échoue
+ *      partiellement sur le réseau).
+ *
+ * Fail-tolérant : si `window.Clerk` ne se charge jamais (ex. route sans
+ * `<ClerkProvider>`), `clerk.signOut` throw → on catch et on reclearCookies.
+ */
+async function ensureSignedOut(page: Page): Promise<void> {
+  try {
+    const hasClerk = await page
+      .evaluate(() => typeof (window as unknown as { Clerk?: unknown }).Clerk !== "undefined")
+      .catch(() => false);
+    if (!hasClerk) {
+      await page.goto("/sign-in");
+    }
+    await clerk.signOut({ page });
+  } catch {
+    // Clerk indisponible ou session déjà vide → on retombe sur
+    // `clearCookies` seul, qui invalide la session côté serveur même
+    // si l'état côté JS n'a pas pu être purgé proprement.
+  }
+  await page.context().clearCookies();
+}
 
 /**
  * docId Firestore de la conversation test PR4. Hardcodé fail-closed
@@ -56,19 +98,32 @@ test.describe("PR4 B2 — Bouton « J'ai contacté le médecin »", () => {
    * Remet la conv PR4 à l'état « non contactée » (fail-tolérant). Signé
    * e2e-admin → 200 si un marquage existait, 409 si aucun. Tout autre
    * status est un vrai échec.
+   *
+   * IMPORTANT : `ensureSignedOut` AVANT `signInAsAdmin`. Appelé depuis
+   * `afterEach`, l'acteur du test (owner, non-titulaire, no-role) est
+   * encore connecté côté Clerk (son état vit dans `localStorage` +
+   * `window.Clerk.session`, pas seulement dans les cookies). Un simple
+   * `clearCookies` ne déconnecte PAS toujours la session JS → `clerk.signIn`
+   * throw « You're already signed in. » (prouvé par le run réel 23/24).
+   *
+   * `ensureSignedOut` appelle `clerk.signOut({ page })` qui purge l'état
+   * JS, PUIS `clearCookies` en défense en profondeur. À la fin, on
+   * `ensureSignedOut` à nouveau pour laisser la page en état propre.
    */
   async function resetMarkingAsAdmin(
-    page: import("@playwright/test").Page,
+    page: Page,
     signInAsAdmin: () => Promise<void>,
   ): Promise<void> {
+    await ensureSignedOut(page);
     await signInAsAdmin();
     const res = await page.request.delete(HANDOFF_CONTACTED_URL);
     expect(
       [200, 409],
       `reset handoff-contacted doit rendre 200 ou 409, pas ${res.status()}`,
     ).toContain(res.status());
-    // On déconnecte pour ne pas polluer la session de l'acteur du test.
-    await page.context().clearCookies();
+    // Libère la session admin pour que le `beforeEach` suivant puisse
+    // appeler `clerk.signIn` sans « already signed in ».
+    await ensureSignedOut(page);
   }
 
   test.beforeEach(async ({ page, signInAsAdmin }) => {
@@ -89,8 +144,17 @@ test.describe("PR4 B2 — Bouton « J'ai contacté le médecin »", () => {
     // Vérifie l'état de départ : la conv PR4 est dans l'onglet
     // « À traiter » du titulaire. On cible par HREF (jamais par position).
     await page.goto("/admin/conversations?tab=a_traiter");
+    // PR4 B2 — tour correctif : en mobile 390, le tableau desktop est
+    // rendu mais caché (`md:hidden`/`hidden md:table`), les cartes
+    // mobiles portent AUSSI un lien href. `.first()` cru résout le
+    // nœud du tableau desktop → `hidden` → `toBeVisible` throw. On
+    // garde seulement les nœuds effectivement visibles via
+    // `.filter({ visible: true })` (Playwright 1.60+).
     await expect(
-      page.locator(`a[href$="/admin/conversations/${CONV_ID_PR4}"]`).first(),
+      page
+        .locator(`a[href$="/admin/conversations/${CONV_ID_PR4}"]`)
+        .filter({ visible: true })
+        .first(),
     ).toBeVisible();
 
     // Navigation vers le détail PR4.
@@ -121,10 +185,19 @@ test.describe("PR4 B2 — Bouton « J'ai contacté le médecin »", () => {
     // de marquage DISPARAÎT (canMarkContacted passé à false au refetch),
     // mais le toast « Médecin marqué comme contacté. » + son action
     // « Annuler » restent visibles.
+    //
+    // Le bouton « Annuler » doit être cherché STRICTEMENT dans le
+    // conteneur du toast sonner, sinon il entrerait en collision avec
+    // « Annuler le contact » du panneau latéral (visible après
+    // marquage pour l'auteur, canUndoContact=true côté serveur).
+    // Chaque toast sonner porte l'attribut `data-sonner-toast`
+    // (`node_modules/sonner/dist/index.mjs:648`) — source unique DOM.
     await expect(markButton).toBeHidden();
-    const toast = page.getByText("Médecin marqué comme contacté.");
+    const toast = page
+      .locator("[data-sonner-toast]")
+      .filter({ hasText: "Médecin marqué comme contacté." });
     await expect(toast).toBeVisible();
-    await expect(page.getByRole("button", { name: "Annuler" })).toBeVisible();
+    await expect(toast.getByRole("button", { name: "Annuler", exact: true })).toBeVisible();
 
     // Le panneau affiche « par E2E CommercialOwner » (nom résolu via
     // `resolveAdminNamesBatch`). On scope sur le panneau pour éviter de
@@ -161,7 +234,13 @@ test.describe("PR4 B2 — Bouton « J'ai contacté le médecin »", () => {
       ),
       markButton.click(),
     ]);
-    const undoAction = page.getByRole("button", { name: "Annuler" });
+    // Même règle qu'en C1 : scope dans le toast sonner
+    // (`[data-sonner-toast]`), nom exact « Annuler » — évite la
+    // collision stricte avec « Annuler le contact » du panneau.
+    const toast = page
+      .locator("[data-sonner-toast]")
+      .filter({ hasText: "Médecin marqué comme contacté." });
+    const undoAction = toast.getByRole("button", { name: "Annuler", exact: true });
     await expect(undoAction).toBeVisible();
 
     // waitForResponse DELETE + GET détail posés AVANT le clic.
@@ -238,7 +317,11 @@ test.describe("PR4 B2 — Bouton « J'ai contacté le médecin »", () => {
     await signInAsCommercialOwner();
     const markResp = await page.request.post(HANDOFF_CONTACTED_URL);
     expect(markResp.status()).toBe(200);
-    await page.context().clearCookies();
+    // Changement de compte : `clearCookies` seul ne purge PAS l'état
+    // JS Clerk → prochain `signIn` throw. On passe par
+    // `ensureSignedOut` (c.f. `clerk.signOut` dans
+    // `node_modules/@clerk/testing/dist/types/playwright/helpers.d.ts:81`).
+    await ensureSignedOut(page);
 
     // Phase 2 : admin annule depuis l'UI.
     await signInAsAdmin();
@@ -340,22 +423,13 @@ test.describe("PR4 B2 — Bouton « J'ai contacté le médecin »", () => {
   });
 
   // ────────────────────────────────────────────────────────────────────
-  // Fin de spec — la conv PR4 revient à l'état non contacté. Posé en
-  // `test.afterAll` pour TOUS les projets (même après les tests qui
-  // n'écrivent pas, par défense en profondeur).
+  // Fin de CHAQUE test — reset authentifié via la fixture
+  // `signInAsAdmin`. Remplace l'ancien `test.afterAll` qui créait un
+  // contexte vierge sans session ni baseURL → DELETE relatif masqué
+  // par un catch, laissant la conv PR4 marquée après C8.
+  // Même tolérance 200/409 que `resetMarkingAsAdmin`.
   // ────────────────────────────────────────────────────────────────────
-  test.afterAll(async ({ browser }) => {
-    const ctx = await browser.newContext();
-    const page = await ctx.newPage();
-    // On ne peut pas appeler signInAsAdmin ici (hors scope fixture) —
-    // on utilise directement l'API avec la session créée via
-    // `storageState`. Si le harnais ne persiste pas la session admin,
-    // la DELETE anonyme renvoie 401 : on tolère ce cas (reset déjà
-    // effectué entre tests par `beforeEach`).
-    const res = await page.request.delete(HANDOFF_CONTACTED_URL).catch(() => null);
-    if (res) {
-      expect([200, 401, 403, 409]).toContain(res.status());
-    }
-    await ctx.close();
+  test.afterEach(async ({ page, signInAsAdmin }) => {
+    await resetMarkingAsAdmin(page, signInAsAdmin);
   });
 });
