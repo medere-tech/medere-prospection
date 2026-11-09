@@ -40,10 +40,12 @@
  */
 import { FieldValue, Timestamp } from "firebase-admin/firestore";
 
-import {
-  E2E_CONV_ID_PR4,
-  TEST_ACCOUNT_WHITELIST_CONV_IDS,
-} from "@/lib/conversations/testaccount-whitelist";
+// IMPORTANT : on importe depuis `e2e-conversation-ids.ts` (SANS
+// `server-only`), PAS depuis `testaccount-whitelist.ts`. Les scripts CLI
+// `scripts/seed-e2e-pr4-conv.mjs` / `scripts/reset-e2e-pr4-conv.mjs`
+// tournent sous `tsx` (Node, pas RSC) et `server-only` throw à l'import
+// dans ce contexte.
+import { E2E_CONV_ID_PR4 } from "@/lib/conversations/e2e-conversation-ids";
 import { appendAuditLogTx } from "@/lib/firestore/audit-log";
 import { queryBackfillContact } from "@/lib/firestore/backfill-conversation-list-fields";
 import {
@@ -65,9 +67,12 @@ export const E2E_PR4_CONTACT_ID = "427963864300";
 export const E2E_PR4_CAMPAIGN_ID = "hubspot-list-999999";
 
 /**
- * Refuse tout identifiant qui n'est pas dans la whitelist PR4. Source
- * unique : `TEST_ACCOUNT_WHITELIST_CONV_IDS`. Le seed/reset PR4 ne
- * manipule QUE `E2E_CONV_ID_PR4` — refus fail-closed sur tout autre.
+ * Refuse tout identifiant qui n'est pas la cible PR4. Comparaison stricte
+ * à `E2E_CONV_ID_PR4` — le seed/reset PR4 ne manipule qu'UNE seule conv
+ * (fail-closed sur tout autre). La whitelist compte-test réelle
+ * (`TEST_ACCOUNT_WHITELIST_CONV_IDS`) vit dans
+ * `src/lib/conversations/testaccount-whitelist.ts` derrière `server-only`
+ * et contient les 2 identifiants e2e ; ici on n'autorise que PR4.
  */
 export function assertTargetConversationIdAllowed(conversationId: string): void {
   if (conversationId !== E2E_CONV_ID_PR4) {
@@ -75,13 +80,6 @@ export function assertTargetConversationIdAllowed(conversationId: string): void 
       message: `seed-reset-pr4: ${conversationId} is not the PR4 target conversation (expected ${E2E_CONV_ID_PR4})`,
       clientMessage: "Identifiant de conversation PR4 refusé.",
       context: { conversationId, expected: E2E_CONV_ID_PR4 },
-    });
-  }
-  if (!TEST_ACCOUNT_WHITELIST_CONV_IDS.has(conversationId)) {
-    throw new ForbiddenError({
-      message: "seed-reset-pr4: conversationId not in TEST_ACCOUNT_WHITELIST_CONV_IDS",
-      clientMessage: "Identifiant hors whitelist.",
-      context: { conversationId },
     });
   }
 }
@@ -158,6 +156,73 @@ export function checkSeedCompleteness(data: unknown): CompletenessResult {
     issues.push(`handoffContacted non-boolean`);
   }
   return { complete: issues.length === 0, issues };
+}
+
+/**
+ * Formatte un `SeedResult` (retour de `applySeed`) pour affichage CLI.
+ * Sort la logique d'affichage du `.mjs` (que `tsc --noEmit` n'inspecte
+ * pas) vers un helper typé testé : `scripts/seed-e2e-pr4-conv.mjs`
+ * n'appelle plus que `describeSeedResult(result)`.
+ *
+ * Contrat :
+ *   - `kind: "created"`           → exitCode 0 + message « Conv créée. »
+ *   - `kind: "already-complete"`  → exitCode 0 + message « Conv déjà complète. »
+ *   - `kind: "already-incomplete"`→ exitCode 1 + liste des issues (une par ligne).
+ *
+ * Toute évolution de `SeedResult` doit être reflétée ici ET couverte par
+ * `seed-reset-e2e-pr4-core.describe.test.ts` (mutation sentinelle :
+ * retirer un `case` → le test tombe).
+ */
+export interface CliOutput {
+  readonly lines: readonly string[];
+  readonly exitCode: 0 | 1;
+}
+
+export function describeSeedResult(result: SeedResult): CliOutput {
+  switch (result.kind) {
+    case "created":
+      return { lines: ["  ✓ Conv créée."], exitCode: 0 };
+    case "already-complete":
+      return { lines: ["  ↪ Conv déjà seedée et complète. No-op."], exitCode: 0 };
+    case "already-incomplete": {
+      const lines = [
+        "  ✗ Conv déjà présente mais INCOMPLÈTE :",
+        ...result.issues.map((i) => `      - ${i}`),
+        "  Action requise : corriger le document en base avant de relancer le seed.",
+      ];
+      return { lines, exitCode: 1 };
+    }
+  }
+}
+
+/**
+ * Formatte un `SeedDecision` (retour de `scanSeed`) pour affichage CLI
+ * en dry-run. Si la conv existe, affiche le diagnostic de
+ * `checkSeedCompleteness` (complète OU liste des issues). Sort en
+ * code 1 si le document est présent mais incomplet.
+ *
+ * Contrat :
+ *   - `kind: "will-create"`       → exitCode 0 + « Conv absente ... ».
+ *   - `kind: "already-exists"`    + `completeness.complete: true`  → exitCode 0 + « Conv déjà complète. »
+ *   - `kind: "already-exists"`    + `completeness.complete: false` → exitCode 1 + liste des issues.
+ */
+export function describeSeedDecision(decision: SeedDecision): CliOutput {
+  if (decision.kind === "will-create") {
+    return { lines: ["  ↪ Conv absente — prête à être créée."], exitCode: 0 };
+  }
+  // already-exists
+  if (decision.completeness.complete) {
+    return {
+      lines: [`  ↪ Conv déjà seedée (status=${decision.currentStatus}) et complète. No-op.`],
+      exitCode: 0,
+    };
+  }
+  const lines = [
+    `  ✗ Conv déjà présente (status=${decision.currentStatus}) mais INCOMPLÈTE :`,
+    ...decision.completeness.issues.map((i) => `      - ${i}`),
+    "  Action requise : corriger le document en base avant de relancer le seed.",
+  ];
+  return { lines, exitCode: 1 };
 }
 
 /**
@@ -324,9 +389,13 @@ export async function scanReset(
 /**
  * Efface `handoff.contactedAt`, `handoff.contactedBy`, pose
  * `handoffContacted: false`, bump `updatedAt`. Si un marquage existait,
- * écrit un audit `handoff_contact_undone` système (actorType `system`,
- * actorTestAccount `true` — opération de maintenance e2e). Idempotent :
- * tourner 2× ne pose qu'un seul audit (le 2e passage voit `no-marking`).
+ * écrit un audit `handoff_contact_undone` système (actorType `system`).
+ * `actorTestAccount` n'est PAS passé par l'appelant : la sentinelle
+ * `validateAndScrub` (`src/lib/firestore/audit-log.ts:234-248`) défaulte
+ * à `false` pour les actors non-`human` — attendu puisque `seed-reset-pr4`
+ * est un acteur système de maintenance, pas un compte de test.
+ * Idempotent : tourner 2× ne pose qu'un seul audit (le 2e passage voit
+ * `no-marking`).
  */
 export async function applyReset(
   db: FirebaseFirestore.Firestore,

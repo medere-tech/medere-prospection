@@ -13,7 +13,7 @@ config({ path: ".env.local" });
 import { cert, getApps, initializeApp } from "firebase-admin/app";
 import { getFirestore } from "firebase-admin/firestore";
 
-import { E2E_CONV_ID_PR4 } from "../src/lib/conversations/testaccount-whitelist.ts";
+import { E2E_CONV_ID_PR4 } from "../src/lib/conversations/e2e-conversation-ids.ts";
 import {
   applyReset,
   assertProjectIdMatches,

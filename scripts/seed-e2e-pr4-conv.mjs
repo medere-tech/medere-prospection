@@ -17,10 +17,12 @@ config({ path: ".env.local" });
 import { cert, getApps, initializeApp } from "firebase-admin/app";
 import { getFirestore } from "firebase-admin/firestore";
 
-import { E2E_CONV_ID_PR4 } from "../src/lib/conversations/testaccount-whitelist.ts";
+import { E2E_CONV_ID_PR4 } from "../src/lib/conversations/e2e-conversation-ids.ts";
 import {
   applySeed,
   assertProjectIdMatches,
+  describeSeedDecision,
+  describeSeedResult,
   E2E_PR4_CAMPAIGN_ID,
   E2E_PR4_CONTACT_ID,
   E2E_PR4_HANDOFF_ASSIGNED_TO,
@@ -76,25 +78,25 @@ console.log("─".repeat(72));
 
 try {
   const decision = await scanSeed(db);
-  if (decision.kind === "already-exists") {
-    console.log(`  ↪ Conv déjà seedée (status=${decision.currentStatus}). No-op.`);
-    process.exit(0);
-  }
-  console.log(`  ↪ Conv absente — prête à être créée.`);
+  const scanOut = describeSeedDecision(decision);
+  for (const line of scanOut.lines) console.log(line);
 
   if (!APPLY) {
     console.log("");
-    console.log("DRY-RUN terminé. Relancer avec `--apply <projectId>` pour écrire.");
-    process.exit(0);
+    if (scanOut.exitCode === 0) {
+      console.log("DRY-RUN terminé. Relancer avec `--apply <projectId>` pour écrire.");
+    }
+    process.exit(scanOut.exitCode);
   }
 
+  // Si le scan a détecté un doc existant incomplet, on ne tente PAS
+  // d'apply : la décision sort en 1, l'opérateur doit corriger la base.
+  if (scanOut.exitCode === 1) process.exit(1);
+
   const result = await applySeed(db);
-  if (result.wrote) {
-    console.log(`  ✓ Conv créée.`);
-  } else {
-    console.log(`  ↪ Conv déjà présente au moment de l'apply (race). No-op.`);
-  }
-  process.exit(0);
+  const applyOut = describeSeedResult(result);
+  for (const line of applyOut.lines) console.log(line);
+  process.exit(applyOut.exitCode);
 } catch (err) {
   console.error(`Échec : ${err?.message ?? err}`);
   process.exit(1);

@@ -16,19 +16,15 @@
  * ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
  * Source unique des deux identifiants
  *
- *   - `E2E_CONV_ID` (`427963864300_hubspot-list-6081`) — importé depuis
- *     `src/lib/firestore/reset-e2e-orphans-core.ts` (défini là-bas
- *     ligne 44) pour garder UNE SEULE source de vérité. C'est la
- *     conversation réelle de Déthié, désormais au statut `opted_out`,
- *     utilisée par les specs e2e orphelins (PR2c) et par la spec e2e
- *     PR3 reveal-phone.
+ *   Les 2 constantes `E2E_CONV_ID` et `E2E_CONV_ID_PR4` vivent dans
+ *   `src/lib/conversations/e2e-conversation-ids.ts` (SANS `server-only`)
+ *   pour être lisibles par les scripts CLI `tsx`. Ce fichier re-exporte
+ *   `E2E_CONV_ID` lui-même défini dans `src/lib/firestore/reset-e2e-orphans-core.ts:44`.
  *
- *   - `E2E_CONV_ID_PR4` (`427963864300_hubspot-list-999999`) — nouvelle
- *     conversation de test dédiée au harnais PR4 (`handed_off` +
- *     `handoff.assignedTo: "U05UVHGBURX"`, sur le même contactId
- *     `427963864300` que la conv A). Seedée par
- *     `scripts/seed-e2e-pr4-conv.mjs`, reset par
- *     `scripts/reset-e2e-pr4-conv.mjs`.
+ *   La liste blanche vraie (`TEST_ACCOUNT_WHITELIST_CONV_IDS`) vit ICI,
+ *   derrière `server-only` : un Client Component qui l'importerait
+ *   ferait planter le build. Seul le code serveur (routes API, core
+ *   mark-handoff-contacted) consomme la garde.
  *
  *   Format du docId prouvé compatible avec tous les parsers (cf.
  *   JSDoc `conversationDocId` dans `src/lib/firestore/conversations.ts:219`
@@ -46,20 +42,13 @@
  */
 import "server-only";
 
-import { E2E_CONV_ID } from "@/lib/firestore/reset-e2e-orphans-core";
+import { E2E_CONV_ID, E2E_CONV_ID_PR4 } from "@/lib/conversations/e2e-conversation-ids";
 import { ForbiddenError } from "@/lib/utils/errors";
 
-/**
- * docId Firestore de la conversation PR4 (seedée par le script). Choisi
- * pour être strictement différent de `E2E_CONV_ID` tout en pointant le
- * MÊME `contactId` (le PS de test de Déthié) pour éviter d'avoir à
- * seeder un nouveau contact.
- *
- * Format : `<contactId>_hubspot-list-<campaignListId>`, conforme à
- * `CAMPAIGN_ID_REGEX = /^hubspot-list-\d+$/` déjà appliqué partout où
- * le `campaignId` est validé côté serveur.
- */
-export const E2E_CONV_ID_PR4 = "427963864300_hubspot-list-999999";
+// Re-export pour ne pas casser les callers existants qui importaient
+// `E2E_CONV_ID_PR4` depuis ce module (routes, tests, docs). Source unique
+// dans `e2e-conversation-ids.ts`.
+export { E2E_CONV_ID_PR4 };
 
 /**
  * Set fermé des `conversationId` que les comptes `testAccount: true`
