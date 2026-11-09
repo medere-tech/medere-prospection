@@ -519,6 +519,9 @@ test.describe("Liste conversations — lecture seule", () => {
         page.goto(`/admin/conversations?tab=${tab}`),
       ]);
       const body = await page.locator("body").innerText();
+      // Sentinelle id technique : reste appliquée au body ENTIER
+      // (l'absence des `U...`/`hubspot-list-\d+`/`user_...` ne dépend
+      // d'aucune conv particulière).
       assertNoTechnicalId(body, `L14 /admin/conversations?tab=${tab}`);
       // Snake_case audit code (pas de fil messages sur la liste → body
       // suffit, mais on garde la même mécanique pour cohérence).
@@ -526,9 +529,50 @@ test.describe("Liste conversations — lecture seule", () => {
         await innerTextWithoutMessageThread(page),
         `L14 snake /admin/conversations?tab=${tab}`,
       );
-      expect(body).not.toContain("Campagne inconnue");
+      // PR4 B2 tour 2 — la conv test PR4 (`hubspot-list-999999`,
+      // campagne fictive) affiche volontairement « Campagne inconnue »
+      // sur SA PROPRE ligne. On scope donc la vérification au CONTENEUR
+      // de la ligne de A, pas au body entier ni au lien.
+      //
+      // Structure DOM prouvée (lue directement) :
+      //   - desktop / tablette :
+      //       `<TableRow className="relative">`
+      //         (`src/app/admin/conversations/conversations-page-client.tsx:456`)
+      //       dans laquelle vit, EN COUCHE TRANSPARENTE, un
+      //       `<Link className="absolute inset-0 z-10">` avec
+      //       uniquement un `sr-only` « Ouvrir la conversation de … »
+      //       (file:line :460-469). Le nom de campagne vit dans les
+      //       cellules frères, PAS dans le lien.
+      //   - mobile (< md) : `<Link className="block rounded-lg border …">`
+      //       (`src/app/admin/conversations/conversation-row-card.tsx:53-57`)
+      //       qui ENGLOBE tout le contenu de la carte (nom, spécialité,
+      //       campagne, etc.).
+      //
+      // Donc :
+      //   1. on récupère le lien visible de A (filtre `visible: true`
+      //      déjà en place) ;
+      //   2. on cherche le `<tr>` ancêtre (`getByRole("row")` filtré par
+      //      `has: convALink`) → match desktop/tablette ;
+      //   3. en mobile, aucun `<tr>` n'est rendu → fallback sur le lien
+      //      lui-même, qui est la carte.
       if (tab === "toutes" || tab === "cloturees") {
-        expect(body).toContain(campaignName!);
+        const convALink = page
+          .locator(`a[href$="/admin/conversations/${CONV_ID_ADMIN_NON_OWNER}"]`)
+          .filter({ visible: true })
+          .first();
+        await expect(convALink).toBeVisible();
+
+        const tableRow = page.getByRole("row").filter({ has: convALink });
+        const rowCount = await tableRow.count();
+        const container = rowCount > 0 ? tableRow.first() : convALink;
+        const rowText = await container.innerText();
+        expect(
+          rowText,
+          `L14 ${tab} conteneur ligne A — pas de « Campagne inconnue »`,
+        ).not.toContain("Campagne inconnue");
+        expect(rowText, `L14 ${tab} conteneur ligne A — vrai nom de campagne`).toContain(
+          campaignName!,
+        );
       }
     }
     // Détail de A — fil des messages EXCLU pour le snake_case
@@ -606,7 +650,14 @@ test.describe("Liste conversations — lecture seule", () => {
         /[?&]q=/.test(r.url()) &&
         r.request().method() === "GET",
     );
-    await expect(page.getByRole("link", { name: /Ouvrir la conversation/ })).toBeVisible();
+    // PR4 — pareil qu'au-dessus : « DÉTHIÉ » matche 2 convs (A + PR4),
+    // on scope sur le href visible de A (plus de strict mode violation).
+    await expect(
+      page
+        .locator(`a[href$="/admin/conversations/${CONV_ID_ADMIN_NON_OWNER}"]`)
+        .filter({ visible: true })
+        .first(),
+    ).toBeVisible();
 
     // "zzz" → empty state dédié.
     await input.fill("");
