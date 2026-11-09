@@ -216,12 +216,18 @@ export function ConversationDetailClient({ conversationId, initialData, viewerRo
         contact={data.contact}
         intent={data.intent}
         conversationId={conversationId}
+        canMarkContacted={data.canMarkContacted}
         // PR3 tour 2b — un clic reveal-phone ne mute pas
         // `conversation.updatedAt` côté Firestore (c'est un write `audit_log`
         // seul), donc le poll `/version` ne détecte pas la nouvelle entrée
         // de journal. On force un refetch du détail à chaque POST reveal
         // réussi pour que l'admin voie « Numéro affiché » / « copié » /
         // « Appel lancé » apparaître immédiatement.
+        // PR4 B1 — même mécanisme pour le bouton « J'ai contacté » : un
+        // POST/DELETE handoff-contacted bump `conversation.updatedAt`
+        // (DANS la tx core), donc `/version` détectera le changement au
+        // prochain poll. On force quand même le refetch immédiat pour
+        // que le panneau affiche « Contacté le … » sans attendre 30 s.
         onAudited={() => setRefetchKey((k) => k + 1)}
       />
 
@@ -237,7 +243,7 @@ export function ConversationDetailClient({ conversationId, initialData, viewerRo
 
       <div className="grid grid-cols-1 gap-6 lg:grid-cols-[1fr_320px]">
         <MessageThread messages={data.messages} />
-        <ConversationSidePanel data={data} />
+        <ConversationSidePanel data={data} onAudited={() => setRefetchKey((k) => k + 1)} />
       </div>
     </div>
   );

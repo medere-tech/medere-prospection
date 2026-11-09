@@ -116,6 +116,12 @@ export interface HandoffDisplayProps {
   contactedAtIso: string | null;
   /** PR4 — Clerk userId de l'auteur du clic ou `null`. Non PII. */
   contactedBy: string | null;
+  /**
+   * PR4 — Nom humain de l'auteur du clic, résolu côté serveur via
+   * `resolveAdminNamesBatch`. `null` si introuvable → l'UI affiche la
+   * date seule, JAMAIS `contactedBy` brut (identifiant technique).
+   */
+  contactedByName: string | null;
 }
 
 /** Entrée du journal fusionné (audits conversation + audits contact). */
@@ -184,4 +190,17 @@ export interface ConversationDetailProps {
    * le server component parent.
    */
   viewerIsOwner: boolean;
+  /**
+   * PR4 — droit calculé côté serveur de marquer « J'ai contacté ».
+   * Vrai si le viewer peut écrire (admin OU commercial titulaire) ET
+   * `status === "handed_off"` ET `handoffContacted === false`.
+   * Source unique : `canMarkHandoffContacted` du core (pas de recopie).
+   */
+  canMarkContacted: boolean;
+  /**
+   * PR4 — droit calculé côté serveur d'annuler un marquage. Vrai si le
+   * viewer est admin OU l'auteur du marquage ET `handoffContacted === true`.
+   * Source unique : `canUnmarkHandoffContacted` du core.
+   */
+  canUndoContact: boolean;
 }

@@ -54,6 +54,10 @@ import { resolveCommercialBySlackUserId } from "@/lib/airtable/commerciaux";
 import { resolveAdminNamesBatch } from "@/lib/auth/resolve-admin-name";
 import { resolveCampaignName } from "@/lib/campaigns/campaign-id";
 import { campaignNameByListIdFrom, getCachedSmsCampaigns } from "@/lib/campaigns/campaigns-cache";
+import {
+  canMarkHandoffContacted,
+  canUnmarkHandoffContacted,
+} from "@/lib/conversations/mark-handoff-contacted";
 import { getAdminDb } from "@/lib/firestore/admin";
 import { listAuditLogByTarget } from "@/lib/firestore/audit-log";
 import { getContact } from "@/lib/firestore/contacts";
@@ -234,6 +238,8 @@ export async function resolveCampaignNameServerSide(
 export async function loadConversationDetail(
   conversationId: string,
   viewer: {
+    /** Clerk userId — requis pour `canUnmarkHandoffContacted` (comparaison stricte auteur). */
+    userId: string;
     role: "admin" | "commercial";
     slackUserId: string | undefined;
     /**
@@ -324,14 +330,44 @@ export async function loadConversationDetail(
     });
     const topFive = merged.slice(0, 5);
     const humanActorIds = topFive.filter((e) => e.actorType === "human").map((e) => e.actorId);
+    // PR4 — on résout aussi `handoff.contactedBy` dans le même batch pour
+    // afficher « Contacté le ... par <nom> » dans le panneau latéral.
+    // Jamais l'id brut côté UI : si le compte Clerk a disparu, `null` →
+    // l'UI affiche la date seule.
+    const contactedByUserId =
+      typeof conv.handoff?.contactedBy === "string" && conv.handoff.contactedBy.length > 0
+        ? conv.handoff.contactedBy
+        : null;
+    const allUserIdsToResolve = new Set<string>(humanActorIds);
+    if (contactedByUserId !== null) allUserIdsToResolve.add(contactedByUserId);
     const actorNameByUserId =
-      humanActorIds.length > 0
-        ? await resolveAdminNamesBatch(humanActorIds)
+      allUserIdsToResolve.size > 0
+        ? await resolveAdminNamesBatch([...allUserIdsToResolve])
         : new Map<string, string | null>();
     const journal: JournalEntryProps[] = sanitizeAuditEntriesForJournal(topFive, {
       actorNameByUserId,
       viewerIsTestAccount: viewer.testAccount,
     });
+    const contactedByName =
+      contactedByUserId !== null ? (actorNameByUserId.get(contactedByUserId) ?? null) : null;
+
+    // PR4 — droits PR4 calculés côté serveur, source unique : les deux
+    // prédicats purs du core `mark-handoff-contacted.ts`. Pas de recopie
+    // de logique métier ici. L'actor pour les prédicats mappe sur le
+    // viewer courant.
+    const actorForPredicates = {
+      userId: viewer.userId,
+      role: viewer.role,
+      slackUserId: viewer.slackUserId,
+      testAccount: viewer.testAccount,
+    };
+    const canMarkContacted =
+      conv.status === "handed_off" &&
+      conv.handoffContacted === false &&
+      canMarkHandoffContacted(actorForPredicates, conv.handoff?.assignedTo);
+    const canUndoContact =
+      conv.handoffContacted === true &&
+      canUnmarkHandoffContacted(actorForPredicates, conv.handoff?.contactedBy);
 
     const data: ConversationDetailProps = {
       conversationId,
@@ -360,11 +396,13 @@ export async function loadConversationDetail(
       inboundCount: conv.inboundCount,
       outboundCount: conv.outboundCount,
       summary: conv.summary ?? null,
-      handoff: sanitizeHandoffForPanel(conv, titulaireName),
+      handoff: sanitizeHandoffForPanel(conv, titulaireName, contactedByName),
       contact: sanitizeContactForHeader(contact),
       messages: sanitizedMessages,
       journal,
       viewerIsOwner: computeViewerIsOwner(viewer.slackUserId, assignedToSlack),
+      canMarkContacted,
+      canUndoContact,
     };
 
     return { kind: "ok", data };

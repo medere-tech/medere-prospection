@@ -177,6 +177,7 @@ describe("loadConversationDetail — persist emulator (VUE-CONVERSATION PR1)", (
 
   it("not_found si conversation inexistante", async () => {
     const res = await loadConversationDetail("no_such_conv", {
+      userId: "test_user_x",
       role: "admin",
       slackUserId: undefined,
       testAccount: false,
@@ -190,6 +191,7 @@ describe("loadConversationDetail — persist emulator (VUE-CONVERSATION PR1)", (
     // `isAdmin || ...` renvoyait toujours true, ce qui cachait la bannière.
     await seed({ withHandoff: true });
     const res = await loadConversationDetail(CONV_ID, {
+      userId: "test_user_x",
       role: "admin",
       slackUserId: undefined,
       testAccount: false,
@@ -205,6 +207,7 @@ describe("loadConversationDetail — persist emulator (VUE-CONVERSATION PR1)", (
     // conv doit être marqué owner (pas de bannière Mode admin inutile).
     await seed({ withHandoff: true });
     const res = await loadConversationDetail(CONV_ID, {
+      userId: "test_user_x",
       role: "admin",
       slackUserId: OWNER_SLACK,
       testAccount: false,
@@ -217,6 +220,7 @@ describe("loadConversationDetail — persist emulator (VUE-CONVERSATION PR1)", (
   it("ok commercial titulaire : voit sa propre conv", async () => {
     await seed({ withHandoff: true });
     const res = await loadConversationDetail(CONV_ID, {
+      userId: "test_user_x",
       role: "commercial",
       slackUserId: OWNER_SLACK,
       testAccount: false,
@@ -229,6 +233,7 @@ describe("loadConversationDetail — persist emulator (VUE-CONVERSATION PR1)", (
   it("not_mine : commercial non-titulaire bloqué 403", async () => {
     await seed({ withHandoff: true });
     const res = await loadConversationDetail(CONV_ID, {
+      userId: "test_user_x",
       role: "commercial",
       slackUserId: INTRUDER_SLACK,
       testAccount: false,
@@ -243,6 +248,7 @@ describe("loadConversationDetail — persist emulator (VUE-CONVERSATION PR1)", (
   it("not_mine : commercial sans slackUserId du tout → 403", async () => {
     await seed({ withHandoff: true });
     const res = await loadConversationDetail(CONV_ID, {
+      userId: "test_user_x",
       role: "commercial",
       slackUserId: undefined,
       testAccount: false,
@@ -261,6 +267,7 @@ describe("loadConversationDetail — persist emulator (VUE-CONVERSATION PR1)", (
   it("exclusion duplicate : un message status='duplicate' n'apparaît PAS dans messages[]", async () => {
     await seed({ withHandoff: true, withDuplicate: true });
     const res = await loadConversationDetail(CONV_ID, {
+      userId: "test_user_x",
       role: "admin",
       slackUserId: undefined,
       testAccount: false,
@@ -276,6 +283,7 @@ describe("loadConversationDetail — persist emulator (VUE-CONVERSATION PR1)", (
   it("mutation testing filtre duplicate — vérif qu'il n'apparaît pas", async () => {
     await seed({ withHandoff: true, withDuplicate: true });
     const res = await loadConversationDetail(CONV_ID, {
+      userId: "test_user_x",
       role: "admin",
       slackUserId: undefined,
       testAccount: false,
@@ -290,6 +298,7 @@ describe("loadConversationDetail — persist emulator (VUE-CONVERSATION PR1)", (
   it("sanity : aucun pattern téléphone dans la payload sérialisée", async () => {
     await seed({ withHandoff: true });
     const res = await loadConversationDetail(CONV_ID, {
+      userId: "test_user_x",
       role: "admin",
       slackUserId: undefined,
       testAccount: false,
@@ -304,6 +313,7 @@ describe("loadConversationDetail — persist emulator (VUE-CONVERSATION PR1)", (
   it("conversation sans handoff : status='in_dialogue' + handoff=null", async () => {
     await seed({ withHandoff: false });
     const res = await loadConversationDetail(CONV_ID, {
+      userId: "test_user_x",
       role: "admin",
       slackUserId: undefined,
       testAccount: false,
@@ -320,6 +330,7 @@ describe("loadConversationDetail — persist emulator (VUE-CONVERSATION PR1)", (
     // au sens strict (slackUserId !== null). Donc 403 pour un commercial.
     await seed({ withHandoff: false });
     const res = await loadConversationDetail(CONV_ID, {
+      userId: "test_user_x",
       role: "commercial",
       slackUserId: INTRUDER_SLACK,
       testAccount: false,

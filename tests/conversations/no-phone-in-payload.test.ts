@@ -278,6 +278,8 @@ describe("Sentinelle PR1 — zero PII dans la payload RSC", () => {
         viewerIsTestAccount: false,
       }),
       viewerIsOwner: true,
+      canMarkContacted: false,
+      canUndoContact: false,
     };
 
     assertNoPhoneInJson(data, "ConversationDetailProps complète");

@@ -48,10 +48,8 @@ import { FieldValue, Timestamp } from "firebase-admin/firestore";
 import { E2E_CONV_ID_PR4 } from "@/lib/conversations/e2e-conversation-ids";
 import { appendAuditLogTx } from "@/lib/firestore/audit-log";
 import { queryBackfillContact } from "@/lib/firestore/backfill-conversation-list-fields";
-import {
-  computeContactDisplayName,
-  normalizeContactNameSearch,
-} from "@/lib/firestore/conversation-list-fields";
+// PR4 B1 — SOURCE UNIQUE partagée avec `backfill-conversation-list-fields.ts`.
+import { computeContactListFieldsFromRaw } from "@/lib/firestore/conversation-list-fields";
 import { ConversationSchema } from "@/lib/firestore/conversations";
 import { ForbiddenError, ValidationError } from "@/lib/utils/errors";
 
@@ -286,19 +284,13 @@ export async function applySeed(
   const contactSnap = await queryBackfillContact(db, E2E_PR4_CONTACT_ID);
   if (contactSnap.exists) {
     const raw = (contactSnap.data() ?? {}) as Record<string, unknown>;
-    const civilite = typeof raw.civilite === "string" ? raw.civilite : undefined;
-    const firstName = typeof raw.firstName === "string" ? raw.firstName : "";
-    const lastName = typeof raw.lastName === "string" ? raw.lastName : "";
-    const dn = computeContactDisplayName({ civilite, firstName, lastName });
-    if (dn.length > 0) contactDisplayName = dn;
-    const ns = normalizeContactNameSearch(`${firstName} ${lastName}`);
-    if (ns.length > 0) contactNameSearch = ns;
-    if (typeof raw.speciality === "string" && raw.speciality.length > 0) {
-      contactSpecialty = raw.speciality;
-    }
-    if (typeof raw.city === "string" && raw.city.length > 0) {
-      contactCity = raw.city;
-    }
+    // PR4 B1 — SOURCE UNIQUE : même compute que le backfill
+    // (`backfill-conversation-list-fields.ts::computeBackfillUpdatesForConversation`).
+    const fields = computeContactListFieldsFromRaw(raw);
+    contactDisplayName = fields.contactDisplayName;
+    contactNameSearch = fields.contactNameSearch;
+    contactSpecialty = fields.contactSpecialty;
+    contactCity = fields.contactCity;
   }
 
   const doc: Record<string, unknown> = {

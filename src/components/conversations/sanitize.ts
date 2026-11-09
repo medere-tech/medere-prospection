@@ -146,6 +146,7 @@ export function sanitizeConversationIntent(conv: Conversation): ConversationDisp
 export function sanitizeHandoffForPanel(
   conv: Conversation,
   commercialName: string | null,
+  contactedByName: string | null = null,
 ): HandoffDisplayProps | null {
   const h = conv.handoff;
   if (!h) return null;
@@ -155,6 +156,7 @@ export function sanitizeHandoffForPanel(
     assignedAtIso: toIsoOrNull(h.assignedAt as Timestamp | undefined),
     contactedAtIso: toIsoOrNull(h.contactedAt as Timestamp | undefined),
     contactedBy: typeof h.contactedBy === "string" ? h.contactedBy : null,
+    contactedByName,
   };
 }
 

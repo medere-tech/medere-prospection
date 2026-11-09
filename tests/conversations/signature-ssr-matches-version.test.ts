@@ -79,6 +79,7 @@ function makeDetail(): ConversationDetailProps {
       assignedAtIso: "2026-10-19T10:03:00.000Z",
       contactedAtIso: null,
       contactedBy: null,
+      contactedByName: null,
     },
     contact: {
       contactId: "contact1",
@@ -93,6 +94,8 @@ function makeDetail(): ConversationDetailProps {
     messages: [],
     journal: [],
     viewerIsOwner: true,
+    canMarkContacted: false,
+    canUndoContact: false,
   };
 }
 

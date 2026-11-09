@@ -165,6 +165,7 @@ describe("ConversationStatusBanner", () => {
           assignedAtIso: "2026-10-19T09:00:00.000Z",
           contactedAtIso: null,
           contactedBy: null,
+          contactedByName: null,
         }}
         contactOptedOut={true}
       />,
@@ -193,6 +194,7 @@ describe("ConversationStatusBanner", () => {
           assignedAtIso: "2026-10-19T09:00:00.000Z",
           contactedAtIso: null,
           contactedBy: null,
+          contactedByName: null,
         }}
         contactOptedOut={false}
       />,
@@ -212,6 +214,7 @@ describe("ConversationStatusBanner", () => {
           assignedAtIso: null,
           contactedAtIso: null,
           contactedBy: null,
+          contactedByName: null,
         }}
         contactOptedOut={false}
       />,
@@ -255,6 +258,7 @@ describe("ConversationHeader", () => {
         }}
         intent="INTERESSE"
         conversationId="conv_1"
+        canMarkContacted={false}
       />,
     );
     expect(screen.getByRole("heading")).toHaveTextContent("Dr Jean Dupont");
@@ -291,6 +295,7 @@ describe("ConversationHeader", () => {
         }}
         intent="unknown"
         conversationId="conv_2"
+        canMarkContacted={false}
       />,
     );
     expect(screen.getByRole("heading")).toHaveTextContent("Contact sans nom");

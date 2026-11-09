@@ -58,7 +58,7 @@ export async function GET(
 
     const { id } = await params;
 
-    const result = await loadConversationDetail(id, { role, slackUserId, testAccount });
+    const result = await loadConversationDetail(id, { userId, role, slackUserId, testAccount });
 
     if (result.kind === "not_found") {
       return NextResponse.json({ error: "not_found" }, { status: 404 });
