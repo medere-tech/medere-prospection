@@ -61,6 +61,7 @@ export interface ConversationsListApiResponse {
 export interface ConversationsCountsApiResponse {
   counts: {
     a_traiter: number;
+    contactees: number;
     cloturees: number;
     toutes: number;
     en_cours?: number;
@@ -90,7 +91,7 @@ export type CountsFetchState =
   | { kind: "success"; data: ConversationsCountsApiResponse["counts"] }
   | { kind: "error" };
 
-export type Tab = "a_traiter" | "en_cours" | "cloturees" | "toutes";
+export type Tab = "a_traiter" | "contactees" | "en_cours" | "cloturees" | "toutes";
 
 export interface CommercialForClient {
   slackUserId: string;

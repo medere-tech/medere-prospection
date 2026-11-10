@@ -35,43 +35,66 @@ test.describe("Liste conversations — lecture seule", () => {
   // L1 — admin : onglets propres + compteurs réels
   // ────────────────────────────────────────────────────────────────────
 
-  test("L1 admin — onglets propres + compteurs = valeurs réelles", async ({
+  test("L1 admin — 5 onglets PR4 + compteurs = valeurs de /counts (jamais de constantes)", async ({
     page,
     signInAsAdmin,
   }) => {
     test.skip(!CONV_ID_ADMIN_NON_OWNER, "E2E_CONV_ID_FOR_ADMIN_NON_OWNER manquant");
     installApiPhoneSentinel(page);
     await signInAsAdmin();
-    await page.goto("/admin/conversations");
 
-    // 4 onglets rendus pour un admin.
+    // PR4 B2 — compteurs attendus LUS depuis l'API `/counts` (plus de
+    // constantes en dur, qui cassent dès qu'une 2e conv apparaît en base
+    // comme la conv test PR4 `427963864300_hubspot-list-999999`).
+    const [countsResp] = await Promise.all([
+      page.waitForResponse(
+        (r) =>
+          /\/api\/admin\/conversations\/counts\?/.test(r.url()) && r.request().method() === "GET",
+      ),
+      page.goto("/admin/conversations"),
+    ]);
+    const { counts } = (await countsResp.json()) as {
+      counts: {
+        a_traiter: number;
+        contactees: number;
+        en_cours: number;
+        cloturees: number;
+        toutes: number;
+      };
+    };
+
+    // PR4 — 5 onglets admin dans l'ordre `ADMIN_TAB_ORDER`
+    // (`src/app/admin/conversations/tabs-bar.tsx:33-39`).
     const tabs = page.getByRole("tab");
-    await expect(tabs).toHaveCount(4);
+    await expect(tabs).toHaveCount(5);
+    const expectedLabels = ["À traiter", "Contactées", "En cours avec Léa", "Clôturées", "Toutes"];
+    for (const label of expectedLabels) {
+      await expect(tabs.filter({ hasText: label })).toHaveCount(1);
+    }
 
-    // Compteurs (texte Badge). A traiter + En cours = 0 ; Clôturées = 1 ; Toutes = 1.
-    const aTraiter = tabs.filter({ hasText: "À traiter" });
-    await expect(aTraiter.getByText(/^0$/)).toBeVisible();
-    const enCours = tabs.filter({ hasText: "En cours avec Léa" });
-    await expect(enCours.getByText(/^0$/)).toBeVisible();
-    const cloturees = tabs.filter({ hasText: "Clôturées" });
-    await expect(cloturees.getByText(/^1$/)).toBeVisible();
-    const toutes = tabs.filter({ hasText: "Toutes" });
-    await expect(toutes.getByText(/^1$/)).toBeVisible();
+    // Chaque badge affiche la valeur exacte de /counts.
+    for (const [label, value] of [
+      ["À traiter", counts.a_traiter],
+      ["Contactées", counts.contactees],
+      ["En cours avec Léa", counts.en_cours],
+      ["Clôturées", counts.cloturees],
+      ["Toutes", counts.toutes],
+    ] as const) {
+      const tab = tabs.filter({ hasText: label });
+      await expect(tab.getByText(new RegExp(`^${value}$`))).toBeVisible();
+    }
 
-    // Onglet "A traiter" vide → phrase utile (role=status, UN SEUL dans le DOM).
-    await expect(
-      page.getByRole("status").filter({ hasText: "Aucune conversation à traiter." }),
-    ).toBeVisible();
+    // Clôturées : la conv A (`CONV_ID_ADMIN_NON_OWNER`, opted_out) doit y
+    // apparaître → cible par HREF, jamais par position/nom. En mobile
+    // 390, le tableau desktop est rendu mais caché (CSS) et porte le
+    // MÊME href que la carte mobile — on ne garde que les nœuds
+    // visibles via `.filter({ visible: true })` (Playwright 1.60+).
+    await tabs.filter({ hasText: "Clôturées" }).click();
+    const convALink = page
+      .locator(`a[href$="/admin/conversations/${CONV_ID_ADMIN_NON_OWNER}"]`)
+      .filter({ visible: true });
+    await expect(convALink.first()).toBeVisible();
 
-    // Clôturées : A visible.
-    await cloturees.click();
-    await expect(page.getByRole("link", { name: /Ouvrir la conversation/ })).toBeVisible();
-
-    // Toutes : A visible.
-    await toutes.click();
-    await expect(page.getByRole("link", { name: /Ouvrir la conversation/ })).toBeVisible();
-
-    // Vérif DOM anti-numéro.
     const body = await page.locator("body").innerText();
     assertNoFrenchPhone(body, "L1 admin — body liste");
   });
@@ -89,8 +112,12 @@ test.describe("Liste conversations — lecture seule", () => {
     await signInAsAdmin();
     // Pré-sélectionne "Toutes" + commercial Déthié via URL.
     await page.goto("/admin/conversations?tab=toutes&assignedTo=U05UVHGBURX");
-    // A visible.
-    await expect(page.getByRole("link", { name: /Ouvrir la conversation/ })).toBeVisible();
+    // A visible — on CIBLE PAR HREF (jamais par position ni nom) depuis
+    // PR4, et on filtre sur les nœuds visibles (mobile vs desktop).
+    const convALink = page
+      .locator(`a[href$="/admin/conversations/${CONV_ID_ADMIN_NON_OWNER}"]`)
+      .filter({ visible: true });
+    await expect(convALink.first()).toBeVisible();
     expect(page.url()).toContain("assignedTo=U05UVHGBURX");
 
     // Autre commercial fictif → aucune ligne.
@@ -115,9 +142,20 @@ test.describe("Liste conversations — lecture seule", () => {
     await page.goto("/admin/conversations?tab=toutes");
 
     const tabs = page.getByRole("tab");
-    await expect(tabs).toHaveCount(3);
+    // PR4 : commercial a maintenant 4 onglets (ajout « Contactées »),
+    // pas d'onglet « En cours avec Léa ». Ordre `COMMERCIAL_TAB_ORDER`
+    // (`src/app/admin/conversations/tabs-bar.tsx:41-46`).
+    await expect(tabs).toHaveCount(4);
+    for (const label of ["À traiter", "Contactées", "Clôturées", "Toutes"]) {
+      await expect(tabs.filter({ hasText: label })).toHaveCount(1);
+    }
     await expect(page.getByText("En cours avec Léa")).toHaveCount(0);
-    await expect(page.getByRole("link", { name: /Ouvrir la conversation/ })).toBeVisible();
+    // Conv A ciblée par HREF (plusieurs convs possibles depuis PR4),
+    // filtrée sur les nœuds visibles (mobile vs desktop).
+    const convALink = page
+      .locator(`a[href$="/admin/conversations/${CONV_ID_ADMIN_NON_OWNER}"]`)
+      .filter({ visible: true });
+    await expect(convALink.first()).toBeVisible();
   });
 
   // ────────────────────────────────────────────────────────────────────
@@ -172,7 +210,12 @@ test.describe("Liste conversations — lecture seule", () => {
     test.skip(!CONV_ID_ADMIN_NON_OWNER, "E2E_CONV_ID_FOR_ADMIN_NON_OWNER manquant");
     await signInAsAdmin();
     await page.goto("/admin/conversations?tab=toutes");
-    const row = page.getByRole("link", { name: /Ouvrir la conversation/ }).first();
+    // PR4 — cibler par HREF (plusieurs convs partagent `Déthié Faye`
+    // comme contact depuis la seed PR4), et filtrer sur visible pour
+    // ne pas tomber sur le tableau desktop caché en mobile 390.
+    const hrefSelector = `a[href$="/admin/conversations/${CONV_ID_ADMIN_NON_OWNER}"]`;
+    const visibleRow = () => page.locator(hrefSelector).filter({ visible: true }).first();
+    const row = visibleRow();
     await expect(row).toBeVisible();
 
     // 1) Clic simple → navigation même onglet.
@@ -185,14 +228,18 @@ test.describe("Liste conversations — lecture seule", () => {
     await page.goBack();
 
     // 2) Entrée au clavier (focus puis Enter).
-    const row2 = page.getByRole("link", { name: /Ouvrir la conversation/ }).first();
+    const row2 = visibleRow();
     await row2.focus();
     await page.keyboard.press("Enter");
-    await expect(page).toHaveURL(/\/admin\/conversations\//);
+    await expect(page).toHaveURL(
+      new RegExp(
+        `/admin/conversations/${CONV_ID_ADMIN_NON_OWNER!.replace(/[.*+?^${}()|[\\]\\\\]/g, "\\\\$&")}`,
+      ),
+    );
     await page.goBack();
 
     // 3) Ctrl/Cmd+clic → ouvre un nouvel onglet.
-    const row3 = page.getByRole("link", { name: /Ouvrir la conversation/ }).first();
+    const row3 = visibleRow();
     const [newPage] = await Promise.all([
       context.waitForEvent("page"),
       row3.click({ modifiers: [process.platform === "darwin" ? "Meta" : "Control"] }),
@@ -236,7 +283,8 @@ test.describe("Liste conversations — lecture seule", () => {
   // rendue avant la vérification DOM.
   // ────────────────────────────────────────────────────────────────────
 
-  for (const tab of ["a_traiter", "en_cours", "cloturees", "toutes"] as const) {
+  // PR4 — ajout du 5ᵉ onglet `contactees` (même scan sentinelle).
+  for (const tab of ["a_traiter", "contactees", "en_cours", "cloturees", "toutes"] as const) {
     test(`L8 ${tab} — zéro numéro FR dans la réponse API et dans le DOM`, async ({
       page,
       signInAsAdmin,
@@ -459,7 +507,8 @@ test.describe("Liste conversations — lecture seule", () => {
     // Chaque onglet de la liste admin : négative (pas d'id) + positive
     // (le nom réel apparaît quand A est présent dans l'onglet — donc
     // "toutes" et "cloturees" uniquement puisque A est opted_out).
-    for (const tab of ["a_traiter", "en_cours", "cloturees", "toutes"] as const) {
+    // PR4 — ajout du 5ᵉ onglet `contactees` (même scan sentinelle).
+    for (const tab of ["a_traiter", "contactees", "en_cours", "cloturees", "toutes"] as const) {
       await Promise.all([
         page.waitForResponse(
           (r) =>
@@ -470,6 +519,9 @@ test.describe("Liste conversations — lecture seule", () => {
         page.goto(`/admin/conversations?tab=${tab}`),
       ]);
       const body = await page.locator("body").innerText();
+      // Sentinelle id technique : reste appliquée au body ENTIER
+      // (l'absence des `U...`/`hubspot-list-\d+`/`user_...` ne dépend
+      // d'aucune conv particulière).
       assertNoTechnicalId(body, `L14 /admin/conversations?tab=${tab}`);
       // Snake_case audit code (pas de fil messages sur la liste → body
       // suffit, mais on garde la même mécanique pour cohérence).
@@ -477,9 +529,50 @@ test.describe("Liste conversations — lecture seule", () => {
         await innerTextWithoutMessageThread(page),
         `L14 snake /admin/conversations?tab=${tab}`,
       );
-      expect(body).not.toContain("Campagne inconnue");
+      // PR4 B2 tour 2 — la conv test PR4 (`hubspot-list-999999`,
+      // campagne fictive) affiche volontairement « Campagne inconnue »
+      // sur SA PROPRE ligne. On scope donc la vérification au CONTENEUR
+      // de la ligne de A, pas au body entier ni au lien.
+      //
+      // Structure DOM prouvée (lue directement) :
+      //   - desktop / tablette :
+      //       `<TableRow className="relative">`
+      //         (`src/app/admin/conversations/conversations-page-client.tsx:456`)
+      //       dans laquelle vit, EN COUCHE TRANSPARENTE, un
+      //       `<Link className="absolute inset-0 z-10">` avec
+      //       uniquement un `sr-only` « Ouvrir la conversation de … »
+      //       (file:line :460-469). Le nom de campagne vit dans les
+      //       cellules frères, PAS dans le lien.
+      //   - mobile (< md) : `<Link className="block rounded-lg border …">`
+      //       (`src/app/admin/conversations/conversation-row-card.tsx:53-57`)
+      //       qui ENGLOBE tout le contenu de la carte (nom, spécialité,
+      //       campagne, etc.).
+      //
+      // Donc :
+      //   1. on récupère le lien visible de A (filtre `visible: true`
+      //      déjà en place) ;
+      //   2. on cherche le `<tr>` ancêtre (`getByRole("row")` filtré par
+      //      `has: convALink`) → match desktop/tablette ;
+      //   3. en mobile, aucun `<tr>` n'est rendu → fallback sur le lien
+      //      lui-même, qui est la carte.
       if (tab === "toutes" || tab === "cloturees") {
-        expect(body).toContain(campaignName!);
+        const convALink = page
+          .locator(`a[href$="/admin/conversations/${CONV_ID_ADMIN_NON_OWNER}"]`)
+          .filter({ visible: true })
+          .first();
+        await expect(convALink).toBeVisible();
+
+        const tableRow = page.getByRole("row").filter({ has: convALink });
+        const rowCount = await tableRow.count();
+        const container = rowCount > 0 ? tableRow.first() : convALink;
+        const rowText = await container.innerText();
+        expect(
+          rowText,
+          `L14 ${tab} conteneur ligne A — pas de « Campagne inconnue »`,
+        ).not.toContain("Campagne inconnue");
+        expect(rowText, `L14 ${tab} conteneur ligne A — vrai nom de campagne`).toContain(
+          campaignName!,
+        );
       }
     }
     // Détail de A — fil des messages EXCLU pour le snake_case
@@ -535,8 +628,15 @@ test.describe("Liste conversations — lecture seule", () => {
     );
     expect(requestsWithQ.length).toBe(1);
 
-    // La conversation A est visible (contact "Déthié Faye").
-    await expect(page.getByRole("link", { name: /Ouvrir la conversation/ })).toBeVisible();
+    // PR4 — la recherche "dethie" matche DEUX convs qui partagent le
+    // contact (A + PR4). On cible A par HREF (jamais par position/nom),
+    // filtré sur les nœuds visibles (mobile vs desktop).
+    await expect(
+      page
+        .locator(`a[href$="/admin/conversations/${CONV_ID_ADMIN_NON_OWNER}"]`)
+        .filter({ visible: true })
+        .first(),
+    ).toBeVisible();
 
     // Indicateur "Trié par nom" visible.
     await expect(page.getByText(/triés par nom/i)).toBeVisible();
@@ -550,7 +650,14 @@ test.describe("Liste conversations — lecture seule", () => {
         /[?&]q=/.test(r.url()) &&
         r.request().method() === "GET",
     );
-    await expect(page.getByRole("link", { name: /Ouvrir la conversation/ })).toBeVisible();
+    // PR4 — pareil qu'au-dessus : « DÉTHIÉ » matche 2 convs (A + PR4),
+    // on scope sur le href visible de A (plus de strict mode violation).
+    await expect(
+      page
+        .locator(`a[href$="/admin/conversations/${CONV_ID_ADMIN_NON_OWNER}"]`)
+        .filter({ visible: true })
+        .first(),
+    ).toBeVisible();
 
     // "zzz" → empty state dédié.
     await input.fill("");

@@ -12,6 +12,7 @@
  */
 import { MapPin, Stethoscope } from "lucide-react";
 
+import { HandoffContactedAction } from "./handoff-contacted-action";
 import { RevealPhoneAction } from "./reveal-phone-action";
 import type { ContactHeaderProps, ConversationDisplayIntent } from "./types";
 
@@ -24,7 +25,12 @@ interface Props {
    * `phoneLast4` est lu depuis `contact.phoneLast4` (source unique).
    */
   conversationId: string;
-  /** Callback appelé après chaque POST reveal-phone réussi — invalide le journal. */
+  /**
+   * PR4 B1 — droit calculé côté serveur (`loadConversationDetail`).
+   * Le bouton « J'ai contacté le médecin » n'est rendu que si `true`.
+   */
+  canMarkContacted: boolean;
+  /** Callback appelé après chaque POST reveal-phone / handoff-contacted réussi — invalide le détail. */
   onAudited?: () => void;
 }
 
@@ -44,12 +50,20 @@ const INTENT_CLASSES: Record<ConversationDisplayIntent, string> = {
   unknown: "border-dashed border-border bg-card text-muted-foreground",
 };
 
-export function ConversationHeader({ contact, intent, conversationId, onAudited }: Props) {
+export function ConversationHeader({
+  contact,
+  intent,
+  conversationId,
+  canMarkContacted,
+  onAudited,
+}: Props) {
   const fullName = buildFullName(contact);
   return (
     <header className="flex flex-col gap-3 border-b pb-4 md:flex-row md:items-start md:justify-between">
-      <div className="flex flex-col gap-2">
-        <h1 className="text-xl font-semibold leading-tight">{fullName ?? "Contact sans nom"}</h1>
+      <div className="flex flex-col gap-2 min-w-0">
+        <h1 className="text-xl font-semibold leading-tight break-words">
+          {fullName ?? "Contact sans nom"}
+        </h1>
         <div className="flex flex-wrap items-center gap-x-4 gap-y-1 text-sm text-muted-foreground">
           {contact.speciality ? (
             <span className="inline-flex items-center gap-1">
@@ -72,11 +86,20 @@ export function ConversationHeader({ contact, intent, conversationId, onAudited 
         </div>
       </div>
 
-      <RevealPhoneAction
-        endpoint={`/api/admin/conversations/${encodeURIComponent(conversationId)}/reveal-phone`}
-        phoneLast4={contact.phoneLast4}
-        onAudited={onAudited}
-      />
+      <div className="flex flex-wrap items-start gap-3 md:justify-end">
+        <RevealPhoneAction
+          endpoint={`/api/admin/conversations/${encodeURIComponent(conversationId)}/reveal-phone`}
+          phoneLast4={contact.phoneLast4}
+          onAudited={onAudited}
+        />
+        {onAudited ? (
+          <HandoffContactedAction
+            conversationId={conversationId}
+            canMarkContacted={canMarkContacted}
+            onAudited={onAudited}
+          />
+        ) : null}
+      </div>
     </header>
   );
 }

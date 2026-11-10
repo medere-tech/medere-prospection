@@ -136,6 +136,10 @@ const EMPTY_COPY_BY_TAB: Record<Tab, { title: string; hint: string }> = {
     title: "Aucune conversation à traiter.",
     hint: "Les nouvelles prises en charge apparaîtront ici.",
   },
+  contactees: {
+    title: "Aucune conversation contactée.",
+    hint: "Les conversations marquées comme contactées apparaîtront ici.",
+  },
   en_cours: {
     title: "Aucune conversation en cours avec Léa.",
     hint: "Léa gère les échanges actifs jusqu'au premier intérêt du médecin.",

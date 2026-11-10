@@ -68,6 +68,7 @@ function buildValidConversation(overrides: Partial<Conversation> = {}): Conversa
     outboundCount: 0,
     inboundCount: 0,
     followupCount: 0,
+    handoffContacted: false,
     createdAt: now,
     updatedAt: now,
     ...overrides,
@@ -570,6 +571,40 @@ describe("conversations.ts", () => {
       const handoffAudit = audits.docs.find((d) => d.data().action === "handoff");
       expect(handoffAudit?.data().actorId).toBe("U05UVHGBURX");
       expect(handoffAudit?.data().actorType).toBe("human");
+    });
+
+    it("PR4 A1.2 — setHandoff sur une conv SANS handoffContacted (legacy) pose `false` explicitement", async () => {
+      // Simule une conv créée avant PR4 (migration) : on écrit le doc
+      // en bypassant `createConversation` et sans le champ.
+      const now = Timestamp.now();
+      const legacyDoc = {
+        contactId: "contact_legacy",
+        campaignId: "dentistes-idf-mai-2026",
+        channel: "sms",
+        status: "active" as const,
+        intent: "unknown" as const,
+        messageCount: 0,
+        outboundCount: 0,
+        inboundCount: 0,
+        followupCount: 0,
+        createdAt: now,
+        updatedAt: now,
+        // PAS de `handoffContacted` — conv pré-PR4.
+      };
+      await getAdminDb()
+        .collection(__CONVERSATIONS_COLLECTION_FOR_TESTS)
+        .doc("conv_hand_legacy")
+        .set(legacyDoc);
+
+      await setHandoff("conv_hand_legacy", "U05UVHGBURX", VALID_NOTES);
+
+      // Preuve directe sur la donnée Firestore (le parser Zod avec default
+      // false masquerait un bug ici, donc on lit la donnée brute).
+      const raw = await getAdminDb()
+        .collection(__CONVERSATIONS_COLLECTION_FOR_TESTS)
+        .doc("conv_hand_legacy")
+        .get();
+      expect(raw.data()?.handoffContacted).toBe(false);
     });
 
     it("audit payload contient notesLength UNIQUEMENT, JAMAIS notes brut", async () => {

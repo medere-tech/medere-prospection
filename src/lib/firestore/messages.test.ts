@@ -111,6 +111,7 @@ function buildValidConversation(overrides: Partial<Conversation> = {}): Conversa
     outboundCount: 0,
     inboundCount: 0,
     followupCount: 0,
+    handoffContacted: false,
     createdAt: now,
     updatedAt: now,
     ...overrides,

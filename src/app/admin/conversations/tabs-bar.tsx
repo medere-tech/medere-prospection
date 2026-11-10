@@ -1,10 +1,10 @@
 "use client";
 
 /**
- * Barre d'onglets `/admin/conversations` (PR2b-1).
+ * Barre d'onglets `/admin/conversations` (PR2b-1 + PR4).
  *
- * - Onglets selon le rôle : admin = 4 (`a_traiter`, `en_cours`,
- *   `cloturees`, `toutes`) ; commercial = 3 (pas `en_cours`).
+ * - Onglets selon le rôle : admin = 5 (`a_traiter`, `contactees`,
+ *   `en_cours`, `cloturees`, `toutes`) ; commercial = 4 (pas `en_cours`).
  *   Source unique : `src/lib/firestore/conversation-list-tabs.ts`
  *   (`ADMIN_TABS` / `COMMERCIAL_TABS`).
  * - Compteurs : prop `counts` (0 si en cours de chargement, Badge affiché).
@@ -24,14 +24,26 @@ export type { Tab };
 /** Libellés FR des onglets — courts, affichés tels quels. */
 export const TAB_LABELS: Record<Tab, string> = {
   a_traiter: "À traiter",
+  contactees: "Contactées",
   en_cours: "En cours avec Léa",
   cloturees: "Clôturées",
   toutes: "Toutes",
 };
 
-export const ADMIN_TAB_ORDER: readonly Tab[] = ["a_traiter", "en_cours", "cloturees", "toutes"];
+export const ADMIN_TAB_ORDER: readonly Tab[] = [
+  "a_traiter",
+  "contactees",
+  "en_cours",
+  "cloturees",
+  "toutes",
+];
 
-export const COMMERCIAL_TAB_ORDER: readonly Tab[] = ["a_traiter", "cloturees", "toutes"];
+export const COMMERCIAL_TAB_ORDER: readonly Tab[] = [
+  "a_traiter",
+  "contactees",
+  "cloturees",
+  "toutes",
+];
 
 export const DEFAULT_TAB: Tab = "a_traiter";
 

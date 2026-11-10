@@ -14,6 +14,13 @@ export const EXPECTED_EXTERNAL_ID = "119256955";
 export const EXPECTED_DUPLICATE_STATUS = "received";
 export const NEW_STATUS = "duplicate";
 export const AUDIT_ACTOR_ID = "U05UVHGBURX";
+/**
+ * Dethie — compte admin connu en production (Slack `U05UVHGBURX`).
+ * Fixe explicite, PAS une valeur par defaut silencieuse : la sentinelle
+ * `validateAndScrub` (`src/lib/firestore/audit-log.ts:234-245`) refuse
+ * tout audit `actorType="human"` sans `actorTestAccount`.
+ */
+export const AUDIT_ACTOR_TEST_ACCOUNT = false;
 export const AUDIT_REASON =
   "BUG-DEDUP-RACE pre-fix (#48) : inbound stocke 2x avec meme externalId, doublon marque duplicate";
 export const LAST_INBOUND_QUERY_LIMIT = 10;
@@ -326,6 +333,7 @@ export async function applyMutation(db, corrections, { Timestamp, appendAuditLog
     appendAuditLogTxFn(tx, {
       actorId: AUDIT_ACTOR_ID,
       actorType: "human",
+      actorTestAccount: AUDIT_ACTOR_TEST_ACCOUNT,
       action: "manual_override",
       targetType: "message",
       targetId: DUPLICATE_ID,

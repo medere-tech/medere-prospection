@@ -128,6 +128,7 @@ function makeFakeConversation(
     outboundCount: 2,
     inboundCount: 1,
     followupCount: 0,
+    handoffContacted: false,
     createdAt: { toMillis: () => 0 } as unknown as Timestamp,
     updatedAt: { toMillis: () => 0 } as unknown as Timestamp,
   };

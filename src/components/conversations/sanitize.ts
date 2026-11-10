@@ -146,6 +146,7 @@ export function sanitizeConversationIntent(conv: Conversation): ConversationDisp
 export function sanitizeHandoffForPanel(
   conv: Conversation,
   commercialName: string | null,
+  contactedByName: string | null = null,
 ): HandoffDisplayProps | null {
   const h = conv.handoff;
   if (!h) return null;
@@ -153,8 +154,9 @@ export function sanitizeHandoffForPanel(
     assignedToName: commercialName,
     assignedToSlackId: h.assignedTo,
     assignedAtIso: toIsoOrNull(h.assignedAt as Timestamp | undefined),
-    contactedAtIso: null, // PR4 : `handoff.contactedAt`
-    acceptedAtIso: toIsoOrNull(h.acceptedAt as Timestamp | undefined),
+    contactedAtIso: toIsoOrNull(h.contactedAt as Timestamp | undefined),
+    contactedBy: typeof h.contactedBy === "string" ? h.contactedBy : null,
+    contactedByName,
   };
 }
 
@@ -188,6 +190,10 @@ const ACTION_LABELS: Record<AuditAction, { label: string; kind: JournalEntryProp
   opt_out: { label: "Opt-out du contact (STOP)", kind: "opt_out" },
   handoff: { label: "Hand-off vers un commercial", kind: "handoff" },
   handoff_accepted: { label: "Hand-off accepté", kind: "handoff" },
+  // PR4 — libellés neutres, précédés du nom de l'auteur par
+  // `sanitizeAuditEntriesForJournal` (préfixe « E2E CommercialOwner — »).
+  handoff_contacted: { label: "Médecin contacté", kind: "handoff" },
+  handoff_contact_undone: { label: "Contact annulé", kind: "handoff" },
   handoff_unassigned: { label: "Hand-off orphelin (sans titulaire)", kind: "handoff" },
   inbound_relayed_to_human: { label: "SMS entrant relayé au commercial", kind: "handoff" },
   inbound_on_inactive_conversation: {

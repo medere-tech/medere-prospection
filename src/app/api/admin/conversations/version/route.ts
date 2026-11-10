@@ -38,7 +38,7 @@ import { NextResponse } from "next/server";
 import { z } from "zod";
 
 import { requireRole } from "@/lib/auth/require-role";
-import { ALLOWED_TABS_BY_ROLE, statusesForTab } from "@/lib/firestore/conversation-list-tabs";
+import { ALLOWED_TABS_BY_ROLE, filterForTab } from "@/lib/firestore/conversation-list-tabs";
 import { queryConversationListVersion } from "@/lib/firestore/conversation-list-version-query";
 import { applyAdminRateLimit } from "@/lib/security/admin-rate-limit";
 import { createRateLimiter } from "@/lib/security/rate-limit";
@@ -66,7 +66,7 @@ const versionLimiter = createRateLimiter({
  * (admin seul, admin + status, commercial seul, commercial + status).
  */
 const QuerySchema = z.object({
-  tab: z.enum(["a_traiter", "en_cours", "cloturees", "toutes"]).optional(),
+  tab: z.enum(["a_traiter", "contactees", "en_cours", "cloturees", "toutes"]).optional(),
   // Partage la regex avec `assertSlackUserId` (source unique).
   assignedTo: z.string().regex(SLACK_USER_ID_REGEX, "slackUserId mal formé").optional(),
 });
@@ -117,14 +117,15 @@ export async function GET(req: Request): Promise<Response> {
       return NextResponse.json({ error: "forbidden_tab" }, { status: 403 });
     }
 
-    const statuses = statusesForTab(tab);
+    const { statuses, handoffContacted } = filterForTab(tab);
 
     const effectiveAssignedTo =
       role === "commercial" ? (slackUserId ?? null) : (parsed.data.assignedTo ?? null);
 
     const payload = await queryConversationListVersion({
-      statusIn: statuses,
+      statusIn: statuses ? [...statuses] : undefined,
       assignedTo: effectiveAssignedTo,
+      ...(handoffContacted !== undefined && { handoffContacted }),
     });
 
     assertNoPhoneInPayload(payload);

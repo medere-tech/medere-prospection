@@ -456,9 +456,15 @@ test.describe("SMS orphelins — /admin/orphan-inbounds (PR2c tour 2b bloc B)", 
       // Étape 1 : recherche par nom (debounce 300 ms, min 2 chars).
       const searchInput = pickConvDialog.getByLabel("Recherche par nom du médecin");
       await searchInput.fill(SEARCH_TERM_O7);
-      const firstHit = pickConvDialog.getByRole("option").first();
-      await expect(firstHit).toBeVisible({ timeout: 5000 });
-      await firstHit.click();
+      // PR4 B2 — le contact de la conv A partage son nom avec la conv
+      // test PR4 (seedée en base). On cible par `data-conversation-id`
+      // (ajouté dans `src/app/admin/orphan-inbounds/attach-dialog.tsx:268`),
+      // jamais par position (`.first()`), pour viser strictement A.
+      const convAOption = pickConvDialog.locator(
+        `[role="option"][data-conversation-id="${CONV_ID_O7}"]`,
+      );
+      await expect(convAOption).toBeVisible({ timeout: 5000 });
+      await convAOption.click();
 
       // Étape 2 — nouveau titre « Désabonnement du médecin ? ».
       const optOutDialog = page.getByRole("dialog", {

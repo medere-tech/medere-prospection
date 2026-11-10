@@ -16,13 +16,21 @@ import { Clock, FileText, Hash, Inbox, Mail, UserCheck } from "lucide-react";
 import { campaignDisplayLabel } from "@/lib/campaigns/campaign-id";
 import { formatDateTimeParis } from "@/lib/utils/format-paris";
 
+import { HandoffContactedUndoButton } from "./handoff-contacted-undo-button";
 import type { ConversationDetailProps, JournalEntryProps } from "./types";
 
 interface Props {
   data: ConversationDetailProps;
+  /**
+   * PR4 B1 — callback appelé après un DELETE réussi depuis le bouton
+   * « Annuler le contact » (même sémantique que `onAudited` dans le
+   * reste de la page). Optionnel : si absent, le bouton n'est jamais
+   * rendu (dégradation gracieuse côté story/tests).
+   */
+  onAudited?: () => void;
 }
 
-export function ConversationSidePanel({ data }: Props) {
+export function ConversationSidePanel({ data, onAudited }: Props) {
   return (
     <aside
       aria-label="Détails de la conversation"
@@ -101,17 +109,25 @@ export function ConversationSidePanel({ data }: Props) {
               <MetaRow
                 icon={<Clock className="h-3.5 w-3.5" />}
                 label="Contacté le"
-                value={formatDateTimeParis(data.handoff.contactedAtIso)}
-              />
-            ) : null}
-            {data.handoff.acceptedAtIso ? (
-              <MetaRow
-                icon={<Clock className="h-3.5 w-3.5" />}
-                label="Accepté le"
-                value={formatDateTimeParis(data.handoff.acceptedAtIso)}
+                // PR4 B1 — « Contacté le {date Paris} par {nom} ». Si le
+                // nom est introuvable (`contactedByName === null`), on
+                // garde la date SEULE, JAMAIS `contactedBy` brut (userId
+                // Clerk technique).
+                value={formatContactedLine(
+                  data.handoff.contactedAtIso,
+                  data.handoff.contactedByName,
+                )}
               />
             ) : null}
           </dl>
+          {data.canUndoContact && onAudited ? (
+            <div className="pt-1">
+              <HandoffContactedUndoButton
+                conversationId={data.conversationId}
+                onAudited={onAudited}
+              />
+            </div>
+          ) : null}
         </section>
       ) : null}
 
@@ -150,6 +166,18 @@ export function ConversationSidePanel({ data }: Props) {
       ) : null}
     </aside>
   );
+}
+
+/**
+ * PR4 B1 — compose « jj/mm/aaaa à HH:mm par {nom} » si le nom est
+ * résolu, sinon « jj/mm/aaaa à HH:mm » seul. Jamais d'identifiant brut.
+ */
+function formatContactedLine(contactedAtIso: string, contactedByName: string | null): string {
+  const date = formatDateTimeParis(contactedAtIso);
+  if (contactedByName !== null && contactedByName.length > 0) {
+    return `${date} par ${contactedByName}`;
+  }
+  return date;
 }
 
 function MetaRow({ icon, label, value }: { icon: React.ReactNode; label: string; value: string }) {

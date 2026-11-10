@@ -50,9 +50,16 @@ export interface ConversationHandoff {
   /** Slack user ID du commercial assigné. */
   assignedTo: string;
   assignedAt: Timestamp;
-  /** Le commercial a accusé réception (clic « J'ai contacté »). */
-  acceptedAt?: Timestamp;
-  acceptedBy?: string;
+  /**
+   * PR4 — horodatage du clic « J'ai contacté le médecin » par le
+   * titulaire ou par un admin. `undefined` tant que personne n'a cliqué.
+   * Effacé par `unmarkHandoffContacted` (FieldValue.delete) en cas
+   * d'annulation. Reflété au top-level par `Conversation.handoffContacted`
+   * (booléen indexé pour les onglets de liste).
+   */
+  contactedAt?: Timestamp;
+  /** Clerk userId de celui qui a cliqué. Apparié avec `contactedAt`. */
+  contactedBy?: string;
   /** ID du deal HubSpot créé lors du hand-off. */
   hubspotDealId?: string;
   notes?: string;
@@ -104,6 +111,22 @@ export interface Conversation {
   lastIntentChangeAt?: Timestamp;
 
   handoff?: ConversationHandoff;
+
+  /**
+   * PR4 — dénormalisation booléenne de `handoff.contactedAt`, pour
+   * permettre le filtre Firestore `where("handoffContacted", "==", true)`
+   * utilisé par l'onglet « Contactées » sans avoir à comparer `null`
+   * sur un champ imbriqué. `false` tant que personne n'a cliqué
+   * « J'ai contacté le médecin » ; `true` après le clic ; de nouveau
+   * `false` après annulation. Posé par `setHandoff` (`false` initial),
+   * par `markHandoffContacted` (`true`) et `unmarkHandoffContacted`
+   * (`false`) — toujours dans la même transaction que le miroir
+   * `handoff.contactedAt`.
+   *
+   * Zod `.default(false)` pour les docs legacy qui n'ont pas le champ
+   * (prouvé en exécution avec zod@4.4.3 — variante B du cadrage).
+   */
+  handoffContacted: boolean;
 
   /**
    * Slack userId du commercial titulaire, OU `null` explicite si aucun

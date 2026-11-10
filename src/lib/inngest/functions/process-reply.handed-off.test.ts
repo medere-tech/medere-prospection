@@ -112,6 +112,7 @@ function makeHandedOffConversation(
     outboundCount: 2,
     inboundCount: 2,
     followupCount: 0,
+    handoffContacted: false,
     handoff: {
       assignedTo,
       assignedAt: { toMillis: () => 0 } as unknown as Timestamp,
@@ -353,6 +354,7 @@ describe("PR-A T6 — non-regression conversation active", () => {
       outboundCount: 1,
       inboundCount: 0,
       followupCount: 0,
+      handoffContacted: false,
       createdAt: { toMillis: () => 0 } as unknown as Timestamp,
       updatedAt: { toMillis: () => 0 } as unknown as Timestamp,
     };

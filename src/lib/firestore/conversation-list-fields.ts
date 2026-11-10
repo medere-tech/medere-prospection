@@ -78,6 +78,41 @@ export interface ConversationContactSnapshot {
 }
 
 /**
+ * PR4 B1 — Compute PUR des 4 champs de liste depuis un doc contact brut.
+ * SOURCE UNIQUE utilisée par :
+ *   - `backfill-conversation-list-fields.ts::computeBackfillUpdatesForConversation`
+ *     (rattrape les conversations existantes sans ces champs).
+ *   - `seed-reset-e2e-pr4-core.ts::applySeed` (seed de la conv de test PR4).
+ *
+ * Chaque champ est `undefined` si la donnée source est absente ou vide —
+ * le caller décide si/comment persister (ex: ne pas écrire un undefined
+ * dans Firestore qui refuse).
+ *
+ * Pur : zéro I/O, zéro side-effect, zéro throw.
+ */
+export function computeContactListFieldsFromRaw(raw: Record<string, unknown>): {
+  readonly contactDisplayName: string | undefined;
+  readonly contactNameSearch: string | undefined;
+  readonly contactSpecialty: string | undefined;
+  readonly contactCity: string | undefined;
+} {
+  const civilite = typeof raw.civilite === "string" ? raw.civilite : undefined;
+  const firstName = typeof raw.firstName === "string" ? raw.firstName : "";
+  const lastName = typeof raw.lastName === "string" ? raw.lastName : "";
+  const dn = computeContactDisplayName({ civilite, firstName, lastName });
+  const ns = normalizeContactNameSearch(`${firstName} ${lastName}`);
+  const speciality =
+    typeof raw.speciality === "string" && raw.speciality.length > 0 ? raw.speciality : undefined;
+  const city = typeof raw.city === "string" && raw.city.length > 0 ? raw.city : undefined;
+  return {
+    contactDisplayName: dn.length > 0 ? dn : undefined,
+    contactNameSearch: ns.length > 0 ? ns : undefined,
+    contactSpecialty: speciality,
+    contactCity: city,
+  };
+}
+
+/**
  * Dérive le snapshot complet depuis un `Contact` validé. Utilisé par
  * `createConversation` ET par la propagation `updateContactStatus`.
  */

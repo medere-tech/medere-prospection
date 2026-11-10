@@ -28,6 +28,13 @@ export const MESSAGE_SPECS = [
 export const NEW_STATUS = "abandoned";
 export const ABANDON_REASON = "stale_pre_launch_test_cleanup";
 export const AUDIT_ACTOR_ID = "U05UVHGBURX";
+/**
+ * Dethie — compte admin connu en production (Slack `U05UVHGBURX`).
+ * Fixe explicite, PAS une valeur par defaut silencieuse : la sentinelle
+ * `validateAndScrub` (`src/lib/firestore/audit-log.ts:234-245`) refuse
+ * tout audit `actorType="human"` sans `actorTestAccount`.
+ */
+export const AUDIT_ACTOR_TEST_ACCOUNT = false;
 export const AUDIT_REASON = "stale pre-launch test cleanup — orphelin confirme sans job OVH";
 export const OVH_SEARCH_WINDOW_MS = 10 * 60 * 1000;
 
@@ -263,6 +270,7 @@ export async function applyMutation(db, results, { Timestamp, appendAuditLogTxFn
       appendAuditLogTxFn(tx, {
         actorId: AUDIT_ACTOR_ID,
         actorType: "human",
+        actorTestAccount: AUDIT_ACTOR_TEST_ACCOUNT,
         action: "manual_override",
         targetType: "message",
         targetId: r.messageId,

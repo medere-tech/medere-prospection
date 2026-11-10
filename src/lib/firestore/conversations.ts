@@ -234,8 +234,14 @@ const TimestampLike = z.unknown();
 export const ConversationHandoffSchema = z.object({
   assignedTo: z.string().min(1),
   assignedAt: TimestampLike,
-  acceptedAt: TimestampLike.optional(),
-  acceptedBy: z.string().optional(),
+  /**
+   * PR4 — horodatage du clic « J'ai contacté le médecin ». Posé par
+   * `markHandoffContacted`, effacé par `unmarkHandoffContacted`
+   * (`FieldValue.delete()`).
+   */
+  contactedAt: TimestampLike.optional(),
+  /** PR4 — Clerk userId de l'auteur du clic. Apparié avec `contactedAt`. */
+  contactedBy: z.string().optional(),
   hubspotDealId: z.string().optional(),
   notes: z.string().min(HANDOFF_NOTES_MIN_LENGTH).optional(),
 });
@@ -264,6 +270,13 @@ export const ConversationSchema = z.object({
   lastInboundAt: TimestampLike.optional(),
   lastIntentChangeAt: TimestampLike.optional(),
   handoff: ConversationHandoffSchema.optional(),
+  /**
+   * PR4 — dénormalisation booléenne de `handoff.contactedAt` pour
+   * filtre indexé `where("handoffContacted", "==", true)` (onglet
+   * « Contactées »). `.default(false)` matérialise la valeur sur les
+   * docs legacy qui n'ont pas le champ (prouvé zod@4.4.3).
+   */
+  handoffContacted: z.boolean().default(false),
   /**
    * Dénormalisation `handoff.assignedTo` racine (VUE-CONVERSATION PR0).
    * Permet `where("assignedTo", "==", null)` pour l'onglet « À traiter ».
@@ -598,6 +611,9 @@ export async function getOrCreateInitialConversation(
     outboundCount: 0,
     inboundCount: 0,
     followupCount: 0,
+    // PR4 — défaut explicite. Posera false sur toute nouvelle conv ;
+    // `setHandoff` le laisse à false ; `markHandoffContacted` le passe à true.
+    handoffContacted: false,
     // VUE-CONVERSATION PR0 — dénormalisation. `null` explicite (vs undefined)
     // pour permettre `where("assignedTo", "==", null)` sur l'onglet « À traiter ».
     assignedTo: null,
@@ -1355,6 +1371,15 @@ export async function setHandoff(
       // `where("assignedTo", "==", slackId)` et `where("assignedTo", "==", null)`
       // pour les onglets de la vue conversation.
       assignedTo: assignedTo,
+      // PR4 — défaut explicite à false lors du hand-off. Permet à
+      // l'onglet « À traiter » (`where status==handed_off AND
+      // handoffContacted==false`) de matcher dès la création. Passera à
+      // `true` au premier clic « J'ai contacté » via
+      // `markHandoffContacted`, puis à nouveau `false` en cas
+      // d'annulation. Posé ici (et NON par défaut Zod) parce qu'une conv
+      // qui vient d'être handed_off ne doit JAMAIS traîner sans ce
+      // champ : les scripts de rattrapage ne tournent pas en temps réel.
+      handoffContacted: false,
       updatedAt: now,
     });
 
@@ -1564,6 +1589,11 @@ const ListConversationsFiltersSchema = z.object({
   statusIn: z.array(ConversationStatusEnum).min(1).max(10).optional(),
   campaignId: z.string().min(1).max(80).optional(),
   contactNameSearch: z.string().min(1).max(80).optional(),
+  /**
+   * PR4 — filtre indexé pour les onglets `a_traiter` (`false`) et
+   * `contactees` (`true`). Omis sur les autres onglets.
+   */
+  handoffContacted: z.boolean().optional(),
 });
 
 export type ListConversationsFilters = z.input<typeof ListConversationsFiltersSchema>;
@@ -1636,6 +1666,10 @@ function applyConversationFilters(
     q = q.where("status", "in", filters.statusIn);
   } else if (filters?.status !== undefined) {
     q = q.where("status", "==", filters.status);
+  }
+  // PR4 — filtre indexé a_traiter/contactees (cf. conversation-list-tabs.ts).
+  if (filters?.handoffContacted !== undefined) {
+    q = q.where("handoffContacted", "==", filters.handoffContacted);
   }
   // PR2b-1 — `filters.intent` retiré (cf. ListConversationsFiltersSchema).
   if (filters?.campaignId !== undefined) {

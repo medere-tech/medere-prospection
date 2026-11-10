@@ -19,8 +19,7 @@ import { Timestamp } from "firebase-admin/firestore";
 import { getAdminDb } from "@/lib/firestore/admin";
 import {
   buildLastMessagePreview,
-  computeContactDisplayName,
-  normalizeContactNameSearch,
+  computeContactListFieldsFromRaw,
 } from "@/lib/firestore/conversation-list-fields";
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -192,34 +191,22 @@ export async function computeBackfillUpdatesForConversation(
       const cSnap = await queryBackfillContact(db, String(conv.contactId));
       if (cSnap.exists) {
         const raw = (cSnap.data() ?? {}) as Record<string, unknown>;
-        if (!conv.contactDisplayName) {
-          const dn = computeContactDisplayName({
-            civilite: typeof raw.civilite === "string" ? raw.civilite : undefined,
-            firstName: typeof raw.firstName === "string" ? raw.firstName : "",
-            lastName: typeof raw.lastName === "string" ? raw.lastName : "",
-          });
-          if (dn.length > 0) {
-            updates.contactDisplayName = dn;
-            posed.push("contactDisplayName");
-          }
+        // PR4 B1 — SOURCE UNIQUE partagée avec `seed-reset-e2e-pr4-core.ts`.
+        const fields = computeContactListFieldsFromRaw(raw);
+        if (!conv.contactDisplayName && fields.contactDisplayName !== undefined) {
+          updates.contactDisplayName = fields.contactDisplayName;
+          posed.push("contactDisplayName");
         }
-        if (!conv.contactNameSearch) {
-          const ns = normalizeContactNameSearch(`${raw.firstName ?? ""} ${raw.lastName ?? ""}`);
-          if (ns.length > 0) {
-            updates.contactNameSearch = ns;
-            posed.push("contactNameSearch");
-          }
+        if (!conv.contactNameSearch && fields.contactNameSearch !== undefined) {
+          updates.contactNameSearch = fields.contactNameSearch;
+          posed.push("contactNameSearch");
         }
-        if (
-          !conv.contactSpecialty &&
-          typeof raw.speciality === "string" &&
-          raw.speciality.length > 0
-        ) {
-          updates.contactSpecialty = raw.speciality;
+        if (!conv.contactSpecialty && fields.contactSpecialty !== undefined) {
+          updates.contactSpecialty = fields.contactSpecialty;
           posed.push("contactSpecialty");
         }
-        if (!conv.contactCity && typeof raw.city === "string" && raw.city.length > 0) {
-          updates.contactCity = raw.city;
+        if (!conv.contactCity && fields.contactCity !== undefined) {
+          updates.contactCity = fields.contactCity;
           posed.push("contactCity");
         }
       }

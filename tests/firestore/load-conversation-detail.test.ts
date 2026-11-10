@@ -177,6 +177,7 @@ describe("loadConversationDetail — persist emulator (VUE-CONVERSATION PR1)", (
 
   it("not_found si conversation inexistante", async () => {
     const res = await loadConversationDetail("no_such_conv", {
+      userId: "test_user_x",
       role: "admin",
       slackUserId: undefined,
       testAccount: false,
@@ -190,6 +191,7 @@ describe("loadConversationDetail — persist emulator (VUE-CONVERSATION PR1)", (
     // `isAdmin || ...` renvoyait toujours true, ce qui cachait la bannière.
     await seed({ withHandoff: true });
     const res = await loadConversationDetail(CONV_ID, {
+      userId: "test_user_x",
       role: "admin",
       slackUserId: undefined,
       testAccount: false,
@@ -205,6 +207,7 @@ describe("loadConversationDetail — persist emulator (VUE-CONVERSATION PR1)", (
     // conv doit être marqué owner (pas de bannière Mode admin inutile).
     await seed({ withHandoff: true });
     const res = await loadConversationDetail(CONV_ID, {
+      userId: "test_user_x",
       role: "admin",
       slackUserId: OWNER_SLACK,
       testAccount: false,
@@ -217,6 +220,7 @@ describe("loadConversationDetail — persist emulator (VUE-CONVERSATION PR1)", (
   it("ok commercial titulaire : voit sa propre conv", async () => {
     await seed({ withHandoff: true });
     const res = await loadConversationDetail(CONV_ID, {
+      userId: "test_user_x",
       role: "commercial",
       slackUserId: OWNER_SLACK,
       testAccount: false,
@@ -229,6 +233,7 @@ describe("loadConversationDetail — persist emulator (VUE-CONVERSATION PR1)", (
   it("not_mine : commercial non-titulaire bloqué 403", async () => {
     await seed({ withHandoff: true });
     const res = await loadConversationDetail(CONV_ID, {
+      userId: "test_user_x",
       role: "commercial",
       slackUserId: INTRUDER_SLACK,
       testAccount: false,
@@ -243,6 +248,7 @@ describe("loadConversationDetail — persist emulator (VUE-CONVERSATION PR1)", (
   it("not_mine : commercial sans slackUserId du tout → 403", async () => {
     await seed({ withHandoff: true });
     const res = await loadConversationDetail(CONV_ID, {
+      userId: "test_user_x",
       role: "commercial",
       slackUserId: undefined,
       testAccount: false,
@@ -261,6 +267,7 @@ describe("loadConversationDetail — persist emulator (VUE-CONVERSATION PR1)", (
   it("exclusion duplicate : un message status='duplicate' n'apparaît PAS dans messages[]", async () => {
     await seed({ withHandoff: true, withDuplicate: true });
     const res = await loadConversationDetail(CONV_ID, {
+      userId: "test_user_x",
       role: "admin",
       slackUserId: undefined,
       testAccount: false,
@@ -276,6 +283,7 @@ describe("loadConversationDetail — persist emulator (VUE-CONVERSATION PR1)", (
   it("mutation testing filtre duplicate — vérif qu'il n'apparaît pas", async () => {
     await seed({ withHandoff: true, withDuplicate: true });
     const res = await loadConversationDetail(CONV_ID, {
+      userId: "test_user_x",
       role: "admin",
       slackUserId: undefined,
       testAccount: false,
@@ -290,6 +298,7 @@ describe("loadConversationDetail — persist emulator (VUE-CONVERSATION PR1)", (
   it("sanity : aucun pattern téléphone dans la payload sérialisée", async () => {
     await seed({ withHandoff: true });
     const res = await loadConversationDetail(CONV_ID, {
+      userId: "test_user_x",
       role: "admin",
       slackUserId: undefined,
       testAccount: false,
@@ -304,6 +313,7 @@ describe("loadConversationDetail — persist emulator (VUE-CONVERSATION PR1)", (
   it("conversation sans handoff : status='in_dialogue' + handoff=null", async () => {
     await seed({ withHandoff: false });
     const res = await loadConversationDetail(CONV_ID, {
+      userId: "test_user_x",
       role: "admin",
       slackUserId: undefined,
       testAccount: false,
@@ -320,10 +330,213 @@ describe("loadConversationDetail — persist emulator (VUE-CONVERSATION PR1)", (
     // au sens strict (slackUserId !== null). Donc 403 pour un commercial.
     await seed({ withHandoff: false });
     const res = await loadConversationDetail(CONV_ID, {
+      userId: "test_user_x",
       role: "commercial",
       slackUserId: INTRUDER_SLACK,
       testAccount: false,
     });
     expect(res.kind).toBe("not_mine");
+  });
+});
+
+/**
+ * PR4 B1 — droits calculés côté serveur (`canMarkContacted`,
+ * `canUndoContact`). On teste le VRAI `loadConversationDetail` sur des
+ * convs seedées.
+ */
+const PR4_CONV_ID = "pr4contact_pr4camp";
+const PR4_CONTACT_ID = "pr4contact";
+const PR4_TITULAIRE_SLACK = "UTITULAIRE_PR4";
+const PR4_AUTRE_SLACK = "UAUTRE_PR4";
+const PR4_AUTEUR_USER_ID = "user_auteur_pr4";
+
+async function seedPr4(opts: {
+  status: "handed_off" | "active";
+  handoffContacted: boolean;
+  contactedBy?: string;
+}): Promise<void> {
+  const db = getAdminDb();
+  await db
+    .collection("contacts")
+    .doc(PR4_CONTACT_ID)
+    .set({
+      hubspotId: PR4_CONTACT_ID,
+      firstName: "Jean",
+      lastName: "Dupont",
+      civilite: "Dr",
+      speciality: "Chirurgien-dentiste",
+      city: "Paris",
+      postalCode: "75001",
+      phone: {
+        e164: "+33612349876",
+        raw: "0612349876",
+        type: "mobile",
+        valid: true,
+        lookupAt: Timestamp.fromMillis(1_700_000_000_000),
+      },
+      segment: "b2c_mobile_perso",
+      bloctelChecked: true,
+      bloctelOptOut: false,
+      consent: {
+        legitimateInterest: "Intérêt légitime documenté PR4 B1 test emulator.",
+        optedOut: false,
+      },
+      enrichment: { source: "lusha", enrichedAt: Timestamp.fromMillis(1_700_000_000_000) },
+      status: "ready",
+      campaignId: "pr4camp",
+      createdAt: Timestamp.fromMillis(1_700_000_000_000),
+      updatedAt: Timestamp.fromMillis(1_700_000_000_000),
+    });
+
+  const convData: Record<string, unknown> = {
+    contactId: PR4_CONTACT_ID,
+    campaignId: "pr4camp",
+    channel: "sms",
+    status: opts.status,
+    intent: "INTERESSE",
+    messageCount: 1,
+    outboundCount: 1,
+    inboundCount: 0,
+    followupCount: 0,
+    handoffContacted: opts.handoffContacted,
+    assignedTo: PR4_TITULAIRE_SLACK,
+    lastMessageAt: Timestamp.fromMillis(1_700_000_200_000),
+    createdAt: Timestamp.fromMillis(1_700_000_000_000),
+    updatedAt: Timestamp.fromMillis(1_700_000_200_000),
+  };
+  const handoff: Record<string, unknown> = {
+    assignedTo: PR4_TITULAIRE_SLACK,
+    assignedAt: Timestamp.fromMillis(1_700_000_150_000),
+  };
+  if (opts.handoffContacted) {
+    handoff.contactedAt = Timestamp.fromMillis(1_700_000_250_000);
+    handoff.contactedBy = opts.contactedBy ?? PR4_AUTEUR_USER_ID;
+  }
+  convData.handoff = handoff;
+  await db.collection("conversations").doc(PR4_CONV_ID).set(convData);
+}
+
+describe("loadConversationDetail — PR4 B1 droits serveur (persist emulator)", () => {
+  beforeEach(async () => {
+    vi.unstubAllEnvs();
+    vi.stubEnv("AUDIT_PII_PEPPER", PEPPER);
+    await fullReset();
+  });
+  afterEach(async () => {
+    vi.unstubAllEnvs();
+    await fullReset();
+  });
+
+  it("admin + handed_off + non contactée → canMarkContacted=true, canUndoContact=false", async () => {
+    await seedPr4({ status: "handed_off", handoffContacted: false });
+    const res = await loadConversationDetail(PR4_CONV_ID, {
+      userId: "user_admin",
+      role: "admin",
+      slackUserId: undefined,
+      testAccount: false,
+    });
+    expect(res.kind).toBe("ok");
+    if (res.kind !== "ok") throw new Error();
+    expect(res.data.canMarkContacted).toBe(true);
+    expect(res.data.canUndoContact).toBe(false);
+  });
+
+  it("commercial titulaire + handed_off + non contactée → canMarkContacted=true", async () => {
+    await seedPr4({ status: "handed_off", handoffContacted: false });
+    const res = await loadConversationDetail(PR4_CONV_ID, {
+      userId: "user_titulaire",
+      role: "commercial",
+      slackUserId: PR4_TITULAIRE_SLACK,
+      testAccount: false,
+    });
+    expect(res.kind).toBe("ok");
+    if (res.kind !== "ok") throw new Error();
+    expect(res.data.canMarkContacted).toBe(true);
+    expect(res.data.canUndoContact).toBe(false);
+  });
+
+  it("commercial non-titulaire → not_mine (bloqué AVANT le calcul des droits PR4)", async () => {
+    await seedPr4({ status: "handed_off", handoffContacted: false });
+    const res = await loadConversationDetail(PR4_CONV_ID, {
+      userId: "user_autre",
+      role: "commercial",
+      slackUserId: PR4_AUTRE_SLACK,
+      testAccount: false,
+    });
+    expect(res.kind).toBe("not_mine");
+  });
+
+  it("auteur du marquage (admin OR commercial titulaire-auteur) → canUndoContact=true", async () => {
+    await seedPr4({
+      status: "handed_off",
+      handoffContacted: true,
+      contactedBy: PR4_AUTEUR_USER_ID,
+    });
+    // Admin — pas auteur, mais admin peut TOUJOURS annuler.
+    const resAdmin = await loadConversationDetail(PR4_CONV_ID, {
+      userId: "user_admin",
+      role: "admin",
+      slackUserId: undefined,
+      testAccount: false,
+    });
+    expect(resAdmin.kind).toBe("ok");
+    if (resAdmin.kind !== "ok") throw new Error();
+    expect(resAdmin.data.canUndoContact).toBe(true);
+    expect(resAdmin.data.canMarkContacted).toBe(false);
+
+    // Commercial titulaire + auteur du marquage → canUndoContact=true.
+    const resAuteur = await loadConversationDetail(PR4_CONV_ID, {
+      userId: PR4_AUTEUR_USER_ID,
+      role: "commercial",
+      slackUserId: PR4_TITULAIRE_SLACK,
+      testAccount: false,
+    });
+    expect(resAuteur.kind).toBe("ok");
+    if (resAuteur.kind !== "ok") throw new Error();
+    expect(resAuteur.data.canUndoContact).toBe(true);
+  });
+
+  it("commercial titulaire NON auteur + conv contactée → canUndoContact=false", async () => {
+    await seedPr4({
+      status: "handed_off",
+      handoffContacted: true,
+      contactedBy: "user_quelquun_dautre",
+    });
+    const res = await loadConversationDetail(PR4_CONV_ID, {
+      userId: PR4_AUTEUR_USER_ID, // userId ≠ contactedBy
+      role: "commercial",
+      slackUserId: PR4_TITULAIRE_SLACK,
+      testAccount: false,
+    });
+    expect(res.kind).toBe("ok");
+    if (res.kind !== "ok") throw new Error();
+    expect(res.data.canUndoContact).toBe(false);
+    expect(res.data.canMarkContacted).toBe(false);
+  });
+
+  it("status ≠ handed_off → canMarkContacted=false (sentinelle MA-1)", async () => {
+    await seedPr4({ status: "active", handoffContacted: false });
+    const res = await loadConversationDetail(PR4_CONV_ID, {
+      userId: "user_admin",
+      role: "admin",
+      slackUserId: undefined,
+      testAccount: false,
+    });
+    expect(res.kind).toBe("ok");
+    if (res.kind !== "ok") throw new Error();
+    expect(res.data.canMarkContacted).toBe(false);
+  });
+
+  it("conv déjà contactée → canMarkContacted=false (sentinelle MA-2)", async () => {
+    await seedPr4({ status: "handed_off", handoffContacted: true });
+    const res = await loadConversationDetail(PR4_CONV_ID, {
+      userId: "user_admin",
+      role: "admin",
+      slackUserId: undefined,
+      testAccount: false,
+    });
+    expect(res.kind).toBe("ok");
+    if (res.kind !== "ok") throw new Error();
+    expect(res.data.canMarkContacted).toBe(false);
   });
 });
