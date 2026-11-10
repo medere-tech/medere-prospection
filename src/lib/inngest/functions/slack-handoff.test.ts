@@ -187,8 +187,8 @@ describe("sentinelles structurelles slack-handoff (S9.9-PR5b)", () => {
     expect(__HANDOFF_NOTES_FOR_TESTS).toBe("Hand-off auto INTERESSE via Léa (S9.9)");
   });
 
-  it("DASHBOARD_URL_FALLBACK figé à l'URL Vercel prod (D5)", () => {
-    expect(__DASHBOARD_URL_FALLBACK_FOR_TESTS).toBe("https://medere-prospection.vercel.app");
+  it("DASHBOARD_URL_FALLBACK figé à l'URL prod prospection.medere.fr (D5)", () => {
+    expect(__DASHBOARD_URL_FALLBACK_FOR_TESTS).toBe("https://prospection.medere.fr");
   });
 
   it("LAST_INBOUND_HISTORY_LIMIT === 5", () => {
@@ -873,7 +873,7 @@ describe("dashboardUrl — env vs fallback (D5)", () => {
 
     expect(deps.sendHandoffNotification).toHaveBeenCalledWith(
       expect.objectContaining({
-        dashboardUrl: "https://medere-prospection.vercel.app/conversations/hs-contact-123_camp-a",
+        dashboardUrl: "https://prospection.medere.fr/conversations/hs-contact-123_camp-a",
       }),
     );
   });
@@ -886,7 +886,7 @@ describe("dashboardUrl — env vs fallback (D5)", () => {
 
     expect(deps.sendHandoffNotification).toHaveBeenCalledWith(
       expect.objectContaining({
-        dashboardUrl: "https://medere-prospection.vercel.app/conversations/hs-contact-123_camp-a",
+        dashboardUrl: "https://prospection.medere.fr/conversations/hs-contact-123_camp-a",
       }),
     );
   });

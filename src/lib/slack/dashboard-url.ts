@@ -47,7 +47,7 @@ import { logger } from "@/lib/utils/logger";
  * est absent. En production (`NODE_ENV === "production"`), `getCoreEnv()`
  * throw `ConfigError` au démarrage si la var manque (R4-Point3 PR-NO-DROPPED-SMS).
  */
-export const DASHBOARD_URL_FALLBACK = "https://medere-prospection.vercel.app";
+export const DASHBOARD_URL_FALLBACK = "https://prospection.medere.fr";
 
 /**
  * Options d'injection pour tests unitaires. En production, ne pas fournir

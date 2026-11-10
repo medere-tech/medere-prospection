@@ -41,7 +41,7 @@
  *   - OVH_SMS_SERVICE_NAME (= sms-ng66707-1 en prod)
  *   - OVH_WEBHOOK_SECRET (token query de notre endpoint)
  *   - DASHBOARD_URL ou NEXT_PUBLIC_APP_URL optionnel (sinon fallback
- *     https://medere-prospection.vercel.app)
+ *     https://prospection.medere.fr)
  */
 import { config } from "dotenv";
 config({ path: ".env.local" });
@@ -55,7 +55,7 @@ import { scrubOvhErrorMessage } from "./_lib/ovh-scrub.mjs";
 // ─────────────────────────────────────────────────────────────────────────────
 
 const ENDPOINT_PATH = "/api/webhooks/ovh-sms-stop";
-const DASHBOARD_URL_FALLBACK = "https://medere-prospection.vercel.app";
+const DASHBOARD_URL_FALLBACK = "https://prospection.medere.fr";
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Garde ecriture pour les GET (lecture seule). Les PUT passent par un

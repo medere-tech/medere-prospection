@@ -201,7 +201,7 @@ const HANDOFF_NOTES = "Hand-off auto INTERESSE via Léa (S9.9)";
  * Warning loggé côté handler quand le fallback est utilisé — surface le
  * problème sans bloquer la feature.
  */
-const DASHBOARD_URL_FALLBACK = "https://medere-prospection.vercel.app";
+const DASHBOARD_URL_FALLBACK = "https://prospection.medere.fr";
 
 /**
  * Nombre de messages récents chargés pour extraire le dernier inbound.
