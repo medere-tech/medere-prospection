@@ -70,6 +70,7 @@
  */
 
 import { hasAdvertiserIdentification } from "@/lib/compliance/advertiser-identification";
+import { hasOptOut } from "@/lib/compliance/opt-out";
 import { ExternalServiceError, ValidationError } from "@/lib/utils/errors";
 
 import { generate } from "./client";
@@ -111,6 +112,44 @@ export const GENERATE_REPLY_TEMPERATURE = 0.5 as const;
  * 1 SMS ~140 chars (~50-60 tokens). Borne de sécurité contre runaway.
  */
 export const GENERATE_REPLY_MAX_TOKENS = 200 as const;
+
+/**
+ * 🔒 SENTINEL — Suffixe STOP concaténé en aval par `assembleReplyBody` à
+ * chaque body de réponse généré (règle 3 `stop_present` L.34-5 CPCE).
+ *
+ * Même format que le 1er SMS (`first-sms-generator.ts:259`, assemblage
+ * `${accroche} STOP.`) pour cohérence cross-pipeline. 6 caractères :
+ * espace, STOP, point. `hasOptOut` matche via `\bSTOP\b` (les deux word
+ * boundaries existent : espace avant, point après — `opt-out.test.ts`
+ * couvre ce format).
+ */
+export const REPLY_STOP_SUFFIX = " STOP." as const;
+
+/**
+ * Concatène le suffixe STOP à un body généré par Claude, de manière
+ * idempotente.
+ *
+ * Comportement :
+ *   - Si `hasOptOut(text)` est vrai (le body contient déjà "STOP" en mot
+ *     isolé, insensible à la casse), on renvoie `text` TEL QUEL — pas de
+ *     doublon "STOP STOP." ni d'alourdissement si Claude a dérivé et
+ *     écrit sa propre mention. La compliance règle 3 reste satisfaite.
+ *   - Sinon, on renvoie `text.trimEnd()` + `REPLY_STOP_SUFFIX`. Le
+ *     `trimEnd()` collapse les éventuels espaces ou retours ligne en fin
+ *     de texte (Claude peut dériver) pour garantir UN SEUL espace avant
+ *     "STOP.".
+ *
+ * N'ajoute AUCUNE nouvelle exception et AUCUNE borne de longueur. La
+ * validation `BODY_MAX_LENGTH = 1600` reste portée par
+ * `validateBodyOrThrow` (`messages.ts:489-503`) au moment du stockage,
+ * défense-en-profondeur.
+ */
+export function assembleReplyBody(text: string): string {
+  if (hasOptOut(text)) {
+    return text;
+  }
+  return text.trimEnd() + REPLY_STOP_SUFFIX;
+}
 
 /**
  * Borne stricte sur la taille de l'historique (décision Déthié S9.3.0).
@@ -244,8 +283,16 @@ export async function generateReply(args: GenerateReplyArgs): Promise<GenerateRe
     });
   }
 
+  // ── 5. Ajout code-side du suffixe STOP (règle 3 `stop_present`) ──────
+  // Cf. `assembleReplyBody` et `REPLY_STOP_SUFFIX` ci-dessus. Idempotent
+  // si Claude a déjà écrit "STOP". L'ordre est volontaire : la triple
+  // garde Médéré (étape 4) est évaluée AVANT sur le texte brut Claude,
+  // pour isoler l'observation d'un LLM qui oublie sa consigne — l'ajout
+  // STOP ne doit pas masquer un symptôme de dérive.
+  const body = assembleReplyBody(result.text);
+
   return {
-    body: result.text,
+    body,
     promptVersion: dispatch.promptVersion,
     model: GENERATE_REPLY_MODEL,
     temperature: GENERATE_REPLY_TEMPERATURE,

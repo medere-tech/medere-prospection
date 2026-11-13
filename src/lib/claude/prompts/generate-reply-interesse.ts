@@ -32,11 +32,12 @@
  *     jusqu'à 375k€ + jusqu'à 900k€ déjà prononcés (SOLOCAL 2025) —
  *     trop cher pour faire confiance à un LLM seul.
  *
- *   - **Pas de STOP** dans le prompt : la mention STOP sur les SMS de
- *     reply S9.4+ sera ajoutée par l'orchestrateur en aval (preSendCheck
- *     rule 3 `stop_present` valide la présence). On laisse Claude se
- *     concentrer sur le message utile (~140 chars), STOP est concatenné
- *     par le wrapper d'envoi.
+ *   - **Pas de STOP** dans le prompt : le mot STOP est ajouté par le code
+ *     dans `generateReply` (`reply-generator.ts`, helper
+ *     `assembleReplyBody` — même suffixe que `first-sms-generator.ts:259`),
+ *     pas par Claude. On laisse Claude se concentrer sur le message utile
+ *     (~140 chars). `preSendCheck` règle 3 `stop_present` valide la
+ *     présence en défense-en-profondeur avant commit.
  *
  *   - **1 SMS unique, ~140 chars utiles** : Claude doit générer un texte
  *     court. Le `MAX_BODY_CHARS = 140` est une borne de design pour le

@@ -18,8 +18,9 @@
  *
  *   - Modèle Sonnet 4.6 pinned, pas de mention IA (verdict 3.F), mention
  *     "Médéré" instruite + assertion code + preSendCheck (triple garde
- *     Q3), pas de STOP dans le prompt (injecté en aval), 1 SMS ~140
- *     chars utiles, ton hybrid pro-naturel.
+ *     Q3), pas de STOP dans le prompt (le mot STOP est ajouté par le code
+ *     dans `generateReply` — `reply-generator.ts`, `assembleReplyBody`),
+ *     1 SMS ~140 chars utiles, ton hybrid pro-naturel.
  *
  *   - **Spécificité NEUTRE** : registre "clarification factuelle".
  *     L'objectif n'est PAS de vendre, c'est de désambiguïser. Une
