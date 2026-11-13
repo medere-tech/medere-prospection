@@ -15,6 +15,7 @@
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
+import { hasOptOut } from "@/lib/compliance/opt-out";
 import { ConfigError, ExternalServiceError, ValidationError } from "@/lib/utils/errors";
 
 import type { GenerateResult } from "./types";
@@ -27,10 +28,12 @@ vi.mock("./client", () => ({
 import { generate } from "./client";
 import {
   __HISTORY_MAX_ENTRIES_FOR_TESTS,
+  assembleReplyBody,
   GENERATE_REPLY_MAX_TOKENS,
   GENERATE_REPLY_MODEL,
   GENERATE_REPLY_TEMPERATURE,
   generateReply,
+  REPLY_STOP_SUFFIX,
 } from "./reply-generator";
 
 const mockedGenerate = generate as unknown as ReturnType<typeof vi.fn>;
@@ -68,6 +71,14 @@ describe("reply-generator — sentinelles constantes", () => {
 
   it("HISTORY_MAX_ENTRIES === 3 (décision Déthié S9.3.0)", () => {
     expect(__HISTORY_MAX_ENTRIES_FOR_TESTS).toBe(3);
+  });
+
+  it("REPLY_STOP_SUFFIX === ' STOP.' (identique au 1er SMS, règle 3 stop_present)", () => {
+    // 🔒 Sentinelle format : espace + STOP + point, 6 chars. Verrouille
+    // la cohérence avec `first-sms-generator.ts:259` (assemble du 1er SMS)
+    // et avec `hasOptOut` dont le word boundary `\b` accepte ce format
+    // (cf. `opt-out.test.ts:11,23` pour STOP suivi/précédé d'un point).
+    expect(REPLY_STOP_SUFFIX).toBe(" STOP.");
   });
 });
 
@@ -251,7 +262,10 @@ describe("reply-generator — happy paths", () => {
       contactCivility: "Dr",
     });
 
-    expect(result.body).toBe(fixtureBody);
+    // Suffixe STOP concaténé en aval par `assembleReplyBody` (cf.
+    // `reply-generator.ts`). La fixture ne contient PAS "STOP" → le body
+    // final = fixture + " STOP.".
+    expect(result.body).toBe(`${fixtureBody} STOP.`);
     expect(result.promptVersion).toBe("1.0.0");
     expect(result.model).toBe("claude-sonnet-4-6");
     expect(result.temperature).toBe(0.5);
@@ -276,7 +290,7 @@ describe("reply-generator — happy paths", () => {
       contactCivility: "Docteur",
     });
 
-    expect(result.body).toBe(fixtureBody);
+    expect(result.body).toBe(`${fixtureBody} STOP.`);
     expect(result.promptVersion).toBe("1.0.0");
     expect(result.model).toBe("claude-sonnet-4-6");
     expect(result.tokensInput).toBe(560);
@@ -298,7 +312,7 @@ describe("reply-generator — happy paths", () => {
       history: [],
     });
 
-    expect(result.body).toBe(fixtureBody);
+    expect(result.body).toBe(`${fixtureBody} STOP.`);
     expect(result.promptVersion).toBe("1.0.0");
     expect(result.model).toBe("claude-sonnet-4-6");
     expect(result.tokensInput).toBe(480);
@@ -454,5 +468,206 @@ describe("reply-generator — propagation erreurs SDK", () => {
         history: [],
       }),
     ).rejects.toBe(cfgErr);
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// assembleReplyBody — unit tests du helper pur (règle 3 stop_present)
+// ─────────────────────────────────────────────────────────────────────────────
+
+describe("assembleReplyBody — suffixe STOP idempotent et pur", () => {
+  it("texte sans STOP → ajout du suffixe ' STOP.'", () => {
+    const text = "Bonjour Docteur, formations Médéré. Une question ?";
+    const result = assembleReplyBody(text);
+    expect(result).toBe(`${text} STOP.`);
+    expect(result).toMatch(/ STOP\.$/);
+    expect(hasOptOut(result)).toBe(true);
+  });
+
+  it("texte contenant déjà STOP → renvoyé TEL QUEL (idempotence, pas de doublon)", () => {
+    // 🔒 Garantit qu'on ne produit JAMAIS "STOP STOP." si Claude a dérivé
+    // et écrit sa propre mention. hasOptOut matche, règle 3 satisfaite.
+    const text = "Formations Médéré. Pour vous désinscrire STOP.";
+    const result = assembleReplyBody(text);
+    expect(result).toBe(text);
+    expect(hasOptOut(result)).toBe(true);
+  });
+
+  it("texte avec 'STOPPER' sans STOP isolé → suffixe ' STOP.' ajouté", () => {
+    // 🔒 Le word boundary `\b` de `hasOptOut` refuse "STOPPER" (cf.
+    // `opt-out.test.ts:27-31`). Un body qui ne contient QUE "STOPPER"
+    // n'a donc pas de STOP isolé et doit recevoir le suffixe en aval.
+    const text = "Formations Médéré. Pour STOPPER votre abonnement, voir web.";
+    const result = assembleReplyBody(text);
+    expect(result).toBe(`${text} STOP.`);
+    expect(hasOptOut(result)).toBe(true);
+  });
+
+  it("texte avec espaces en fin → trimEnd → un seul espace avant ' STOP.'", () => {
+    const text = "Formations Médéré, une question ?   ";
+    const result = assembleReplyBody(text);
+    expect(result).toBe("Formations Médéré, une question ? STOP.");
+    // Un seul espace entre le "?" et "STOP" — pas de double espace.
+    expect(result).not.toMatch(/  STOP/);
+    expect(result).toMatch(/\? STOP\.$/);
+  });
+
+  it("texte avec retour ligne en fin → trimEnd → un seul espace avant ' STOP.'", () => {
+    const text = "Formations Médéré, une question ?\n\n";
+    const result = assembleReplyBody(text);
+    expect(result).toBe("Formations Médéré, une question ? STOP.");
+    expect(result).not.toContain("\n");
+    expect(result).toMatch(/\? STOP\.$/);
+  });
+
+  it("texte avec mix espaces + tab + retour ligne en fin → trimEnd exhaustif", () => {
+    const text = "Formations Médéré.\t  \n";
+    const result = assembleReplyBody(text);
+    expect(result).toBe("Formations Médéré. STOP.");
+    expect(result).toMatch(/\. STOP\.$/);
+  });
+
+  it("texte avec STOP minuscule → traité comme déjà opt-out (case-insensitive)", () => {
+    // `hasOptOut` est case-insensitive (opt-out.ts:92 : `/\bSTOP\b/i`).
+    // Si Claude écrit "stop" en minuscules, on NE double PAS la mention.
+    const text = "Formations Médéré. Tapez stop pour vous désinscrire.";
+    const result = assembleReplyBody(text);
+    expect(result).toBe(text);
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// generateReply — suffixe STOP en sortie, par intent (règle 3 stop_present)
+// ─────────────────────────────────────────────────────────────────────────────
+
+describe("generateReply — ajout du suffixe STOP sur chaque intent", () => {
+  beforeEach(() => {
+    mockedGenerate.mockReset();
+  });
+
+  afterEach(() => {
+    mockedGenerate.mockReset();
+  });
+
+  it("INTERESSE — SDK renvoie texte avec 'Médéré' sans STOP → body finit par ' STOP.' + hasOptOut true", async () => {
+    // 🔒 Sentinelle bout-en-bout pipeline reply. Le SYSTEM du prompt
+    // INTERESSE interdit à Claude d'écrire STOP (cf. prompt l.169). On
+    // simule donc un retour conforme au prompt : avec "Médéré", sans STOP.
+    // Le body final DOIT contenir STOP (ajouté par le code).
+    const fixture = "Bonjour Docteur, ravi de votre intérêt pour Médéré. Quelle formation ?";
+    mockedGenerate.mockResolvedValueOnce(makeGenerateResult(fixture));
+
+    const result = await generateReply({
+      intent: "INTERESSE",
+      rawMessage: "ça m'intéresse",
+      history: [],
+    });
+
+    expect(result.body).toMatch(/ STOP\.$/);
+    expect(hasOptOut(result.body)).toBe(true);
+    expect(result.body).toBe(`${fixture} STOP.`);
+  });
+
+  it("NEUTRE — SDK renvoie texte avec 'Médéré' sans STOP → body finit par ' STOP.' + hasOptOut true", async () => {
+    const fixture = "Bonjour Docteur, souhaitez-vous plus d'infos sur Médéré ?";
+    mockedGenerate.mockResolvedValueOnce(makeGenerateResult(fixture));
+
+    const result = await generateReply({
+      intent: "NEUTRE",
+      rawMessage: "OK",
+      history: [],
+    });
+
+    expect(result.body).toMatch(/ STOP\.$/);
+    expect(hasOptOut(result.body)).toBe(true);
+    expect(result.body).toBe(`${fixture} STOP.`);
+  });
+
+  it("OBJECTION — SDK renvoie texte avec 'Médéré' sans STOP → body finit par ' STOP.' + hasOptOut true", async () => {
+    const fixture = "Bonjour Docteur, je comprends. Chez Médéré, DPC pris en charge.";
+    mockedGenerate.mockResolvedValueOnce(makeGenerateResult(fixture));
+
+    const result = await generateReply({
+      intent: "OBJECTION",
+      rawMessage: "Trop cher",
+      history: [],
+    });
+
+    expect(result.body).toMatch(/ STOP\.$/);
+    expect(hasOptOut(result.body)).toBe(true);
+    expect(result.body).toBe(`${fixture} STOP.`);
+  });
+
+  it("SDK renvoie texte contenant déjà STOP → body strictement égal au texte (idempotence)", async () => {
+    // Si Claude dérape et inclut sa propre mention STOP malgré l'interdit
+    // du prompt, on NE double PAS — body === texte brut, règle 3 OK.
+    const fixture = "Bonjour Docteur, formations Médéré. Pour vous désinscrire STOP au 38080.";
+    mockedGenerate.mockResolvedValueOnce(makeGenerateResult(fixture));
+
+    const result = await generateReply({
+      intent: "INTERESSE",
+      rawMessage: "ok",
+      history: [],
+    });
+
+    expect(result.body).toBe(fixture);
+    expect(hasOptOut(result.body)).toBe(true);
+  });
+
+  it("SDK renvoie texte avec 'STOPPER' sans STOP isolé → suffixe ajouté (word boundary)", async () => {
+    const fixture = "Bonjour Docteur, formations Médéré. Pour STOPPER votre abonnement, web.";
+    mockedGenerate.mockResolvedValueOnce(makeGenerateResult(fixture));
+
+    const result = await generateReply({
+      intent: "OBJECTION",
+      rawMessage: "ok",
+      history: [],
+    });
+
+    expect(result.body).toBe(`${fixture} STOP.`);
+    expect(result.body).toMatch(/ STOP\.$/);
+    expect(hasOptOut(result.body)).toBe(true);
+  });
+
+  it("SDK renvoie texte avec espaces/retour ligne en fin → un seul espace avant ' STOP.'", async () => {
+    const fixture = "Bonjour Docteur, formations Médéré.\n  ";
+    mockedGenerate.mockResolvedValueOnce(makeGenerateResult(fixture));
+
+    const result = await generateReply({
+      intent: "NEUTRE",
+      rawMessage: "ok",
+      history: [],
+    });
+
+    expect(result.body).toBe("Bonjour Docteur, formations Médéré. STOP.");
+    expect(result.body).not.toMatch(/  STOP/);
+    expect(result.body).not.toContain("\n");
+    expect(hasOptOut(result.body)).toBe(true);
+  });
+
+  it("non-régression triple garde Médéré : SDK renvoie texte SANS 'Médéré' → ExternalServiceError (pas de STOP ajouté avant throw)", async () => {
+    // 🔒 Sentinelle ordre des étapes : triple garde Médéré est évaluée
+    // AVANT `assembleReplyBody`. Un body sans Médéré doit lever
+    // l'exception existante — même ligne, même code, même context —
+    // SANS que le suffixe STOP soit appliqué (preuve via bodyLength qui
+    // reste la longueur brute du texte LLM, pas +6 pour " STOP.").
+    const llmBody = "Bonjour Docteur, quelle formation vous intéresse ?";
+    mockedGenerate.mockResolvedValueOnce(makeGenerateResult(llmBody));
+
+    try {
+      await generateReply({
+        intent: "INTERESSE",
+        rawMessage: "ok",
+        history: [],
+      });
+      throw new Error("Should have thrown ExternalServiceError");
+    } catch (err) {
+      expect(err).toBeInstanceOf(ExternalServiceError);
+      const ctx = (err as ExternalServiceError).context;
+      expect(ctx).toBeDefined();
+      // bodyLength = longueur brute, pas `+ 6` : prouve que l'ajout STOP
+      // n'a pas eu lieu avant le throw.
+      expect(ctx!.bodyLength).toBe(llmBody.length);
+    }
   });
 });
